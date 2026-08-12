@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 가상환경 / 에디터
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 데이터셋 (전부 외부 스토리지 심볼릭 링크)
+data/
+
+# 학습 결과 (심볼릭 링크 -> /data1/yong/SSR/work_dirs)
+# 심볼릭 링크는 git 이 파일로 취급하므로 뒤에 / 를 붙이지 않는다
+work_dirs
+*.pth
+*.pkl
+
+# 외부 의존성 (별도 git 저장소를 clone 해온 것)
+mmdetection3d/
+
+# 로그 / 텐서보드
+*.log
+*.log.json
+tf_logs/
+
+# --work-dir 인자를 literal 로 넘겨서 잘못 생긴 디렉터리
+path/

@@ -517,8 +517,27 @@ log_config = dict(
     interval=100,
     hooks=[
         dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook')
+        dict(type='TensorboardLoggerHook'),
+        dict(
+            type='WandbLoggerHook',
+            init_kwargs=dict(
+                project='para-ssr',
+                name='para_ssr_v1',
+                group='para',
+                tags=['para-ssr', 'no-ffp', 'aux', '2gpu'],
+                config=dict(model='ParaSSR', ffp=False, gpus=2,
+                            batch_per_gpu=1, aux='det+map_seg+occ',
+                            task_loss_weight='1/1/1/1')),
+            # step with the runner's iteration so train curves and the
+            # per-epoch validation metrics land on the same x axis
+            by_epoch=False,
+            interval=100),
     ])
+
+# Validation every epoch. dataset.evaluate() returns plan_L2_* / plan_obj_col_*
+# (plus *_avg); with test_aux_heads=False only planning is evaluated, which is
+# the deployment configuration.
+evaluation = dict(interval=1, pipeline=test_pipeline)
 
 checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
 

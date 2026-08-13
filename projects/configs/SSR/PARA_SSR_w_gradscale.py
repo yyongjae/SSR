@@ -15,3 +15,19 @@ _base_ = ['./PARA_SSR_e2e.py']
 model = dict(
     task_loss_weight=dict(plan=1.0, det=1.0, map=1.0, occ=1.0),
     aux_grad_scale=0.02)
+
+log_config = dict(
+    hooks=[
+        dict(type='TextLoggerHook'),
+        dict(type='TensorboardLoggerHook'),
+        dict(
+            type='WandbLoggerHook',
+            init_kwargs=dict(
+                project='para-ssr',
+                name='para_w_gradscale',
+                group='loss-weight-sweep',
+                tags=['para-ssr', 'sweep'],
+                config=dict(task_loss_weight='1/1/1/1', aux_grad_scale=0.02)),
+            by_epoch=False,
+            interval=100),
+    ])

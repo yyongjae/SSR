@@ -1746,12 +1746,31 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             metric_dict[k] = metric_dict[k] / num_valid
             print("{}:{}".format(k, metric_dict[k]))
 
-        result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
-
+        # Return the planning metrics instead of only printing them, so that
+        # EvalHook and the loggers (TensorBoard / wandb) can record them.
         results_dict = dict()
+        for k, v in metric_dict.items():
+            if k == 'fut_valid_flag':   # always 1.0 after the averaging above
+                continue
+            results_dict[k] = float(v)
+        results_dict['plan_num_valid'] = float(num_valid)
+        for prefix in ('plan_L2', 'plan_L2_stp3', 'plan_obj_col',
+                       'plan_obj_box_col', 'plan_obj_col_stp3',
+                       'plan_obj_box_col_stp3'):
+            horizons = [results_dict[f'{prefix}_{t}s'] for t in (1, 2, 3)
+                        if f'{prefix}_{t}s' in results_dict]
+            if len(horizons) == 3:
+                results_dict[f'{prefix}_avg'] = sum(horizons) / 3.0
 
-        if tmp_dir is not None:
-            tmp_dir.cleanup()
+        # The json formatting below decodes 3D boxes; it only applies when the
+        # model actually emits detections. SSR (and PARA-SSR with the auxiliary
+        # heads deactivated) predicts a trajectory only, so skip it -- otherwise
+        # _format_bbox raises on the missing 'boxes_3d' key.
+        has_det = bool(results) and 'boxes_3d' in results[0].get('pts_bbox', {})
+        if has_det:
+            result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
+            if tmp_dir is not None:
+                tmp_dir.cleanup()
 
         if show:
             self.show(results, out_dir, pipeline=pipeline)

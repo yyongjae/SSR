@@ -369,8 +369,26 @@ log_config = dict(
     interval=100,
     hooks=[
         dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook')
+        dict(type='TensorboardLoggerHook'),
+        dict(
+            type='WandbLoggerHook',
+            init_kwargs=dict(
+                project='para-ssr',
+                name='ssr_baseline',
+                group='baseline',
+                tags=['ssr', 'ffp', '2gpu'],
+                config=dict(model='SSR', ffp=True, gpus=2, batch_per_gpu=1)),
+            # step with the runner's iteration so train curves and the
+            # per-epoch validation metrics land on the same x axis
+            by_epoch=False,
+            interval=100),
     ])
+
+# Validation. The base dataset config sets interval=24, i.e. never within the
+# 12-epoch schedule; evaluate every epoch instead so the planning metrics are
+# logged as training progresses. dataset.evaluate() returns plan_L2_*/
+# plan_obj_col_* (plus *_avg), which the loggers pick up automatically.
+evaluation = dict(interval=1, pipeline=test_pipeline)
 # fp16 = dict(loss_scale=512.)
 find_unused_parameters = True
 checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)

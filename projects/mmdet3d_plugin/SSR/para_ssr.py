@@ -34,6 +34,25 @@ from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.SSR.planner.metric_stp3 import PlanningMetric
 
 
+class _ScaleGrad(torch.autograd.Function):
+    """Identity forward; scales the gradient flowing backwards.
+
+    Lets the aux heads train at full strength while limiting how strongly they
+    reshape the shared BEV feature. Down-weighting the aux *losses* couples the
+    two: it also slows the heads themselves, which matters when the heads are
+    meant to be distillation teachers.
+    """
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+
+
 @DETECTORS.register_module()
 class ParaSSR(MVXTwoStageDetector):
     """Fully parallel SSR."""
@@ -60,6 +79,7 @@ class ParaSSR(MVXTwoStageDetector):
                  video_test_mode=False,
                  fut_ts=6,
                  task_loss_weight=None,
+                 aux_grad_scale=1.0,
                  test_aux_heads=False):
         super(ParaSSR, self).__init__(
             pts_voxel_layer, pts_voxel_encoder, pts_middle_encoder,
@@ -93,6 +113,9 @@ class ParaSSR(MVXTwoStageDetector):
         self.task_loss_weight = dict(plan=1.0, det=1.0, map=1.0, occ=1.0)
         if task_loss_weight is not None:
             self.task_loss_weight.update(task_loss_weight)
+        # <1.0 keeps the aux heads learning normally while reducing how much
+        # they pull the shared BEV feature (see _ScaleGrad)
+        self.aux_grad_scale = aux_grad_scale
         self.test_aux_heads = test_aux_heads
 
     @staticmethod
@@ -234,15 +257,19 @@ class ParaSSR(MVXTwoStageDetector):
         losses.update(self._scale(plan_losses, w['plan'], prefix=''))
 
         # --- auxiliary heads: each sees only bev_embed ---
+        aux_bev = bev_embed
+        if self.aux_grad_scale != 1.0:
+            aux_bev = _ScaleGrad.apply(bev_embed, self.aux_grad_scale)
+
         if self.det_motion_head is not None:
             det_losses = self.det_motion_head.forward_train(
-                bev_embed, img_metas, gt_bboxes_3d, gt_labels_3d,
+                aux_bev, img_metas, gt_bboxes_3d, gt_labels_3d,
                 gt_attr_labels)
             losses.update(self._scale(det_losses, w['det'], prefix='det.'))
 
         if self.map_head is not None:
             map_losses = self.map_head.forward_train(
-                bev_embed, img_metas, map_gt_bboxes_3d, map_gt_labels_3d)
+                aux_bev, img_metas, map_gt_bboxes_3d, map_gt_labels_3d)
             losses.update(self._scale(map_losses, w['map'], prefix='map.'))
 
         if self.occ_head is not None:
@@ -251,7 +278,7 @@ class ParaSSR(MVXTwoStageDetector):
                 'GenerateSSROccLabels to the pipeline and gt_occ_seg/' \
                 'gt_occ_valid to CustomCollect3D keys.'
             occ_losses = self.occ_head.forward_train(
-                bev_embed, gt_occ_seg, gt_occ_valid)
+                aux_bev, gt_occ_seg, gt_occ_valid)
             losses.update(self._scale(occ_losses, w['occ'], prefix='occ.'))
 
         return losses

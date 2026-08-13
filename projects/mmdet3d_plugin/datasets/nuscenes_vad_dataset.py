@@ -997,6 +997,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         use_pkl_result=False,
         custom_eval_version='vad_nusc_detection_cvpr_2019',
         samples_per_gpu=None,
+        use_future_frame=True,
         *args,
         **kwargs
     ):
@@ -1007,6 +1008,13 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         self.with_attr = with_attr
         self.fut_ts = fut_ts
         self.use_pkl_result = use_pkl_result
+        # SSR appends a future frame (index+3) to the temporal queue purely to
+        # supervise the FFP / latent world model. PARA-SSR drops the world model,
+        # so the future frame is not needed. Setting this to False also fixes the
+        # GT alignment: union2one keeps queue[-1] as the metadata container, so
+        # with the future frame present every box/map GT actually belongs to
+        # frame index+3 instead of the current frame.
+        self.use_future_frame = use_future_frame
 
         self.custom_eval_version = custom_eval_version
         # Check if config exists.
@@ -1145,22 +1153,23 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             return None
         data_queue.insert(0, example)
 
-        future_index = index + 3
-        # if future_index > len(self.data_infos) - 1:
-        #     return None
-        future_index = min(future_index, len(self.data_infos) - 1)
-        input_dict = self.get_data_info(future_index)
-        if input_dict is None:
-            return None
-        if input_dict['frame_idx'] > frame_idx and input_dict['scene_token'] == scene_token:
-            self.pre_pipeline(input_dict)
-            example = self.pipeline(input_dict)
-            example = self.vectormap_pipeline(example,input_dict)
-            if self.filter_empty_gt and \
-                    ((example is None or ~(example['gt_labels_3d']._data != -1).any()) or \
-                        (example is None or ~(example['map_gt_labels_3d']._data != -1).any())):
+        if self.use_future_frame:
+            future_index = index + 3
+            # if future_index > len(self.data_infos) - 1:
+            #     return None
+            future_index = min(future_index, len(self.data_infos) - 1)
+            input_dict = self.get_data_info(future_index)
+            if input_dict is None:
                 return None
-        data_queue.append(example)
+            if input_dict['frame_idx'] > frame_idx and input_dict['scene_token'] == scene_token:
+                self.pre_pipeline(input_dict)
+                example = self.pipeline(input_dict)
+                example = self.vectormap_pipeline(example,input_dict)
+                if self.filter_empty_gt and \
+                        ((example is None or ~(example['gt_labels_3d']._data != -1).any()) or \
+                            (example is None or ~(example['map_gt_labels_3d']._data != -1).any())):
+                    return None
+            data_queue.append(example)
         for i in prev_indexs_list:
             i = max(0, i)
             input_dict = self.get_data_info(i)

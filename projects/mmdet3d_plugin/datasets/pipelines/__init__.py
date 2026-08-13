@@ -1,14 +1,16 @@
 from .transform_3d import (
-    PadMultiViewImage, NormalizeMultiviewImage, 
+    PadMultiViewImage, NormalizeMultiviewImage,
     PhotoMetricDistortionMultiViewImage, CustomCollect3D,
     RandomScaleImageMultiViewImage, CustomObjectRangeFilter, CustomObjectNameFilter)
 from .formating import CustomDefaultFormatBundle3D
 from .loading import CustomLoadPointsFromFile, CustomLoadPointsFromMultiSweeps
+from .occ_label import GenerateSSROccLabels
 
 __all__ = [
-    'PadMultiViewImage', 'NormalizeMultiviewImage', 
+    'PadMultiViewImage', 'NormalizeMultiviewImage',
     'PhotoMetricDistortionMultiViewImage', 'CustomDefaultFormatBundle3D',
-    'CustomCollect3D', 'RandomScaleImageMultiViewImage', 
+    'CustomCollect3D', 'RandomScaleImageMultiViewImage',
     'CustomObjectRangeFilter', 'CustomObjectNameFilter',
-    'CustomLoadPointsFromFile', 'CustomLoadPointsFromMultiSweeps'
+    'CustomLoadPointsFromFile', 'CustomLoadPointsFromMultiSweeps',
+    'GenerateSSROccLabels'
 ]

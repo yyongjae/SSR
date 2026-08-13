@@ -51,5 +51,17 @@ class CustomDefaultFormatBundle3D(DefaultFormatBundle3D):
                 results['ego_lcf_feat'] = DC(to_tensor(results['ego_lcf_feat'][None, None, ...]), stack=True)
             if 'gt_attr_labels' in results:
                 results['gt_attr_labels'] = DC(to_tensor(results['gt_attr_labels']), cpu_only=False)
-                
+
+        # PARA-SSR occupancy GT: [T, C, bev_h, bev_w] / [T].
+        # pad_dims=None because the shapes are fixed by the BEV grid, so collate
+        # should just stack (the default pad_dims=2 also rejects the 1-D mask).
+        if 'gt_occ_seg' in results:
+            results['gt_occ_seg'] = DC(
+                to_tensor(results['gt_occ_seg'].astype(np.float32)),
+                stack=True, pad_dims=None)
+        if 'gt_occ_valid' in results:
+            results['gt_occ_valid'] = DC(
+                to_tensor(results['gt_occ_valid'].astype(np.uint8)),
+                stack=True, pad_dims=None)
+
         return results

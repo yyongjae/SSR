@@ -413,10 +413,23 @@ class SSRHead(DETRHead):
             return bev_embed
 
         pos_embd = bev_pos.flatten(2).permute(0, 2, 1)
-        cmd = cmd[0, 0, 0]
-        cmd_idx = torch.nonzero(cmd)[0, 0]
 
-        navi_embed = self.navi_embedding.weight[cmd_idx][None, None]
+        # ``ego_fut_cmd`` is collated as [B, 1, 1, num_commands].  The
+        # original implementation indexed sample 0 and then broadcast its
+        # command over the whole local batch.  Keep the singleton dimensions
+        # flexible, but require exactly one command vector per sample so a
+        # malformed tensor cannot silently mix samples.
+        if cmd is None:
+            raise ValueError('cmd is required when only_bev=False')
+        num_commands = self.navi_embedding.num_embeddings
+        if cmd.size(0) != bs or cmd.numel() != bs * num_commands:
+            raise ValueError(
+                f'expected one {num_commands}-way command per sample, '
+                f'but got cmd shape {tuple(cmd.shape)} for batch size {bs}')
+        cmd = cmd.reshape(bs, num_commands)
+        cmd_idx = cmd.argmax(dim=-1)  # [B]
+
+        navi_embed = self.navi_embedding(cmd_idx).unsqueeze(1)  # [B, 1, C]
         bev_navi_embed = self.navi_se(bev_embed, navi_embed)
 
         bev_query = torch.cat((bev_navi_embed, pos_embd), -1)
@@ -451,12 +464,15 @@ class SSRHead(DETRHead):
                 key_pos=latent_pos)
 
         outputs_ego_trajs = self.ego_fut_decoder(way_point)
-        outputs_ego_trajs = outputs_ego_trajs.permute(1, 0, 2). view(bs, 
-                                                      self.ego_fut_mode, self.fut_ts, 2)
-        outputs_ego_trajs_fut=outputs_ego_trajs[:,cmd_idx,...]
-        wp_vector = outputs_ego_trajs_fut.reshape(-1)
+        outputs_ego_trajs = outputs_ego_trajs.permute(1, 0, 2).reshape(
+            bs, self.ego_fut_mode, self.fut_ts, 2)
 
-        wp_vector = wp_vector.unsqueeze(0).unsqueeze(0)
+        # Select each sample's commanded mode without introducing a B x B
+        # advanced-indexing dimension.  MLN consumes [sequence, batch, T*2].
+        batch_idx = torch.arange(bs, device=outputs_ego_trajs.device)
+        outputs_ego_trajs_fut = outputs_ego_trajs[batch_idx, cmd_idx]
+        wp_vector = outputs_ego_trajs_fut.reshape(bs, self.fut_ts * 2)
+        wp_vector = wp_vector.unsqueeze(0)  # [1, B, T*2]
 
         act_query = self.action_mln(latent_query, wp_vector)
         # act_pos = self.pos_mln(latent_pos[:self.num_scenes, ...], wp_vector)

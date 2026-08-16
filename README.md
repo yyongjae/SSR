@@ -39,6 +39,17 @@ conda activate ssr
 python -m torch.distributed.run --nproc_per_node=8 --master_port=2333 tools/train.py projects/configs/SSR/SSR_e2e.py --launcher pytorch --deterministic --work-dir path/to/save/outputs
 ```
 
+### Train SSR with 2 GPUs and the same global batch
+```shell
+cd /path/to/SSR
+CUDA_VISIBLE_DEVICES=0,1 ./train_baseline_2gpu_b4.sh
+```
+
+This uses 2 GPUs x 4 samples/GPU, preserving the original global batch of 8,
+learning rate, optimizer-step count, warmup and EMA schedule. Do not pass
+`--autoscale-lr`. Validation and test still use one sample/GPU because their
+streaming scene state is intentionally single-sample.
+
 ### Eval SSR with 1 GPU
 ```shell
 cd /path/to/SSR

@@ -120,8 +120,19 @@ class BEVFormerEncoder(TransformerLayerSequence):
         reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
             reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3]) * eps)
 
-        reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
-        reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
+        # [B, num_cam, (height, width)].  The former code used sample 0 / camera
+        # 0 for every projection, which was only correct while all image shapes
+        # happened to be identical.
+        image_hw = reference_points_cam.new_tensor([
+            [[shape[0], shape[1]] for shape in img_meta['img_shape']]
+            for img_meta in img_metas
+        ])
+        if tuple(image_hw.shape[:2]) != (B, num_cam):
+            raise ValueError(
+                f'expected image shapes for {(B, num_cam)}, '
+                f'but got {tuple(image_hw.shape)}')
+        reference_points_cam[..., 0] /= image_hw[None, :, :, None, 1]
+        reference_points_cam[..., 1] /= image_hw[None, :, :, None, 0]
 
         bev_mask = (bev_mask & (reference_points_cam[..., 1:2] > 0.0)
                     & (reference_points_cam[..., 1:2] < 1.0)

@@ -16,6 +16,22 @@ from mmdet.models.builder import LOSSES
 from mmdet.models.losses.utils import weight_reduce_loss
 
 
+def _expand_frame_mask(frame_mask, n_gt, s):
+    """Normalise a frame-validity mask to a broadcastable ``[n, T]`` float.
+
+    Accepts ``[T]`` (one mask shared by the whole batch, correct only when
+    every sample agrees) or ``[n, T]`` (per row of the instance axis, which is
+    what ``batch x class`` occupancy needs once ``samples_per_gpu > 1``).
+    """
+    mask = frame_mask.float()
+    if mask.dim() == 1:
+        assert mask.size(0) == s, f'{tuple(frame_mask.shape)} vs T={s}'
+        return mask.view(1, s)
+    assert tuple(mask.shape) == (n_gt, s), \
+        f'{tuple(frame_mask.shape)} vs {(n_gt, s)}'
+    return mask
+
+
 @LOSSES.register_module()
 class OccBinarySegmentationLoss(nn.Module):
     """BCE with temporal discounting and optional top-k hard pixel mining."""
@@ -40,10 +56,10 @@ class OccBinarySegmentationLoss(nn.Module):
             prediction, target.float(), reduction='none')
 
         if frame_mask is not None:
-            assert frame_mask.size(0) == s, f'{frame_mask.size()}'
+            frame_mask = _expand_frame_mask(frame_mask, n_gt, s)
             if frame_mask.sum().item() == 0:
                 return prediction.sum() * 0.
-            loss = loss * frame_mask.view(1, s, 1, 1).float()
+            loss = loss * frame_mask.unsqueeze(-1).unsqueeze(-1)
 
         future_discounts = self.future_discount ** torch.arange(
             s, device=loss.device, dtype=loss.dtype)
@@ -72,10 +88,9 @@ def occ_dice_loss(pred,
     assert pred.size() == target.size(), f'{pred.size()}, {target.size()}'
 
     if frame_mask is not None:
-        assert frame_mask.size(0) == s, f'{frame_mask.size()}'
-        if frame_mask.sum().item() == 0:
+        fm = _expand_frame_mask(frame_mask, n, s).unsqueeze(-1).unsqueeze(-1)
+        if fm.sum().item() == 0:
             return pred.sum() * 0.
-        fm = frame_mask.view(1, s, 1, 1).float()
         target = target * fm
         pred = pred * fm
 

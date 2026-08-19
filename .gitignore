@@ -14,6 +14,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+.wandb/
 
 # Jupyter
 .ipynb_checkpoints/

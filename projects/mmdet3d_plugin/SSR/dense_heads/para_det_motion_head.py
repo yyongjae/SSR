@@ -35,6 +35,11 @@ from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.core.bbox.coders import build_bbox_coder
 
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
+from projects.mmdet3d_plugin.SSR.modules.decoder import CustomMSDeformableAttention
+from projects.mmdet3d_plugin.SSR.modules.spatial_cross_attention import (
+    MSDeformableAttention3D)
+from projects.mmdet3d_plugin.SSR.modules.temporal_self_attention import (
+    TemporalSelfAttention)
 
 
 def _get_clones(module, n):
@@ -208,6 +213,19 @@ class ParaDetMotionHead(BaseModule):
         for p in self.motion_decoder.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+        # Xavier above overwrites the deformable-attention weights, which must
+        # start at zero so that step 0 samples exactly the radial grid held in
+        # ``sampling_offsets.bias`` with uniform attention. Re-apply their own
+        # initialisation afterwards, exactly as VAD's transformer and
+        # ``SSRPerceptionTransformer.init_weights`` do. (The biases survive the
+        # loop because they are 1-D, but the weights do not.)
+        for m in self.modules():
+            if isinstance(m, (MSDeformableAttention3D, TemporalSelfAttention,
+                              CustomMSDeformableAttention)):
+                try:
+                    m.init_weight()
+                except AttributeError:
+                    m.init_weights()
         xavier_init(self.reference_points, distribution='uniform', bias=0.)
         if self.use_sigmoid_cls:
             bias_init = bias_init_with_prob(0.01)

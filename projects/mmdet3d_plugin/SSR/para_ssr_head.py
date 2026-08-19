@@ -191,10 +191,24 @@ class ParaSSRHead(BaseModule):
             return bev_embed
 
         pos_embd = bev_pos.flatten(2).permute(0, 2, 1)
-        cmd = cmd[0, 0, 0]
-        cmd_idx = torch.nonzero(cmd)[0, 0]
 
-        navi_embed = self.navi_embedding.weight[cmd_idx][None, None]
+        # ``ego_fut_cmd`` is collated as [B, 1, 1, num_commands]. The original
+        # implementation indexed sample 0 and then broadcast its command over
+        # the whole local batch, which silently steered every sample by sample
+        # 0's navigation command once B > 1. Keep the singleton dimensions
+        # flexible, but require exactly one command vector per sample so a
+        # malformed tensor cannot mix samples again.
+        if cmd is None:
+            raise ValueError('cmd is required when only_bev=False')
+        num_commands = self.navi_embedding.num_embeddings
+        if cmd.size(0) != bs or cmd.numel() != bs * num_commands:
+            raise ValueError(
+                f'expected one {num_commands}-way command per sample, '
+                f'but got cmd shape {tuple(cmd.shape)} for batch size {bs}')
+        cmd = cmd.reshape(bs, num_commands)
+        cmd_idx = cmd.argmax(dim=-1)  # [B]
+
+        navi_embed = self.navi_embedding(cmd_idx).unsqueeze(1)  # [B, 1, C]
         bev_navi_embed = self.navi_se(bev_embed, navi_embed)
 
         bev_query = torch.cat((bev_navi_embed, pos_embd), -1)

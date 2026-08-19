@@ -998,10 +998,18 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         custom_eval_version='vad_nusc_detection_cvpr_2019',
         samples_per_gpu=None,
         use_future_frame=True,
+        det_score_thresh=0.0,
         *args,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
+        # Score floor for the detection submission json. VAD hard-codes 0.2
+        # (_format_bbox), which shrinks the file but also truncates the tail of
+        # every PR curve, so its published mAP is measured at 0.2. nuScenes AP
+        # integrates over recall, so a lower floor can only help: 0.0 is the
+        # honest number and 0.2 is the like-for-like comparison against VAD's
+        # paper. evaluate_det() reports both when they differ.
+        self.det_score_thresh = det_score_thresh
         self.queue_length = queue_length
         self.overlap_test = overlap_test
         self.bev_size = bev_size
@@ -1738,6 +1746,22 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         # NOTE: print planning metric
         print('\n')
         print('-------------- Planning --------------')
+        # custom_multi_gpu_test returns {'bbox_results': [...]} while
+        # single_gpu_test returns the list directly, and CustomDistEvalHook
+        # forwards whichever it got. Without this, in-training validation on
+        # more than one GPU fails here on the first eval epoch. VAD's dataset
+        # unwraps the same way.
+        if isinstance(results, dict):
+            results = results['bbox_results']
+
+        # ``metric_results`` also carries the ViP3D motion counters when the
+        # detection head ran. Those are raw counts aggregated over the whole
+        # split by evaluate_motion(), so averaging them here -- over only the
+        # fut_valid_flag samples, no less -- would be meaningless. Keep the
+        # planning keys.
+        def _is_plan_key(k):
+            return k.startswith('plan_') or k == 'fut_valid_flag'
+
         metric_dict = None
         num_valid = 0
         for res in results:
@@ -1745,12 +1769,14 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                 num_valid += 1
             else:
                 continue
+            plan_only = {k: v for k, v in res['metric_results'].items()
+                         if _is_plan_key(k)}
             if metric_dict is None:
-                metric_dict = copy.deepcopy(res['metric_results'])
+                metric_dict = copy.deepcopy(plan_only)
             else:
-                for k in res['metric_results'].keys():
-                    metric_dict[k] += res['metric_results'][k]
-        
+                for k in plan_only:
+                    metric_dict[k] += plan_only[k]
+
         for k in metric_dict:
             metric_dict[k] = metric_dict[k] / num_valid
             print("{}:{}".format(k, metric_dict[k]))
@@ -1771,11 +1797,39 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             if len(horizons) == 3:
                 results_dict[f'{prefix}_avg'] = sum(horizons) / 3.0
 
+        # Every formatter below pairs results[i] with data_infos[i]['token'].
+        # Under distributed eval that holds only if the contiguous sampler and
+        # collect_results_cpu agree on the ordering, which is a two-file
+        # invariant nothing else checks. ParaSSR stamps each result with the
+        # token it came from, so check it here rather than silently scoring
+        # predictions against the wrong scene.
+        self._assert_token_alignment(results)
+
+        # Auxiliary heads are off by default (PARA-Drive deactivates them at
+        # inference), so evaluate whatever the model actually emitted.
+        first = results[0].get('pts_bbox', {}) if results else {}
+
+        if 'boxes_3d' in first:
+            results_dict.update(
+                self.evaluate_det(results, logger=logger,
+                                  jsonfile_prefix=jsonfile_prefix))
+        if 'gt_car' in results[0].get('metric_results', {}):
+            results_dict.update(self.evaluate_motion(results))
+
+        if 'map_pts_3d' in first:
+            results_dict.update(
+                self.evaluate_map(results, logger=logger,
+                                  map_metric=map_metric,
+                                  jsonfile_prefix=jsonfile_prefix))
+
+        if 'occ_scores' in first:
+            results_dict.update(self.evaluate_occ(results))
+
         # The json formatting below decodes 3D boxes; it only applies when the
         # model actually emits detections. SSR (and PARA-SSR with the auxiliary
         # heads deactivated) predicts a trajectory only, so skip it -- otherwise
         # _format_bbox raises on the missing 'boxes_3d' key.
-        has_det = bool(results) and 'boxes_3d' in results[0].get('pts_bbox', {})
+        has_det = bool(results) and 'boxes_3d' in first
         if has_det:
             result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
             if tmp_dir is not None:
@@ -1784,6 +1838,435 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         if show:
             self.show(results, out_dir, pipeline=pipeline)
         return results_dict
+
+    # ------------------------------------------------------------------ #
+    # auxiliary-head evaluation                                           #
+    # ------------------------------------------------------------------ #
+    def _format_det_results(self, results, out_dir, score_thresh=0.0):
+        """Detections -> the nuScenes submission json ``NuScenesEval`` reads.
+
+        This is VAD's ``_format_bbox`` detection loop, which SSR had stripped
+        out because SSR predicts a trajectory only. Restored here so PARA-SSR's
+        detection head can be scored without also demanding map predictions.
+        """
+        nusc_annos = {}
+        det_mapped_class_names = self.CLASSES
+        for sample_id, det in enumerate(mmcv.track_iter_progress(results)):
+            det = det.get('pts_bbox', det)
+            annos = []
+            boxes = output_to_nusc_box(det)
+            sample_token = self.data_infos[sample_id]['token']
+            boxes = lidar_nusc_box_to_global(
+                self.data_infos[sample_id], boxes, det_mapped_class_names,
+                self.custom_eval_detection_configs, self.eval_version)
+            for box in boxes:
+                if box.score < score_thresh:
+                    continue
+                name = det_mapped_class_names[box.label]
+                if np.sqrt(box.velocity[0]**2 + box.velocity[1]**2) > 0.2:
+                    if name in ('car', 'construction_vehicle', 'bus', 'truck',
+                                'trailer'):
+                        attr = 'vehicle.moving'
+                    elif name in ('bicycle', 'motorcycle'):
+                        attr = 'cycle.with_rider'
+                    else:
+                        attr = NuScenesDataset.DefaultAttribute[name]
+                else:
+                    if name == 'pedestrian':
+                        attr = 'pedestrian.standing'
+                    elif name == 'bus':
+                        attr = 'vehicle.stopped'
+                    else:
+                        attr = NuScenesDataset.DefaultAttribute[name]
+                annos.append(dict(
+                    sample_token=sample_token,
+                    translation=box.center.tolist(),
+                    size=box.wlh.tolist(),
+                    rotation=box.orientation.elements.tolist(),
+                    velocity=box.velocity[:2].tolist(),
+                    detection_name=name,
+                    detection_score=box.score,
+                    attribute_name=attr,
+                    fut_traj=box.fut_trajs.tolist()))
+            nusc_annos[sample_token] = annos
+
+        mmcv.mkdir_or_exist(out_dir)
+        res_path = osp.join(out_dir, 'det_results_nusc.json')
+        mmcv.dump(dict(meta=self.modality, results=nusc_annos), res_path)
+        return res_path
+
+    def _load_nuscenes(self):
+        """``NuScenes`` devkit handle, tolerating a lidarseg-less install.
+
+        This data root ships ``v1.0-trainval/lidarseg.json`` but not the
+        ``lidarseg/`` label files it indexes, so the devkit asserts during
+        __init__ even though detection evaluation never touches lidarseg. Fall
+        back to a shadow data root of symlinks with that one json omitted --
+        the user's data is not modified.
+        """
+        from nuscenes import NuScenes
+        try:
+            return NuScenes(version=self.version, dataroot=self.data_root,
+                            verbose=False)
+        except (AssertionError, FileNotFoundError) as e:
+            if 'lidarseg' not in str(e) and 'panoptic' not in str(e):
+                raise
+            print(f'  nuScenes devkit init failed on lidarseg/panoptic ({e});'
+                  ' retrying without those tables')
+
+        # Symlink targets must be absolute: they are resolved relative to the
+        # link's own directory, not the process cwd. lexists() rather than
+        # exists() so a stale broken link is replaced instead of raising.
+        root = osp.abspath(self.data_root)
+        shadow = osp.join(tempfile.gettempdir(),
+                          f'nusc_nolidarseg_{os.getuid()}')
+        table_dir = osp.join(shadow, self.version)
+        mmcv.mkdir_or_exist(table_dir)
+
+        def _link(src, dst):
+            if osp.lexists(dst):
+                if osp.islink(dst) and os.readlink(dst) == src:
+                    return
+                os.remove(dst)
+            os.symlink(src, dst)
+
+        for name in os.listdir(root):
+            if name != self.version:
+                _link(osp.join(root, name), osp.join(shadow, name))
+        for name in os.listdir(osp.join(root, self.version)):
+            if name in ('lidarseg.json', 'panoptic.json'):
+                continue
+            _link(osp.join(root, self.version, name),
+                  osp.join(table_dir, name))
+        return NuScenes(version=self.version, dataroot=shadow, verbose=False)
+
+    def _assert_token_alignment(self, results):
+        """results[i] must be the prediction for data_infos[i].
+
+        Silent when the model does not stamp a token (older checkpoints, or a
+        model other than ParaSSR); loud when it does and they disagree.
+        """
+        tokens = [r.get('pts_bbox', {}).get('sample_token') for r in results]
+        if not tokens or tokens[0] is None:
+            return
+        want = [info['token'] for info in self.data_infos[:len(tokens)]]
+        if tokens == want:
+            return
+        n_bad = sum(a != b for a, b in zip(tokens, want))
+        first = next(i for i, (a, b) in enumerate(zip(tokens, want)) if a != b)
+        raise RuntimeError(
+            f'result ordering does not match the dataset: {n_bad}/{len(tokens)} '
+            f'positions differ, first at index {first} '
+            f'(got {tokens[first]}, expected {want[first]}). Check the test '
+            'sampler and collect_results_cpu -- an interleaved split with a '
+            'contiguous collection (or vice versa) produces exactly this.')
+
+    def evaluate_det(self, results, logger=None, jsonfile_prefix=None):
+        """nuScenes detection mAP / NDS for the parallel det+motion head.
+
+        ``det_score_thresh`` may be a float or a list. VAD publishes its mAP at
+        0.2 and this repo defaults to 0.0, which is not a like-for-like
+        comparison -- nuScenes AP integrates over recall, so raising the floor
+        can only remove operating points. Set ``det_score_thresh=[0.0, 0.2]``
+        in the dataset config to get both; the extra runs are keyed
+        ``.../mAP@0.2`` and the first threshold keeps the unsuffixed names the
+        EvalHook watches.
+        """
+        print('\n-------------- Detection --------------')
+        # NuScenesEval asserts the prediction sample_tokens equal the GT split
+        # exactly, so a partial run cannot be scored. Say so instead of letting
+        # it fail deep inside the evaluator.
+        if len(results) != len(self):
+            print(f'  {len(results)} predictions for {len(self)} samples -- '
+                  'nuScenes detection mAP needs the whole split; skipping.')
+            return {}
+        base_dir = jsonfile_prefix or osp.join(
+            tempfile.gettempdir(), 'para_ssr_det_eval')
+
+        thresholds = self.det_score_thresh
+        if not isinstance(thresholds, (list, tuple)):
+            thresholds = [thresholds]
+        detail = {}
+        for i, thr in enumerate(thresholds):
+            suffix = '' if i == 0 else f'@{thr}'
+            out_dir = base_dir if i == 0 else f'{base_dir}_thr{thr}'
+            res_path = self._format_det_results(results, out_dir,
+                                                score_thresh=thr)
+            metrics = self._run_nuscenes_det_eval(res_path, out_dir)
+            if metrics is None:
+                continue
+            prefix = 'pts_bbox_NuScenes'
+            for name in self.CLASSES:
+                for k, v in metrics['label_aps'][name].items():
+                    detail[f'{prefix}/{name}_AP_dist_{k}{suffix}'] = \
+                        float(f'{v:.4f}')
+                for k, v in metrics['label_tp_errors'][name].items():
+                    detail[f'{prefix}/{name}_{k}{suffix}'] = float(f'{v:.4f}')
+            for k, v in metrics['tp_errors'].items():
+                detail[f'{prefix}/{self.ErrNameMapping[k]}{suffix}'] = \
+                    float(f'{v:.4f}')
+            detail[f'{prefix}/NDS{suffix}'] = metrics['nd_score']
+            detail[f'{prefix}/mAP{suffix}'] = metrics['mean_ap']
+            print(f"  score>={thr}:  mAP {metrics['mean_ap']:.4f}   "
+                  f"NDS {metrics['nd_score']:.4f}")
+        return detail
+
+    def _run_nuscenes_det_eval(self, res_path, out_dir):
+        nusc = self._load_nuscenes()
+        eval_set_map = {'v1.0-mini': 'mini_val', 'v1.0-trainval': 'val'}
+        try:
+            nusc_eval = NuScenesEval_custom(
+                nusc,
+                config=self.custom_eval_detection_configs,
+                result_path=res_path,
+                eval_set=eval_set_map[self.version],
+                output_dir=out_dir,
+                verbose=False,
+                overlap_test=self.overlap_test,
+                data_infos=self.data_infos)
+            nusc_eval.main(plot_examples=0, render_curves=False)
+        except AssertionError as e:
+            # Most often "Samples in split doesn't match samples in
+            # predictions" from a partial run. Do not let it discard the map,
+            # occupancy and planning numbers computed alongside it.
+            print(f'  detection evaluation skipped: {e}')
+            return None
+        return mmcv.load(osp.join(out_dir, 'metrics_summary.json'))
+
+    def evaluate_motion(self, results):
+        """ViP3D EPA / ADE / FDE / MR, aggregated over the split.
+
+        The per-sample counters are produced by ParaSSR during inference; this
+        only sums and normalises them, which is why EPA is defined here and not
+        per frame. Same protocol as VAD so the numbers are comparable.
+        """
+        motion_cls_names = ['car', 'pedestrian']
+        motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit', 'fp',
+                               'ADE', 'FDE', 'MR']
+        totals = {f'{m}_{c}': 0.0
+                  for m in motion_metric_names for c in motion_cls_names}
+        for res in results:
+            mr = res.get('metric_results', {})
+            for k in totals:
+                totals[k] += mr.get(k, 0.0)
+
+        alpha = 0.5          # VAD's false-positive penalty in EPA
+        detail = {}
+        print('\n-------------- Motion Prediction --------------')
+
+        def _div(num, den):
+            """NaN, not 0, when nothing was counted.
+
+            Clamping the denominator to 1 would report ADE/FDE = 0.0000 for a
+            model that matched no agents at all -- i.e. a completely dead head
+            would look perfect, which is the exact failure this evaluation
+            exists to catch.
+            """
+            return float(num) / float(den) if den > 0 else float('nan')
+
+        for cls in motion_cls_names:
+            n_gt = totals[f'gt_{cls}']
+            n_ade = totals[f'cnt_ade_{cls}']
+            n_fde = totals[f'cnt_fde_{cls}']
+            detail[f'EPA_{cls}'] = _div(
+                totals[f'hit_{cls}'] - alpha * totals[f'fp_{cls}'], n_gt)
+            detail[f'ADE_{cls}'] = _div(totals[f'ADE_{cls}'], n_ade)
+            detail[f'FDE_{cls}'] = _div(totals[f'FDE_{cls}'], n_fde)
+            detail[f'MR_{cls}'] = _div(totals[f'MR_{cls}'], n_fde)
+            # counts, so a NaN or a suspicious value can be interpreted
+            detail[f'motion_cnt_{cls}/gt'] = n_gt
+            detail[f'motion_cnt_{cls}/matched'] = n_ade
+            detail[f'motion_cnt_{cls}/hit'] = totals[f'hit_{cls}']
+            detail[f'motion_cnt_{cls}/fp'] = totals[f'fp_{cls}']
+            print(f'  {cls:11s} EPA {detail[f"EPA_{cls}"]:7.4f}  '
+                  f'ADE {detail[f"ADE_{cls}"]:7.4f}  '
+                  f'FDE {detail[f"FDE_{cls}"]:7.4f}  '
+                  f'MR {detail[f"MR_{cls}"]:7.4f}   '
+                  f'[gt {n_gt:.0f}, matched {n_ade:.0f}, '
+                  f'hit {totals[f"hit_{cls}"]:.0f}, fp {totals[f"fp_{cls}"]:.0f}]')
+            if n_ade == 0:
+                print(f'    ^ no {cls} matched: ADE/FDE are undefined, '
+                      'not zero')
+        return detail
+
+    def _format_map_results(self, results, out_dir):
+        """Per-sample vector predictions -> the dict ``eval_map`` consumes.
+
+        ``format_res_gt_by_classes`` zips ``gen_results.values()`` against the
+        GT *list* positionally, so this must be inserted in dataset order and
+        must contain one entry per sample -- hence the explicit length check.
+        """
+        map_pred_annos = {}
+        for sample_id, det in enumerate(mmcv.track_iter_progress(results)):
+            det = det.get('pts_bbox', det)
+            sample_token = self.data_infos[sample_id]['token']
+            pred_vec_list = []
+            for vec in output_to_vecs(det):
+                pred_vec_list.append(
+                    dict(pts=vec['pts'],
+                         pts_num=len(vec['pts']),
+                         cls_name=self.MAPCLASSES[vec['label']],
+                         type=vec['label'],
+                         confidence_level=vec['score']))
+            map_pred_annos[sample_token] = dict(sample_token=sample_token,
+                                                vectors=pred_vec_list)
+        assert len(map_pred_annos) == len(self), \
+            (f'{len(map_pred_annos)} map predictions for {len(self)} samples; '
+             'chamfer mAP pairs predictions with GT by position')
+
+        mmcv.mkdir_or_exist(out_dir)
+        res_path = osp.join(out_dir, 'map_results.pkl')
+        mmcv.dump(dict(meta=self.modality, map_results=map_pred_annos),
+                  res_path)
+        return map_pred_annos, res_path
+
+    def evaluate_map(self, results, logger=None, map_metric='chamfer',
+                     jsonfile_prefix=None):
+        """Chamfer / IoU mAP for the vectorised map head.
+
+        Kept separate from ``_evaluate_single`` on purpose: that path also runs
+        the full nuScenes detection evaluation, which needs detections PARA-SSR
+        does not emit when only the map head is switched on.
+        """
+        from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import (
+            eval_map, format_res_gt_by_classes)
+
+        out_dir = jsonfile_prefix or osp.join(
+            tempfile.gettempdir(), 'para_ssr_map_eval')
+        print('\n-------------- Map (vectorised) --------------')
+        map_results, res_path = self._format_map_results(results, out_dir)
+
+        # GT side: built once from the dataset itself and cached on disk.
+        if self.map_ann_file is None:
+            print('map_ann_file is not set; skipping map mAP')
+            return {}
+        if not os.path.exists(self.map_ann_file):
+            self._format_gt()
+        map_annotations = mmcv.load(self.map_ann_file)['GTs']
+        # eval_map zips predictions against GT by POSITION, so a cache built
+        # from a different split or ordering silently scores every prediction
+        # against the wrong scene. Counting entries does not catch that --
+        # match on the tokens themselves and reorder the GT to follow the
+        # predictions. Reordering rather than demanding positional equality is
+        # what lets a subset of the split be evaluated (tools/verify_dist_eval)
+        # without weakening the guarantee: every predicted token must still be
+        # present in the cache.
+        pred_tokens = list(map_results.keys())
+        by_token = {a['sample_token']: a for a in map_annotations}
+        missing = [t for t in pred_tokens if t not in by_token]
+        if missing:
+            raise RuntimeError(
+                f'map GT cache {self.map_ann_file} does not cover this '
+                f'dataset: {len(map_annotations)} GT vs {len(pred_tokens)} '
+                f'pred samples, {len(missing)} predicted tokens absent from '
+                f'the cache (first: {missing[0]}). Delete the cache so it is '
+                'rebuilt for the current split.')
+        map_annotations = [by_token[t] for t in pred_tokens]
+
+        cls_gens, cls_gts = format_res_gt_by_classes(
+            res_path, map_results, map_annotations,
+            cls_names=self.MAPCLASSES,
+            num_pred_pts_per_instance=self.fixed_num,
+            eval_use_same_gt_sample_num_flag=self.eval_use_same_gt_sample_num_flag,
+            pc_range=self.pc_range)
+
+        metrics = map_metric if isinstance(map_metric, list) else [map_metric]
+        detail = {}
+        for metric in metrics:
+            if metric == 'chamfer':
+                thresholds = [0.5, 1.0, 1.5]
+            elif metric == 'iou':
+                thresholds = np.linspace(
+                    .5, 0.95, int(np.round((0.95 - .5) / .05)) + 1,
+                    endpoint=True)
+            else:
+                raise KeyError(f'metric {metric} is not supported')
+
+            cls_aps = np.zeros((len(thresholds), self.NUM_MAPCLASSES))
+            for i, thr in enumerate(thresholds):
+                _, cls_ap = eval_map(
+                    map_results, map_annotations, cls_gens, cls_gts,
+                    threshold=thr, cls_names=self.MAPCLASSES, logger=logger,
+                    num_pred_pts_per_instance=self.fixed_num,
+                    pc_range=self.pc_range, metric=metric)
+                for j in range(self.NUM_MAPCLASSES):
+                    cls_aps[i, j] = cls_ap[j]['ap']
+
+            for i, name in enumerate(self.MAPCLASSES):
+                detail[f'NuscMap_{metric}/{name}_AP'] = float(cls_aps.mean(0)[i])
+                for j, thr in enumerate(thresholds):
+                    if metric == 'chamfer' or thr in (0.5, 0.75):
+                        detail[f'NuscMap_{metric}/{name}_AP_thr_{thr}'] = \
+                            float(cls_aps[j][i])
+            detail[f'NuscMap_{metric}/mAP'] = float(cls_aps.mean(0).mean())
+            for name in self.MAPCLASSES:
+                print('{}: {}'.format(
+                    name, detail[f'NuscMap_{metric}/{name}_AP']))
+            print('map ({}): {}'.format(
+                metric, detail[f'NuscMap_{metric}/mAP']))
+        return detail
+
+    def evaluate_occ(self, results, thresholds=(0.1, 0.3, 0.5)):
+        """IoU of the predicted occupancy against the pipeline's own GT.
+
+        The occupancy GT is rasterised inside the pipeline, so it is only
+        available when the test pipeline includes ``GenerateSSROccLabels``.
+        Reported at several thresholds because the usable operating point is
+        class-dependent -- UniAD evaluates at 0.1, not 0.5 (report #01 6.1).
+        """
+        first = results[0].get('pts_bbox', results[0])
+        if 'occ_scores' not in first:
+            return {}
+        print('\n-------------- Occupancy --------------')
+        n_cls = first['occ_scores'].shape[2]
+        inter = np.zeros((len(thresholds), n_cls))
+        union = np.zeros((len(thresholds), n_cls))
+        n_seen = 0
+        n_frames = n_valid_frames = 0
+        for sample_id, det in enumerate(results):
+            det = det.get('pts_bbox', det)
+            gt = det.get('gt_occ_seg', None)
+            if gt is None:
+                continue
+            p = det['occ_scores'][0].float()      # [T, C, H, W] (stored fp16)
+            g = torch.as_tensor(gt)[0].bool()
+            # Score only the frames the loss supervised. Frames that ran off
+            # the end of the scene have no GT, so counting them rewards
+            # predicting "empty" there.
+            valid = det.get('gt_occ_valid', None)
+            if valid is not None:
+                valid = torch.as_tensor(valid).reshape(-1)[:p.shape[0]].bool()
+                n_frames += valid.numel()
+                n_valid_frames += int(valid.sum())
+                if not valid.any():
+                    continue
+                p, g = p[valid], g[valid]
+            for ti, thr in enumerate(thresholds):
+                pb = p > thr
+                inter[ti] += (pb & g).sum((0, 2, 3)).numpy()
+                union[ti] += (pb | g).sum((0, 2, 3)).numpy()
+            n_seen += 1
+        if n_seen == 0:
+            print('no occupancy GT in the test pipeline; skipping occ IoU')
+            return {}
+        detail = {}
+        if n_frames:
+            frac = n_valid_frames / n_frames
+            detail['occ_valid_frame_frac'] = float(frac)
+            print(f'  scored {n_valid_frames}/{n_frames} frames '
+                  f'({frac*100:.2f}% valid; the rest ran off the end of a '
+                  'scene and carry no GT)')
+        else:
+            print('  gt_occ_valid absent -- scoring ALL frames, including '
+                  'ones past the end of a scene')
+        for ti, thr in enumerate(thresholds):
+            ious = inter[ti] / np.maximum(union[ti], 1)
+            for c in range(n_cls):
+                detail[f'occ_iou_thr{thr}/cls{c}'] = float(ious[c])
+            detail[f'occ_iou_thr{thr}/mean'] = float(ious.mean())
+            print(f'  thr {thr}: ' + ' '.join(f'cls{c} {ious[c]:.4f}'
+                                              for c in range(n_cls)))
+        return detail
 
 def output_to_nusc_box(detection):
     """Convert the output to the box class in the nuScenes.

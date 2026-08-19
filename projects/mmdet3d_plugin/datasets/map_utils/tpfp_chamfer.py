@@ -1,10 +1,39 @@
 # from ..chamfer_dist import ChamferDistance
 import numpy as np
+import shapely
 from shapely.geometry import LineString, Polygon
 from shapely.strtree import STRtree
 from shapely.geometry import CAP_STYLE, JOIN_STYLE
 from scipy.spatial import distance
 import similaritymeasures
+
+_SHAPELY2 = int(shapely.__version__.split('.')[0]) >= 2
+
+
+class GeomIndex:
+    """``STRtree`` that yields ``(index, geometry)`` on shapely 1.x and 2.x.
+
+    shapely < 2.0 returns the geometry objects themselves from
+    ``STRtree.query`` -- which is why the original code kept an ``id()`` ->
+    index dict -- while shapely >= 2.0 returns integer indices into the
+    sequence the tree was built from. Calling ``.intersects`` on the latter
+    raises ``AttributeError: 'numpy.int64' object has no attribute
+    'intersects'``, so every query site goes through this wrapper.
+    """
+
+    def __init__(self, geoms):
+        self.geoms = geoms
+        self.tree = STRtree(geoms)
+        self._by_id = None if _SHAPELY2 else {
+            id(g): i for i, g in enumerate(geoms)}
+
+    def query(self, geom):
+        for item in self.tree.query(geom):
+            if self._by_id is None:
+                idx = int(item)
+                yield idx, self.geoms[idx]
+            else:
+                yield self._by_id[id(item)], item
 
 # def chamfer_distance(pred_bbox, gt_bbox):
 
@@ -32,16 +61,14 @@ def vec_iou(pred_lines, gt_lines):
                         for i in gt_lines]
 
     # construct tree
-    tree = STRtree(gt_lines_shapely)
-    index_by_id = dict((id(pt), i) for i, pt in enumerate(gt_lines_shapely))
+    tree = GeomIndex(gt_lines_shapely)
 
     iou_matrix = np.zeros((num_preds, num_gts))
 
     for i, pline in enumerate(pred_lines_shapely):
 
-        for o in tree.query(pline):
+        for gt_id, o in tree.query(pline):
             if o.intersects(pline):
-                gt_id = index_by_id[id(o)]
 
                 inter = o.intersection(pline).area
                 union = o.union(pline).area
@@ -66,16 +93,14 @@ def convex_iou(pred_lines, gt_lines, gt_mask):
         [Polygon(i[m].reshape(-1,2)).convex_hull for i,m in zip(gt_lines,gt_mask)]
 
     # construct tree
-    tree = STRtree(pred_lines_shapely)
-    index_by_id = dict((id(pt), i) for i, pt in enumerate(pred_lines_shapely))
+    tree = GeomIndex(pred_lines_shapely)
 
     iou_matrix = np.zeros((num_preds, num_gts))
 
     for i, pline in enumerate(gt_lines_shapely):
 
-        for o in tree.query(pline):
+        for pred_id, o in tree.query(pline):
             if o.intersects(pline):
-                pred_id = index_by_id[id(o)]
 
                 inter = o.intersection(pline).area
                 union = o.union(pline).area
@@ -100,16 +125,14 @@ def rbbox_iou(pred_lines, gt_lines, gt_mask):
         [Polygon(i[m].reshape(-1,2)) for i,m in zip(gt_lines,gt_mask)]
 
     # construct tree
-    tree = STRtree(pred_lines_shapely)
-    index_by_id = dict((id(pt), i) for i, pt in enumerate(pred_lines_shapely))
+    tree = GeomIndex(pred_lines_shapely)
 
     iou_matrix = np.zeros((num_preds, num_gts))
 
     for i, pline in enumerate(gt_lines_shapely):
 
-        for o in tree.query(pline):
+        for pred_id, o in tree.query(pline):
             if o.intersects(pline):
-                pred_id = index_by_id[id(o)]
 
                 inter = o.intersection(pline).area
                 union = o.union(pline).area
@@ -142,8 +165,7 @@ def polyline_score(pred_lines, gt_lines, linewidth=1., metric='POR'):
                         for i in gt_lines]
 
     # construct tree
-    tree = STRtree(pred_lines_shapely)
-    index_by_id = dict((id(pt), i) for i, pt in enumerate(pred_lines_shapely))
+    tree = GeomIndex(pred_lines_shapely)
 
     if metric=='POR':
         iou_matrix = np.zeros((num_preds, num_gts),dtype=np.float64)
@@ -156,9 +178,8 @@ def polyline_score(pred_lines, gt_lines, linewidth=1., metric='POR'):
 
     for i, pline in enumerate(gt_lines_shapely):
 
-        for o in tree.query(pline):
+        for pred_id, o in tree.query(pline):
             if o.intersects(pline):
-                pred_id = index_by_id[id(o)]
 
                 if metric=='POR':
                     dist_mat = distance.cdist(
@@ -240,8 +261,7 @@ def custom_polyline_score(pred_lines, gt_lines, linewidth=1., metric='chamfer'):
                         for i in gt_lines]
 
     # construct tree
-    tree = STRtree(pred_lines_shapely)
-    index_by_id = dict((id(pt), i) for i, pt in enumerate(pred_lines_shapely))
+    tree = GeomIndex(pred_lines_shapely)
 
 
     if metric=='chamfer':
@@ -253,9 +273,8 @@ def custom_polyline_score(pred_lines, gt_lines, linewidth=1., metric='chamfer'):
 
     for i, pline in enumerate(gt_lines_shapely):
 
-        for o in tree.query(pline):
+        for pred_id, o in tree.query(pline):
             if o.intersects(pline):
-                pred_id = index_by_id[id(o)]
 
                 if metric=='chamfer':
                     dist_mat = distance.cdist(

@@ -188,7 +188,18 @@ class TemporalSelfAttention(BaseModule):
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
         assert self.num_bev_queue == 2
 
-        query = torch.cat([value[:bs], query], -1)
+        if value.size(0) != bs * self.num_bev_queue:
+            raise ValueError(
+                f'expected {bs * self.num_bev_queue} queued BEV tensors, '
+                f'but got {value.size(0)}')
+
+        # Encoder flattens [B, queue, Q, C] in batch-major order:
+        # [prev0, cur0, prev1, cur1, ...].  ``value[:bs]`` therefore mixes
+        # samples as soon as B > 1.  Restore the queue axis before selecting
+        # the history tensor used to predict offsets and attention weights.
+        history_value = value.reshape(
+            bs, self.num_bev_queue, num_value, embed_dims)[:, 0]
+        query = torch.cat([history_value, query], -1)
         value = self.value_proj(value)
 
         if key_padding_mask is not None:

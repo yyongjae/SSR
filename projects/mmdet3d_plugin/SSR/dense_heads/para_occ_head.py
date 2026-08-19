@@ -192,9 +192,14 @@ class ParaOccHead(BaseModule):
 
         frame_mask = None
         if gt_occ_valid is not None:
-            # losses take a single [T] mask; with samples_per_gpu=1 this is
-            # exact, and for B>1 a frame is kept if any sample has valid GT.
-            frame_mask = gt_occ_valid[:, :self.num_frames].bool().any(dim=0)
+            # One mask per row of the instance axis. dim 0 above is batch-major
+            # (sample 0's classes, then sample 1's, ...), so repeating each
+            # sample's [T] mask ``c`` times lines the two up. Sharing a single
+            # [T] mask across the batch would supervise frames that ran off the
+            # end of one sample's scene as "empty" whenever another sample in
+            # the same batch still had valid GT there.
+            frame_mask = gt_occ_valid[:, :self.num_frames].bool()
+            frame_mask = frame_mask.repeat_interleave(c, dim=0)
 
         loss_dict = dict()
         loss_dict['loss_occ_mask'] = self.loss_weight * self.loss_mask(
@@ -203,9 +208,67 @@ class ParaOccHead(BaseModule):
             pred, target, avg_factor=b * c, frame_mask=frame_mask)
         return loss_dict
 
-    def forward_train(self, bev_embed, gt_occ_seg, gt_occ_valid=None, **kwargs):
+    def forward_train(self, bev_embed, gt_occ_seg, gt_occ_valid=None,
+                      metrics_out=None, **kwargs):
         occ_preds = self(bev_embed)
+        if metrics_out is not None:
+            metrics_out.update(
+                self.train_metrics(occ_preds, gt_occ_seg, gt_occ_valid))
         return self.loss(occ_preds, gt_occ_seg, gt_occ_valid)
+
+    @torch.no_grad()
+    def train_metrics(self, occ_preds, gt_occ_seg, gt_occ_valid=None,
+                      thresholds=(0.1, 0.5)):
+        """IoU on the current training batch -- cheap and diagnostic.
+
+        The BCE/Dice pair can fall for 12 epochs while the head converges to a
+        spatially constant output (that is what happened to the dense map head:
+        loss -18% but a 1.06x positive/negative separation). IoU cannot be
+        faked that way, so it is the number to watch to catch a dead head early
+        rather than after a full training run. Reported at 0.1 as well because
+        the usable operating point depends on class prevalence -- UniAD
+        evaluates occupancy at 0.1, not 0.5 (report #01 6.1).
+        """
+        probs = occ_preds.detach().sigmoid()
+        gt = gt_occ_seg[:, :self.num_frames].to(probs.device).bool()
+        # Restrict to the frames the loss actually supervised. Without this the
+        # metric scores frames past the end of a scene as "everything empty",
+        # which both flatters a dead head and disagrees with the loss.
+        #
+        # `valid` has to gate the NEGATIVE set explicitly. Zeroing the
+        # probabilities of unsupervised cells (the first version of this) keeps
+        # them out of the numerator but leaves them in the `~gt` denominator, so
+        # p_off is diluted towards zero and the separation ratio is inflated --
+        # measured 5.33 against a true 2.67 on a synthetic constant head.
+        if gt_occ_valid is not None:
+            v = gt_occ_valid[:, :self.num_frames].to(probs.device).bool()
+            valid = v[:, :, None, None, None].expand_as(gt)
+        else:
+            valid = torch.ones_like(gt)
+        gt = gt & valid
+        out = {}
+        for thr in thresholds:
+            pb = (probs > thr) & valid
+            inter = (pb & gt).sum(dim=(0, 1, 3, 4)).float()
+            union = (pb | gt).sum(dim=(0, 1, 3, 4)).float().clamp(min=1)
+            iou = inter / union
+            for c in range(iou.numel()):
+                out[f'occ_iou{thr}/cls{c}'] = iou[c]
+            out[f'occ_iou{thr}/mean'] = iou.mean()
+        # separation of predicted probability on positive vs negative cells:
+        # a constant-output head sits at 1.0 no matter what the loss does
+        pos, neg = gt, (~gt) & valid
+        p_on = (probs * pos).sum() / pos.sum().clamp(min=1)
+        p_off = (probs * neg).sum() / neg.sum().clamp(min=1)
+        out['occ_sep/p_on'] = p_on
+        out['occ_sep/p_off'] = p_off
+        out['occ_sep/ratio'] = p_on / p_off.clamp(min=1e-6)
+        # Fraction of the batch the metrics above are computed on. If every
+        # frame were invalid the keys would all read 0; the key set stays fixed
+        # either way because _parse_losses all-reduces log_vars across ranks and
+        # would hang on a rank-dependent key set.
+        out['occ_sep/valid_frac'] = valid.float().mean()
+        return out
 
     def forward_test(self, bev_embed, **kwargs):
         occ_preds = self(bev_embed)

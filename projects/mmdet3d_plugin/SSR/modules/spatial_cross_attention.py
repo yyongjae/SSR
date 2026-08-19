@@ -128,11 +128,20 @@ class SpatialCrossAttention(BaseModule):
         bs, num_query, _ = query.size()
 
         D = reference_points_cam.size(3)
+        # Visibility depends on both the sample and the camera.  Reusing batch
+        # element 0's indexes drops valid queries (or gathers invalid ones) for
+        # every other sample in a local batch.
         indexes = []
-        for i, mask_per_img in enumerate(bev_mask):
-            index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
-            indexes.append(index_query_per_img)
-        max_len = max([len(each) for each in indexes])
+        for batch_idx in range(bs):
+            indexes_per_sample = []
+            for camera_idx in range(self.num_cams):
+                visible = bev_mask[camera_idx, batch_idx].sum(-1) > 0
+                indexes_per_sample.append(visible.nonzero().squeeze(-1))
+            indexes.append(indexes_per_sample)
+        max_len = max(
+            len(index_query)
+            for indexes_per_sample in indexes
+            for index_query in indexes_per_sample)
 
         # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.
         queries_rebatch = query.new_zeros(
@@ -141,10 +150,12 @@ class SpatialCrossAttention(BaseModule):
             [bs, self.num_cams, max_len, D, 2])
         
         for j in range(bs):
-            for i, reference_points_per_img in enumerate(reference_points_cam):   
-                index_query_per_img = indexes[i]
-                queries_rebatch[j, i, :len(index_query_per_img)] = query[j, index_query_per_img]
-                reference_points_rebatch[j, i, :len(index_query_per_img)] = reference_points_per_img[j, index_query_per_img]
+            for i in range(self.num_cams):
+                index_query_per_img = indexes[j][i]
+                queries_rebatch[j, i, :len(index_query_per_img)] = \
+                    query[j, index_query_per_img]
+                reference_points_rebatch[j, i, :len(index_query_per_img)] = \
+                    reference_points_cam[i, j, index_query_per_img]
 
         num_cams, l, bs, embed_dims = key.shape
 
@@ -157,8 +168,10 @@ class SpatialCrossAttention(BaseModule):
                                             reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
                                             level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
         for j in range(bs):
-            for i, index_query_per_img in enumerate(indexes):
-                slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]
+            for i in range(self.num_cams):
+                index_query_per_img = indexes[j][i]
+                slots[j, index_query_per_img] += \
+                    queries[j, i, :len(index_query_per_img)]
 
         count = bev_mask.sum(-1) > 0
         count = count.permute(1, 2, 0).sum(-1)

@@ -30,6 +30,11 @@ from mmdet.models import HEADS, build_loss
 from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.core.bbox.coders import build_bbox_coder
 
+from projects.mmdet3d_plugin.SSR.modules.decoder import CustomMSDeformableAttention
+from projects.mmdet3d_plugin.SSR.modules.spatial_cross_attention import (
+    MSDeformableAttention3D)
+from projects.mmdet3d_plugin.SSR.modules.temporal_self_attention import (
+    TemporalSelfAttention)
 from projects.mmdet3d_plugin.SSR.utils.map_utils import (
     denormalize_2d_bbox, denormalize_2d_pts, normalize_2d_bbox, normalize_2d_pts)
 
@@ -168,6 +173,19 @@ class ParaMapHead(BaseModule):
         for p in self.map_decoder.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+        # Xavier above overwrites the deformable-attention weights, which must
+        # start at zero so that step 0 samples exactly the radial grid held in
+        # ``sampling_offsets.bias`` with uniform attention. Re-apply their own
+        # initialisation afterwards, exactly as VAD's transformer and
+        # ``SSRPerceptionTransformer.init_weights`` do. (The biases survive the
+        # loop because they are 1-D, but the weights do not.)
+        for m in self.modules():
+            if isinstance(m, (MSDeformableAttention3D, TemporalSelfAttention,
+                              CustomMSDeformableAttention)):
+                try:
+                    m.init_weight()
+                except AttributeError:
+                    m.init_weights()
         xavier_init(self.map_reference_points, distribution='uniform', bias=0.)
         if self.map_use_sigmoid_cls:
             bias_init = bias_init_with_prob(0.01)
@@ -477,9 +495,116 @@ class ParaMapHead(BaseModule):
         return loss_dict
 
     def forward_train(self, bev_embed, img_metas, map_gt_bboxes_3d,
-                      map_gt_labels_3d, **kwargs):
+                      map_gt_labels_3d, metrics_out=None, **kwargs):
         preds = self(bev_embed, img_metas)
+        if metrics_out is not None:
+            metrics_out.update(
+                self.train_metrics(preds, map_gt_bboxes_3d, map_gt_labels_3d))
         return self.loss(preds, map_gt_bboxes_3d, map_gt_labels_3d)
+
+    @torch.no_grad()
+    def train_metrics(self, preds, map_gt_bboxes_3d, map_gt_labels_3d):
+        """Cheap quality signals for the vectorised map head.
+
+        ``loss_map_pts`` falling is necessary but NOT sufficient: the point
+        regression can tighten while the classification head stays wrong, or
+        while every query collapses onto the same polyline, and chamfer mAP
+        would still be ~0.
+
+        ``map_cls_acc``   classification accuracy on the matched queries.
+        ``map_conf_pos``  mean confidence on matched queries; ``map_conf_neg``
+                          the same on unmatched ones. Accuracy alone is blind
+                          both to a head that stays right about its few matches
+                          while every score sinks, and to a flood of confident
+                          background false positives.
+        ``map_spread_m``  std of the predicted polyline centres across queries,
+                          in metres. This is the collapse detector: if every
+                          query regresses the same line it goes to zero and
+                          nothing else here notices.
+        ``map_pts_err_m`` mean EUCLIDEAN per-point error in metres.
+        ``map_n_gt``      GT instances per image -- a pure data statistic, kept
+                          only as a pipeline sanity check.
+
+        Two warnings, both earned the hard way:
+
+        * ``map_pts_err_m`` is an upper bound on chamfer distance, not a
+          chamfer threshold test. It is index-aligned under the shift
+          permutation the matcher chose, whereas chamfer takes the nearest
+          point.
+        * this method runs its OWN Hungarian matching below; ``loss()`` then
+          runs one more per decoder layer. There is no extra network forward,
+          but there is an extra matching, which is why it is gated behind
+          ``aux_metric_log_interval``.
+
+        ``map_pos_frac`` used to live here, reporting ``num_total_pos`` over
+        the query count. It is gone because ``MapHungarianAssigner3D`` applies
+        no cost threshold: it always returns ``min(n_query, n_gt)`` pairs, so
+        that quantity is identically ``sum(n_gt) / (B * n_query)`` no matter
+        what the head predicts. It was a data statistic in the costume of a
+        model diagnostic. ``map_n_gt`` is the same number, named honestly.
+        """
+        cls_scores = preds['map_all_cls_scores'][-1]        # [B, Q, C]
+        bbox_preds = preds['map_all_bbox_preds'][-1]
+        pts_preds = preds['map_all_pts_preds'][-1]
+        device = cls_scores.device
+
+        gt_vecs = copy.deepcopy(map_gt_bboxes_3d)
+        gt_bboxes = [g.bbox.to(device) for g in gt_vecs]
+        shift_attr = {
+            'v0': 'shift_fixed_num_sampled_points',
+            'v1': 'shift_fixed_num_sampled_points_v1',
+            'v2': 'shift_fixed_num_sampled_points_v2',
+            'v3': 'shift_fixed_num_sampled_points_v3',
+            'v4': 'shift_fixed_num_sampled_points_v4',
+        }[self.map_gt_shift_pts_pattern]
+        gt_shifts = [getattr(g, shift_attr).to(device) for g in gt_vecs]
+
+        (labels_list, _, _, _, pts_targets_list, pts_weights_list,
+         num_total_pos, num_total_neg) = self.map_get_targets(
+            [cls_scores[i] for i in range(cls_scores.size(0))],
+            [bbox_preds[i] for i in range(bbox_preds.size(0))],
+            [pts_preds[i] for i in range(pts_preds.size(0))],
+            gt_bboxes, map_gt_labels_3d, gt_shifts)
+
+        labels = torch.cat(labels_list, 0)
+        pos = labels < self.map_num_classes
+        neg = ~pos
+        flat_cls = cls_scores.reshape(-1, self.map_cls_out_channels)
+        zero = flat_cls.new_zeros(())
+        acc = (flat_cls.argmax(-1)[pos] == labels[pos]).float().mean() \
+            if pos.any() else zero
+
+        conf = (flat_cls.sigmoid() if self.map_use_sigmoid_cls
+                else flat_cls.softmax(-1)[..., :self.map_num_classes])
+        conf = conf.max(-1).values
+
+        # predictions are normalised to (0, 1) over pc_range; scale each axis
+        # back to metres before measuring anything so the numbers are readable
+        scale = pts_preds.new_tensor([self.pc_range[3] - self.pc_range[0],
+                                      self.pc_range[4] - self.pc_range[1]])
+        centres = pts_preds.mean(-2)                     # [B, Q, 2]
+        spread = (centres.std(dim=1) * scale).mean()
+
+        pts_targets = torch.cat(pts_targets_list, 0)
+        # both coordinate channels of the weight carry the same 0/1 mask
+        pts_weights = torch.cat(pts_weights_list, 0)[..., 0]
+        pts_flat = pts_preds.reshape(-1, pts_preds.size(-2), pts_preds.size(-1))
+        # Euclidean, NOT the mean of |dx| and |dy|: averaging the two axes
+        # under-reports a single-axis error by 2x and a 45-degree one by
+        # sqrt(2), which is exactly the mistake that made the first map/occ
+        # shift controls read as passing.
+        delta = (pts_flat - normalize_2d_pts(pts_targets, self.pc_range)) * scale
+        err = delta.norm(dim=-1) * pts_weights
+        denom = pts_weights.sum().clamp(min=1)
+        return {
+            'map_cls_acc': acc,
+            'map_conf_pos': conf[pos].mean() if pos.any() else zero,
+            'map_conf_neg': conf[neg].mean() if neg.any() else zero,
+            'map_spread_m': spread,
+            'map_pts_err_m': err.sum() / denom,
+            'map_n_gt': flat_cls.new_tensor(
+                num_total_pos / max(cls_scores.size(0), 1)),
+        }
 
     def forward_test(self, bev_embed, img_metas, rescale=False):
         preds = self(bev_embed, img_metas)

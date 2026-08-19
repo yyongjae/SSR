@@ -58,9 +58,23 @@ total_epochs = 12
 # exactly the 6 future steps stored per agent in gt_attr_labels, so occupancy and
 # motion are supervised from one and the same source.
 occ_n_future = 6
+# Vehicles only -- UniAD's ``only_vehicle=True`` set, which is also what FIERY,
+# ST-P3 and PARA-Drive supervise. A pedestrian channel was trained for 12 epochs
+# and did not reach a useful operating point: 0.16% of BEV cells are pedestrian
+# (vs 15.5% vehicle), each pedestrian is a ~7-cell blob, and the best IoU over
+# all thresholds was 0.104 (at 0.05) against 0.574 for vehicles. At that
+# threshold recall was only 20%, so no threshold traded off usefully.
+#
+# The head did learn *something* -- mean p is 124x higher on GT-positive cells
+# than on negatives, a better ratio than vehicles get. What it cannot do at this
+# input resolution (640x384, single-level C5) and cell size (0.3 x 0.6 m) is
+# localise a 7-pixel blob well enough to be useful, and the top-k BCE settles
+# non-discriminating pixels near n_pos/k = 16/2500 = 0.006, which makes the
+# usable operating range very narrow. Dropping the channel is an empirical
+# call, not a proof of impossibility.
+# See report/01_baseline_vs_para_ssr.md 6.
 occ_class_labels = (
-    (0, 1, 2, 3, 4, 6, 7),  # vehicle  (UniAD's only_vehicle set)
-    (8, ),                  # pedestrian
+    (0, 1, 2, 3, 4, 6, 7),  # vehicle
 )
 occ_num_classes = len(occ_class_labels)
 
@@ -72,7 +86,73 @@ model = dict(
     # safety checks only, so they stay off at inference. Flip to True to dump
     # detection / map / occupancy predictions.
     test_aux_heads=False,
+    # --------------------------------------------------------------- #
+    # Three multipliers stack on every loss term. Know which is which.  #
+    # --------------------------------------------------------------- #
+    #   1. `loss_weight` inside each loss cfg      -- VAD's layer, per TERM
+    #   2. `loss_weight` on each aux head          -- per HEAD
+    #   3. `task_loss_weight` below                -- per TASK
+    #
+    # effective = (1) x (2) x (3), and (2) and (3) are mathematically the same
+    # knob: both multiply every term of one head. Two names for one lever is a
+    # trap -- setting each to 0.5 gives 0.25, not 0.5. Both are 1.0 here, so
+    # today every term sits at exactly VAD's published weight; prefer (3) if
+    # one of them ever has to move.
+    #
+    # `grad_balance` is NOT in this stack. It scales the gradient entering
+    # bev_embed and leaves each head's own parameter gradients alone, which is
+    # why it can hold a task's influence on the shared feature down without
+    # slowing the head itself.
     task_loss_weight=dict(plan=1.0, det=1.0, map=1.0, occ=1.0),
+    # --------------------------------------------------------------- #
+    # Controlling the shared-BEV gradient: two mutually exclusive ways.  #
+    # --------------------------------------------------------------- #
+    # `aux_grad_scale` -- one constant on all three aux heads -- sets a KNOB and
+    # lets the resulting share fall where it may. Measured on a real batch, at
+    # 0.01 the planner still only received 4.1% of the BEV gradient.
+    #
+    # `grad_balance` sets the OUTCOME instead. Every `interval` iterations it
+    # measures ||dL_k/d bev_embed|| per task, backs out the valve currently in
+    # effect, and re-solves so the shares land on `target`. Planning is the
+    # numeraire and is never scaled:
+    #
+    #   grad_balance=dict(
+    #       target=dict(plan=0.4, det=0.2, map=0.2, occ=0.2),
+    #       interval=200, momentum=0.9, clamp=(1e-4, 1.0), warmup_iters=500),
+    #
+    # Verified closed-loop on real batches (tools/verify_grad_balance.py). The
+    # untouched shares are plan 0.07% / det 57% / map 27% / occ 15%, and the
+    # solved valves come out det 5.5e-4, map 1.2e-3, occ 2.1e-3 -- a factor of
+    # four apart from each other, which is why one shared constant cannot
+    # balance them whatever value it takes.
+    #
+    # Detection and motion share a valve: one forward through det_motion_head
+    # means one BEV input, so there can only be one scale. Motion is measured
+    # separately as gshare/motion, which OVERLAPS det and is therefore excluded
+    # from the shares that sum to 1.
+    #
+    # Neither option addresses the real limit: both balance gradient MAGNITUDE.
+    # Two tasks pulling in opposite directions cancel in the actual update and
+    # still read as large here.
+    #
+    # This file sets NEITHER. It is the reference 8-GPU definition and the v1
+    # result it is compared against ran unscaled. Derived configs opt in --
+    # see PARA_SSR_e2e_2gpu_b4.py.
+
+    # Log ||d L_task / d bev_embed|| every N iterations as gnorm/* and gshare/*.
+    # The four tasks share one representation and their gradients differ by
+    # orders of magnitude, so the loss curves alone do not reveal which task is
+    # steering the BEV feature -- gshare/plan is the number to watch. Costs a
+    # few extra partial backwards per epoch (<1% of runtime).
+    grad_norm_log_interval=200,
+    # Log aux-head QUALITY every N iterations as occ_iou*/... and occ_sep/...
+    # A falling loss does not prove a head learned anything: the v1 dense map
+    # head cut its BCE 18% over 12 epochs while converging to a spatially
+    # constant output (positive/negative probability ratio 1.06x). IoU and the
+    # separation ratio cannot be satisfied that way, so these are the numbers
+    # that catch a dead head in epoch 1 instead of after a 15-hour run.
+    # Costs one extra sigmoid + a few reductions on tensors already in memory.
+    aux_metric_log_interval=200,
     pretrained=dict(img='torchvision://resnet50'),
     img_backbone=dict(
         type='ResNet',
@@ -201,13 +281,20 @@ model = dict(
         use_pe=True,
         sync_cls_avg_factor=True,
         loss_weight=1.0,
-        # num_layers=6 follows VAD-Base. NOTE: SSR itself is built on VAD-Tiny,
-        # which uses 3-layer map/motion decoders (VAD paper Sec. 4.1); dropping
-        # to 3 here is the SSR-lineage-consistent (and cheaper) variant worth
-        # ablating -- aux-head capacity, not correctness.
+        # 3 layers, matching VAD-Tiny -- which is what SSR is built on, and what
+        # the map head here already uses. v1 ran this at 6 (VAD-Base) while
+        # everything else stayed Tiny-scale, and the parameter count showed what
+        # that cost: the 6-layer decoder alone was 4.26M of the head's 6.67M,
+        # making detection 70% of all auxiliary parameters and, measured, 82% of
+        # the gradient arriving at the shared BEV. At 3 layers det drops to
+        # ~3.8M and sits much closer to map (2.91M), so grad_balance has a far
+        # smaller correction to apply.
+        #
+        # v1's 6-layer definition is preserved in
+        # work_dirs/para_ssr_8gpu/PARA_SSR_e2e.py.
         transformer_decoder=dict(
             type='DetectionTransformerDecoder',
-            num_layers=6,
+            num_layers=3,
             return_intermediate=True,
             transformerlayers=dict(
                 type='DetrTransformerDecoderLayer',
@@ -257,77 +344,109 @@ model = dict(
 
     # ------------------------------------------------------------------ #
     # AUX 2: online mapping (parallel, train-only)                        #
-    # Dense semantic BEV segmentation (PARA-Drive's own representation).  #
-    # Chosen over the VAD vector head because its per-pixel logits are a  #
-    # clean KD target (no Hungarian matching between teacher/student) and #
-    # it is ~14x smaller (~3 GB less activation memory). To ablate the    #
-    # representation axis, swap in the ParaMapHead block kept below.      #
+    # VAD-style VECTORISED map: 100 polyline instances x 20 points,       #
+    # Hungarian-matched, regressed as point sets.                         #
+    #                                                                     #
+    # Previously this was the dense ParaMapSegHead (PARA-Drive's own      #
+    # representation). It failed to train while still consuming 17.7% of  #
+    # the shared BEV gradient, i.e. it injected near-noise into the       #
+    # representation the planner depends on.                              #
+    #                                                                     #
+    # The failure was NOT class imbalance -- measured GT positive rates   #
+    # are divider 8.2%, ped_crossing 1.8%, boundary 10.0%, and top-k 25%  #
+    # brings the effective ratio to about 1:2. It was a loss of spatial   #
+    # discrimination: mean p on GT-positive vs GT-negative was 1.06x for  #
+    # boundary (a near-constant 0.29 everywhere) and 1.6x for divider,    #
+    # against 7.8x for vehicle occupancy. A 0.41M 3-layer conv with a     #
+    # ~7x7-cell receptive field cannot localise 30 m lane structures from #
+    # single-level C5 features of a 0.4x-downscaled image.                #
+    #                                                                     #
+    # The vector formulation helps precisely there: the query embeddings  #
+    # carry a shape prior ("lanes are long smooth curves"), so weak       #
+    # evidence still yields plausible geometry. It is also the setup      #
+    # SSR's own lineage (VAD-Tiny) was validated with.                    #
+    # See report/01_baseline_vs_para_ssr.md 6 and report/02.              #
+    #                                                                     #
+    # PARA-Drive is about the parallel-vs-sequential wiring, not the map  #
+    # representation (paper 2 explicitly lists both dense and vectorised  #
+    # as valid mapping-module choices), so this stays faithful to it.     #
+    # Nothing from this head reaches motion or the planner -- edges (1)   #
+    # and (5) of PARA-Drive Fig. 4, both removed.                         #
     # ------------------------------------------------------------------ #
     map_head=dict(
-        type='ParaMapSegHead',
+        type='ParaMapHead',
+        map_num_vec=map_num_vec,
+        map_num_pts_per_vec=map_fixed_ptsnum_per_pred_line,
+        map_num_pts_per_gt_vec=map_fixed_ptsnum_per_gt_line,
+        map_num_classes=map_num_classes,
+        embed_dims=_dim_,
         bev_h=bev_h_,
         bev_w=bev_w_,
-        in_channels=_dim_,
-        mid_channels=128,
-        feat_channels=64,
-        num_classes=map_num_classes,
-        num_trunk_blocks=2,
         pc_range=point_cloud_range,
-        line_thickness=2,
+        map_code_size=2,
+        map_code_weights=[1.0, 1.0, 1.0, 1.0],
+        map_dir_interval=1,
+        map_transform_method='minmax',
+        map_gt_shift_pts_pattern='v2',
+        num_reg_fcs=2,
+        sync_cls_avg_factor=True,
         loss_weight=1.0,
-        test_thresh=0.5,
-        loss_mask=dict(
-            type='OccBinarySegmentationLoss',
-            use_top_k=True,
-            top_k_ratio=0.25,
-            future_discount=1.0,
-            loss_weight=5.0),
-        loss_dice=dict(
-            type='OccDiceLoss',
-            use_sigmoid=True,
-            activate=True,
-            naive_dice=True,
-            eps=1.0,
-            loss_weight=1.0)),
-    # --- alternative: VAD-style vectorised map (chamfer-mAP evaluable) ---
+        # num_layers=3 is VAD-Tiny, which is what SSR is built on
+        # (VAD-Base uses 6). NOTE: `dropout=0.1` / `ffn_dropout=0.1` below are
+        # the deprecated mmcv kwargs that mutate class-level default dicts.
+        # They are safe *here* because det_motion_head is built immediately
+        # before this head with the same values, and the planning head (built
+        # earlier, in super().__init__) pins every dropout explicitly.
+        transformer_decoder=dict(
+            type='MapDetectionTransformerDecoder',
+            num_layers=3,
+            return_intermediate=True,
+            transformerlayers=dict(
+                type='DetrTransformerDecoderLayer',
+                attn_cfgs=[
+                    dict(type='MultiheadAttention', embed_dims=_dim_,
+                         num_heads=8, dropout=0.1),
+                    dict(type='CustomMSDeformableAttention',
+                         embed_dims=_dim_, num_levels=1),
+                ],
+                feedforward_channels=_ffn_dim_,
+                ffn_dropout=0.1,
+                operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
+                                 'ffn', 'norm'))),
+        bbox_coder=dict(
+            type='MapNMSFreeCoder',
+            post_center_range=[-20, -35, -20, -35, 20, 35, 20, 35],
+            pc_range=point_cloud_range,
+            max_num=50,
+            voxel_size=voxel_size,
+            num_classes=map_num_classes),
+        # VAD-Tiny weights verbatim. bbox/iou are 0.0: the (cx, cy, w, h) box is
+        # only a matching aid, the supervision that matters is on the points.
+        loss_map_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2.0,
+                          alpha=0.25, loss_weight=2.0),
+        loss_map_bbox=dict(type='L1Loss', loss_weight=0.0),
+        loss_map_iou=dict(type='GIoULoss', loss_weight=0.0),
+        loss_map_pts=dict(type='PtsL1Loss', loss_weight=1.0),
+        loss_map_dir=dict(type='PtsDirCosLoss', loss_weight=0.005)),
+    # --- alternative: dense semantic BEV segmentation --------------------
+    # Kept for the representation ablation and as a per-pixel KD interface.
+    # If re-enabled, the defect to fix is receptive field and evidence, not
+    # class weighting: multi-level FPN features instead of C5 only, a much
+    # larger decoder (PARA-Drive uses Panoptic SegFormer against this 0.41M
+    # trunk), and only then thicker rasterisation. Re-weighting the loss
+    # alone will not create spatial discrimination that the features do not
+    # carry -- see report/01_baseline_vs_para_ssr.md 6.3.
     # map_head=dict(
-    #     type='ParaMapHead',
-    #     map_num_vec=map_num_vec,
-    #     map_num_pts_per_vec=map_fixed_ptsnum_per_pred_line,
-    #     map_num_pts_per_gt_vec=map_fixed_ptsnum_per_gt_line,
-    #     map_num_classes=map_num_classes,
-    #     embed_dims=_dim_, bev_h=bev_h_, bev_w=bev_w_,
-    #     pc_range=point_cloud_range,
-    #     map_code_size=2, map_code_weights=[1.0, 1.0, 1.0, 1.0],
-    #     map_dir_interval=1, map_transform_method='minmax',
-    #     map_gt_shift_pts_pattern='v2', num_reg_fcs=2,
-    #     sync_cls_avg_factor=True, loss_weight=1.0,
-    #     # 6 layers = VAD-Base; VAD-Tiny (SSR's base) uses 3.
-    #     transformer_decoder=dict(
-    #         type='MapDetectionTransformerDecoder',
-    #         num_layers=6, return_intermediate=True,
-    #         transformerlayers=dict(
-    #             type='DetrTransformerDecoderLayer',
-    #             attn_cfgs=[
-    #                 dict(type='MultiheadAttention', embed_dims=_dim_,
-    #                      num_heads=8, dropout=0.1),
-    #                 dict(type='CustomMSDeformableAttention',
-    #                      embed_dims=_dim_, num_levels=1),
-    #             ],
-    #             feedforward_channels=_ffn_dim_, ffn_dropout=0.1,
-    #             operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-    #                              'ffn', 'norm'))),
-    #     bbox_coder=dict(
-    #         type='MapNMSFreeCoder',
-    #         post_center_range=[-20, -35, -20, -35, 20, 35, 20, 35],
-    #         pc_range=point_cloud_range, max_num=50,
-    #         voxel_size=voxel_size, num_classes=map_num_classes),
-    #     loss_map_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2.0,
-    #                       alpha=0.25, loss_weight=2.0),
-    #     loss_map_bbox=dict(type='L1Loss', loss_weight=0.0),
-    #     loss_map_iou=dict(type='GIoULoss', loss_weight=0.0),
-    #     loss_map_pts=dict(type='PtsL1Loss', loss_weight=1.0),
-    #     loss_map_dir=dict(type='PtsDirCosLoss', loss_weight=0.005)),
+    #     type='ParaMapSegHead',
+    #     bev_h=bev_h_, bev_w=bev_w_, in_channels=_dim_,
+    #     mid_channels=128, feat_channels=64,
+    #     num_classes=map_num_classes, num_trunk_blocks=2,
+    #     pc_range=point_cloud_range, line_thickness=2,
+    #     loss_weight=1.0, test_thresh=0.5,
+    #     loss_mask=dict(type='OccBinarySegmentationLoss', use_top_k=True,
+    #                    top_k_ratio=0.25, future_discount=1.0, loss_weight=5.0),
+    #     loss_dice=dict(type='OccDiceLoss', use_sigmoid=True, activate=True,
+    #                    naive_dice=True, eps=1.0, loss_weight=1.0)),
 
     # ------------------------------------------------------------------ #
     # AUX 3: occupancy prediction (parallel, train-only, query-free)      #
@@ -420,6 +539,16 @@ test_pipeline = [
          file_client_args=file_client_args),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True,
          with_attr_label=True),
+    # Same placement as the train pipeline: before the range filter, so agents
+    # that start outside the BEV box but drive into it are still rasterised.
+    # Carried through to the result dict so evaluate_occ() can score the
+    # occupancy head against the very GT the loss was trained on -- rebuilding
+    # it inside evaluate() would duplicate the class grouping and horizon.
+    dict(type='GenerateSSROccLabels',
+         pc_range=point_cloud_range,
+         bev_size=(bev_h_, bev_w_),
+         n_future=occ_n_future,
+         class_labels=occ_class_labels),
     dict(type='CustomObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='CustomObjectNameFilter', classes=class_names),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -437,7 +566,7 @@ test_pipeline = [
                  keys=['points', 'gt_bboxes_3d', 'gt_labels_3d', 'img',
                        'fut_valid_flag', 'ego_his_trajs', 'ego_fut_trajs',
                        'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat',
-                       'gt_attr_labels'])])
+                       'gt_attr_labels', 'gt_occ_seg', 'gt_occ_valid'])])
 ]
 
 data = dict(
@@ -503,7 +632,19 @@ optimizer = dict(
         }),
     weight_decay=0.01)
 
-optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+# max_norm stays at SSR/VAD's 35 so this run remains comparable to the
+# plan-only baseline; the hook only adds telemetry, it does not change the
+# optimisation. It is needed because clipping is global: measured on the v1
+# 8-GPU run the total norm reaches 38.5 and clips on 100% of iterations from
+# epoch 10, while the plan-only baseline sits at 0.93 and never clips. So the
+# planner's update is being scaled by ~0.91 whenever aux heads are attached,
+# and `aux_grad_scale` does not help -- it scales the BEV path, not the aux
+# heads' own parameter gradients, which are what dominate the norm.
+# Watch clip/rate and pnorm/* before deciding whether to raise max_norm.
+optimizer_config = dict(
+    type='ClipMonitorOptimizerHook',
+    grad_clip=dict(max_norm=35, norm_type=2),
+    group_norm_interval=200)
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
@@ -520,13 +661,19 @@ log_config = dict(
         dict(type='TensorboardLoggerHook'),
         dict(
             type='WandbLoggerHook',
+            # NOTE: gpus / batch_per_gpu are NOT known here -- they come from
+            # the launcher. Derived configs (e.g. PARA_SSR_e2e_2gpu_b4.py)
+            # override this whole block; this one describes the 8 x 1 default
+            # that train_para_8gpu.sh uses.
             init_kwargs=dict(
                 project='para-ssr',
-                name='para_ssr_v1',
+                name='para_ssr_v2_8gpu',
                 group='para',
-                tags=['para-ssr', 'no-ffp', 'aux', '2gpu'],
-                config=dict(model='ParaSSR', ffp=False, gpus=2,
-                            batch_per_gpu=1, aux='det+map_seg+occ',
+                tags=['para-ssr', 'no-ffp', 'aux', '8gpu', 'batch1',
+                      'global8'],
+                config=dict(model='ParaSSR', ffp=False, gpus=8,
+                            batch_per_gpu=1, global_batch=8,
+                            aux='det+map_vec+occ_vehicle',
                             task_loss_weight='1/1/1/1')),
             # step with the runner's iteration so train curves and the
             # per-epoch validation metrics land on the same x axis
@@ -546,6 +693,15 @@ find_unused_parameters = True
 # Same training-time hooks as SSR_e2e.py so the comparison is apples-to-apples
 # (the EMA weights are what SSR evaluates with).
 custom_hooks = [
+    # Watches the loss / gradient / evaluation stream and appends anything odd
+    # to anomalies.jsonl in the work dir, plus an anomaly/* counter for wandb.
+    # It never raises: a monitor that can kill a seven-day run over a threshold
+    # it got wrong is worse than no monitor.
+    #
+    # priority='LOW' (70) places it between EvalHook (NORMAL=50) and LoggerHook
+    # (VERY_LOW=90), so after_train_epoch sees the evaluation results sitting in
+    # log_buffer.output before the logger clears them.
+    dict(type='TrainingAnomalyHook', priority='LOW'),
     dict(type='CustomSetEpochInfoHook'),
     dict(
         type='MEGVIIEMAHook',

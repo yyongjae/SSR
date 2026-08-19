@@ -54,8 +54,13 @@ case "$CKPT" in
      echo "      been measured. Continuing anyway." >&2 ;;
 esac
 
-export PATH="/home/yongjae/miniconda3/envs/ssr/bin:$PATH"
-export NUMBA_CPU_NAME=generic NUMBA_CPU_FEATURES=""
+# run.sh exports a working PATH/NUMBA before calling this; standalone use falls
+# back to whatever env is active, or SSR_PYTHON.
+if ! python -c 'import torch, mmcv' >/dev/null 2>&1; then
+  [ -n "${SSR_PYTHON:-}" ] || { echo "activate the env, or use ./run.sh eval" >&2; exit 1; }
+  export PATH="$(dirname "$SSR_PYTHON"):$PATH"
+fi
+export NUMBA_CPU_NAME="${NUMBA_CPU_NAME:-generic}"
 export CUDA_VISIBLE_DEVICES="$GPU"
 
 OUT=${OUT:-$(dirname "$CKPT")/final_eval_$(basename "${CKPT%.pth}")}

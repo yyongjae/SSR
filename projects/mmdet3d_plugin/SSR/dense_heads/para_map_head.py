@@ -444,7 +444,8 @@ class ParaMapHead(BaseModule):
              preds_dicts,
              map_gt_bboxes_list,
              map_gt_labels_list,
-             map_gt_bboxes_ignore=None):
+             map_gt_bboxes_ignore=None,
+             gt_shifts=None):
         assert map_gt_bboxes_ignore is None, \
             f'{self.__class__.__name__} only supports map_gt_bboxes_ignore=None'
 
@@ -457,16 +458,12 @@ class ParaMapHead(BaseModule):
         map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_list)
 
         map_gt_bboxes_list = [g.bbox.to(device) for g in map_gt_vecs_list]
-        shift_attr = {
-            'v0': 'shift_fixed_num_sampled_points',
-            'v1': 'shift_fixed_num_sampled_points_v1',
-            'v2': 'shift_fixed_num_sampled_points_v2',
-            'v3': 'shift_fixed_num_sampled_points_v3',
-            'v4': 'shift_fixed_num_sampled_points_v4',
-        }[self.map_gt_shift_pts_pattern]
-        map_gt_shifts_pts_list = [
-            getattr(g, shift_attr).to(device) for g in map_gt_vecs_list
-        ]
+        # Reading this attribute draws from the global NumPy RNG for closed
+        # polylines -- see materialise_shifts. forward_train does it once and
+        # passes the result in; the fallback keeps a direct loss() call working.
+        map_gt_shifts_pts_list = (
+            gt_shifts if gt_shifts is not None
+            else self.materialise_shifts(map_gt_vecs_list, device))
 
         all_gt_bboxes = [map_gt_bboxes_list for _ in range(num_dec_layers)]
         all_gt_labels = [map_gt_labels_list for _ in range(num_dec_layers)]
@@ -494,16 +491,58 @@ class ParaMapHead(BaseModule):
             loss_dict[f'd{i}.loss_map_dir'] = w * losses_dir[i]
         return loss_dict
 
+    _SHIFT_ATTR = {
+        'v0': 'shift_fixed_num_sampled_points',
+        'v1': 'shift_fixed_num_sampled_points_v1',
+        'v2': 'shift_fixed_num_sampled_points_v2',
+        'v3': 'shift_fixed_num_sampled_points_v3',
+        'v4': 'shift_fixed_num_sampled_points_v4',
+    }
+
+    def materialise_shifts(self, map_gt_bboxes_3d, device):
+        """Read the shifted GT polylines ONCE per forward.
+
+        `shift_fixed_num_sampled_points_v*` is not a pure accessor. For a
+        CLOSED polyline with more vertices than `fixed_num` it enumerates every
+        rotation and then picks a subset with `np.random.choice` on the GLOBAL
+        NumPy RNG (nuscenes_vad_dataset.py, the `shifts_num > final_shift_num`
+        branch). Two consequences, both measured:
+
+          * two reads of the same GT give two different targets, so the metric
+            and the loss were being computed against different ground truth;
+          * the extra draw shifts the global NumPy stream, which GridMask also
+            draws from -- so turning the metric on, or changing its interval,
+            changed the augmentation of every later iteration.
+
+        Measured on a closed 41-vertex polyline: loss_map_pts 9.26400375
+        without the metric against 9.27320004 with it, and the next
+        np.random.rand() 0.0636 against 0.8095.
+
+        A metric is supposed to observe training, not participate in it.
+        Materialising once and handing the same tensors to both callers removes
+        both effects; saving and restoring the RNG around the metric would fix
+        the GridMask side only, and still leave metric and loss scoring
+        different targets.
+        """
+        attr = self._SHIFT_ATTR[self.map_gt_shift_pts_pattern]
+        return [getattr(g, attr).to(device) for g in map_gt_bboxes_3d]
+
     def forward_train(self, bev_embed, img_metas, map_gt_bboxes_3d,
                       map_gt_labels_3d, metrics_out=None, **kwargs):
         preds = self(bev_embed, img_metas)
+        # One materialisation, shared. See materialise_shifts.
+        gt_shifts = self.materialise_shifts(
+            map_gt_bboxes_3d, preds['map_all_cls_scores'].device)
         if metrics_out is not None:
             metrics_out.update(
-                self.train_metrics(preds, map_gt_bboxes_3d, map_gt_labels_3d))
-        return self.loss(preds, map_gt_bboxes_3d, map_gt_labels_3d)
+                self.train_metrics(preds, map_gt_bboxes_3d, map_gt_labels_3d,
+                                   gt_shifts=gt_shifts))
+        return self.loss(preds, map_gt_bboxes_3d, map_gt_labels_3d,
+                         gt_shifts=gt_shifts)
 
     @torch.no_grad()
-    def train_metrics(self, preds, map_gt_bboxes_3d, map_gt_labels_3d):
+    def train_metrics(self, preds, map_gt_bboxes_3d, map_gt_labels_3d,
+                      gt_shifts=None):
         """Cheap quality signals for the vectorised map head.
 
         ``loss_map_pts`` falling is necessary but NOT sufficient: the point
@@ -550,14 +589,11 @@ class ParaMapHead(BaseModule):
 
         gt_vecs = copy.deepcopy(map_gt_bboxes_3d)
         gt_bboxes = [g.bbox.to(device) for g in gt_vecs]
-        shift_attr = {
-            'v0': 'shift_fixed_num_sampled_points',
-            'v1': 'shift_fixed_num_sampled_points_v1',
-            'v2': 'shift_fixed_num_sampled_points_v2',
-            'v3': 'shift_fixed_num_sampled_points_v3',
-            'v4': 'shift_fixed_num_sampled_points_v4',
-        }[self.map_gt_shift_pts_pattern]
-        gt_shifts = [getattr(g, shift_attr).to(device) for g in gt_vecs]
+        # Must be the SAME tensors the loss scores against. Re-reading the
+        # attribute would draw a different random shift for closed polylines
+        # AND advance the global NumPy stream that GridMask shares.
+        if gt_shifts is None:
+            gt_shifts = self.materialise_shifts(gt_vecs, device)
 
         (labels_list, _, _, _, pts_targets_list, pts_weights_list,
          num_total_pos, num_total_neg) = self.map_get_targets(

@@ -99,7 +99,7 @@ checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
 # at workers_per_gpu=16 (32 workers produce ~14 samples/s against the ~3.6/s
 # training consumes), so it does not show up in wall time.
 model = dict(
-    occ_head=None,
+    # occ_head=None now comes from the base config.
     test_aux_heads=True,
     # plan keeps the 0.4 it had, so the planning arm of the experiment is
     # unchanged; occ's 0.2 is split evenly between the two remaining heads.
@@ -112,7 +112,7 @@ model = dict(
     # solving for a head that does not exist.
     grad_balance=dict(
         target=dict(_delete_=True, plan=0.4, det=0.3, map=0.3)))
-evaluation = dict(interval=10)
+evaluation = dict(interval=6)
 
 log_config = dict(
     hooks=[
@@ -128,7 +128,7 @@ log_config = dict(
                       'global8', '60ep', 'aux-convergence'],
                 config=dict(
                     model='PARA-SSR', ffp=False, gpus=2, batch_per_gpu=4,
-                    global_batch=8, epochs=60, eval_interval=10)),
+                    global_batch=8, epochs=60, eval_interval=6)),
             by_epoch=False,
             interval=100),
     ])

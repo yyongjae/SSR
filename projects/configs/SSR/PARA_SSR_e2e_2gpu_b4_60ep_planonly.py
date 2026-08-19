@@ -44,6 +44,8 @@ model = dict(
     grad_balance=dict(
         target=dict(_delete_=True, plan=1.0, det=0.0, map=0.0)))
 
+evaluation = dict(interval=6)
+
 log_config = dict(
     hooks=[
         dict(type='TextLoggerHook'),
@@ -58,7 +60,7 @@ log_config = dict(
                       'global8', '60ep', 'control', 'plan1.0'],
                 config=dict(
                     model='PARA-SSR', ffp=False, gpus=2, batch_per_gpu=4,
-                    global_batch=8, epochs=60, eval_interval=10,
+                    global_batch=8, epochs=60, eval_interval=6,
                     grad_target='plan1.0/det0/map0')),
             by_epoch=False,
             interval=100),

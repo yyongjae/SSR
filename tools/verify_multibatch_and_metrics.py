@@ -98,7 +98,12 @@ fails += [] if ok4 else ['P0-4']
 # training-time metric
 print('\n  training-time train_metrics:')
 from mmdet.models import build_head
-head = build_head(cfg.model.occ_head)
+# occ_head is None in the configs now (the head is off). The definition is kept
+# at the base as `_occ_head` precisely so this check can still run -- the metric
+# has to stay correct for whenever occupancy comes back.
+occ_cfg = cfg.get('_occ_head') or cfg.model.get('occ_head')
+assert occ_cfg is not None, 'no occupancy head definition to test against'
+head = build_head(occ_cfg)
 logits = torch.where(pred.bool(), torch.tensor(10.), torch.tensor(-10.))
 m_v = head.train_metrics(logits, gt, valid)
 m_a = head.train_metrics(logits, gt, None)
@@ -117,9 +122,60 @@ print(f'  2gpu_b4        : {c12.runner["max_epochs"]} ep, '
 print(f'  2gpu_b4_60ep   : {c60.runner["max_epochs"]} ep, '
       f'eval/{c60.evaluation["interval"]}, aux={c60.model.test_aux_heads}')
 ok2 = (c12.runner['max_epochs'] == 12 and c12.model.test_aux_heads is False
-       and c60.runner['max_epochs'] == 60 and c60.evaluation['interval'] == 10
+       and c60.runner['max_epochs'] == 60 and c60.evaluation['interval'] == 6
        and c60.model.test_aux_heads is True)
 fails += [] if ok2 else ['P0-2']
+
+# ------------------------------------------------------- occupancy off ----
+# This has drifted back on twice: the occ head lives in the base config, so any
+# config that does not explicitly disable it inherits a head that has never been
+# shown to learn. It is off at the base now; this keeps it that way.
+print('\n=== occupancy must be off in every PARA config ===')
+import glob                                                    # noqa: E402
+on = []
+for f in sorted(glob.glob('projects/configs/SSR/PARA_SSR*.py')):
+    k = Config.fromfile(f)
+    name = os.path.basename(f)
+    why = []
+    if k.model.get('occ_head') is not None:
+        why.append('occ_head')
+    if k.model.get('task_loss_weight', {}).get('occ'):
+        why.append('task_loss_weight')
+    if any(t['type'] == 'GenerateSSROccLabels'
+           for t in k.data['train']['pipeline']):
+        why.append('train pipeline')
+    if any(t['type'] == 'GenerateSSROccLabels'
+           for t in k.data['test']['pipeline']):
+        why.append('test pipeline')
+    if why:
+        on.append(f'{name}({",".join(why)})')
+print(f'  {len(glob.glob("projects/configs/SSR/PARA_SSR*.py"))} configs checked')
+print(f'  occupancy still enabled in: {on or "none"}')
+fails += [] if not on else ['occ-still-on']
+
+# ---------------------------------------------------- det vs motion ----
+# "det" means detection. Motion is its own task with its own weight, even
+# though one head produces both.
+print('\n=== det and motion must be separately weightable ===')
+c1 = Config.fromfile('projects/configs/SSR/PARA_SSR_stage1_detmap.py')
+w1 = c1.model['task_loss_weight']
+print(f'  stage1 task_loss_weight: {dict(w1)}')
+# stage 1 trains everything except planning: det, motion and map all on.
+ok = (w1.get('det') == 1.0 and w1.get('motion') == 1.0
+      and w1.get('map') == 1.0 and w1.get('plan') == 0.0)
+fails += [] if ok else ['stage1-weights']
+
+# and every config's eval interval must divide its epoch count, or the final
+# model is never scored
+print('\n=== every config must evaluate its LAST epoch ===')
+_miss = []
+for _f in sorted(glob.glob('projects/configs/SSR/PARA_SSR*.py')):
+    _k = Config.fromfile(_f)
+    _ep, _iv = _k.runner['max_epochs'], _k.evaluation['interval']
+    if _ep % _iv:
+        _miss.append(f'{os.path.basename(_f)}({_ep}ep/{_iv})')
+print(f'  configs whose last epoch is never evaluated: {_miss or "none"}')
+fails += [] if not _miss else ['eval-misses-last-epoch']
 
 print('\n' + ('ALL P0 UNIT CHECKS PASS' if not fails
               else f'STILL FAILING: {fails}'))

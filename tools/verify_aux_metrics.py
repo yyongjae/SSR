@@ -36,8 +36,19 @@ cfg = Config.fromfile(CFG)
 model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'))
 
 # ------------------------------------------------------------------ occ ----
+# The occupancy head is disabled in every config (report #07: it never reached
+# a usable operating point). Its definition is preserved at the base as
+# `_occ_head` so these checks keep running -- the separation metric was WRONG
+# and got fixed, and that fix has to stay correct for whenever occupancy is
+# switched back on.
 print('=== occ_sep must ignore unsupervised frames on BOTH sides ===')
+from mmdet.models import build_head                              # noqa: E402
 occ = model.occ_head
+if occ is None:
+    occ_cfg = cfg.get('_occ_head')
+    assert occ_cfg is not None, 'no occupancy head definition to test against'
+    occ = build_head(occ_cfg)
+    print('  (occ_head is off in the config; testing the preserved definition)')
 B, T, C, H, W = 2, occ.num_frames, occ.num_classes, occ.bev_h, occ.bev_w
 gt = torch.zeros(B, T, C, H, W)
 gt[:, :, :, :H // 2, :W // 2] = 1                    # 25% positive

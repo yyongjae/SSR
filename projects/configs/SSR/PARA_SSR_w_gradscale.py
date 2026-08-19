@@ -20,7 +20,7 @@ supervision hurts the BEV" from "aux supervision is simply too strong".
 _base_ = ['./PARA_SSR_e2e.py']
 
 model = dict(
-    task_loss_weight=dict(plan=1.0, det=1.0, map=1.0, occ=1.0),
+    task_loss_weight=dict(plan=1.0, det=1.0, map=1.0),
     aux_grad_scale=0.02)
 
 log_config = dict(

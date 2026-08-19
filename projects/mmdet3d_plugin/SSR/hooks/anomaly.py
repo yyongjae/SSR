@@ -95,7 +95,8 @@ class TrainingAnomalyHook(Hook):
                  map_spread_min=0.5,
                  conf_gap_min=0.02,
                  eval_rel_tol=0.02,
-                 clamp=None):
+                 clamp=None,
+                 eval_watch=None):
         self.out_file = out_file
         self.spike_factor = spike_factor
         self.stall_epochs = stall_epochs
@@ -104,6 +105,13 @@ class TrainingAnomalyHook(Hook):
         self.conf_gap_min = conf_gap_min
         self.eval_rel_tol = eval_rel_tol
         self.clamp = clamp
+        # Which evaluation metrics to police. A stage that does not train a
+        # task still gets that task scored at validation -- stage 1 reports
+        # plan_L2 for a planner it never touched -- and calling the noise in an
+        # untrained head's numbers a "regression" trains the reader to ignore
+        # the monitor. Restrict the watch list to what the stage actually
+        # trains; None means all of them.
+        self.eval_watch = set(eval_watch) if eval_watch else None
 
         self._recent_loss = deque(maxlen=window)
         self._epoch = defaultdict(list)      # key -> values seen this epoch
@@ -257,6 +265,8 @@ class TrainingAnomalyHook(Hook):
         seen = False
         for key, direction in _EVAL_DIRECTION.items():
             if key not in out:
+                continue
+            if self.eval_watch is not None and key not in self.eval_watch:
                 continue
             seen = True
             try:

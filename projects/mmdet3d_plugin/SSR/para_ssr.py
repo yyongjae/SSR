@@ -92,6 +92,7 @@ class ParaSSR(MVXTwoStageDetector):
                  aux_grad_scale=1.0,
                  grad_balance=None,
                  grad_norm_log_interval=0,
+                 encoder_grad_log=True,
                  aux_metric_log_interval=0,
                  motion_score_thresh=0.6,
                  test_aux_heads=False):
@@ -124,7 +125,8 @@ class ParaSSR(MVXTwoStageDetector):
         self.map_head = self._build_aux(map_head, train_cfg_pts)
         self.occ_head = self._build_aux(occ_head, train_cfg_pts)
 
-        self.task_loss_weight = dict(plan=1.0, det=1.0, map=1.0, occ=1.0)
+        self.task_loss_weight = dict(
+            plan=1.0, det=1.0, motion=1.0, map=1.0, occ=1.0)
         if task_loss_weight is not None:
             self.task_loss_weight.update(task_loss_weight)
         # <1.0 keeps the aux heads learning normally while reducing how much
@@ -144,6 +146,10 @@ class ParaSSR(MVXTwoStageDetector):
         # orders of magnitude, so the loss values alone do not show which task
         # is actually steering the BEV feature.
         self.grad_norm_log_interval = grad_norm_log_interval
+        # Also decompose the gradient at the BEV encoder's parameters, not just
+        # at its output. Costs one extra encoder-only backward per task on the
+        # measurement iterations (the head-side backward is reused).
+        self.encoder_grad_log = encoder_grad_log
         # >0 logs aux-head *quality* (occupancy IoU and positive/negative
         # probability separation) every N iterations. Loss curves alone do not
         # tell a learning head from one that collapsed to a constant.
@@ -288,8 +294,18 @@ class ParaSSR(MVXTwoStageDetector):
         groups = dict()
         w = self.task_loss_weight
 
+        # Declared before the first loss: the planner's per-command breakdown is
+        # produced inside pts_bbox_head.loss, on the same schedule as the aux
+        # heads' quality metrics.
+        aux_metrics = {}
+        want_metrics = (self.aux_metric_log_interval > 0 and
+                        (self._train_iter + 1) % self.aux_metric_log_interval == 0)
+        if want_metrics:
+            aux_metrics.update(self._representation_metrics(outs))
+
         plan_losses = self.pts_bbox_head.loss(
-            outs, ego_fut_trajs, ego_fut_masks, ego_fut_cmd)
+            outs, ego_fut_trajs, ego_fut_masks, ego_fut_cmd,
+            metrics_out=aux_metrics if want_metrics else None)
         groups['plan'] = self._scale(plan_losses, w['plan'], prefix='')
         losses.update(groups['plan'])
 
@@ -298,8 +314,7 @@ class ParaSSR(MVXTwoStageDetector):
         # detection and motion share a valve since they come out of one forward
         # pass through det_motion_head and therefore one BEV input.
         def _valve(task):
-            s = (self.grad_balancer.scale_for(task) if self.grad_balancer
-                 else self.aux_grad_scale)
+            s = self._task_scale(task)
             return bev_embed if s == 1.0 else _ScaleGrad.apply(bev_embed, s)
 
         # Only for heads that exist. Building a valve for a disabled head would
@@ -310,18 +325,31 @@ class ParaSSR(MVXTwoStageDetector):
 
         # Quality (not loss) probes, gathered while the heads run so no extra
         # forward pass is needed. Must be declared before the first head.
-        aux_metrics = {}
-        want_metrics = (self.aux_metric_log_interval > 0 and
-                        (self._train_iter + 1) % self.aux_metric_log_interval == 0)
-        if want_metrics:
-            aux_metrics.update(self._representation_metrics(outs))
 
         if self.det_motion_head is not None:
-            det_losses = self.det_motion_head.forward_train(
+            head_losses = self.det_motion_head.forward_train(
                 aux_bev['det'], img_metas, gt_bboxes_3d, gt_labels_3d,
                 gt_attr_labels)
-            groups['det'] = self._scale(det_losses, w['det'], prefix='det.')
-            losses.update(groups['det'])
+            # det and motion are separate TASKS with separate loss weights,
+            # even though one forward produces both. `motion=0.0` therefore
+            # leaves detection entirely untouched -- and because _scale drops a
+            # zero-weighted task rather than multiplying it by zero, the
+            # motion-only parameters get no gradient at all, so AdamW's
+            # decoupled weight decay does not quietly shrink them either.
+            #
+            # They still share one grad_balance VALVE: aux_bev['det'] is a
+            # single tensor, so there is a single scale on the gradient going
+            # back into bev_embed. That is why grad_balance targets name `det`
+            # and not `motion`.
+            motion_losses = {k: v for k, v in head_losses.items() if 'traj' in k}
+            det_losses = {k: v for k, v in head_losses.items()
+                          if 'traj' not in k}
+            scaled = self._scale(det_losses, w['det'], prefix='det.')
+            scaled.update(
+                self._scale(motion_losses, w.get('motion', 1.0),
+                            prefix='motion.'))
+            groups['det'] = scaled
+            losses.update(scaled)
 
         if self.map_head is not None:
             map_losses = self.map_head.forward_train(
@@ -368,6 +396,15 @@ class ParaSSR(MVXTwoStageDetector):
             if want_gnorm:
                 losses.update(self._format_grad_norms(norms))
                 losses.update(cosines)
+                # The UNSCALED norm, i.e. what each task would push into the
+                # BEV with no valve at all. gnorm/* is measured through
+                # _ScaleGrad and so already carries the balancer's scale;
+                # recalibrating a target by hand needs the raw number, and
+                # dividing it back out afterwards is exactly the step that
+                # gets forgotten.
+                losses.update({
+                    f'gnorm_raw/{k}': v / max(self._task_scale(k), 1e-12)
+                    for k, v in norms.items()})
                 if self.grad_balancer is not None:
                     losses.update({
                         k: bev_embed.new_tensor(v) for k, v
@@ -412,7 +449,47 @@ class ParaSSR(MVXTwoStageDetector):
         if bev is not None and bev.dim() == 3:
             # [B, H*W, C] -- std over the spatial axis, then over channels
             out['bev_std'] = bev.detach().float().std(dim=1).mean()
+
+        # How much of the BEV survives the 16-token bottleneck. TokenLearner
+        # returns `selected` [B, n_tokens, H*W], a softmax over BEV cells, so
+        # each token is a convex combination of cells and the attention itself
+        # says what it kept.
+        #
+        #   tok_cover  exp(entropy) / (H*W): the effective FRACTION of the BEV
+        #              one token averages over. Near 1/(H*W) means each token
+        #              is a single cell; near 1 means each token is the global
+        #              mean and the 16 of them carry one number's worth of
+        #              spatial information.
+        #   tok_union  fraction of BEV cells receiving more than uniform
+        #              attention from at least one token -- the spatial support
+        #              of the whole bottleneck, overlap included.
+        #
+        # This is the cheap half of "what does compression cost planning": it
+        # measures what is discarded, not what that costs in metres of waypoint
+        # error. The expensive half needs a dense-BEV planner trained alongside
+        # as a reference.
+        sel = outs.get('token_attn')
+        if sel is not None and sel.dim() == 3:
+            p = sel.detach().float()
+            hw = p.size(-1)
+            ent = -(p * (p + 1e-12).log()).sum(-1)          # [B, n] nats
+            out['tok_cover'] = (ent.exp() / hw).mean()
+            out['tok_union'] = (p.max(dim=1).values > 1.0 / hw).float().mean()
         return out
+
+    def _task_scale(self, task):
+        """The valve currently on this task's path into bev_embed.
+
+        `plan` is never scaled; `motion` shares `det`'s valve because both come
+        out of one forward through det_motion_head.
+        """
+        if task in ('plan', 'motion'):
+            task = 'det' if task == 'motion' else task
+            if task == 'plan':
+                return 1.0
+        if self.grad_balancer is not None:
+            return self.grad_balancer.scale_for(task)
+        return self.aux_grad_scale if task != 'plan' else 1.0
 
     def _bev_grad_norms(self, bev_embed, groups):
         """``||d L_task / d bev_embed||`` per task, at the shared feature.
@@ -430,10 +507,11 @@ class ParaSSR(MVXTwoStageDetector):
         groups = dict(groups)
         det = groups.get('det')
         if det is not None:
-            motion = {k: v for k, v in det.items() if 'traj' in k}
+            motion = {k: v for k, v in det.items() if k.startswith('motion.')}
             if motion:
                 groups['motion'] = motion
-        grads = {}
+        grads, enc_grads = {}, {}
+        enc_params = self._encoder_params() if self.encoder_grad_log else []
         for name, loss_dict in groups.items():
             terms = [v for v in loss_dict.values()
                      if torch.is_tensor(v) and v.requires_grad]
@@ -442,6 +520,11 @@ class ParaSSR(MVXTwoStageDetector):
             g = torch.autograd.grad(sum(terms), bev_embed, retain_graph=True,
                                     allow_unused=True)[0]
             grads[name] = None if g is None else g.detach().flatten()
+            if enc_params:
+                # same reason as in _bev_grad_cosines: unconditional keys
+                enc_grads[name] = (
+                    bev_embed.new_zeros(1) if g is None
+                    else self._encoder_grad(bev_embed, enc_params, g))
         zero = bev_embed.new_zeros(())
         norms = {k: (zero if v is None else v.norm()) for k, v in grads.items()}
         # Each gradient is the size of bev_embed (41 MB at batch 4). Only the
@@ -451,7 +534,53 @@ class ParaSSR(MVXTwoStageDetector):
         grads.pop('motion', None)
         cosines = self._bev_grad_cosines(grads, norms, zero)
         grads.clear()
+
+        # The same decomposition one level deeper: at the encoder's WEIGHTS
+        # rather than at the feature it produces. These are not the same
+        # question. gshare says who is pushing the shared FEATURE around;
+        # enc_gshare says who is reshaping the shared ENCODER, and the two can
+        # disagree -- a task whose feature-gradient concentrates on a handful
+        # of BEV cells writes a very different weight-gradient than one spread
+        # evenly, even at identical feature-gradient norm.
+        #
+        # enc_gcos is arguably the more meaningful conflict measurement of the
+        # two, because it is conflict in the direction the shared trunk's
+        # parameters actually move.
+        if enc_grads:
+            enc_norms = {k: v.norm() for k, v in enc_grads.items()}
+            enc_grads.pop('motion', None)
+            enc_cos = self._bev_grad_cosines(enc_grads, enc_norms, zero)
+            enc_grads.clear()
+            cosines.update({k.replace('gcos/', 'enc_gcos/'): v
+                            for k, v in enc_cos.items()})
+            cosines.update(self._format_grad_norms(enc_norms, prefix='enc_'))
         return norms, cosines
+
+    def _encoder_params(self):
+        """The BEV encoder's own parameters, i.e. the shared trunk below
+        ``bev_embed``. Everything else in ``pts_bbox_head`` is the planner."""
+        head = getattr(self, 'pts_bbox_head', None)
+        if head is None:
+            return []
+        pre = ('transformer.', 'bev_embedding', 'positional_encoding')
+        return [p for n, p in head.named_parameters()
+                if n.startswith(pre) and p.requires_grad]
+
+    @staticmethod
+    def _encoder_grad(bev_embed, enc_params, g_flat):
+        """``dL_task/dW_enc`` from the already-computed ``dL_task/d bev_embed``.
+
+        The chain rule, used to avoid paying twice: the head-side backward has
+        already run to produce ``g_flat``, so feeding it as ``grad_outputs``
+        continues from bev_embed into the encoder and nothing else. Asking for
+        ``autograd.grad(loss, enc_params)`` directly would redo the head. The
+        backbone is upstream of the encoder, so it is never entered either.
+        """
+        gs = torch.autograd.grad(
+            bev_embed, enc_params, grad_outputs=g_flat.view_as(bev_embed),
+            retain_graph=True, allow_unused=True)
+        parts = [x.detach().flatten() for x in gs if x is not None]
+        return torch.cat(parts) if parts else bev_embed.new_zeros(1)
 
     @staticmethod
     def _bev_grad_cosines(grads, norms, zero):
@@ -484,29 +613,62 @@ class ParaSSR(MVXTwoStageDetector):
         # to save memory; this keeps the docstring's guarantee true for anyone
         # who calls the helper directly, which is exactly what the regression
         # test does.
-        keys = [k for k in grads
-                if k != 'motion' and grads[k] is not None]
+        # The key set must not depend on the data. _parse_losses all-reduces
+        # every entry of log_vars in dict order, so a rank that omits one key
+        # because its gradient came back None desynchronises the collective --
+        # a hang, two ranks deep, days into a run. Emit every pair
+        # unconditionally and put a zero in when there is nothing to measure.
+        keys = [k for k in grads if k != 'motion']
         out = {}
         for i, a in enumerate(keys):
             for b in keys[i + 1:]:
+                ga, gb = grads[a], grads[b]
+                if ga is None or gb is None:
+                    out[f'gcos/{a}-{b}'] = zero
+                    continue
                 denom = (norms[a] * norms[b]).clamp(min=1e-12)
-                out[f'gcos/{a}-{b}'] = torch.dot(grads[a], grads[b]) / denom
+                out[f'gcos/{a}-{b}'] = torch.dot(ga, gb) / denom
         return out
 
     @staticmethod
-    def _format_grad_norms(norms):
+    def _format_grad_norms(norms, prefix=''):
         """Diagnostic keys. They avoid the substring "loss" so that mmdet's
         _parse_losses logs them without adding them to the optimised total."""
         out = {}
         # motion overlaps det, so it must not enter the normaliser
         total = sum(v for k, v in norms.items() if k != 'motion')
         for name, value in norms.items():
-            out[f'gnorm/{name}'] = value
-            out[f'gshare/{name}'] = value / total.clamp(min=1e-12)
+            out[f'{prefix}gnorm/{name}'] = value
+            out[f'{prefix}gshare/{name}'] = value / total.clamp(min=1e-12)
         return out
 
     @staticmethod
     def _scale(loss_dict, weight, prefix=''):
+        """Apply a task weight, and treat 0 as OFF rather than as a factor.
+
+        Dropping the terms is not the same as multiplying them by zero, because
+        of AdamW. `loss * 0.0` is still a tensor in the graph, so backward gives
+        those parameters a ZEROS gradient rather than no gradient -- and AdamW
+        skips a parameter only when `p.grad is None`. A zeros gradient still
+        goes through
+
+            param.mul_(1 - lr * weight_decay)
+
+        every step, decoupled weight decay being decoupled from the gradient.
+        Measured for stage 1 (48 epochs x 3516 iterations, cosine mean LR ~1e-4,
+        wd 0.01): exp(-1e-4 * 0.01 * 168768) = 0.845, so the planner-only
+        modules would finish stage 1 at 85% of their initial norm despite never
+        having been trained.
+
+        The effect is mild -- the eight LayerNorms in the planner renormalise
+        their input, so the shrink does not compound through the stack; what is
+        left is a 15% smaller initial waypoint scale and slightly flatter
+        attention, both recovered early in stage 2. It is also pointless, and
+        avoiding it costs one branch. VAD zeroes its planner loss weights and
+        therefore has the same artefact; this is a deliberate departure.
+        """
+        if weight == 0:
+            return {}
         return {f'{prefix}{k}': v * weight for k, v in loss_dict.items()}
 
     # ------------------------------------------------------------------ #

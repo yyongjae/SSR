@@ -28,6 +28,8 @@ _base_ = ['./PARA_SSR_e2e_2gpu_b4_60ep.py']
 
 data = dict(samples_per_gpu=2, workers_per_gpu=8)
 
+evaluation = dict(interval=6)
+
 log_config = dict(
     hooks=[
         dict(type='TextLoggerHook'),
@@ -42,7 +44,7 @@ log_config = dict(
                       'global8', '60ep', 'aux-convergence'],
                 config=dict(
                     model='PARA-SSR', ffp=False, gpus=4, batch_per_gpu=2,
-                    global_batch=8, epochs=60, eval_interval=10)),
+                    global_batch=8, epochs=60, eval_interval=6)),
             by_epoch=False,
             interval=100),
     ])

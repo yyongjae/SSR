@@ -85,6 +85,21 @@ class CustomDistEvalHook(BaseDistEvalHook):
             print('\n')
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
+            # Each evaluation writes a nuScenes detection submission json (~1.2
+            # GB for the full split) and the map artefacts under
+            # jsonfile_prefix. That prefix is built ONCE, when the hook is
+            # registered, so every evaluation was writing to the same path and
+            # overwriting the previous one -- the per-epoch json needed to
+            # re-score or debug an earlier checkpoint was simply gone by the
+            # time the run finished. Suffix it per evaluation.
+            if not hasattr(self, '_json_base'):
+                self._json_base = self.eval_kwargs.get('jsonfile_prefix')
+            if self._json_base is not None:
+                tag = (f'epoch_{runner.epoch + 1}' if self.by_epoch
+                       else f'iter_{runner.iter + 1}')
+                self.eval_kwargs['jsonfile_prefix'] = osp.join(
+                    self._json_base, tag)
+
             key_score = self.evaluate(runner, results)
 
             if self.save_best:

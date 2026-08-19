@@ -78,6 +78,34 @@ occ_class_labels = (
 )
 occ_num_classes = len(occ_class_labels)
 
+# Kept for re-enabling; not referenced while occ_head=None.
+_occ_head = dict(
+        type='ParaOccHead',
+        bev_h=bev_h_,
+        bev_w=bev_w_,
+        in_channels=_dim_,
+        mid_channels=128,
+        feat_channels=64,
+        num_trunk_blocks=2,
+        n_future=occ_n_future,
+        num_classes=occ_num_classes,
+        temporal_decoder=False,
+        loss_weight=1.0,
+        test_thresh=0.5,
+        loss_mask=dict(
+            type='OccBinarySegmentationLoss',
+            use_top_k=True,
+            top_k_ratio=0.25,
+            future_discount=0.95,
+            loss_weight=5.0),
+        loss_dice=dict(
+            type='OccDiceLoss',
+            use_sigmoid=True,
+            activate=True,
+            naive_dice=True,
+            eps=1.0,
+            loss_weight=1.0))
+
 model = dict(
     type='ParaSSR',
     use_grid_mask=True,
@@ -103,7 +131,13 @@ model = dict(
     # bev_embed and leaves each head's own parameter gradients alone, which is
     # why it can hold a task's influence on the shared feature down without
     # slowing the head itself.
-    task_loss_weight=dict(plan=1.0, det=1.0, map=1.0, occ=1.0),
+    #   4. `motion` is its own task here, separate from `det`. They come out of
+    #      one head, so they share a grad_balance VALVE, but they are different
+    #      supervisions and get different loss weights -- setting motion=0.0
+    #      leaves detection training untouched.
+    #   `occ` is absent because the occupancy head is off (see below); the model
+    #   still accepts it if the head is put back.
+    task_loss_weight=dict(plan=1.0, det=1.0, motion=1.0, map=1.0),
     # --------------------------------------------------------------- #
     # Controlling the shared-BEV gradient: two mutually exclusive ways.  #
     # --------------------------------------------------------------- #
@@ -455,32 +489,21 @@ model = dict(
     # the KD interface. temporal_decoder=True switches to the UniAD-style #
     # recurrent decoder (heavier; capacity ablation / stronger teacher).  #
     # ------------------------------------------------------------------ #
-    occ_head=dict(
-        type='ParaOccHead',
-        bev_h=bev_h_,
-        bev_w=bev_w_,
-        in_channels=_dim_,
-        mid_channels=128,
-        feat_channels=64,
-        num_trunk_blocks=2,
-        n_future=occ_n_future,
-        num_classes=occ_num_classes,
-        temporal_decoder=False,
-        loss_weight=1.0,
-        test_thresh=0.5,
-        loss_mask=dict(
-            type='OccBinarySegmentationLoss',
-            use_top_k=True,
-            top_k_ratio=0.25,
-            future_discount=0.95,
-            loss_weight=5.0),
-        loss_dice=dict(
-            type='OccDiceLoss',
-            use_sigmoid=True,
-            activate=True,
-            naive_dice=True,
-            eps=1.0,
-            loss_weight=1.0)),
+    # --------------------------------------------------------------- #
+    # Occupancy is OFF, at the base, so nothing can inherit it back on. #
+    # --------------------------------------------------------------- #
+    # It never reached a usable operating point in v1 or ver2: occ_sep/ratio sat
+    # at 1.008 against a floor of 1.0 (a spatially constant output), and the
+    # corrected metric says the true separation is worse than that number, not
+    # better -- report #07 2. Carrying a head that has not been shown to learn
+    # only adds parameters to the clip norm and takes a slice of the BEV
+    # gradient, for no teacher.
+    #
+    # To re-enable: set `occ_head=_occ_head` below, put occ back into
+    # task_loss_weight and into any grad_balance target, and restore
+    # GenerateSSROccLabels plus the gt_occ_seg / gt_occ_valid collect keys in
+    # both pipelines (all four sites are marked "occupancy:" further down).
+    occ_head=None,
 
     train_cfg=dict(pts=dict(
         grid_size=[512, 512, 1],
@@ -512,11 +535,12 @@ train_pipeline = [
          with_attr_label=True),
     # Rasterise occupancy BEFORE the range filter so agents that are outside the
     # BEV now but drive into it later are still drawn.
-    dict(type='GenerateSSROccLabels',
-         pc_range=point_cloud_range,
-         bev_size=(bev_h_, bev_w_),
-         n_future=occ_n_future,
-         class_labels=occ_class_labels),
+    # occupancy: restore this entry to re-enable the occ head.
+    # dict(type='GenerateSSROccLabels',
+    # pc_range=point_cloud_range,
+    # bev_size=(bev_h_, bev_w_),
+    # n_future=occ_n_future,
+    # class_labels=occ_class_labels),
     dict(type='CustomObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='CustomObjectNameFilter', classes=class_names),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -527,7 +551,7 @@ train_pipeline = [
     dict(type='CustomCollect3D',
          keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs',
                'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat',
-               'gt_attr_labels', 'gt_occ_seg', 'gt_occ_valid'])
+               'gt_attr_labels'])
 ]
 
 test_pipeline = [
@@ -544,11 +568,12 @@ test_pipeline = [
     # Carried through to the result dict so evaluate_occ() can score the
     # occupancy head against the very GT the loss was trained on -- rebuilding
     # it inside evaluate() would duplicate the class grouping and horizon.
-    dict(type='GenerateSSROccLabels',
-         pc_range=point_cloud_range,
-         bev_size=(bev_h_, bev_w_),
-         n_future=occ_n_future,
-         class_labels=occ_class_labels),
+    # occupancy: restore this entry to re-enable the occ head.
+    # dict(type='GenerateSSROccLabels',
+    # pc_range=point_cloud_range,
+    # bev_size=(bev_h_, bev_w_),
+    # n_future=occ_n_future,
+    # class_labels=occ_class_labels),
     dict(type='CustomObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='CustomObjectNameFilter', classes=class_names),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -566,7 +591,7 @@ test_pipeline = [
                  keys=['points', 'gt_bboxes_3d', 'gt_labels_3d', 'img',
                        'fut_valid_flag', 'ego_his_trajs', 'ego_fut_trajs',
                        'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat',
-                       'gt_attr_labels', 'gt_occ_seg', 'gt_occ_valid'])])
+                       'gt_attr_labels'])])
 ]
 
 data = dict(

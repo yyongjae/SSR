@@ -9,7 +9,7 @@ Rule of thumb behind the numbers: w_task ~ L_plan / L_task.
 """
 _base_ = ['./PARA_SSR_e2e.py']
 
-model = dict(task_loss_weight=dict(plan=1.0, det=0.01, map=0.05, occ=0.06))
+model = dict(task_loss_weight=dict(plan=1.0, det=0.01, map=0.05))
 
 log_config = dict(
     hooks=[
@@ -22,7 +22,7 @@ log_config = dict(
                 name='para_w_plan',
                 group='loss-weight-sweep',
                 tags=['para-ssr', 'sweep'],
-                config=dict(task_loss_weight='plan1/det0.01/map0.05/occ0.06', aux_grad_scale=1.0)),
+                config=dict(task_loss_weight='plan1/det0.01/map0.05', aux_grad_scale=1.0)),
             by_epoch=False,
             interval=100),
     ])

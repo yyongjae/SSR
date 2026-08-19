@@ -250,7 +250,7 @@ class ParaSSRHead(BaseModule):
 
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self, preds_dicts, ego_fut_gt, ego_fut_masks, ego_fut_cmd,
-             **kwargs):
+             metrics_out=None, **kwargs):
         """L1 on the commanded branch only -- identical to ``SSRHead.loss``."""
         ego_fut_preds = preds_dicts['ego_fut_preds']
 
@@ -262,5 +262,57 @@ class ParaSSRHead(BaseModule):
         weight = ego_fut_cmd[..., None, None] * ego_fut_masks[:, None, :, None]
         weight = weight.repeat(1, 1, 1, 2)
 
+        if metrics_out is not None:
+            metrics_out.update(
+                self._per_command_error(ego_fut_preds, ego_fut_gt, weight))
+
         return dict(
             loss_plan_reg=self.loss_plan_reg(ego_fut_preds, ego_fut_gt, weight))
+
+    # command index -> name, from the converter that built gt_ego_fut_cmd:
+    # VAD/tools/data_converter/vad_nuscenes_converter.py:452-457 keys them off
+    # the final future x-offset (>= 2 m right, <= -2 m left, else straight).
+    _CMD_NAMES = ('right', 'left', 'straight')
+
+    @torch.no_grad()
+    def _per_command_error(self, preds, gt, weight):
+        """Waypoint error split by driving command. Diagnostic only.
+
+        Each sample supervises exactly ONE of the three command branches -- the
+        weight above zeroes the other two -- so ``loss_plan_reg`` is a mixture
+        whose proportions are set by whatever commands the batch happened to
+        contain. On the nuScenes training split that mixture is
+
+            go straight  87.7%      turn right  6.9%      turn left  5.4%
+
+        which means a left-turn branch that never learns moves the total by at
+        most a few percent, and the planning L2 that scores it is dominated by
+        the same straight-ahead samples. Turning is where planning is hard;
+        this is the only place it is visible separately.
+
+        It matters more here than it would in a plain 3-head regressor: SSR
+        gates the BEV feature by command (``navi_se``), so the three branches
+        are three conditioned pathways, not three output layers. A branch that
+        does not learn means that conditioning is broken for that command.
+
+        NOT the same quantity as ``plan_L2``. This is the error on the per-step
+        OFFSETS the loss is computed on; ``plan_L2`` cumsums both prediction and
+        ground truth first and measures displacement from the origin. The two
+        move together but are in different units and must not be read against
+        each other -- offsets are ~0.2 m, positions grow to several metres.
+
+        Reported as SUMS and COUNTS rather than a ratio. Turn commands are
+        absent from most batches at this batch size, and a per-iteration ratio
+        would either be a lie (0.0 reads as perfect) or a NaN (which
+        _parse_losses all-reduces into every rank). Divide sum by count over
+        whatever window is being read.
+        """
+        err = (preds - gt).abs() * weight             # [B, mode, T, 2]
+        num = err.sum(dim=(0, 2, 3))                  # [mode]
+        den = weight.sum(dim=(0, 2, 3))               # [mode]
+        out = {}
+        for i in range(min(num.numel(), len(self._CMD_NAMES))):
+            name = self._CMD_NAMES[i]
+            out[f'plan_err_sum/{name}'] = num[i]
+            out[f'plan_n/{name}'] = den[i]
+        return out

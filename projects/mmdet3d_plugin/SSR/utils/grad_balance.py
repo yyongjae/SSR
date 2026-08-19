@@ -20,6 +20,27 @@ planning as the numeraire (its path is never scaled, so ``s_plan = 1``):
 
 which gives share_k = t_k / sum(t) by construction, for every k including plan.
 
+WHAT `target` ACTUALLY MEANS, stated precisely because the number invites a
+reading it does not support. `plan=0.4` means:
+
+    the rank-averaged share of ||dL_task / d bev_embed||,
+    measured at the BEV ACTIVATION, on the measurement iterations.
+
+It is NOT any of these, and the gap is not small:
+
+  * the share of the parameter-gradient update after DDP averaging. Gradients
+    are all-reduced across ranks BEFORE the optimiser sees them; the balancer
+    averages per-rank NORMS, which is a different operation -- mean of norms is
+    not the norm of the mean, and they coincide only if the ranks agree.
+  * the share of the actual optimiser step. AdamW divides by a running second
+    moment, so a task holding 40% of the gradient does not get 40% of the
+    movement. That is what uwr/* measures, and it is not this.
+  * contribution accounting for direction. Two tasks at 30% each can reinforce
+    or cancel; see gcos/* and the first bullet below.
+
+Read `target` as a knob on one specific, measurable quantity -- not as "task X
+gets 40% of the learning".
+
 Three things this does NOT do, all of which matter:
 
 * Equal magnitude is not equal influence. ``sum||g_k|| != ||sum g_k||`` -- two

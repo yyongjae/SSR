@@ -235,10 +235,34 @@ pnorm/aux   24.7853      <-- 전체 norm의 사실상 전부
 pnorm/other  0.0000
 ```
 
-**aux head 파라미터 gradient가 planner의 60배, trunk의 293배다.** `max_norm=35`가
-재는 norm은 거의 전적으로 aux head의 것이고, `_ScaleGrad`는 여기에 손을 대지
-않는다. `aux_grad_scale`을 아무리 낮춰도 clipping 발생률은 변하지 않는다는
-위 주장이 그대로 확인된다.
+**`max_norm=35`가 재는 norm은 거의 전적으로 aux head의 것이고**, `_ScaleGrad`는
+여기에 손을 대지 않는다. `aux_grad_scale`을 아무리 낮춰도 clipping 발생률은
+변하지 않는다는 위 주장이 그대로 확인된다.
+
+> **정정 (2026-08-19).** 위 `pnorm/plan`은 planning 전용이 아니었다.
+> `pts_bbox_head`는 mmdet3d가 검출 헤드에 붙이는 관례적 이름이고, 우리 모델에서는
+> **BEV encoder(4,651,781)와 planner(2,416,978)를 함께** 담고 있다. BEV encoder는
+> 공유 feature `bev_embed`를 만드는 쪽이라 **네 task 전부에서 gradient를 받는다** —
+> 반면 planner는 planning loss 하나에서만 받는다. 성격이 정반대인 둘을 한 그룹으로
+>묶고 `plan`이라 부른 것이다.
+>
+> 따라서 "aux가 planner의 60배"는 분모에 남의 gradient를 섞은 값이다. norm이
+> 제곱합이므로 `plan_옛값² = bev² + plan_새값²`, 즉 옛 분모가 더 크고, 게다가 BEV
+> encoder의 gradient는 대부분 aux가 만든 것이다(`gshare`에서 det+map이 60~99%).
+> **실제 배수는 60배보다 크다.** 정확한 값은 분리된 그룹으로 재측정해야 나온다.
+>
+> `ClipMonitorOptimizerHook`의 그룹을 `trunk / bev / plan / aux`로 쪼갰다:
+>
+> | 그룹 | 파라미터 | gradient 출처 |
+> |---|---:|---|
+> | `trunk` | 24,347,136 | 네 task 전부 |
+> | `bev` | 4,651,781 | **네 task 전부** (신설) |
+> | `plan` | 2,416,978 | planning만 (이제 진짜) |
+> | `aux` | 6,720,925 | det + motion + map |
+>
+> **바뀌지 않는 것:** clipping norm을 지배하는 게 aux라는 사실(`pnorm/aux` 17.7 vs
+> 나머지 1~2)과, `aux_grad_scale`이 clipping을 줄이지 못한다는 결론. 둘 다 aux 대
+> 전체의 비교이지 planner와의 배수에 의존하지 않는다.
 
 warm-up 첫 iteration(5)에서는 `grad_norm 58.70 / clip/rate 1.0000 /
 clip/factor 0.6503` — 35% 축소가 걸렸다. 즉 clipping은 학습 초반과 후반
@@ -636,6 +660,30 @@ MAP     cls + reg branches           796,431    2.1%
 공유 trunk가 76%다. 네 task가 다투는 대상을 만드는 부분이 압도적이고, task 고유
 파라미터는 다 합쳐도 24%다 -- `grad_balance`가 조절하는 것이 정확히 그 76%로
 되돌아가는 gradient다.
+
+---
+
+## 9.8 2-GPU 평가 차이의 실제 크기 (2026-08-19 정정)
+
+앞서 "rank 1의 첫 1개 샘플"이라고 두 번 적었다. **틀렸다.** `prev_bev`는 체인이라
+오염이 전파된다.
+
+val split에서 측정: 2-rank 연속 분할의 rank 1은 index 3010에서 시작하고, 그
+샘플은 scene 중간이라 `prev_bev=None`을 받는다. 그 뒤 샘플들은 오염된 `prev_bev`를
+물려받고, scene이 바뀌는 index 3031에서야 끊긴다.
+
+    영향 구간  index 3010..3031 = 22 샘플 = 6019 의 0.37%
+    scene 길이 중앙값 40 이므로 최악의 경우 40 까지 갈 수 있다
+
+첫 샘플만 큰 차이이고 나머지 21개는 감쇠하므로 6019개 평균에는 유의미한 영향이
+없다. 그래도 "1개"는 과소 서술이었다.
+
+**`tools/final_eval.sh`의 존재 이유도 다시 적었다.** 1-GPU가 아니라 **EMA**다.
+`EvalHook`은 `eval_model`을 받지 않으므로 학습 로그의 모든 수치는 raw 가중치의
+것이고, `MEGVIIEMAHook`이 따로 쓰는 `epoch_N_ema.pth`는 **한 번도 채점되지
+않는다.** 이건 GPU 개수와 무관한 실재하는 공백이다. 1-GPU는 "두 실행이 같은
+방식으로 채점됐음을 논증 없이 보장"하는 값싼 보험이지, 2-GPU 수치가 틀렸다는
+뜻이 아니다.
 
 ---
 

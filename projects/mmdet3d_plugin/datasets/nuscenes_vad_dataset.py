@@ -1003,12 +1003,20 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         **kwargs
     ):
         super().__init__(*args, **kwargs)
-        # Score floor for the detection submission json. VAD hard-codes 0.2
-        # (_format_bbox), which shrinks the file but also truncates the tail of
-        # every PR curve, so its published mAP is measured at 0.2. nuScenes AP
-        # integrates over recall, so a lower floor can only help: 0.0 is the
-        # honest number and 0.2 is the like-for-like comparison against VAD's
-        # paper. evaluate_det() reports both when they differ.
+        # Score floor for the detection submission json. 0.0 is the nuScenes
+        # protocol: the official config sets no score threshold at all, only
+        # `max_boxes_per_sample: 500`, and AP is the area under the full
+        # precision-recall curve. Throwing away low-scoring boxes only removes
+        # the tail of that curve, so any floor above 0 lowers mAP.
+        #
+        # The head emits 300 queries per sample, comfortably under the 500 cap,
+        # so nothing is dropped and no floor is needed to stay legal.
+        #
+        # VAD hard-codes 0.2 in its own _format_bbox -- a submission-file-size
+        # measure, not a protocol requirement -- so VAD's published mAP is a
+        # thresholded number. To compare like for like against it, pass a list:
+        # det_score_thresh=[0.0, 0.2]. The first entry keeps the unsuffixed
+        # metric names the EvalHook watches; the rest are keyed .../mAP@0.2.
         self.det_score_thresh = det_score_thresh
         self.queue_length = queue_length
         self.overlap_test = overlap_test
@@ -1777,6 +1785,13 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                 for k in plan_only:
                     metric_dict[k] += plan_only[k]
 
+        if not num_valid:
+            # Every sample had fut_valid_flag False, so metric_dict was never
+            # initialised. Cannot happen on the full split; can on a subset
+            # (tools/verify_dist_eval.sh) or a split whose scenes all end
+            # early. Say so instead of raising TypeError on a None dict.
+            print('no sample has a valid 3 s future; skipping planning metrics')
+            metric_dict = {}
         for k in metric_dict:
             metric_dict[k] = metric_dict[k] / num_valid
             print("{}:{}".format(k, metric_dict[k]))
@@ -2068,11 +2083,11 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             n_gt = totals[f'gt_{cls}']
             n_ade = totals[f'cnt_ade_{cls}']
             n_fde = totals[f'cnt_fde_{cls}']
-            detail[f'EPA_{cls}'] = _div(
+            detail[f'motion_EPA/{cls}'] = _div(
                 totals[f'hit_{cls}'] - alpha * totals[f'fp_{cls}'], n_gt)
-            detail[f'ADE_{cls}'] = _div(totals[f'ADE_{cls}'], n_ade)
-            detail[f'FDE_{cls}'] = _div(totals[f'FDE_{cls}'], n_fde)
-            detail[f'MR_{cls}'] = _div(totals[f'MR_{cls}'], n_fde)
+            detail[f'motion_ADE/{cls}'] = _div(totals[f'ADE_{cls}'], n_ade)
+            detail[f'motion_FDE/{cls}'] = _div(totals[f'FDE_{cls}'], n_fde)
+            detail[f'motion_MR/{cls}'] = _div(totals[f'MR_{cls}'], n_fde)
             # counts, so a NaN or a suspicious value can be interpreted
             detail[f'motion_cnt_{cls}/gt'] = n_gt
             detail[f'motion_cnt_{cls}/matched'] = n_ade

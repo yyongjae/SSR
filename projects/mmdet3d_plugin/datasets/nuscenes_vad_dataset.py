@@ -2093,10 +2093,10 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             detail[f'motion_cnt_{cls}/matched'] = n_ade
             detail[f'motion_cnt_{cls}/hit'] = totals[f'hit_{cls}']
             detail[f'motion_cnt_{cls}/fp'] = totals[f'fp_{cls}']
-            print(f'  {cls:11s} EPA {detail[f"EPA_{cls}"]:7.4f}  '
-                  f'ADE {detail[f"ADE_{cls}"]:7.4f}  '
-                  f'FDE {detail[f"FDE_{cls}"]:7.4f}  '
-                  f'MR {detail[f"MR_{cls}"]:7.4f}   '
+            print(f'  {cls:11s} EPA {detail[f"motion_EPA/{cls}"]:7.4f}  '
+                  f'ADE {detail[f"motion_ADE/{cls}"]:7.4f}  '
+                  f'FDE {detail[f"motion_FDE/{cls}"]:7.4f}  '
+                  f'MR {detail[f"motion_MR/{cls}"]:7.4f}   '
                   f'[gt {n_gt:.0f}, matched {n_ade:.0f}, '
                   f'hit {totals[f"hit_{cls}"]:.0f}, fp {totals[f"fp_{cls}"]:.0f}]')
             if n_ade == 0:

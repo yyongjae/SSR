@@ -109,7 +109,7 @@ from mmdet3d.models import build_model as _build                # noqa: E402
 from projects.mmdet3d_plugin.SSR.hooks.clip_monitor import (    # noqa: E402
     ClipMonitorOptimizerHook, _DEFAULT_GROUPS)
 
-_k = _Cfg.fromfile('projects/configs/SSR/PARA_SSR_e2e_2gpu_b4_60ep.py')
+_k = _Cfg.fromfile('projects/configs/SSR/PARA_SSR_e2e_60ep.py')
 _m = _build(_k.model, train_cfg=_k.get('train_cfg'))
 
 

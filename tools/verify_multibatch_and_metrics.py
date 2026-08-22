@@ -38,7 +38,7 @@ fails += [] if ok else ['P0-1']
 
 # ---------------------------------------------------------------- P0-3 ----
 print('\n=== P0-3: motion metric must not mutate detection labels ===')
-cfg = Config.fromfile('projects/configs/SSR/PARA_SSR_e2e_2gpu_b4.py')
+cfg = Config.fromfile('projects/configs/SSR/PARA_SSR_e2e_12ep.py')
 model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'))
 model.CLASSES = ('car', 'truck', 'construction_vehicle', 'bus', 'trailer',
                  'barrier', 'motorcycle', 'bicycle', 'pedestrian',
@@ -115,11 +115,11 @@ fails += [] if ok4b else ['P0-4-train']
 
 # ---------------------------------------------------------------- P0-2 ----
 print('\n=== P0-2: the 12-epoch config must stay 12 epochs ===')
-c12 = Config.fromfile('projects/configs/SSR/PARA_SSR_e2e_2gpu_b4.py')
-c60 = Config.fromfile('projects/configs/SSR/PARA_SSR_e2e_2gpu_b4_60ep.py')
-print(f'  2gpu_b4        : {c12.runner["max_epochs"]} ep, '
+c12 = Config.fromfile('projects/configs/SSR/PARA_SSR_e2e_12ep.py')
+c60 = Config.fromfile('projects/configs/SSR/PARA_SSR_e2e_60ep.py')
+print(f'  12ep           : {c12.runner["max_epochs"]} ep, '
       f'eval/{c12.evaluation["interval"]}, aux={c12.model.test_aux_heads}')
-print(f'  2gpu_b4_60ep   : {c60.runner["max_epochs"]} ep, '
+print(f'  60ep           : {c60.runner["max_epochs"]} ep, '
       f'eval/{c60.evaluation["interval"]}, aux={c60.model.test_aux_heads}')
 ok2 = (c12.runner['max_epochs'] == 12 and c12.model.test_aux_heads is False
        and c60.runner['max_epochs'] == 60 and c60.evaluation['interval'] == 6

@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # One entry point for every PARA-SSR run.
 #
-#   ./run.sh <what> [gpus]
+#   ./run.sh <what> [gpus] [config]
 #
-#   ./run.sh 60ep 3,6          60-epoch single-stage      (2 GPU, ~3-5 days)
-#   ./run.sh staged 3,6        48ep no-planning -> 12ep all  (2 GPU)
-#   ./run.sh planonly 3,6      control: aux cannot touch the BEV  (2 GPU)
-#   ./run.sh 4gpu 0,1,2,3      60ep on four GPUs, same batch, half the time
+#   ./run.sh 12ep 3,6          12-epoch single-stage
+#   ./run.sh 60ep 0,1,2,3      60-epoch single-stage
+#   ./run.sh 60ep 0,1 projects/configs/SSR/custom.py
+#                              60-epoch preset with a custom config
+#   ./run.sh staged 3,6        48ep no-planning -> 12ep all
+#   ./run.sh staged 3,6 stage1.py stage2.py
+#                              staged run with both configs overridden
+#   ./run.sh planonly 3,6      control: aux cannot touch the BEV
 #
 #   ./run.sh smoke 3,6         validation path, 8 samples (~10 min) -- run this
 #                              BEFORE committing days to a training run
 #   ./run.sh calib 3,6         200 iterations, prints real s/iter and the ETA
 #   ./run.sh test              CPU regression suite, no GPU
 #   ./run.sh doctor            check this machine: env, GPUs, dataset symlinks
-#   ./run.sh eval CKPT [gpu]   final numbers: 1 GPU, sequential, EMA weights
+#   ./run.sh eval CKPT [gpu] [config]
+#                              final numbers: 1 GPU, sequential, EMA weights
 #
-# gpus defaults to $CUDA_VISIBLE_DEVICES, or 0,1. The GPU count has to match
-# what the config expects -- every config fixes samples_per_gpu so that
-# gpus x samples = the global batch of 8, and changing one without the other
-# silently changes the experiment.
+# gpus defaults to $CUDA_VISIBLE_DEVICES, or 0,1. For training, the number of
+# GPUs must divide 8. The launcher sets samples_per_gpu=8/N automatically, so
+# every supported layout keeps the experiment's global batch fixed at 8.
+# DataLoader workers default to 8 per GPU; override with
+# SSR_WORKERS_PER_GPU=<N> when benchmarking a different host.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -43,7 +49,8 @@ if ! PY=$(pick_python); then
   echo "Activate the env ('conda activate ssr') or set SSR_PYTHON=/path/to/python." >&2
   exit 1
 fi
-export PATH="$(dirname "$PY"):$PATH"
+PY_DIR=$(dirname "$PY")
+export PATH="$PY_DIR:$PATH"
 
 # numba 0.48/LLVM 8 segfaults probing some newer CPUs (Sapphire Rapids here).
 # 'generic' is a safe target everywhere; override if a machine wants otherwise.
@@ -55,16 +62,31 @@ C=projects/configs/SSR
 WHAT=${1:-}
 GPUS=${2:-${CUDA_VISIBLE_DEVICES:-0,1}}
 NG=$(awk -F, '{print NF}' <<<"$GPUS")
+GLOBAL_BATCH=8
+WORKERS_PER_GPU=${SSR_WORKERS_PER_GPU:-8}
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \?//'; exit "${1:-1}"; }
 [ -z "$WHAT" ] && usage 0
 
-need_gpus() {
-  [ "$NG" -eq "$1" ] && return 0
-  echo "'$WHAT' needs $1 GPU(s); got $NG ($GPUS)." >&2
-  echo "Every config pins samples_per_gpu so gpus x samples = 8. Changing the" >&2
-  echo "GPU count alone changes the global batch and invalidates the LR." >&2
-  exit 1
+validate_gpu_list() {
+  if [[ ! "$GPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "invalid GPU list: '$GPUS' (expected e.g. 0,1 or 0,1,2,3)" >&2
+    exit 1
+  fi
+}
+
+prepare_batch() {
+  validate_gpu_list
+  if (( NG < 1 || GLOBAL_BATCH % NG != 0 )); then
+    echo "training needs a GPU count that divides $GLOBAL_BATCH; got $NG ($GPUS)." >&2
+    echo "Supported counts: 1, 2, 4, or 8." >&2
+    exit 1
+  fi
+  if [[ ! "$WORKERS_PER_GPU" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SSR_WORKERS_PER_GPU must be a positive integer; got '$WORKERS_PER_GPU'." >&2
+    exit 1
+  fi
+  BATCH_PER_GPU=$((GLOBAL_BATCH / NG))
 }
 
 # Things that are set up per machine and fail late if missing: the dataset
@@ -74,7 +96,7 @@ preflight() {
   local bad=0 f
   for f in data/nuscenes/vad_nuscenes_infos_temporal_train.pkl \
            data/nuscenes/vad_nuscenes_infos_temporal_val.pkl \
-           data/nuscenes/nuscenes_map_anns_val.json \
+           data/nuscenes/nuscenes_map_anns_val_ssr.json \
            data/nuscenes/samples data/nuscenes/maps data/can_bus; do
     [ -e "$f" ] || { echo "missing: $f" >&2; bad=1; }
   done
@@ -84,22 +106,39 @@ preflight() {
     echo "be symlinks) before training." >&2; exit 1; }
 }
 
-# train <config-name> <work-dir-name> <n-gpus> [extra args...]
+# Use the preset when no override is supplied. An override may be relative to
+# the repository or absolute, but it must name an existing config file.
+resolve_config() {
+  local preset=$1 override=${2:-} cfg
+  cfg=${override:-$C/$preset.py}
+  if [ ! -f "$cfg" ]; then
+    echo "config not found: $cfg" >&2
+    exit 1
+  fi
+  printf '%s\n' "$cfg"
+}
+
+# train <preset-name> <work-dir-name> <config-override> [extra cfg-options...]
 train() {
-  local cfg=$1 wd=$2 n=$3; shift 3
-  need_gpus "$n"
+  local preset=$1 wd=$2 override=${3:-} cfg
+  shift 3
+  cfg=$(resolve_config "$preset" "$override")
+  prepare_batch
   preflight
-  echo "=== $cfg -> work_dirs/$wd  (GPU $GPUS) ==="
+  echo "=== $cfg -> work_dirs/$wd ==="
+  echo "    GPU $GPUS: $NG x $BATCH_PER_GPU = global batch $GLOBAL_BATCH"
   CUDA_VISIBLE_DEVICES="$GPUS" PORT="${PORT:-$((28500 + RANDOM % 500))}" \
-    ./tools/dist_train.sh "$C/$cfg.py" "$n" \
-      --work-dir "work_dirs/$wd" --seed 0 "$@"
+    ./tools/dist_train.sh "$cfg" "$NG" \
+      --work-dir "work_dirs/$wd" --seed 0 \
+      --cfg-options data.samples_per_gpu="$BATCH_PER_GPU" \
+        data.workers_per_gpu="$WORKERS_PER_GPU" "$@"
 }
 
 case "$WHAT" in
-  60ep)     train PARA_SSR_e2e_2gpu_b4_60ep          para_ssr_60ep      2 ;;
-  4gpu)     train PARA_SSR_e2e_4gpu_60ep             para_ssr_4gpu_60ep 4 ;;
-  planonly) train PARA_SSR_e2e_2gpu_b4_60ep_planonly para_ssr_planonly  2 ;;
-  stage1)   train PARA_SSR_stage1_detmap             para_ssr_stage1    2 ;;
+  12ep)     train PARA_SSR_e2e_12ep          para_ssr_12ep     "${3:-}" ;;
+  60ep)     train PARA_SSR_e2e_60ep          para_ssr_60ep     "${3:-}" ;;
+  planonly) train PARA_SSR_e2e_60ep_planonly para_ssr_planonly "${3:-}" ;;
+  stage1)   train PARA_SSR_stage1_detmap     para_ssr_stage1   "${3:-}" ;;
 
   stage2)
     CKPT=${CKPT:-work_dirs/para_ssr_stage1/latest.pth}
@@ -110,28 +149,37 @@ case "$WHAT" in
     fi
     # The config names a default checkpoint; override it so a non-default CKPT
     # is actually honoured instead of silently ignored.
-    train PARA_SSR_stage2_all para_ssr_stage2 2 --cfg-options load_from="$CKPT"
+    train PARA_SSR_stage2_all para_ssr_stage2 "${3:-}" load_from="$CKPT"
     ;;
 
   staged)
-    "$0" stage1 "$GPUS"
-    CKPT=work_dirs/para_ssr_stage1/latest.pth "$0" stage2 "$GPUS"
+    "$0" stage1 "$GPUS" "${3:-}"
+    CKPT=work_dirs/para_ssr_stage1/latest.pth \
+      "$0" stage2 "$GPUS" "${4:-}"
     ;;
 
   smoke)
-    need_gpus 2
+    validate_gpu_list
+    if (( 8 % NG != 0 )); then
+      echo "smoke uses 8 samples, so the GPU count must divide 8; got $NG." >&2
+      exit 1
+    fi
     echo "=== validation path, 8 samples. Catches an epoch-6 crash now, not in five days. ==="
-    tools/verify_dist_eval.sh 8 "$C/PARA_SSR_e2e_2gpu_b4_60ep.py" "$GPUS"
+    CFG=$(resolve_config PARA_SSR_e2e_60ep "${3:-}")
+    tools/verify_dist_eval.sh 8 "$CFG" "$GPUS"
     ;;
 
   calib)
-    need_gpus 2
+    prepare_batch
+    CFG=$(resolve_config PARA_SSR_e2e_60ep "${3:-}")
     OUT=$(mktemp -d)
     echo "=== 200 iterations to measure the real s/iter (~15 min) ==="
     CUDA_VISIBLE_DEVICES="$GPUS" PORT="${PORT:-$((28500 + RANDOM % 500))}" \
       timeout 2400 ./tools/dist_train.sh \
-        "$C/PARA_SSR_e2e_2gpu_b4_60ep.py" 2 --work-dir "$OUT" --seed 0 \
-        --no-validate --cfg-options log_config.interval=20 2>&1 | tee "$OUT/log"
+        "$CFG" "$NG" --work-dir "$OUT" --seed 0 \
+        --no-validate --cfg-options data.samples_per_gpu="$BATCH_PER_GPU" \
+          data.workers_per_gpu="$WORKERS_PER_GPU" log_config.interval=20 \
+        2>&1 | tee "$OUT/log"
     python - "$OUT/log" <<'EOF'
 import re, sys
 t = [float(m) for m in re.findall(r'time: ([0-9.]+)', open(sys.argv[1]).read())]
@@ -151,13 +199,15 @@ EOF
 
   eval)
     CKPT=${2:?usage: ./run.sh eval CKPT [gpu]}
-    tools/final_eval.sh "$C/PARA_SSR_e2e_2gpu_b4_60ep.py" "$CKPT" "${3:-0}"
+    CFG=$(resolve_config PARA_SSR_e2e_60ep "${4:-}")
+    tools/final_eval.sh "$CFG" "$CKPT" "${3:-0}"
     ;;
 
   test)
     fail=0
     for t in verify_diagnostics verify_anomaly_hook verify_grad_balance \
-             verify_aux_metrics verify_multibatch_and_metrics; do
+             verify_aux_metrics verify_multibatch_and_metrics \
+             verify_wandb_logger; do
       printf '%-32s ' "$t"
       if CUDA_VISIBLE_DEVICES="" python "tools/$t.py" >/dev/null 2>&1; then
         echo ok

@@ -2,8 +2,8 @@
 # The numbers that go in a table. ONE GPU, sequential, on the EMA weights.
 #
 #   tools/final_eval.sh CONFIG CKPT [GPU]
-#   tools/final_eval.sh projects/configs/SSR/PARA_SSR_e2e_2gpu_b4_60ep.py \
-#                       work_dirs/para_ssr_2gpu_b4_60ep/epoch_60_ema.pth 0
+#   tools/final_eval.sh projects/configs/SSR/PARA_SSR_e2e_60ep.py \
+#                       work_dirs/para_ssr_60ep/epoch_60_ema.pth 0
 #
 # WHY THIS EXISTS: the EMA weights. Not the GPU count.
 #
@@ -58,7 +58,8 @@ esac
 # back to whatever env is active, or SSR_PYTHON.
 if ! python -c 'import torch, mmcv' >/dev/null 2>&1; then
   [ -n "${SSR_PYTHON:-}" ] || { echo "activate the env, or use ./run.sh eval" >&2; exit 1; }
-  export PATH="$(dirname "$SSR_PYTHON"):$PATH"
+  SSR_PYTHON_DIR=$(dirname "$SSR_PYTHON")
+  export PATH="$SSR_PYTHON_DIR:$PATH"
 fi
 export NUMBA_CPU_NAME="${NUMBA_CPU_NAME:-generic}"
 export CUDA_VISIBLE_DEVICES="$GPU"

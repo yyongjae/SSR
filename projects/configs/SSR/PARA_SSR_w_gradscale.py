@@ -11,7 +11,7 @@ Arms of the scale sweep, all against the unscaled 8-GPU PARA_SSR_e2e.py:
 
     PARA_SSR_w_equal.py         1.0    no scaling (the control)
     this file                   0.02
-    PARA_SSR_e2e_2gpu_b4.py     0.01   the working 2-GPU configuration
+    PARA_SSR_e2e_12ep.py         0.01   the runnable 12-epoch configuration
 
 None of these is a published value; 0.01 came from one warm-up measurement of
 gshare and needs its own ablation. Compare against W2 to separate "aux
@@ -28,7 +28,7 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
+            type='SSRWandbLoggerHook',
             init_kwargs=dict(
                 project='para-ssr',
                 name='para_w_gradscale',

@@ -11,8 +11,8 @@ two finished runs:
 ===========================  ==============  ==========
 run                          mean grad_norm  fraction > 35
 ===========================  ==============  ==========
-ssr_noffp_2gpu_b4 (plan only)          0.93         0.0%
-para_ssr_8gpu     (v1, aux)           34.07        56.2%
+SSR plan-only (measured run)            0.93         0.0%
+PARA-SSR v1 (measured run)             34.07        56.2%
 ===========================  ==============  ==========
 
 and the PARA run is at 100% from epoch 10 onward. Note that ``aux_grad_scale``

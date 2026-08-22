@@ -16,7 +16,7 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
+            type='SSRWandbLoggerHook',
             init_kwargs=dict(
                 project='para-ssr',
                 name='para_w_plan',

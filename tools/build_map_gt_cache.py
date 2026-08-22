@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         'config', nargs='?',
-        default='projects/configs/SSR/PARA_SSR_e2e_2gpu_b4.py')
+        default='projects/configs/SSR/PARA_SSR_e2e_12ep.py')
     parser.add_argument('--split', default='test', choices=['val', 'test'],
                         help='which data split entry to read map_ann_file from')
     args = parser.parse_args()

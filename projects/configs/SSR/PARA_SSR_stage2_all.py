@@ -1,7 +1,7 @@
 """Stage 2 of 2: switch planning on, starting from the stage-1 weights.
 
-    tools/dist_train.sh projects/configs/SSR/PARA_SSR_stage1_detmap.py 2 ...
-    tools/dist_train.sh projects/configs/SSR/PARA_SSR_stage2_all.py    2 ...
+    ./run.sh stage1 0,1
+    ./run.sh stage2 0,1
 
 ``load_from`` (not ``resume_from``): the weights carry over, the optimiser
 state, epoch counter and LR schedule all restart. That is what VAD does
@@ -43,13 +43,13 @@ matcher optimising a different objective than the loss is a real bug, not a
 cosmetic mismatch).
 
 WHAT TO COMPARE THIS AGAINST -- and how not to. 48 + 12 = 60 epochs is the same
-wall-clock budget as the single-stage PARA_SSR_e2e_2gpu_b4_60ep.py, but it is
+wall-clock budget as the single-stage PARA_SSR_e2e_60ep.py, but it is
 NOT "the same run with one variable changed". See the stage-1 docstring: the LR
 schedule, the optimiser state, the EMA, the RNG stream and above all the number
 of iterations the planner and motion heads receive (42,192 against 210,960) all
 differ. Read the pair as two recipes, not as an ablation of staging.
 """
-_base_ = ['./PARA_SSR_e2e_2gpu_b4_60ep.py']
+_base_ = ['./PARA_SSR_e2e_60ep.py']
 
 total_epochs = 12
 runner = dict(max_epochs=total_epochs)
@@ -57,7 +57,7 @@ checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
 
 # Weights only. Optimiser state, epoch and LR schedule restart -- see above.
 # Point this at wherever stage 1 was written; the launcher passes --work-dir.
-load_from = 'work_dirs/para_ssr_stage1_detmap/latest.pth'
+load_from = 'work_dirs/para_ssr_stage1/latest.pth'
 
 model = dict(
     task_loss_weight=dict(plan=1.0, det=1.0, motion=1.0, map=1.0),
@@ -87,16 +87,16 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
+            type='SSRWandbLoggerHook',
             init_kwargs=dict(
                 project='para-ssr',
                 name='para_ssr_stage2_all',
                 group='para-staged',
-                tags=['para-ssr', 'no-ffp', 'aux', '2gpu', 'batch4',
-                      'global8', 'stage2', 'all-tasks'],
+                tags=['para-ssr', 'no-ffp', 'aux', 'global8', 'stage2',
+                      'all-tasks'],
                 config=dict(
-                    model='PARA-SSR', ffp=False, gpus=2, batch_per_gpu=4,
-                    global_batch=8, epochs=12, eval_interval=6,
+                    model='PARA-SSR', ffp=False, global_batch=8, epochs=12,
+                    eval_interval=6,
                     stage=2, tasks='plan+det+motion+map')),
             by_epoch=False,
             interval=100),

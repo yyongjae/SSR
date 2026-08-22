@@ -11,7 +11,7 @@ here.
     stage 2   12 epochs   plan 1.0   det 1.0   motion 1.0   map 1.0  + grad_balance
     -----------------------------------------------------------------
     total     60 epochs, the same wall-clock budget as the single-stage
-              PARA_SSR_e2e_2gpu_b4_60ep.py.
+              PARA_SSR_e2e_60ep.py.
 
 THAT IS A BUDGET MATCH, NOT A CONTROLLED EXPERIMENT. An earlier version of this
 docstring called the pair "a controlled comparison of staging itself"; that was
@@ -59,7 +59,7 @@ retrains the planner from there regardless; freezing them instead
 (requires_grad=False) would avoid it, at the cost of diverging from the
 reference. Left as VAD has it.
 
-The planning metrics reported at the epoch-10 validations are therefore
+The planning metrics reported at the epoch-6 validations are therefore
 meaningless in this stage -- the planner has not been trained. Read map mAP and
 detection mAP; ignore plan_L2.
 
@@ -67,7 +67,7 @@ USEFUL SIDE EFFECT: this stage answers "how long do the auxiliary tasks take to
 converge" in isolation, with no planning gradient competing for the
 representation. That is the cleanest possible version of that measurement.
 """
-_base_ = ['./PARA_SSR_e2e_2gpu_b4_60ep.py']
+_base_ = ['./PARA_SSR_e2e_60ep.py']
 
 total_epochs = 48
 runner = dict(max_epochs=total_epochs)
@@ -109,16 +109,16 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
+            type='SSRWandbLoggerHook',
             init_kwargs=dict(
                 project='para-ssr',
                 name='para_ssr_stage1_detmap',
                 group='para-staged',
-                tags=['para-ssr', 'no-ffp', 'aux', '2gpu', 'batch4',
-                      'global8', 'stage1', 'no-planning'],
+                tags=['para-ssr', 'no-ffp', 'aux', 'global8', 'stage1',
+                      'no-planning'],
                 config=dict(
-                    model='PARA-SSR', ffp=False, gpus=2, batch_per_gpu=4,
-                    global_batch=8, epochs=48, eval_interval=6,
+                    model='PARA-SSR', ffp=False, global_batch=8, epochs=48,
+                    eval_interval=6,
                     stage=1, tasks='det+motion+map')),
             by_epoch=False,
             interval=100),

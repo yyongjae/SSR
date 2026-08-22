@@ -19,7 +19,7 @@ from mmdet3d.models import build_model
 from mmdet3d.datasets import build_dataset
 from mmdet.datasets import build_dataloader
 
-CFG = 'projects/configs/SSR/PARA_SSR_e2e_2gpu_b4.py'
+CFG = 'projects/configs/SSR/PARA_SSR_e2e_12ep.py'
 BS = 4
 cfg = Config.fromfile(CFG)
 ds = build_dataset(cfg.data.train)

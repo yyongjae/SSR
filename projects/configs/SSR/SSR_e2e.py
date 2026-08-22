@@ -324,7 +324,7 @@ data = dict(
              pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
              classes=class_names, modality=input_modality, samples_per_gpu=1,
              map_classes=map_classes,
-             map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+             map_ann_file=data_root + 'nuscenes_map_anns_val_ssr.json',
              map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
              map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
              use_pkl_result=True,
@@ -336,7 +336,7 @@ data = dict(
               pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
               classes=class_names, modality=input_modality, samples_per_gpu=1,
               map_classes=map_classes,
-              map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+              map_ann_file=data_root + 'nuscenes_map_anns_val_ssr.json',
               map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
               map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
               use_pkl_result=True,
@@ -371,7 +371,7 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
+            type='SSRWandbLoggerHook',
             init_kwargs=dict(
                 project='para-ssr',
                 name='ssr_baseline',

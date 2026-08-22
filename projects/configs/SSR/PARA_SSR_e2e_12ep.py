@@ -1,29 +1,26 @@
-"""PARA-SSR on two GPUs at the paper's global batch of 8.
+"""PARA-SSR 12-epoch experiment at the paper's global batch of 8.
 
-Same relationship to ``PARA_SSR_e2e.py`` that ``SSR_noffp_e2e_2gpu_b4.py`` has
-to ``SSR_noffp_e2e.py``: 8 GPUs x 1 sample re-factored into 2 GPUs x 4 samples.
-Global batch, optimizer step count, LR schedule and EMA cadence are unchanged,
-so results stay comparable to the 8-GPU PARA-SSR run.
+This derives the runnable 12-epoch experiment from ``PARA_SSR_e2e.py``.
+``run.sh`` chooses the per-GPU batch from the visible GPU count, keeping the
+global batch, optimizer step count, LR schedule and EMA cadence unchanged.
 
 Requires the multibatch fixes (ported from SSR-orig commit 8fe89d5 plus the
 matching change in ``para_ssr_head.py`` and per-sample occupancy frame masks).
 Before those, ``samples_per_gpu > 1`` silently applied sample 0's navigation
 command, camera visibility and image shape to the whole local batch.
 
-Do not combine with ``--autoscale-lr``: the global batch is already 8, so 5e-5
-is the correct learning rate.
+Do not combine with ``--autoscale-lr``: the global batch is already fixed at 8.
 """
 _base_ = ['./PARA_SSR_e2e.py']
 
-# 2 GPUs x 4 samples = global batch 8.
+# Standalone default: 2 GPUs x 4 samples = global batch 8. ``run.sh`` overrides
+# the per-GPU batch to keep the same global batch for other supported counts.
 #
-# workers_per_gpu is raised from 4 to 16 so the total worker count (2 x 16 = 32)
-# matches what the 8-GPU runs had (8 x 4). This is a dataloader-parallelism knob
-# only; it does not change the experiment. Without it the run is data-bound:
-# measured 4.83 s/iter of which 3.12 s was data_time (65% idle GPU) against
-# 1.22 s / 0.12 s on 8 GPUs. Each sample decodes 3 frames x 6 cameras of JPEG,
-# so halving the GPU count does not halve the CPU demand. The box has 64 cores.
-data = dict(samples_per_gpu=4, workers_per_gpu=16)
+# Eight workers per GPU keeps two concurrent 2-GPU experiments at 32 workers
+# total on the 64-logical-CPU host. This is a dataloader throughput knob only;
+# it does not change the experiment. Override with SSR_WORKERS_PER_GPU when a
+# different host has been benchmarked.
+data = dict(samples_per_gpu=4, workers_per_gpu=8)
 
 # --------------------------------------------------------------------- #
 # Give every task a fixed slice of the shared-BEV gradient.              #
@@ -97,16 +94,14 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
+            type='SSRWandbLoggerHook',
             init_kwargs=dict(
                 project='para-ssr',
-                name='para_ssr_2gpu_b4',
+                name='para_ssr_12ep',
                 group='para',
-                tags=['para-ssr', 'no-ffp', 'aux', '2gpu', 'batch4',
-                      'global8'],
+                tags=['para-ssr', 'no-ffp', 'aux', 'global8', '12ep'],
                 config=dict(
-                    model='PARA-SSR', ffp=False, gpus=2, batch_per_gpu=4,
-                    global_batch=8)),
+                    model='PARA-SSR', ffp=False, global_batch=8, epochs=12)),
             by_epoch=False,
             interval=100),
     ])

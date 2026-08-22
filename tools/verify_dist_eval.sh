@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 N=${1:-8}
-CONFIG=${2:-projects/configs/SSR/PARA_SSR_e2e_2gpu_b4_60ep.py}
+CONFIG=${2:-projects/configs/SSR/PARA_SSR_e2e_60ep.py}
 GPUS=${3:-0,1}
 NRANKS=$(awk -F, '{print NF}' <<<"$GPUS")
 PORT=${PORT:-$((29000 + RANDOM % 1000))}

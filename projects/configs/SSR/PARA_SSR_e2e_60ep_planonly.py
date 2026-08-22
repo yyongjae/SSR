@@ -1,9 +1,8 @@
 """The plan=1.0 control arm: aux heads present, but blind to the BEV.
 
 This is the comparison group for the 60-epoch run. It is the same experiment
-with one variable moved -- the auxiliary heads contribute nothing to the shared
-BEV feature -- which is exactly SSR's original situation, where planning owned
-100% of the BEV gradient because no other head existed.
+with one variable moved: the auxiliary heads contribute nothing to the shared
+BEV feature, matching SSR's original planning-only ownership of that feature.
 
 Why this rather than an SSR-orig run:
 
@@ -21,22 +20,18 @@ things at once, and the clip norm one is not small: global gradient clipping is
 driven almost entirely by the aux heads' own parameter gradients, which are
 present here and absent there.
 
-And it answers a question of its own, for the distillation work. `_ScaleGrad`
-zeroes only the path back into `bev_embed`; each head's own parameters still
-receive full gradients from its own loss. So the aux heads here train as pure
-READERS of a planning-only BEV. Whatever map mAP / detection mAP / occupancy IoU
-they reach is the quality of teacher obtainable WITHOUT letting the teacher
-reshape the representation -- the floor against which co-training has to justify
-itself.
+This also provides a useful floor for distillation. ``_ScaleGrad`` zeroes only
+the path back into ``bev_embed``; each head's own parameters still receive full
+gradients from its loss. The aux heads therefore train as pure readers of a
+planning-only BEV.
 
-Everything else (60-epoch cosine, lr 2e-4, batch 8, eval every 10) is inherited
-unchanged, so the two runs are directly comparable.
+Everything else (60-epoch cosine, lr 2e-4, global batch 8 and evaluation every
+6 epochs) is inherited unchanged, so the two runs are directly comparable.
 """
-_base_ = ['./PARA_SSR_e2e_2gpu_b4_60ep.py']
+_base_ = ['./PARA_SSR_e2e_60ep.py']
 
 # A target of exactly 0 is handled as OFF, not as "very small": GradBalancer
-# pins the scale at 0.0 up front and never revisits it, so it does not drift up
-# to the clamp floor.
+# pins the scale at 0.0 up front and never revisits it.
 # occ_head=None is inherited from the 60ep config; only det and map remain.
 model = dict(
     # _delete_=True: mmcv deep-merges, so without it the parent's shares
@@ -51,17 +46,16 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
+            type='SSRWandbLoggerHook',
             init_kwargs=dict(
                 project='para-ssr',
-                name='para_ssr_2gpu_b4_60ep_planonly',
+                name='para_ssr_60ep_planonly',
                 group='para',
-                tags=['para-ssr', 'no-ffp', 'aux', '2gpu', 'batch4',
-                      'global8', '60ep', 'control', 'plan1.0'],
+                tags=['para-ssr', 'no-ffp', 'aux', 'global8', '60ep',
+                      'control', 'plan1.0'],
                 config=dict(
-                    model='PARA-SSR', ffp=False, gpus=2, batch_per_gpu=4,
-                    global_batch=8, epochs=60, eval_interval=6,
-                    grad_target='plan1.0/det0/map0')),
+                    model='PARA-SSR', ffp=False, global_batch=8, epochs=60,
+                    eval_interval=6, grad_target='plan1.0/det0/map0')),
             by_epoch=False,
             interval=100),
     ])

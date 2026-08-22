@@ -1,6 +1,6 @@
 """PARA-SSR long run: train until the auxiliary tasks converge.
 
-``PARA_SSR_e2e_2gpu_b4.py`` stays the 12-epoch definition so results from it
+``PARA_SSR_e2e_12ep.py`` stays the 12-epoch definition so results from it
 remain comparable to the 8-GPU runs; this file is the separate long-run
 experiment. Everything except the schedule and the validation cadence is
 inherited unchanged.
@@ -14,7 +14,7 @@ This is NOT "the 12-epoch run, continued", for two separate reasons.
 
 CosineAnnealing is by_epoch, so at epoch 12 this run sits at 4.5e-5 of its base
 LR where the 12-epoch run had already annealed to ~0. And the base LR itself is
-now VAD's 2e-4 rather than SSR's 5e-5 (see PARA_SSR_e2e_2gpu_b4.py), because
+now VAD's 2e-4 rather than SSR's 5e-5 (see PARA_SSR_e2e_12ep.py), because
 the auxiliary heads are VAD's and VAD converges them in 60 epochs at that rate.
 
 So the reproduced SSR-orig result -- L2 MAX avg 0.7526, measured at 5e-5 over
@@ -22,16 +22,16 @@ So the reproduced SSR-orig result -- L2 MAX avg 0.7526, measured at 5e-5 over
 auxiliary heads cost or give the planner needs a plan-only baseline on THIS
 schedule: 60-epoch cosine, lr 2e-4.
 
-Run with train_para_2gpu_b4_60ep.sh, which deliberately omits --no-validate.
+Run with ``./run.sh 60ep [gpus]``, which deliberately omits --no-validate.
 Build the map GT cache first (~30 min, CPU only):
 
-    python tools/build_map_gt_cache.py projects/configs/SSR/PARA_SSR_e2e_2gpu_b4_60ep.py
+    python tools/build_map_gt_cache.py projects/configs/SSR/PARA_SSR_e2e_60ep.py
 
 Then smoke-test the validation path before committing five days to it:
 
-    tools/verify_dist_eval.sh 8 projects/configs/SSR/PARA_SSR_e2e_2gpu_b4_60ep.py 0,1
+    ./run.sh smoke 0,1
 """
-_base_ = ['./PARA_SSR_e2e_2gpu_b4.py']
+_base_ = ['./PARA_SSR_e2e_12ep.py']
 
 total_epochs = 60
 runner = dict(max_epochs=total_epochs)
@@ -51,7 +51,7 @@ runner = dict(max_epochs=total_epochs)
 # own after_train_epoch and ignores checkpoint_config entirely.)
 checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
 
-# Validate every 10 epochs -- 6 points over the run. The knee is located from
+# Validate every 6 epochs -- 10 points over the run. The knee is located from
 # the training-time metrics instead (map_pts_err_m, map_spread_m, map_cls_acc,
 # map_conf_pos/neg, logged every 200 iterations = ~18 points per epoch); these
 # validation points anchor that continuous curve in real mAP rather than being
@@ -119,16 +119,16 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
+            type='SSRWandbLoggerHook',
             init_kwargs=dict(
                 project='para-ssr',
-                name='para_ssr_2gpu_b4_60ep',
+                name='para_ssr_60ep',
                 group='para',
-                tags=['para-ssr', 'no-ffp', 'aux', '2gpu', 'batch4',
-                      'global8', '60ep', 'aux-convergence'],
+                tags=['para-ssr', 'no-ffp', 'aux', 'global8', '60ep',
+                      'aux-convergence'],
                 config=dict(
-                    model='PARA-SSR', ffp=False, gpus=2, batch_per_gpu=4,
-                    global_batch=8, epochs=60, eval_interval=6)),
+                    model='PARA-SSR', ffp=False, global_batch=8, epochs=60,
+                    eval_interval=6)),
             by_epoch=False,
             interval=100),
     ])

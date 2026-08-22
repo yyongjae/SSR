@@ -89,7 +89,7 @@ print(f'  zero planning gradient -> scales unchanged: {b2.scale == before}')
 # --------------------------------------------------------- 2. real model --
 ap = argparse.ArgumentParser()
 ap.add_argument('--config',
-                default='projects/configs/SSR/PARA_SSR_e2e_2gpu_b4.py')
+                default='projects/configs/SSR/PARA_SSR_e2e_12ep.py')
 ap.add_argument('--iters', type=int, default=6)
 ap.add_argument('--skip-model', action='store_true')
 args = ap.parse_args()

@@ -31,7 +31,7 @@ importlib.import_module('projects.mmdet3d_plugin')
 from mmdet3d.models import build_model  # noqa: E402
 
 fails = []
-CFG = 'projects/configs/SSR/PARA_SSR_e2e_2gpu_b4.py'
+CFG = 'projects/configs/SSR/PARA_SSR_e2e_12ep.py'
 cfg = Config.fromfile(CFG)
 model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'))
 

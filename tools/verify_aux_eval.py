@@ -46,7 +46,7 @@ def shift_occ(t, cells, axis):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--config',
-                    default='projects/configs/SSR/PARA_SSR_e2e_2gpu_b4.py')
+                    default='projects/configs/SSR/PARA_SSR_e2e_12ep.py')
     ap.add_argument('--samples', type=int, default=12)
     args = ap.parse_args()
 

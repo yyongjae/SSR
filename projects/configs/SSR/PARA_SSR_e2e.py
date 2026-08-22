@@ -171,7 +171,7 @@ model = dict(
     #
     # This file sets NEITHER. It is the reference 8-GPU definition and the v1
     # result it is compared against ran unscaled. Derived configs opt in --
-    # see PARA_SSR_e2e_2gpu_b4.py.
+    # see PARA_SSR_e2e_12ep.py.
 
     # Log ||d L_task / d bev_embed|| every N iterations as gnorm/* and gshare/*.
     # The four tasks share one representation and their gradients differ by
@@ -325,7 +325,7 @@ model = dict(
         # smaller correction to apply.
         #
         # v1's 6-layer definition is preserved in
-        # work_dirs/para_ssr_8gpu/PARA_SSR_e2e.py.
+        # the archived v1 run's resolved config.
         transformer_decoder=dict(
             type='DetectionTransformerDecoder',
             num_layers=3,
@@ -626,7 +626,7 @@ data = dict(
              bev_size=(bev_h_, bev_w_),
              classes=class_names, modality=input_modality, samples_per_gpu=1,
              map_classes=map_classes,
-             map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+             map_ann_file=data_root + 'nuscenes_map_anns_val_ssr.json',
              map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
              map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
              use_pkl_result=True,
@@ -639,7 +639,7 @@ data = dict(
               bev_size=(bev_h_, bev_w_),
               classes=class_names, modality=input_modality, samples_per_gpu=1,
               map_classes=map_classes,
-              map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+              map_ann_file=data_root + 'nuscenes_map_anns_val_ssr.json',
               map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
               map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
               use_pkl_result=True,
@@ -685,19 +685,15 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
         dict(
-            type='WandbLoggerHook',
-            # NOTE: gpus / batch_per_gpu are NOT known here -- they come from
-            # the launcher. Derived configs (e.g. PARA_SSR_e2e_2gpu_b4.py)
-            # override this whole block; this one describes the 8 x 1 default
-            # that train_para_8gpu.sh uses.
+            type='SSRWandbLoggerHook',
+            # GPU count and per-GPU batch are launcher concerns. ``run.sh``
+            # overrides them while keeping the global batch fixed at 8.
             init_kwargs=dict(
                 project='para-ssr',
-                name='para_ssr_v2_8gpu',
+                name='para_ssr_e2e',
                 group='para',
-                tags=['para-ssr', 'no-ffp', 'aux', '8gpu', 'batch1',
-                      'global8'],
-                config=dict(model='ParaSSR', ffp=False, gpus=8,
-                            batch_per_gpu=1, global_batch=8,
+                tags=['para-ssr', 'no-ffp', 'aux', 'global8'],
+                config=dict(model='ParaSSR', ffp=False, global_batch=8,
                             aux='det+map_vec+occ_vehicle',
                             task_loss_weight='1/1/1/1')),
             # step with the runner's iteration so train curves and the

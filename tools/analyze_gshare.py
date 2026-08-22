@@ -90,7 +90,7 @@ def instantaneous(rows, key):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('path', nargs='?', default='work_dirs/para_ssr_2gpu_b4')
+    ap.add_argument('path', nargs='?', default='work_dirs/para_ssr_12ep')
     ap.add_argument('--epoch', type=int, default=None,
                     help='restrict to one epoch (default: the last one seen)')
     ap.add_argument('--all-epochs', action='store_true')

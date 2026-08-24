@@ -93,13 +93,16 @@ def main():
     for i, data, tap in iter_samples(model, loader, a.samples, a.device):
         bev_ref = tap['out']['bev_embed'].detach()
         rhead = reader.pts_bbox_head
-        tgt, contrib, bias, idx = analyse(rhead, tap, bev_ref)
+        tgt, contrib, bias, idx, _ = analyse(rhead, tap, bev_ref)
 
-        r_sum = float((tgt - (contrib.sum(0) + bias)).abs().max() / tgt.abs().max())
+        # float64 for the 10,000-term accumulation; see run_e0.analyse
+        tot = contrib.double().sum(0)
+        r_sum = float((tgt.double() - (tot + bias.double())).abs().max()
+                      / tgt.abs().max())
         pi = contrib.abs().sum(1)
         pi = (pi / pi.sum()).cpu().numpy()
         pr = float(pi.sum() ** 2 / (pi ** 2).sum())
-        rho = float(bias.norm() / (bias.norm() + contrib.sum(0).norm()))
+        rho = float(bias.double().norm() / (bias.double().norm() + tot.norm()))
 
         m = gt_box_mask(data, xs, ys)
         ppa = float(pi[m].sum() / max(m.mean(), 1e-9)) if m is not None and m.any() else np.nan

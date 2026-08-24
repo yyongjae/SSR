@@ -38,3 +38,6 @@ tf_logs/
 
 # --work-dir 인자를 literal 로 넘겨서 잘못 생긴 디렉터리
 path/
+
+# LMD analysis outputs (npz maps + logs)
+out/

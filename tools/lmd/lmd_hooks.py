@@ -220,13 +220,21 @@ def linearise(root, rec, deformable=True):
     import importlib
     undo = []
 
-    for parent in root.modules():
+    # Materialise the walk BEFORE mutating. root.modules() is a generator, and a
+    # freshly installed wrapper holds the module it wrapped as a child -- so a
+    # lazy walk reaches that child again and wraps the wrapper, forever.
+    targets = []
+    for parent in list(root.modules()):
+        if isinstance(parent, _Frozen):
+            continue
         for name, child in list(parent.named_children()):
             for cls, wrap in _SWAP.items():
                 if type(child) is cls:
-                    setattr(parent, name, wrap(child, rec))
-                    undo.append((parent, name, child))
+                    targets.append((parent, name, child, wrap))
                     break
+    for parent, name, child, wrap in targets:
+        setattr(parent, name, wrap(child, rec))
+        undo.append((parent, name, child))
 
     tl_orig = TokenLearnerV11.forward
     TokenLearnerV11.forward = _frozen_tokenlearner_forward

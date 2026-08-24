@@ -24,9 +24,11 @@ export PYTHONPATH="$REPO:$REPO/tools/lmd:${PYTHONPATH:-}"
 STAGE=${1:-all}
 N=${2:-200}
 
-# condition -> extra args.  aux_only has no trained planner of its own (plan=0
-# for 48 epochs), so it is read with stage2's planner -- legitimate only because
-# stage2 forked from it.  See report #10 section 2.
+# condition -> extra args, E1 ONLY.  aux_only has no trained planner of its own
+# (plan=0 for 48 epochs), so its BEV is read with stage2's planner -- legitimate
+# only because stage2 forked from it.  See report #10 section 2.  E0 does not
+# take this: it checks the linearisation identity, which holds whether or not
+# the planner reading the BEV was ever trained.
 declare -A EXTRA=(
   [plan_only]=""
   [both]=""
@@ -42,8 +44,10 @@ run_shard () {              # $1 = stage, $2 = extra python args
     local gpu=${GPUS[$((i % ${#GPUS[@]}))]}
     local log="$OUT/logs/${stage}_${c}.log"
     echo "  [gpu $gpu] $stage $c  -> $log"
+    local per_cond=""
+    [[ "$stage" == "e1" ]] && per_cond="${EXTRA[$c]}"
     CUDA_VISIBLE_DEVICES=$gpu python "tools/lmd/run_${stage}.py" \
-        --ckpt "$c" --device cuda:0 ${EXTRA[$c]} ${extra//COND/$c} > "$log" 2>&1 &
+        --ckpt "$c" --device cuda:0 $per_cond ${extra//COND/$c} > "$log" 2>&1 &
     pids+=($!); names+=("$c"); i=$((i + 1))
     # two per GPU: let the first wave finish before launching the second
     if (( i % ${#GPUS[@]} == 0 )); then

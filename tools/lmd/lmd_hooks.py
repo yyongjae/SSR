@@ -63,15 +63,19 @@ class Recorder:
         return self.new_pass()
 
     def take(self, owner, fn):
-        k = id(owner)
+        # `owner` must be something that OUTLIVES a single linearise() block --
+        # the wrapped module or a stable string, never the wrapper, which is
+        # rebuilt every time the context manager is entered.
+        k = owner if isinstance(owner, str) else id(owner)
         i = self._n.get(k, 0)
         self._n[k] = i + 1
         key = (k, i)
         if self.mode == 'replay':
             if key not in self.store:
+                name = owner if isinstance(owner, str) else type(owner).__name__
                 raise KeyError(
-                    f'replay asked for {type(owner).__name__} call #{i}, which the '
-                    f'recording pass never made -- the two passes ran different code')
+                    f'replay asked for {name} call #{i}, which the recording pass '
+                    f'never made -- the two passes ran different code')
             return self.store[key]
         v = fn()
         v = tuple(t.detach() for t in v) if isinstance(v, tuple) else v.detach()
@@ -90,7 +94,7 @@ class _Frozen(nn.Module):
 class FrozenLayerNorm(_Frozen):
     def forward(self, x):
         ln = self.inner
-        mu, rstd = self._rec.take(self, lambda: (
+        mu, rstd = self._rec.take(self.inner, lambda: (
             x.mean(-1, keepdim=True),
             1.0 / torch.sqrt(x.var(-1, unbiased=False, keepdim=True) + ln.eps)))
         y = (x - mu) * rstd
@@ -104,7 +108,7 @@ class FrozenGroupNorm(_Frozen):
         gn = self.inner
         assert gn.num_groups == 1, 'only GroupNorm(1, C) appears on this path'
         dims = tuple(range(1, x.dim()))
-        mu, rstd = self._rec.take(self, lambda: (
+        mu, rstd = self._rec.take(self.inner, lambda: (
             x.mean(dim=dims, keepdim=True),
             1.0 / torch.sqrt(x.var(dim=dims, unbiased=False, keepdim=True) + gn.eps)))
         shape = [1, -1] + [1] * (x.dim() - 2)
@@ -116,12 +120,12 @@ class FrozenGELU(_Frozen):
         # exact GELU IS x * Phi(x), so this is not an approximation
         import math
         return x * self._rec.take(
-            self, lambda: 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0))))
+            self.inner, lambda: 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0))))
 
 
 class FrozenReLU(_Frozen):
     def forward(self, x):
-        return x * self._rec.take(self, lambda: (x > 0).to(x.dtype))
+        return x * self._rec.take(self.inner, lambda: (x > 0).to(x.dtype))
 
 
 class FrozenMHA(_Frozen):
@@ -140,7 +144,7 @@ class FrozenMHA(_Frozen):
         q = F.linear(query, W[:E], b[:E]).reshape(L, N * H, hd).transpose(0, 1) / math.sqrt(hd)
         k = F.linear(key, W[E:2 * E], b[E:2 * E]).reshape(S, N * H, hd).transpose(0, 1)
         v = F.linear(value, W[2 * E:], b[2 * E:]).reshape(S, N * H, hd).transpose(0, 1)
-        A = self._rec.take(self, lambda: torch.bmm(q, k.transpose(1, 2)).softmax(-1))
+        A = self._rec.take(self.inner, lambda: torch.bmm(q, k.transpose(1, 2)).softmax(-1))
         o = torch.bmm(A, v).transpose(0, 1).reshape(L, N, E)
         return F.linear(o, a.out_proj.weight, a.out_proj.bias), None
 
@@ -187,7 +191,7 @@ class _FrozenDeformFn:
         # one counter per interception point, not per module: the calls happen
         # in a fixed order inside a head's forward, and record/replay run the
         # same forward
-        return self._rec.take(self, lambda: (loc, w))
+        return self._rec.take(self._tag, lambda: (loc, w))
 
     def apply(self, value, spatial_shapes, level_start_index,
               sampling_locations, attention_weights, im2col_step):

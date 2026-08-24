@@ -55,8 +55,8 @@ cat > "$CONDA_PREFIX/etc/conda/activate.d/ssr_env.sh" <<EOF
 export NUMBA_CPU_NAME=generic
 export NUMBA_CPU_FEATURES=
 export CUDA_HOME=$CUDA
-export PATH=\$CUDA_HOME/bin:\$PATH
-export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH
+export PATH=\$CUDA_HOME/bin:\${PATH:-}
+export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\${LD_LIBRARY_PATH:-}
 export TORCH_CUDA_ARCH_LIST="8.6"
 EOF
 cat > "$CONDA_PREFIX/etc/conda/deactivate.d/ssr_env.sh" <<'EOF'

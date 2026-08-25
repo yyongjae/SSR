@@ -11,6 +11,8 @@ SSR(ICLR'25)을 PARA-Drive(CVPR'24)식 병렬 aux 구조로 개조하는 작업�
 | 05 | [ver2 수정 내역](05_ver2_changes.md) | occ 1채널화, grad scale 증명, map 설계 논의, multibatch 이식, 코드 리뷰 대응 |
 | 06 | [Aux 평가 배선](06_aux_evaluation_wiring.md) | map mAP / occ IoU 평가, 학습 중 품질 로깅, shapely 2.x 수정 |
 | 07 | [2차 리뷰 검토 및 수정](07_review_round2_fixes.md) | **진단 지표의 의미 오류 수정** — occ 분리도 편향, map 붕괴 감지, gshare 재구성 버그, clipping 계측, 분산 eval 통합 테스트 |
+| 08 | [최종 구조 및 코드 검수](08_final_architecture_and_code_review.md) | SSR-noFFP에서 현 PARA-SSR까지의 구조·학습·평가 코드 통합 설명과 최종 검수 |
+| 09 | [BEV 표현 통합 stitching 분석](09_teacher_bev_stitching_analysis.md) | SSR↔PARA 기존 분석, 해석 정정, IG, BEVFusion·MapTRv2 teacher 후속 분석을 한 문서로 통합 |
 
 > #03(occupancy teacher 설계)은 미작성. #05 §3.3에 KD 인터페이스 논의가 일부 들어 있다.
 >

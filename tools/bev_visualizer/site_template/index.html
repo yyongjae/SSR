@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SSR BEV Representation Explorer</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">NUScenes val · qualitative explorer</div>
+      <h1>SSR BEV Representation Explorer</h1>
+    </div>
+    <div class="sample-nav">
+      <button id="prev" aria-label="Previous sample">←</button>
+      <span id="position">— / —</span>
+      <button id="next" aria-label="Next sample">→</button>
+    </div>
+  </header>
+
+  <section id="warning" class="warning"></section>
+
+  <main>
+    <aside class="controls">
+      <h2>Sample</h2>
+      <label>검색
+        <input id="search" type="search" placeholder="token / scene / description">
+      </label>
+      <label>지역
+        <select id="location"><option value="">전체</option></select>
+      </label>
+      <label>조건
+        <select id="condition"><option value="">전체</option></select>
+      </label>
+      <label>명령
+        <select id="command"><option value="">전체</option></select>
+      </label>
+      <label>표본
+        <select id="sample"></select>
+      </label>
+
+      <h2>BEV view</h2>
+      <label>표현
+        <select id="mode">
+          <option value="pca">PCA RGB</option>
+          <option value="spatial_contrast">Spatial contrast</option>
+          <option value="ego_cosine">Ego-prototype cosine</option>
+          <option value="rms">RMS activation</option>
+          <option value="channel_std">Channel std</option>
+          <option value="abs_mean">Mean |activation|</option>
+          <option value="token_max">Planner token max</option>
+          <option value="token_entropy">Per-cell token assignment entropy</option>
+        </select>
+      </label>
+      <label>정규화
+        <select id="normalization">
+          <option value="global">Source-global p1–p99</option>
+          <option value="local">Sample-local p1–p99</option>
+        </select>
+      </label>
+
+      <h2>Overlays</h2>
+      <label class="check"><input id="gtMap" type="checkbox" checked> GT map</label>
+      <label class="check"><input id="gtBoxes" type="checkbox" checked> GT boxes</label>
+      <label class="check"><input id="prediction" type="checkbox" checked> Predictions</label>
+      <label class="check"><input id="planning" type="checkbox" checked> Ego planning</label>
+      <label class="check"><input id="motion" type="checkbox"> Agent motion modes</label>
+      <label>Detection score <output id="detValue">0.20</output>
+        <input id="detThreshold" type="range" min="0" max="1" value="0.2" step="0.01">
+      </label>
+      <label>Map score <output id="mapValue">0.20</output>
+        <input id="mapThreshold" type="range" min="0" max="1" value="0.2" step="0.01">
+      </label>
+
+      <div class="coordinate">
+        Cursor: <code id="coordinate">x —, y —</code>
+      </div>
+      <a class="provenance" href="data/provenance.json" target="_blank">Provenance JSON ↗</a>
+    </aside>
+
+    <section class="content">
+      <section class="sample-hero">
+        <div>
+          <div id="tags" class="tags"></div>
+          <h2 id="sceneTitle">Loading…</h2>
+          <p id="description"></p>
+          <dl id="sampleStats"></dl>
+        </div>
+        <img id="cameras" alt="Six nuScenes camera views">
+      </section>
+
+      <section class="legend-strip">
+        <div><span class="legend gt"></span>GT boxes/map</div>
+        <div><span class="legend gt-plan"></span>GT ego path</div>
+        <div><span class="legend det"></span>Detection</div>
+        <div><span class="legend map0"></span>Divider</div>
+        <div><span class="legend map1"></span>Ped crossing</div>
+        <div><span class="legend map2"></span>Boundary</div>
+        <div><span class="legend plan"></span>Planning</div>
+        <div class="axis-note">공통 local frame: +x 오른쪽 [−15,15]m · +y 전방/위쪽 [−30,30]m</div>
+      </section>
+
+      <section id="cards" class="cards"></section>
+    </section>
+  </main>
+
+  <template id="cardTemplate">
+    <article class="source-card">
+      <header>
+        <div>
+          <div class="source-name"></div>
+          <div class="source-meta"></div>
+        </div>
+        <div class="capabilities"></div>
+      </header>
+      <div class="bev-stage">
+        <img class="bev-image" alt="BEV activation map">
+        <canvas class="overlay"></canvas>
+        <div class="unsupported">이 source는 선택한 view를 지원하지 않아 fallback view를 표시합니다.</div>
+      </div>
+      <footer>
+        <span class="view-label"></span>
+        <span class="source-warning"></span>
+      </footer>
+    </article>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

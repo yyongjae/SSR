@@ -1,0 +1,76 @@
+_target_: navsim.agents.para_ssr.para_ssr_agent.ParaSSRAgent
+_convert_: 'all'
+
+config:
+  _target_: navsim.agents.para_ssr.configs.default.ParaSSRConfig
+  _convert_: 'all'
+
+  # --- shared BEV encoder -------------------------------------------------
+  bev_h: 100
+  bev_w: 100
+  embed_dims: 256
+  encoder_num_layers: 3
+  use_grid_mask: true
+
+  # --- input --------------------------------------------------------------
+  # navsim gives history frames 0..3; 3 is the current one and must come last.
+  # A longer queue costs one image load + one no-grad BEV pass per extra frame.
+  frame_indices: [2, 3]
+  camera_names: [cam_f0, cam_l0, cam_l1, cam_l2, cam_r0, cam_r1, cam_r2, cam_b0]
+  # 1920x1080 * 0.4 -> 768x432, then drop 16 rows of sky -> 768x416
+  image_scale: 0.4
+  crop_top: 16
+
+  # --- heads --------------------------------------------------------------
+  use_det_motion_head: true
+  use_map_head: true
+  num_query: 300
+  map_num_vec: 100
+  test_aux_heads: false
+
+  # --- PARA-Drive wiring --------------------------------------------------
+  task_loss_weight:
+    # Restores the commanded x/y coefficient after (3 modes x 2 dims) became
+    # (4 modes x 3 dims). This does not remove the new heading objective.
+    plan: 2.0
+    det: 1.0
+    motion: 1.0
+    map: 1.0
+  # Closed-loop control of each task's gradient share at the shared BEV.
+  # Same target as the nuScenes 60-epoch arm (PARA_SSR_e2e_60ep.py:114).
+  # Measured unscaled on real navsim batches: plan 0.25% / det 73.5% /
+  # map 26.2% -- the planner barely steers the shared feature without this.
+  # Set to null to train the unscaled reference arm instead.
+  grad_balance_target:
+    plan: 0.4
+    det: 0.3
+    map: 0.3
+  # These count MICRO-batches (one per compute_loss call), not optimiser steps.
+  # accumulate_grad_batches=16 means one optimiser step is 16 of them, so the
+  # nuScenes config's 500 does NOT transfer -- it would fire after 31 optimiser
+  # steps, deep inside the 3-epoch LR warm-up, and the first measurement is
+  # adopted without smoothing.  10600 is one epoch at 2 GPUs x batch 4.
+  grad_balance_warmup_iters: 10600
+  grad_balance_interval: 200
+  grad_norm_log_interval: 200
+
+  # --- optimisation (WoTE/SeerDrive recipe, report #09 4) -----------------
+  max_epochs: 30
+  warmup_epochs: 3
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  backbone_lr_mult: 0.1
+  optimizer_type: AdamW
+
+trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+  _convert_: 'all'
+  time_horizon: 4
+  interval_length: 0.5
+
+checkpoint_path: null
+resume_from_checkpoint: false
+
+# NOTE: 1e-4 was tuned at WoTE's global batch 128. The default 2-GPU launch
+# reproduces it with 4/GPU x accumulate 16; see report #09.
+lr: 1.0e-4

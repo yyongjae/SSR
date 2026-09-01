@@ -11,6 +11,9 @@ config:
   embed_dims: 256
   encoder_num_layers: 3
   use_grid_mask: true
+  # Keep ImageNet initialization for fresh training.  Checkpoint-only
+  # evaluators set this false because strict loading replaces every weight.
+  backbone_pretrained: true
 
   # --- input --------------------------------------------------------------
   # navsim gives history frames 0..3; 3 is the current one and must come last.

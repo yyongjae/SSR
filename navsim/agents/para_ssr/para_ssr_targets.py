@@ -71,6 +71,44 @@ DET_NAME_TO_INDEX = {name: i for i, name in enumerate(DET_CLASS_NAMES)}
 MAP_CLASS_NAMES: Tuple[str, ...] = ("divider", "ped_crossing", "boundary")
 
 
+def navsim_box_to_ssr(
+    box: npt.NDArray[np.floating],
+    velocity: npt.NDArray[np.floating],
+) -> npt.NDArray[np.float32]:
+    """Convert one NAVSIM annotation box to PARA-SSR's physical box code.
+
+    NAVSIM stores ``(x_forward, y_left, z, length, width, height, heading)``.
+    PARA-SSR follows the SECOND/VAD convention
+    ``(x_right, y_forward, z, width, length, height, yaw, vx, vy)``.
+
+    Keeping this conversion in one public helper prevents the training target
+    builder and the held-out auxiliary evaluator from drifting apart.
+    """
+
+    box = np.asarray(box, dtype=np.float64).reshape(7)
+    velocity = np.asarray(velocity, dtype=np.float64).reshape(-1)
+    if velocity.size < 2:
+        raise ValueError(
+            f"NAVSIM velocity must have at least two components, got {velocity.shape}"
+        )
+    syaw_raw = -float(box[6]) - np.pi
+    syaw = float(np.arctan2(np.sin(syaw_raw), np.cos(syaw_raw)))
+    return np.asarray(
+        [
+            -box[1],
+            box[0],
+            box[2],
+            box[4],
+            box[3],
+            box[5],
+            syaw,
+            -velocity[1],
+            velocity[0],
+        ],
+        dtype=np.float32,
+    )
+
+
 def _geometry_local_coords(geometry, origin: StateSE2):
     """Shapely geometry from global frame into ``origin``'s local frame."""
     a, b = np.cos(origin.heading), np.sin(origin.heading)
@@ -235,16 +273,7 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
 
         for slot, i in enumerate(kept):
             box = boxes[i]
-            sx, sy = -box[1], box[0]
-            # NAVSIM: [x_fwd, y_left, z_center, length, width, height,
-            # heading_longitudinal].  Original SSR uses the LIDAR/SECOND box
-            # representation [x_right, y_forward, z_center, x_size(width),
-            # y_size(length), height, yaw].  With r = heading + pi/2 in the SSR
-            # xy frame, SECOND yaw is q = -r - pi/2 = -heading - pi.
-            syaw_raw = -float(box[6]) - np.pi
-            syaw = float(np.arctan2(np.sin(syaw_raw), np.cos(syaw_raw)))
-            svx, svy = -vel[i][1], vel[i][0]
-            gt_boxes[slot] = [sx, sy, box[2], box[4], box[3], box[5], syaw, svx, svy]
+            gt_boxes[slot] = navsim_box_to_ssr(box, vel[i])
             gt_labels[slot] = DET_NAME_TO_INDEX[names[i]]
             gt_valid[slot] = True
 
@@ -260,6 +289,62 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             "gt_valid": torch.tensor(gt_valid),
             "gt_fut_trajs": torch.tensor(gt_fut),
             "gt_fut_masks": torch.tensor(gt_fut_mask),
+        }
+
+    def compute_detection_evaluation_targets(
+        self, scene: Scene
+    ) -> Dict[str, torch.Tensor]:
+        """Return uncapped current-frame detection GT for held-out mAP.
+
+        Training retains only the nearest ``max_agents`` objects because it
+        needs fixed-size tensors.  Evaluation must not inherit that cap: an
+        omitted annotation would turn a geometrically correct prediction into
+        a false positive.  Filtering and coordinates otherwise exactly match
+        :meth:`_compute_agent_targets`.
+        """
+
+        cur_idx = scene.scene_metadata.num_history_frames - 1
+        ann: Annotations = scene.frames[cur_idx].annotations
+        boxes = np.asarray(ann.boxes, dtype=np.float32).reshape(-1, 7)
+        velocities = np.asarray(ann.velocity_3d, dtype=np.float32).reshape(-1, 3)
+        names = list(ann.names)
+        if not (len(boxes) == len(velocities) == len(names)):
+            raise ValueError(
+                "NAVSIM annotation boxes/names/velocities count mismatch for "
+                f"token={scene.frames[cur_idx].token!r}: "
+                f"{len(boxes)}/{len(names)}/{len(velocities)}"
+            )
+        x0, y0, x1, y1 = (
+            self._config.pc_range[0],
+            self._config.pc_range[1],
+            self._config.pc_range[3],
+            self._config.pc_range[4],
+        )
+
+        eval_boxes: List[npt.NDArray[np.float32]] = []
+        eval_labels: List[int] = []
+        for box, velocity, name in zip(boxes, velocities, names):
+            if name not in DET_NAME_TO_INDEX:
+                continue
+            converted = navsim_box_to_ssr(box, velocity)
+            sx, sy = float(converted[0]), float(converted[1])
+            if not (x0 <= sx <= x1 and y0 <= sy <= y1):
+                continue
+            if not np.isfinite(converted).all() or np.any(converted[3:6] <= 0):
+                raise ValueError(
+                    "non-finite or non-positive NAVSIM detection GT for "
+                    f"token={scene.frames[cur_idx].token!r}, class={name!r}"
+                )
+            eval_boxes.append(converted)
+            eval_labels.append(DET_NAME_TO_INDEX[name])
+
+        if eval_boxes:
+            box_array = np.stack(eval_boxes).astype(np.float32, copy=False)
+        else:
+            box_array = np.zeros((0, 9), dtype=np.float32)
+        return {
+            "gt_boxes": torch.from_numpy(box_array),
+            "gt_labels": torch.tensor(eval_labels, dtype=torch.long),
         }
 
     def _track_future(
@@ -312,9 +397,10 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         return traj, mask
 
     # ------------------------------------------------------------------ #
-    def _compute_map_targets(self, scene: Scene, cur_idx: int) -> Dict[str, torch.Tensor]:
+    def _compute_map_targets(
+        self, scene: Scene, cur_idx: int, *, uncapped: bool = False
+    ) -> Dict[str, torch.Tensor]:
         cfg = self._config
-        max_vec = cfg.map_max_vec
         num_pts = cfg.map_num_pts_per_vec
         num_orders = cfg.map_num_orders
 
@@ -476,10 +562,6 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         x0, y0, x1, y1 = cfg.pc_range[0], cfg.pc_range[1], cfg.pc_range[3], cfg.pc_range[4]
         patch = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
 
-        gt_pts = np.zeros((max_vec, num_orders, num_pts, 2), dtype=np.float32)
-        gt_labels = np.zeros(max_vec, dtype=np.int64)
-        gt_valid = np.zeros(max_vec, dtype=bool)
-
         # Clip and resample everything first, bucketed by class.
         # Filling slots in source order would be wrong: LANE + LANE_CONNECTOR
         # contribute ~34 objects x 2 boundaries per scene against a median of
@@ -537,6 +619,15 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
                 orders[..., 1] = (orders[..., 1] - y0) / (y1 - y0)
                 buckets[label].append(orders.astype(np.float32))
 
+        max_vec = (
+            sum(len(instances) for instances in buckets.values())
+            if uncapped
+            else cfg.map_max_vec
+        )
+        gt_pts = np.zeros((max_vec, num_orders, num_pts, 2), dtype=np.float32)
+        gt_labels = np.zeros(max_vec, dtype=np.int64)
+        gt_valid = np.zeros(max_vec, dtype=bool)
+
         # round-robin across classes so every present class is represented
         slot = 0
         cursors = {label: 0 for label in buckets}
@@ -562,4 +653,22 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             "gt_map_pts": torch.tensor(gt_pts),
             "gt_map_labels": torch.tensor(gt_labels),
             "gt_map_valid": torch.tensor(gt_valid),
+        }
+
+    def compute_map_evaluation_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
+        """Return every in-patch vector-map instance for held-out mAP.
+
+        The training tensor is class-balanced and capped at ``map_max_vec``.
+        Chamfer mAP instead uses the complete geometry produced by the exact
+        same map extraction and coordinate conversion.  The returned arrays
+        are variable-length and contain no padding.
+        """
+
+        cur_idx = scene.scene_metadata.num_history_frames - 1
+        result = self._compute_map_targets(scene, cur_idx, uncapped=True)
+        if not bool(result["gt_map_valid"].all()):
+            raise RuntimeError("uncapped map evaluation targets unexpectedly contain padding")
+        return {
+            "gt_map_pts": result["gt_map_pts"],
+            "gt_map_labels": result["gt_map_labels"],
         }

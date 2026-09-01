@@ -865,3 +865,235 @@ WANDB_PROJECT=my-proj WANDB_GROUP=ablation ./scripts/training/train_para_ssr.sh
 
 전용 env에서 `pip install wandb && wandb login` 후 짧은 run으로 한 번 확인하는 것을 권한다.
 미설치 상태에서도 학습이 죽지 않는 것은 확인했으므로, 최악의 경우에도 TensorBoard는 남는다.
+
+---
+
+## 16. 2026-08-29 epoch-30 NAVSIM 전체 PDM 평가 완료
+
+학습 완료 checkpoint를 `navtest`의 고정 token 전체에 대해 공식 NAVSIM PDM scorer로
+평가했다. 이 평가는 짧은 smoke나 일부 scene 샘플이 아니라 **12,146개 token 전체**다.
+
+```text
+checkpoint: /data1/yongjae/SSR/navsim/para_ssr/para_ssr_ep30_final.ckpt
+checkpoint SHA-256: 3d6457200b78aec6129871e57efbede911d0753580736c835a5e5eadcf48b3fb
+split / scene_filter: test / navtest
+시작: 2026-08-29 15:41:52 KST
+종료: 2026-08-29 19:31:22 KST
+wall time: 약 3시간 49분 30초
+성공 / 실패: 12,146 / 0
+```
+
+### 16.1 결과
+
+| PDM 구성 지표 | 전체 token 평균 |
+|---|---:|
+| no-at-fault collisions | **0.9757121686** |
+| drivable-area compliance | **0.9342993578** |
+| driving-direction compliance | **1.0000000000** |
+| ego progress | **0.7945745345** |
+| time-to-collision within bound | **0.9313354191** |
+| comfort | **0.9998353367** |
+| **PDM score** | **0.8461304359** |
+
+결과 CSV:
+
+```text
+/data1/yongjae/SSR/navsim/eval/para_ssr_ep30/2026.08.29.19.31.22.csv
+SHA-256: ad12fd0ced339702f67a1b015a4f385d586cdc6438391f465ccf062eaccaf67d
+```
+
+### 16.2 결과 무결성 재검증
+
+CSV를 평가 코드와 독립적으로 다시 읽어 다음을 확인했다.
+
+- 총 12,147행 = scenario 12,146행 + 마지막 `average` 1행
+- scenario token 12,146개가 모두 유일하고 정렬되어 있음
+- `navtest.yaml`의 12,146개 token 집합과 missing 0 / extra 0으로 정확히 일치
+- 성공 표시가 전부 참이고 실행 로그의 `Agent failed`가 0건
+- 모든 7개 수치 열에 NaN/Inf가 없고 모두 `[0, 1]` 범위
+- raw 12,146행에서 재계산한 평균과 저장된 average 행의 최대 절대차
+  `1.11e-16`
+
+고정 token 집합의 정렬 SHA-256은
+`19cf783cbae935fce54cc459f05be508cfb546b0d92e7a5a122d0fc0d8bd4419`다.
+실행 Hydra config와 overrides의 SHA-256은 각각
+`7feb868bf792d40c2545a7ed27249b72cc20c271ca699e0dcc15b8a2c5970158`,
+`d930d0cf6553149ad8205b7da667de180ba5f221f554e4e8c1bbc621725674a3`다.
+
+### 16.3 해석 범위
+
+이 결과는 NAVSIM으로 포팅한 **full PARA-SSR 한 모델이 끝까지 학습·추론·PDM 평가되는
+상태**임을 확정한다. 다만 하나의 full 모델 결과이므로 detection/map supervision이
+planning을 개선했는지에 대한 인과 비교는 아니다. nuScenes 결과와도 GT trajectory 및
+좌표 규약, 평가기가 다르므로 수치를 평균하거나 같은 metric처럼 직접 비교하면 안 된다.
+
+---
+
+## 17. 2026-08-31 detection / vector-map auxiliary mAP 평가 추가 및 전체 실행
+
+이 저장소에서 사용하는 NAVSIM planning evaluator는 PDM score를 계산하며, 이 포트의
+7-class detection head와 3-class vector-map head용 공식 mAP는 제공하지 않는다. 따라서
+perception head의 수렴과 모델 간 상대 비교를 가능하게 하도록 **비공식 auxiliary mAP**를
+구현하고, §16과 같은 epoch-30 checkpoint를 `navtest` 12,146개 token 전체에서 평가했다.
+
+이하의 수치는 **NAVSIM leaderboard 점수가 아니며**, protocol·split·코드 버전이 같은
+PARA-SSR checkpoint끼리 비교할 때만 사용한다.
+
+### 17.1 구현 범위
+
+| 파일 | 역할 |
+|---|---|
+| `navsim/evaluate/aux_metrics.py` | detection center-distance AP와 vector-map Chamfer AP 집계 |
+| `navsim/planning/script/run_aux_evaluation.py` | checkpoint 추론, multi-GPU shard(이번 실행 2 GPU), 재개 가능한 token record, 무결성 검사 및 최종 집계 |
+| `navsim/planning/script/config/aux_evaluation/default_aux_evaluation.yaml` | 평가 기본 설정 |
+| `scripts/evaluation/eval_para_ssr_aux.sh` | 재현 실행 스크립트 |
+| `tests/test_para_ssr_aux_metrics.py` | matcher, AP, 좌표 decode 단위 테스트 |
+| `tests/test_aux_evaluation_runner.py` | manifest, record, resume, inventory 검증 테스트 |
+
+평가용 GT는 학습 head의 고정 query 수에 맞춘 cap을 적용하지 않는다. 특히 map GT가
+100개를 넘는 scene도 모두 평가해야 하므로 `compute_map_evaluation_targets()`를 별도로
+두었다. 실제 `navtest`에서 map GT 112개인 token을 사용해 학습 target은 첫 100개로
+cap되고 평가 target은 112개를 모두 보존하는 것을 확인했다.
+전체 결과에는 학습 cap 100을 넘는 scene이 5개 있었으며, 최대 map GT는 120개(token
+`94d209006f485164`)였다.
+
+### 17.2 고정한 평가 protocol
+
+**Detection (`NAVSIMAuxDet/center_mAP`)**
+
+- 클래스: `vehicle`, `pedestrian`, `bicycle`, `traffic_cone`, `barrier`,
+  `czone_sign`, `generic_object`
+- 마지막 decoder layer의 query×class sigmoid score를 펼친 뒤 stable top-100 사용
+- ROI/`pc_range`: `[-15, -30, -2, 15, 30, 2]` (`x_right, y_forward, z`), GT center도
+  같은 x/y ROI로 제한
+- confidence 내림차순으로 prediction을 처리하고, 가장 가까운 아직 매칭되지 않은 동일
+  클래스 GT와 greedy 1:1 matching
+- BEV box center 거리 threshold: 0.5 / 1.0 / 2.0 / 4.0 m (`distance < threshold`)
+- AP: nuScenes 방식의 101-point interpolation, `min_recall=0.1`, `min_precision=0.1`
+- 최종 mAP: 7개 클래스 × 4개 거리 threshold AP의 산술평균
+
+GT box는 NAVSIM `(x_forward, y_left, z, length, width, height, heading)`에서 SSR
+`(x_right, y_forward, z, width, length, height, yaw, vx, vy)`로 변환한다. 이때
+`x_right=-y_left`, `y_forward=x_forward`, `yaw=wrap(-heading-pi)` 규약을 학습 target과
+공유한다.
+이 auxiliary AP는 **2-D center 위치만 평가**한다. box size, yaw, velocity, nuScenes의
+TP error/NDS는 평가하지 않으므로 full 3-D detection 성능으로 해석하면 안 된다.
+
+**Vector map (`NAVSIMAuxMap/chamfer_mAP`)**
+
+- 클래스: `divider`, `ped_crossing`, `boundary`
+- 마지막 decoder layer의 query×class sigmoid score를 펼친 뒤 stable top-100 사용
+- head의 20-point prediction과 GT polyline을 각각 arc-length 기준 100점으로 재표본화
+- 거리: 양방향 mean Chamfer distance
+- confidence 내림차순으로 prediction을 처리하되, 각 prediction의 absolute-nearest 동일
+  클래스 GT를 먼저 고정하는 VAD/MapTR 계열 legacy 1:1 matching. 그 GT가 이미 matched면
+  더 먼 unmatched GT로 fallback하지 않고 FP 처리
+- threshold: 0.5 / 1.0 / 1.5 m (`distance <= threshold`)
+- AP: precision-envelope area, 최종 mAP은 3개 클래스 × 3개 threshold AP의 산술평균
+
+map GT는 고정 ROI로 clip하고 1.0 m 미만 fragment를 제거한다. `divider`는 NAVSIM map
+API의 lane/lane-connector 양쪽 boundary, `ped_crossing`은 `CROSSWALK` polygon exterior,
+`boundary`는 `ROADBLOCK`과 `ROADBLOCK_CONNECTOR`의 union contour에서 구성한 포트 고유
+근사다. 따라서 다른 논문의 map mAP와 protocol 확인 없이 수치를 직접 비교하면 안 된다.
+
+### 17.3 실행과 검증
+
+```bash
+conda activate ssr-navsim
+cd /home/yongjae/e2e/SSR-para-navsim
+GPU_IDS=2,3 AUX_EXPERIMENT=eval/para_ssr_ep30_aux \
+  scripts/evaluation/eval_para_ssr_aux.sh
+```
+
+```text
+checkpoint: /data1/yongjae/SSR/navsim/para_ssr/para_ssr_ep30_final.ckpt
+resolved checkpoint: /data1/yongjae/SSR/navsim/para_ssr/lightning_logs/version_1/checkpoints/epoch=29-step=19950.ckpt
+checkpoint SHA-256: 3d6457200b78aec6129871e57efbede911d0753580736c835a5e5eadcf48b3fb
+split / scene_filter: test / navtest
+token: 12,146 / missing 0 / extra 0
+GPU extraction wall time: 약 12분 56초
+CPU AP aggregation: 약 23분 44초
+total wall time: 약 37분
+완료: 2026-08-31 10:07:54 KST
+```
+
+검증 결과:
+
+- checkpoint strict load 성공: 38,417,195 parameters, floating parameter/buffer 모두 FP32
+- 전체 실행 record 중 token `648b875dc34259c2`에서 detection prediction/GT
+  `(100, 9)/(18, 9)`, map prediction/GT `(100, 20, 2)/(112, 20, 2)` 확인
+- 전체 record 12,146개가 token당 정확히 하나이며 임시 파일 0개
+- JSON의 threshold AP에서 mAP를 독립 재계산해 저장값과 정확히 일치
+- JSON/CSV의 모든 AP가 finite이며 `[0, 1]` 범위
+- 전체 test suite `84 passed`, shell syntax와 `git diff --check` 통과
+
+### 17.4 epoch-30 전체 결과
+
+| 평가 | mAP |
+|---|---:|
+| **Detection center mAP** | **0.362148** |
+| **Vector-map Chamfer mAP** | **0.228846** |
+
+Detection의 거리 threshold별 전체 클래스 평균:
+
+| center threshold | mAP |
+|---:|---:|
+| 0.5 m | 0.098559 |
+| 1.0 m | 0.300406 |
+| 2.0 m | 0.481491 |
+| 4.0 m | 0.568137 |
+
+| Detection class | AP (4 thresholds 평균) | GT 수 |
+|---|---:|---:|
+| vehicle | **0.686339** | 69,142 |
+| generic_object | **0.636987** | 61,214 |
+| pedestrian | 0.371805 | 34,653 |
+| traffic_cone | 0.334533 | 20,942 |
+| barrier | 0.309098 | 8,073 |
+| bicycle | 0.170928 | 931 |
+| czone_sign | 0.025347 | 753 |
+
+Vector map의 Chamfer threshold별 전체 클래스 평균:
+
+| Chamfer threshold | mAP |
+|---:|---:|
+| 0.5 m | 0.071251 |
+| 1.0 m | 0.226054 |
+| 1.5 m | 0.389232 |
+
+| Map class | AP (3 thresholds 평균) | GT 수 |
+|---|---:|---:|
+| divider | **0.305325** | 351,619 |
+| boundary | 0.261014 | 59,534 |
+| ped_crossing | 0.120198 | 21,511 |
+
+### 17.5 산출물과 재현성 식별자
+
+```text
+output directory:
+  /data1/yongjae/SSR/navsim/eval/para_ssr_ep30_aux
+result JSON:
+  /data1/yongjae/SSR/navsim/eval/para_ssr_ep30_aux/aux_metrics.json
+  SHA-256 ef88df67757997c270bb712412592170c7e211940f4d951d483a40c9422e34eb
+result CSV:
+  /data1/yongjae/SSR/navsim/eval/para_ssr_ep30_aux/aux_metrics.csv
+  SHA-256 5b07b798b2cec116d4871c3e5c229da98f8c248574c7d967fa239075fbda1d74
+archived training config:
+  /data1/yongjae/SSR/navsim/para_ssr/code/hydra/config.yaml
+  SHA-256 a1eddfbcc766fd919ae6c66ab6dc8a6602062f56e7c5c1dbb2e8e8e87fd898a6
+sorted token-set SHA-256:
+  19cf783cbae935fce54cc459f05be508cfb546b0d92e7a5a122d0fc0d8bd4419
+manifest identity SHA-256:
+  34caf4a53142b87ed8ec40063908751f9e77c1c0da41ca49bf73208edd6471f7
+manifest file SHA-256:
+  9726aa1b935a95bfcdc1cb1f4ba27c02a59e6ec5505dc22830d59e6722c152cc
+aggregate record digest:
+  fde5eb18574b130c533cc70701ff56c252ab7bdbd55540574bf1759d6e5b1b84
+```
+
+평가기는 token별 압축 record를 원자적으로 저장하며 같은 manifest identity에서 완료된
+record는 재사용한다. 반면 checkpoint, archived training config, token 집합, metric source,
+manifest에 기록된 runtime package 버전 또는 batch/protocol 설정이 달라지면 identity가
+달라져 잘못된 resume을 거부한다. 다만 resolved data path와 token 집합은 묶지만 약 219 GB
+sensor/map/log 파일 전체를 byte-hash하지는 않으므로, 같은 경로의 데이터가 in-place로
+교체되는 경우까지 자동 검출하지는 않는다.

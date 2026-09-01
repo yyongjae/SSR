@@ -120,7 +120,7 @@ class ParaSSRModel(nn.Module):
 
         self.image_encoder = timm.create_model(
             cfg.image_architecture,
-            pretrained=True,
+            pretrained=bool(getattr(cfg, "backbone_pretrained", True)),
             features_only=True,
             out_indices=cfg.backbone_out_indices,
         )

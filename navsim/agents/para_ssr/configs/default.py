@@ -67,6 +67,11 @@ class ParaSSRConfig:
     # The tag matters: bare timm ``resnet50`` resolves to its A1 recipe, while
     # original SSR uses torchvision://resnet50 (0676ba61 / tv_in1k).
     image_architecture: str = "resnet50.tv_in1k"
+    # Training starts from ImageNet weights.  Checkpoint evaluation overrides
+    # this to False: the strict checkpoint load immediately replaces every
+    # parameter, so asking timm to download/cache a second copy is unnecessary
+    # and can make an otherwise self-contained evaluation fail offline.
+    backbone_pretrained: bool = True
     backbone_out_indices: Tuple[int, ...] = (4,)   # timm feature index for C5
     frozen_stages: int = 1
     # Original mmdet config: norm_cfg=dict(type="BN", requires_grad=False).

@@ -11,6 +11,7 @@ SSR(ICLR'25)을 PARA-Drive(CVPR'24)식 병렬 aux 구조로 개조하는 작업�
 | 05 | [ver2 수정 내역](05_ver2_changes.md) | occ 1채널화, grad scale 증명, map 설계 논의, multibatch 이식, 코드 리뷰 대응 |
 | 06 | [Aux 평가 배선](06_aux_evaluation_wiring.md) | map mAP / occ IoU 평가, 학습 중 품질 로깅, shapely 2.x 수정 |
 | 07 | [2차 리뷰 검토 및 수정](07_review_round2_fixes.md) | **진단 지표의 의미 오류 수정** — occ 분리도 편향, map 붕괴 감지, gshare 재구성 버그, clipping 계측, 분산 eval 통합 테스트 |
+| 10 | [PARA-SSR NAVSIM vector mapping 참고서](10_para_ssr_navsim_vector_mapping_reference.md) | NAVSIM map GT 좌표·클래스·tensor·loss·Chamfer mAP와 새 online mapping 모델 포팅 체크리스트 |
 
 > #03(occupancy teacher 설계)은 미작성. #05 §3.3에 KD 인터페이스 논의가 일부 들어 있다.
 >

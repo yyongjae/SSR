@@ -12,5 +12,7 @@ from .SSR_transformer import SSRPerceptionTransformer, \
 from .utils.occ_loss import OccBinarySegmentationLoss, OccDiceLoss
 from .para_ssr_head import ParaSSRHead
 from .para_ssr import ParaSSR
+from .planning_distill_models import (CachedTeacherAdapterPlanner,
+                                      SSRPlanningDecoder)
 from .dense_heads import (ParaDetMotionHead, ParaMapHead, ParaMapSegHead,
                           ParaOccHead)

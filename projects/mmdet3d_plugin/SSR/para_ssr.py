@@ -35,6 +35,8 @@ from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.SSR.planner.metric_stp3 import PlanningMetric
 from projects.mmdet3d_plugin.SSR.utils.grad_balance import (
     GradBalancer, all_reduce_mean)
+from projects.mmdet3d_plugin.SSR.utils.planning_distill import \
+    PlanningDistillation
 
 # ``self.CLASSES`` is injected by tools/train.py and tools/test.py from the
 # dataset. Fall back to the standard nuScenes detection order so the motion
@@ -95,7 +97,8 @@ class ParaSSR(MVXTwoStageDetector):
                  encoder_grad_log=True,
                  aux_metric_log_interval=0,
                  motion_score_thresh=0.6,
-                 test_aux_heads=False):
+                 test_aux_heads=False,
+                 distill=None):
         super(ParaSSR, self).__init__(
             pts_voxel_layer, pts_voxel_encoder, pts_middle_encoder,
             pts_fusion_layer, img_backbone, pts_backbone, img_neck, pts_neck,
@@ -158,6 +161,15 @@ class ParaSSR(MVXTwoStageDetector):
         self.motion_score_thresh = motion_score_thresh
         self._train_iter = 0
         self.test_aux_heads = test_aux_heads
+
+        # Optional frozen-teacher feature distillation.  The teacher encoders
+        # themselves were evaluated once into a cache; only their stage-1
+        # planning adapters are restored here, and those adapters stay frozen.
+        # This keeps the student experiment's trainable modules exactly its
+        # image/BEV trunk and SSR planning head.
+        self.planning_distillation = None
+        if distill is not None:
+            self.planning_distillation = PlanningDistillation(**distill)
 
     @staticmethod
     def _build_aux(cfg, train_cfg_pts):
@@ -308,6 +320,18 @@ class ParaSSR(MVXTwoStageDetector):
             metrics_out=aux_metrics if want_metrics else None)
         groups['plan'] = self._scale(plan_losses, w['plan'], prefix='')
         losses.update(groups['plan'])
+
+        # The same frozen adapter is applied to a cached teacher feature and
+        # the student BEV.  Although the adapter has requires_grad=False,
+        # autograd differentiates its input, so this loss reshapes the student
+        # BEV encoder without letting an independently trainable adapter absorb
+        # the mismatch.
+        if self.planning_distillation is not None:
+            distill_losses, distill_metrics = \
+                self.planning_distillation.forward_train(bev_embed, img_metas)
+            groups['distill'] = distill_losses
+            losses.update(distill_losses)
+            losses.update(distill_metrics)
 
         # --- auxiliary heads: each sees only bev_embed ---
         # One valve per head, because that is the finest granularity available:

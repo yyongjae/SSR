@@ -11,6 +11,19 @@
 #   ./run.sh staged 3,6 stage1.py stage2.py
 #                              staged run with both configs overridden
 #   ./run.sh planonly 3,6      control: aux cannot touch the BEV
+#   ./run.sh teacher-bevdepth 0,1
+#                              train BEVDepth adapter + planner for 6 epochs
+#   ./run.sh teacher-hdmapnet 2,3
+#                              train HDMapNet adapter + planner for 6 epochs
+#   ./run.sh teacher-bevfusion 0
+#                              train BEVFusion adapter + planner for 6 epochs
+#   ./run.sh teacher-maptrv2 1
+#                              train MapTRv2 adapter + planner for 6 epochs
+#   ./run.sh teacher-adapters 0,1
+#                              legacy joint two-teacher adapter training
+#   ./run.sh distill 3,6       planning-only SSR student + feature distillation
+#   ./run.sh distill-bevfusion-maptr 3,6
+#                              same, from frozen BEVFusion + MapTRv2 adapters
 #
 #   ./run.sh smoke 3,6         validation path, 8 samples (~10 min) -- run this
 #                              BEFORE committing days to a training run
@@ -19,6 +32,11 @@
 #   ./run.sh doctor            check this machine: env, GPUs, dataset symlinks
 #   ./run.sh eval CKPT [gpu] [config]
 #                              final numbers: 1 GPU, sequential, EMA weights
+#   ./run.sh eval-teacher-bevdepth [CKPT] [gpu]
+#   ./run.sh eval-teacher-hdmapnet [CKPT] [gpu]
+#   ./run.sh eval-teacher-bevfusion [CKPT] [gpu]
+#   ./run.sh eval-teacher-maptrv2 [CKPT] [gpu]
+#                              stage-1 adapter/planner L2 evaluation
 #
 # gpus defaults to $CUDA_VISIBLE_DEVICES, or 0,1. For training, the number of
 # GPUs must divide 8. The launcher sets samples_per_gpu=8/N automatically, so
@@ -64,8 +82,10 @@ GPUS=${2:-${CUDA_VISIBLE_DEVICES:-0,1}}
 NG=$(awk -F, '{print NF}' <<<"$GPUS")
 GLOBAL_BATCH=8
 WORKERS_PER_GPU=${SSR_WORKERS_PER_GPU:-8}
+DISTILL_CKPT_OUT_ROOT=${DISTILL_CKPT_OUT_ROOT:-/data2/byounggun/rideflux/pretrained_checkpoints/planning_distill_checkpoints}
+DISTILL_STUDENT_WORK_DIR=${DISTILL_STUDENT_WORK_DIR:-$DISTILL_CKPT_OUT_ROOT/student}
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \?//'; exit "${1:-1}"; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \?//'; exit "${1:-1}"; }
 [ -z "$WHAT" ] && usage 0
 
 validate_gpu_list() {
@@ -120,16 +140,25 @@ resolve_config() {
 
 # train <preset-name> <work-dir-name> <config-override> [extra cfg-options...]
 train() {
-  local preset=$1 wd=$2 override=${3:-} cfg
+  local preset=$1 wd=$2 override=${3:-} cfg work_dir
   shift 3
   cfg=$(resolve_config "$preset" "$override")
   prepare_batch
   preflight
-  echo "=== $cfg -> work_dirs/$wd ==="
+  if [[ "$wd" = /* ]]; then
+    work_dir=$wd
+  else
+    work_dir=work_dirs/$wd
+  fi
+  mkdir -p "$work_dir" || {
+    echo "checkpoint directory is not writable: $work_dir" >&2
+    exit 1
+  }
+  echo "=== $cfg -> $work_dir ==="
   echo "    GPU $GPUS: $NG x $BATCH_PER_GPU = global batch $GLOBAL_BATCH"
   CUDA_VISIBLE_DEVICES="$GPUS" PORT="${PORT:-$((28500 + RANDOM % 500))}" \
     ./tools/dist_train.sh "$cfg" "$NG" \
-      --work-dir "work_dirs/$wd" --seed 0 \
+      --work-dir "$work_dir" --seed 0 \
       --cfg-options data.samples_per_gpu="$BATCH_PER_GPU" \
         data.workers_per_gpu="$WORKERS_PER_GPU" "$@"
 }
@@ -138,6 +167,77 @@ case "$WHAT" in
   12ep)     train PARA_SSR_e2e_12ep          para_ssr_12ep     "${3:-}" ;;
   60ep)     train PARA_SSR_e2e_60ep          para_ssr_60ep     "${3:-}" ;;
   planonly) train PARA_SSR_e2e_60ep_planonly para_ssr_planonly "${3:-}" ;;
+  teacher-bevdepth)
+    train DISTILL_teacher_bevdepth \
+      "$DISTILL_CKPT_OUT_ROOT/teacher_bevdepth" "${3:-}"
+    ;;
+  teacher-hdmapnet)
+    train DISTILL_teacher_hdmapnet \
+      "$DISTILL_CKPT_OUT_ROOT/teacher_hdmapnet" "${3:-}"
+    ;;
+  teacher-adapters)
+    train DISTILL_teacher_adapters \
+      "$DISTILL_CKPT_OUT_ROOT/teacher_joint" "${3:-}"
+    ;;
+  teacher-bevfusion)
+    train DISTILL_teacher_bevfusion \
+      "$DISTILL_CKPT_OUT_ROOT/teacher_bevfusion" "${3:-}"
+    ;;
+  teacher-maptrv2)
+    train DISTILL_teacher_maptrv2 \
+      "$DISTILL_CKPT_OUT_ROOT/teacher_maptrv2" "${3:-}"
+    ;;
+
+  distill)
+    if [ -n "${ADAPTER_CKPT:-}" ]; then
+      if [ ! -e "$ADAPTER_CKPT" ]; then
+        echo "student distillation needs $ADAPTER_CKPT." >&2
+        exit 1
+      fi
+      # Backward-compatible path for a legacy joint stage-1 checkpoint.
+      train DISTILL_SSR_student "$DISTILL_STUDENT_WORK_DIR" "${3:-}" \
+        model.distill.adapter_checkpoint="$ADAPTER_CKPT"
+    else
+      BEVDEPTH_ADAPTER_CKPT=${BEVDEPTH_ADAPTER_CKPT:-$DISTILL_CKPT_OUT_ROOT/teacher_bevdepth/epoch_6.pth}
+      HDMAPNET_ADAPTER_CKPT=${HDMAPNET_ADAPTER_CKPT:-$DISTILL_CKPT_OUT_ROOT/teacher_hdmapnet/epoch_6.pth}
+      missing=0
+      for checkpoint in "$BEVDEPTH_ADAPTER_CKPT" "$HDMAPNET_ADAPTER_CKPT"; do
+        if [ ! -e "$checkpoint" ]; then
+          echo "student distillation needs $checkpoint." >&2
+          missing=1
+        fi
+      done
+      if [ "$missing" -ne 0 ]; then
+        echo "Run './run.sh teacher-bevdepth 0,1' and " \
+             "'./run.sh teacher-hdmapnet 2,3' first." >&2
+        exit 1
+      fi
+      train DISTILL_SSR_student "$DISTILL_STUDENT_WORK_DIR" "${3:-}" \
+        model.distill.adapter_checkpoint.bevdepth="$BEVDEPTH_ADAPTER_CKPT" \
+        model.distill.adapter_checkpoint.hdmapnet="$HDMAPNET_ADAPTER_CKPT"
+    fi
+    ;;
+
+  distill-bevfusion-maptr)
+    BEVFUSION_ADAPTER_CKPT=${BEVFUSION_ADAPTER_CKPT:-$DISTILL_CKPT_OUT_ROOT/teacher_bevfusion/epoch_6.pth}
+    MAPTRV2_ADAPTER_CKPT=${MAPTRV2_ADAPTER_CKPT:-$DISTILL_CKPT_OUT_ROOT/teacher_maptrv2/epoch_6.pth}
+    FUSION_STUDENT_WORK_DIR=${DISTILL_FUSION_STUDENT_WORK_DIR:-$DISTILL_CKPT_OUT_ROOT/student_bevfusion_maptrv2}
+    missing=0
+    for checkpoint in "$BEVFUSION_ADAPTER_CKPT" "$MAPTRV2_ADAPTER_CKPT"; do
+      if [ ! -e "$checkpoint" ]; then
+        echo "student distillation needs $checkpoint." >&2
+        missing=1
+      fi
+    done
+    if [ "$missing" -ne 0 ]; then
+      echo "Run './run.sh teacher-bevfusion 0' and " \
+           "'./run.sh teacher-maptrv2 1' first." >&2
+      exit 1
+    fi
+    train DISTILL_SSR_student_bevfusion_maptrv2 "$FUSION_STUDENT_WORK_DIR" "${3:-}" \
+      model.distill.adapter_checkpoint.bevfusion="$BEVFUSION_ADAPTER_CKPT" \
+      model.distill.adapter_checkpoint.maptrv2="$MAPTRV2_ADAPTER_CKPT"
+    ;;
   stage1)   train PARA_SSR_stage1_detmap     para_ssr_stage1   "${3:-}" ;;
 
   stage2)
@@ -203,11 +303,35 @@ EOF
     tools/final_eval.sh "$CFG" "$CKPT" "${3:-0}"
     ;;
 
+  eval-teacher-bevdepth)
+    CKPT=${2:-$DISTILL_CKPT_OUT_ROOT/teacher_bevdepth/epoch_6.pth}
+    EXPECT_RAW=1 tools/final_eval.sh \
+      "$C/DISTILL_teacher_bevdepth.py" "$CKPT" "${3:-0}"
+    ;;
+
+  eval-teacher-hdmapnet)
+    CKPT=${2:-$DISTILL_CKPT_OUT_ROOT/teacher_hdmapnet/epoch_6.pth}
+    EXPECT_RAW=1 tools/final_eval.sh \
+      "$C/DISTILL_teacher_hdmapnet.py" "$CKPT" "${3:-2}"
+    ;;
+
+  eval-teacher-bevfusion)
+    CKPT=${2:-$DISTILL_CKPT_OUT_ROOT/teacher_bevfusion/epoch_6.pth}
+    EXPECT_RAW=1 tools/final_eval.sh \
+      "$C/DISTILL_teacher_bevfusion.py" "$CKPT" "${3:-0}"
+    ;;
+
+  eval-teacher-maptrv2)
+    CKPT=${2:-$DISTILL_CKPT_OUT_ROOT/teacher_maptrv2/epoch_6.pth}
+    EXPECT_RAW=1 tools/final_eval.sh \
+      "$C/DISTILL_teacher_maptrv2.py" "$CKPT" "${3:-1}"
+    ;;
+
   test)
     fail=0
     for t in verify_diagnostics verify_anomaly_hook verify_grad_balance \
              verify_aux_metrics verify_multibatch_and_metrics \
-             verify_wandb_logger; do
+             verify_wandb_logger verify_planning_distill; do
       printf '%-32s ' "$t"
       if CUDA_VISIBLE_DEVICES="" python "tools/$t.py" >/dev/null 2>&1; then
         echo ok

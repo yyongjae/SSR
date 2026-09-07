@@ -145,11 +145,12 @@ class ParaMapHead(nn.Module):
         self,
         map_num_vec: int = 100,
         map_num_pts_per_vec: int = 20,
-        map_num_classes: int = 3,
+        map_num_classes: int = 4,
         embed_dims: int = 256,
         bev_h: int = 100,
         bev_w: int = 100,
-        pc_range: Sequence[float] = (-15.0, -30.0, -2.0, 15.0, 30.0, 2.0),
+        # front-half extent: see ParaSSRConfig.map_pc_range
+        pc_range: Sequence[float] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
         num_reg_fcs: int = 2,
         num_decoder_layers: int = 3,
         num_heads: int = 8,
@@ -357,8 +358,8 @@ class ParaMapHead(nn.Module):
 
             d = self.map_dir_interval
             # Cosine direction must be computed in metric BEV space.  The x/y
-            # extents are anisotropic (30 m vs 60 m by default), so directions
-            # in [0, 1] coordinates have different angles.
+            # extents are anisotropic (64 m lateral vs 32 m forward by default),
+            # so directions in [0, 1] coordinates have different angles.
             metric_scale = pts_pred_flat.new_tensor(
                 [
                     self.pc_range[3] - self.pc_range[0],

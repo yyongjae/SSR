@@ -64,7 +64,10 @@ PROTOCOL_TOP_K = 100
 PROTOCOL_MAP_POINTS = 20
 PROTOCOL_MAP_ORDERS = 20
 PROTOCOL_MAP_MIN_LENGTH = 1.0
-PROTOCOL_PC_RANGE = (-15.0, -30.0, -2.0, 15.0, 30.0, 2.0)
+# Detection and the BEV encoder use the full extent; the map is scored on the
+# front half only.  Both mirror NAVSIM TransFuser -- see ParaSSRConfig.
+PROTOCOL_PC_RANGE = (-32.0, -32.0, -2.0, 32.0, 32.0, 2.0)
+PROTOCOL_MAP_PC_RANGE = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
 PRODUCTION_TOKEN_COUNT = 12_146
 PRODUCTION_TOKEN_SHA256 = (
     "19cf783cbae935fce54cc459f05be508cfb546b0d92e7a5a122d0fc0d8bd4419"
@@ -506,6 +509,7 @@ def _build_identity(
             "map_equivalent_orders": PROTOCOL_MAP_ORDERS,
             "map_min_length_m": PROTOCOL_MAP_MIN_LENGTH,
             "pc_range": list(PROTOCOL_PC_RANGE),
+            "map_pc_range": list(PROTOCOL_MAP_PC_RANGE),
             "batch_size": int(cfg.dataloader.batch_size),
             "checkpoint_only_overrides": {
                 "test_aux_heads": True,
@@ -590,18 +594,23 @@ def _build_agent(
         )
     if int(agent.config.map_num_orders) != PROTOCOL_MAP_ORDERS:
         raise RuntimeError(
-            f"metric protocol V1 fixes map_num_orders={PROTOCOL_MAP_ORDERS}, "
+            f"metric protocol V2 fixes map_num_orders={PROTOCOL_MAP_ORDERS}, "
             f"got {agent.config.map_num_orders}"
         )
     if float(agent.config.map_min_length) != PROTOCOL_MAP_MIN_LENGTH:
         raise RuntimeError(
-            f"metric protocol V1 fixes map_min_length={PROTOCOL_MAP_MIN_LENGTH}, "
+            f"metric protocol V2 fixes map_min_length={PROTOCOL_MAP_MIN_LENGTH}, "
             f"got {agent.config.map_min_length}"
         )
     if tuple(float(value) for value in agent.config.pc_range) != PROTOCOL_PC_RANGE:
         raise RuntimeError(
-            f"metric protocol V1 fixes pc_range={PROTOCOL_PC_RANGE}, "
+            f"metric protocol V2 fixes pc_range={PROTOCOL_PC_RANGE}, "
             f"got {tuple(agent.config.pc_range)}"
+        )
+    if tuple(float(value) for value in agent.config.map_pc_range) != PROTOCOL_MAP_PC_RANGE:
+        raise RuntimeError(
+            f"metric protocol V2 fixes map_pc_range={PROTOCOL_MAP_PC_RANGE}, "
+            f"got {tuple(agent.config.map_pc_range)}"
         )
     if int(agent.config.num_query) * int(agent.config.num_det_classes) < PROTOCOL_TOP_K:
         raise RuntimeError("detection head has fewer logits than protocol top-100")
@@ -623,11 +632,11 @@ def _build_agent(
 def _validate_protocol_options(cfg: DictConfig) -> None:
     if int(cfg.det_max_predictions) != PROTOCOL_TOP_K:
         raise ValueError(
-            f"metric protocol V1 fixes det_max_predictions={PROTOCOL_TOP_K}"
+            f"metric protocol V2 fixes det_max_predictions={PROTOCOL_TOP_K}"
         )
     if int(cfg.map_max_predictions) != PROTOCOL_TOP_K:
         raise ValueError(
-            f"metric protocol V1 fixes map_max_predictions={PROTOCOL_TOP_K}"
+            f"metric protocol V2 fixes map_max_predictions={PROTOCOL_TOP_K}"
         )
     if isinstance(cfg.num_shards, bool) or int(cfg.num_shards) < 1:
         raise ValueError(f"num_shards must be a positive integer, got {cfg.num_shards}")
@@ -657,13 +666,14 @@ def _record_from_batch_item(
     decoded_detection: Mapping[str, np.ndarray],
     decoded_map: Mapping[str, np.ndarray],
     targets: Mapping[str, torch.Tensor],
-    pc_range: Sequence[float],
+    map_pc_range: Sequence[float],
     manifest_identity_sha256: str,
 ) -> Dict[str, np.ndarray]:
     det_gt_boxes = targets["gt_boxes"].detach().cpu().numpy()
     det_gt_labels = targets["gt_labels"].detach().cpu().numpy()
     normalized_map_gt = targets["gt_map_pts"].detach().cpu().numpy()
-    map_gt_points = denormalize_map_ground_truth(normalized_map_gt, pc_range)
+    # map GT is normalised over the front-half extent, not the BEV extent
+    map_gt_points = denormalize_map_ground_truth(normalized_map_gt, map_pc_range)
     map_gt_labels = targets["gt_map_labels"].detach().cpu().numpy()
     record = {
         "token": np.asarray(token),
@@ -736,7 +746,7 @@ def _run_missing_inference(
     dataloader = DataLoader(dataset, **loader_kwargs)
 
     model = agent.para_ssr_model
-    pc_range = tuple(float(value) for value in agent.config.pc_range)
+    map_pc_range = tuple(float(value) for value in agent.config.map_pc_range)
     progress = tqdm(total=len(missing_tokens), desc="Auxiliary inference", unit="token")
     with torch.inference_mode():
         for batch_tokens, features, targets in dataloader:
@@ -776,7 +786,7 @@ def _run_missing_inference(
             )
             decoded_map = decode_map_predictions(
                 predictions,
-                pc_range=pc_range,
+                pc_range=map_pc_range,
                 max_predictions=int(cfg.map_max_predictions),
             )
             if not (
@@ -791,7 +801,7 @@ def _run_missing_inference(
                     decoded_detection[batch_index],
                     decoded_map[batch_index],
                     targets[batch_index],
-                    pc_range,
+                    map_pc_range,
                     manifest_identity_sha256,
                 )
                 _atomic_write_record(records_dir / f"{token}.npz", record)

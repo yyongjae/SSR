@@ -178,7 +178,8 @@ def test_map_query_failure_is_contextual_and_not_empty_gt(caplog) -> None:
         map_max_vec=1,
         map_num_pts_per_vec=20,
         map_num_orders=20,
-        pc_range=(-15.0, -30.0, -2.0, 15.0, 30.0, 2.0),
+        pc_range=(-32.0, -32.0, -2.0, 32.0, 32.0, 2.0),
+        map_pc_range=(-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
         map_min_length=1.0,
     )
     builder = ParaSSRTargetBuilder(config, trajectory_sampling=SimpleNamespace())

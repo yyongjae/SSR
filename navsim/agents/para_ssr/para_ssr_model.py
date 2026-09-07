@@ -205,7 +205,8 @@ class ParaSSRModel(nn.Module):
                 embed_dims=cfg.embed_dims,
                 bev_h=cfg.bev_h,
                 bev_w=cfg.bev_w,
-                pc_range=cfg.pc_range,
+                # the map lives on the front half; see ParaSSRConfig.map_pc_range
+                pc_range=cfg.map_pc_range,
                 num_reg_fcs=cfg.num_reg_fcs,
                 num_decoder_layers=cfg.map_num_decoder_layers,
                 num_heads=cfg.num_heads,

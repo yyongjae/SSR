@@ -56,9 +56,38 @@ class ParaSSRConfig:
     # shared BEV encoder
     # ------------------------------------------------------------------ #
     # VAD/SSR ego frame: x lateral (+right), y longitudinal (+forward).
-    pc_range: Tuple[float, ...] = (-15.0, -30.0, -2.0, 15.0, 30.0, 2.0)
+    #
+    # The EXTENT is NAVSIM TransFuser's, so the agent is compared on the region
+    # its baselines use: TransFuser rasterises LiDAR over +-32 m in both axes
+    # (transfuser_config.py: lidar_min/max_x/y) and filters detection GT by the
+    # same bounds.
+    #
+    # The RESOLUTION is not TransFuser's, because TransFuser has no single BEV
+    # to copy.  It carries two: the LiDAR C5 at 8x8, which is what its 31
+    # trajectory/agent queries cross-attend to, and an FPN map at 64x64, which
+    # only the dense semantic head reads.  Here one `bev_embed` serves the
+    # planner, the detection head and the map head at once, so it has to satisfy
+    # the most demanding of them -- the vector map head, scored by chamfer
+    # distance at 0.5 / 1.0 / 1.5 m.  A one-metre cell would leave the feature
+    # coarser than the strictest threshold it is graded on.
+    #
+    # 100 x 100 gives 0.64 m square cells, which is also the ReSMap teacher's
+    # cell size over the same front extent (its 50 x 100 grid at 0.64 m), so the
+    # front half of this BEV lands on the teacher's grid one-to-one and
+    # distillation is a crop rather than a resample.  Token count is 10,000,
+    # unchanged from the SSR configuration this replaces.
+    pc_range: Tuple[float, ...] = (-32.0, -32.0, -2.0, 32.0, 32.0, 2.0)
     bev_h: int = 100
     bev_w: int = 100
+
+    # The map is supervised over the FRONT half only.  TransFuser's
+    # `bev_semantic_map` is (128, 256) at 0.25 m and its `_coords_to_pixel`
+    # offsets the lateral axis alone ("remove half in backward direction"), so
+    # its map GT covers y in [0, 32] and x in [-32, 32] -- the same extent the
+    # ReSMap teacher is trained on, since a three-front-camera teacher has no
+    # rear observation to build a rear map from.  The BEV feature keeps the full
+    # +-32 m because this agent, unlike the teacher, has a rear camera.
+    map_pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
     embed_dims: int = 256
     num_heads: int = 8
     ffn_channels: int = 512

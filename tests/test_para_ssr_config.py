@@ -4,6 +4,7 @@ import pytest
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
 from navsim.agents.para_ssr.para_ssr_agent import ParaSSRAgent
+from navsim.agents.para_ssr.para_ssr_targets import MAP_CLASS_NAMES
 
 
 def _config(**overrides):
@@ -18,7 +19,7 @@ def _config(**overrides):
         "num_det_classes": 7,
         "det_code_size": 10,
         "det_code_weights": (1.0,) * 10,
-        "map_num_classes": 3,
+        "map_num_classes": len(MAP_CLASS_NAMES),
         "map_num_orders": 20,
         "camera_names": ("cam_f0", "cam_l0", "cam_r0"),
         "max_agents": 100,

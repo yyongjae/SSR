@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from navsim.agents.para_ssr.modules.losses import normalize_bbox
-from navsim.agents.para_ssr.para_ssr_targets import navsim_box_to_ssr
+from navsim.agents.para_ssr.para_ssr_targets import MAP_CLASS_NAMES, navsim_box_to_ssr
 from navsim.evaluate.aux_metrics import (
     decode_detection_predictions,
     decode_map_predictions,
@@ -97,7 +97,7 @@ def test_detection_decoder_uses_last_layer_sigmoid_flattened_topk():
 
 
 def test_map_decoder_uses_last_layer_flattened_topk_and_metric_axes():
-    logits = torch.full((2, 1, 2, 3), -10.0)
+    logits = torch.full((2, 1, 2, len(MAP_CLASS_NAMES)), -10.0)
     logits[0, 0, 0, 0] = 100.0
     logits[1, 0, 1, 2] = 6.0
     logits[1, 0, 0, 1] = 5.0
@@ -153,7 +153,7 @@ def test_map_chamfer_thresholds_use_metric_distance_and_inclusive_boundary():
         map_gt_labels=[0],
     )
     result = evaluate_auxiliary_records([record])
-    thresholds = result["map"]["classes"]["divider"]["thresholds"]
+    thresholds = result["map"]["classes"][MAP_CLASS_NAMES[0]]["thresholds"]
     assert thresholds["0.5"]["AP"] == pytest.approx(0.0)
     assert thresholds["1"]["AP"] == pytest.approx(1.0)
     assert thresholds["1.5"]["AP"] == pytest.approx(1.0)
@@ -166,7 +166,7 @@ def test_map_chamfer_thresholds_use_metric_distance_and_inclusive_boundary():
         map_gt_labels=[0],
     )
     boundary_result = evaluate_auxiliary_records([boundary])
-    assert boundary_result["map"]["classes"]["divider"]["thresholds"]["0.5"][
+    assert boundary_result["map"]["classes"][MAP_CLASS_NAMES[0]]["thresholds"]["0.5"][
         "AP"
     ] == pytest.approx(1.0)
 
@@ -227,8 +227,8 @@ def test_map_duplicate_does_not_fall_back_to_second_closest_gt():
         map_gt_labels=[0, 0],
     )
     result = evaluate_auxiliary_records([record])
-    divider = result["map"]["classes"]["divider"]["thresholds"]
-    assert divider["1.5"]["max_recall"] == pytest.approx(0.5)
+    first_class = result["map"]["classes"][MAP_CLASS_NAMES[0]]["thresholds"]
+    assert first_class["1.5"]["max_recall"] == pytest.approx(0.5)
 
 
 def test_records_must_be_unique_and_sorted_and_nonfinite_fails_closed():

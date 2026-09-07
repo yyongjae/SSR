@@ -45,6 +45,8 @@ import logging
 from collections.abc import Mapping
 from typing import Dict, List, Optional, Tuple
 
+import math
+
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -215,6 +217,7 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             (
                 ("map_classes", MAP_CLASS_NAMES),
                 ("pc_range", cfg.pc_range),
+                ("map_pc_range", cfg.map_pc_range),
                 ("fut_ts", cfg.fut_ts),
                 ("max_agents", cfg.max_agents),
                 ("map_max_vec", cfg.map_max_vec),
@@ -444,7 +447,14 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         pose = scene.frames[cur_idx].ego_status.ego_pose
         origin = StateSE2(float(pose[0]), float(pose[1]), float(pose[2]))
         map_api: AbstractMap = scene.map_api
-        radius = float(max(abs(v) for v in cfg.pc_range[:2] + cfg.pc_range[3:5])) * 1.5
+        # Query far enough that every corner of the map patch is inside; the
+        # clip below is what actually bounds the GT.  Deriving it from the
+        # corner distance keeps that true for an asymmetric (front-only) patch,
+        # where a max-of-extents heuristic can fall short of the diagonal.
+        mr = cfg.map_pc_range
+        radius = 1.05 * float(
+            max(math.hypot(x, y) for x in (mr[0], mr[3]) for y in (mr[1], mr[4]))
+        )
         context = (
             f"token={scene.frames[cur_idx].token!r}, "
             f"map={scene.scene_metadata.map_name!r}"
@@ -537,7 +547,12 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         for obj in objects.get(SemanticMapLayer.CROSSWALK, []):
             _rings(_polygon_of(obj, SemanticMapLayer.CROSSWALK), 3)
 
-        x0, y0, x1, y1 = cfg.pc_range[0], cfg.pc_range[1], cfg.pc_range[3], cfg.pc_range[4]
+        x0, y0, x1, y1 = (
+            cfg.map_pc_range[0],
+            cfg.map_pc_range[1],
+            cfg.map_pc_range[3],
+            cfg.map_pc_range[4],
+        )
         patch = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
 
         # Clip and resample everything first, bucketed by class.

@@ -12,12 +12,19 @@ across the scene's future frames and expressing each future box centre in the
 map API is fully vector, so the polylines are extracted directly:
 
 ===============  =========================================================
-divider          ``Lane`` / ``LaneConnector`` ``left_boundary``,
-                 ``right_boundary`` linestrings (open)
-ped_crossing     ``SemanticMapLayer.CROSSWALK`` polygon exterior (closed)
-boundary         contour of the union of ``ROADBLOCK`` and
-                 ``ROADBLOCK_CONNECTOR`` polygons
+road             contour (exterior + holes) of the union of ``LANE`` and
+                 ``INTERSECTION`` polygons -- what TransFuser rasterises as
+                 its ``road`` class
+walkway          ``WALKWAYS`` polygon rings
+centerline       ``Lane`` / ``LaneConnector`` ``baseline_path`` (open)
+crosswalk        ``SemanticMapLayer.CROSSWALK`` polygon exterior (closed)
 ===============  =========================================================
+
+Earlier revisions used every lane and lane-connector *edge* as a "divider" and
+the roadblock union as "boundary".  nuPlan has no divider labels, so that was an
+interpretation of an undocumented ``boundary_type_fid`` (the TODO said as much);
+the classes above are layers the map API serves as labelled objects, and they
+match the ReSMap teacher this model is distilled from.
 
 ``SemanticMapLayer.BOUNDARIES`` is deliberately *not* used: nuPlan's
 ``get_proximal_map_objects`` only serves LANE, LANE_CONNECTOR, ROADBLOCK,
@@ -68,7 +75,12 @@ DET_CLASS_NAMES: Tuple[str, ...] = (
 )
 DET_NAME_TO_INDEX = {name: i for i, name in enumerate(DET_CLASS_NAMES)}
 
-MAP_CLASS_NAMES: Tuple[str, ...] = ("divider", "ped_crossing", "boundary")
+# NAVSIM-convention map classes, shared with the ReSMap teacher.  nuPlan has no
+# divider/boundary labels -- the old three were an interpretation of an
+# undocumented boundary_type_fid (see the TODO that used to sit in
+# _compute_map_targets).  These four are layers the map API serves as labelled
+# classes: the ones TransFuser rasterises, plus CROSSWALK.
+MAP_CLASS_NAMES: Tuple[str, ...] = ("road", "walkway", "centerline", "crosswalk")
 
 
 def navsim_box_to_ssr(
@@ -418,9 +430,9 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         layers = [
             SemanticMapLayer.LANE,
             SemanticMapLayer.LANE_CONNECTOR,
+            SemanticMapLayer.INTERSECTION,
+            SemanticMapLayer.WALKWAYS,
             SemanticMapLayer.CROSSWALK,
-            SemanticMapLayer.ROADBLOCK,
-            SemanticMapLayer.ROADBLOCK_CONNECTOR,
         ]
         try:
             objects = map_api.get_proximal_map_objects(
@@ -447,117 +459,58 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             logger.warning("Invalid map-query result for %s: %s", context, error)
             raise RuntimeError(f"Invalid map-query result for {context}") from error
 
-        seen_boundary_ids = set()
-        # TODO: nuPlan lane boundaries also contain road-outline/virtual edges.
-        # Keep the existing source until boundary_type_fid semantics are mapped
-        # and regression-tested; treating every edge as a VAD divider is known
-        # to be an approximation, not a verified semantic equivalence.
-        for layer in (SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR):
-            for obj in objects.get(layer, []):
-                for side in ("left_boundary", "right_boundary"):
-                    bound = getattr(obj, side, None)
-                    if bound is None:
-                        continue
-                    bid = getattr(bound, "id", None)
-                    if bid is not None and bid in seen_boundary_ids:
-                        continue
-                    if bid is not None:
-                        seen_boundary_ids.add(bid)
-                    try:
-                        ls: LineString = bound.linestring
-                    except Exception as exc:
-                        logger.warning(
-                            "Lane boundary extraction failed for %s, boundary=%r: %s",
-                            context,
-                            bid,
-                            exc,
-                            exc_info=True,
-                        )
-                        raise RuntimeError(
-                            f"Lane boundary extraction failed for {context}, boundary={bid!r}"
-                        ) from exc
-                    polylines.append((0, np.asarray(ls.coords, dtype=np.float64)))
-
-        for obj in objects.get(SemanticMapLayer.CROSSWALK, []):
+        def _polygon_of(obj, layer):
             try:
-                poly: Polygon = obj.polygon
+                return obj.polygon
             except Exception as exc:
-                logger.warning(
-                    "Crosswalk polygon extraction failed for %s, object=%r: %s",
-                    context,
-                    getattr(obj, "id", None),
-                    exc,
-                    exc_info=True,
-                )
-                raise RuntimeError(
-                    f"Crosswalk polygon extraction failed for {context}"
-                ) from exc
-            polylines.append((1, np.asarray(poly.exterior.coords, dtype=np.float64)))
+                logger.warning("Polygon extraction failed for %s, layer=%s, object=%r: %s",
+                               context, getattr(layer, "name", str(layer)),
+                               getattr(obj, "id", None), exc, exc_info=True)
+                raise RuntimeError(f"Polygon extraction failed for {context}") from exc
 
-        # VAD's boundary target is the contour of the drivable polygon union,
-        # not every roadblock's exterior.  Individual exteriors introduce seams
-        # between adjacent roadblocks, and omitting connectors removes much of
-        # the intersection geometry.
-        road_polygons: List[Polygon] = []
-        for layer in (
-            SemanticMapLayer.ROADBLOCK,
-            SemanticMapLayer.ROADBLOCK_CONNECTOR,
-        ):
-            for obj in objects.get(layer, []):
-                try:
-                    poly = obj.polygon
-                except Exception as exc:
-                    logger.warning(
-                        "Road polygon extraction failed for %s, layer=%s, object=%r: %s",
-                        context,
-                        getattr(layer, "name", str(layer)),
-                        getattr(obj, "id", None),
-                        exc,
-                        exc_info=True,
-                    )
-                    raise RuntimeError(
-                        f"Road polygon extraction failed for {context}"
-                    ) from exc
-                if poly is not None and not poly.is_empty:
-                    road_polygons.append(poly)
+        def _rings(poly, label):
+            """Exterior and holes of one polygon as closed polylines."""
+            if poly is None or poly.is_empty:
+                return
+            parts = [poly] if poly.geom_type == "Polygon" else [
+                g for g in getattr(poly, "geoms", []) if g.geom_type == "Polygon"]
+            for g in parts:
+                polylines.append((label, np.asarray(g.exterior.coords, dtype=np.float64)))
+                for interior in g.interiors:
+                    polylines.append((label, np.asarray(interior.coords, dtype=np.float64)))
 
+        # 0 road: union of LANE + INTERSECTION so adjacent lanes leave no seams.
+        road_polygons = [
+            _polygon_of(obj, layer)
+            for layer in (SemanticMapLayer.LANE, SemanticMapLayer.INTERSECTION)
+            for obj in objects.get(layer, [])
+        ]
+        road_polygons = [p for p in road_polygons if p is not None and not p.is_empty]
         if road_polygons:
             try:
-                union_geometry = unary_union(road_polygons)
+                _rings(unary_union(road_polygons), 0)
             except Exception as exc:
-                logger.warning(
-                    "Road polygon union failed for %s: %s", context, exc, exc_info=True
-                )
+                logger.warning("Road polygon union failed for %s: %s", context, exc, exc_info=True)
                 raise RuntimeError(f"Road polygon union failed for {context}") from exc
 
-            # Normally unary_union(polygons) is Polygon/MultiPolygon.  Flattening
-            # GeometryCollections as well keeps valid polygonal parts when GEOS
-            # has to preserve a lower-dimensional remnant of an invalid source.
-            union_polygons: List[Polygon] = []
-            pending = [union_geometry]
-            while pending:
-                geometry = pending.pop()
-                if geometry.geom_type == "Polygon":
-                    union_polygons.append(geometry)
-                elif geometry.geom_type in ("MultiPolygon", "GeometryCollection"):
-                    pending.extend(geometry.geoms)
+        # 1 walkway
+        for obj in objects.get(SemanticMapLayer.WALKWAYS, []):
+            _rings(_polygon_of(obj, SemanticMapLayer.WALKWAYS), 1)
 
-            if not union_polygons and not union_geometry.is_empty:
-                error = TypeError(
-                    "road polygon union contained no polygonal geometry "
-                    f"(type={union_geometry.geom_type})"
-                )
-                logger.warning("Invalid road polygon union for %s: %s", context, error)
-                raise RuntimeError(f"Invalid road polygon union for {context}") from error
+        # 2 centerline: baseline paths of LANE and LANE_CONNECTOR (open)
+        for layer in (SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR):
+            for obj in objects.get(layer, []):
+                try:
+                    ls: LineString = obj.baseline_path.linestring
+                except Exception as exc:
+                    logger.warning("Baseline path extraction failed for %s, object=%r: %s",
+                                   context, getattr(obj, "id", None), exc, exc_info=True)
+                    raise RuntimeError(f"Baseline path extraction failed for {context}") from exc
+                polylines.append((2, np.asarray(ls.coords, dtype=np.float64)))
 
-            for poly in union_polygons:
-                polylines.append(
-                    (2, np.asarray(poly.exterior.coords, dtype=np.float64))
-                )
-                for interior in poly.interiors:
-                    polylines.append(
-                        (2, np.asarray(interior.coords, dtype=np.float64))
-                    )
+        # 3 crosswalk (closed)
+        for obj in objects.get(SemanticMapLayer.CROSSWALK, []):
+            _rings(_polygon_of(obj, SemanticMapLayer.CROSSWALK), 3)
 
         x0, y0, x1, y1 = cfg.pc_range[0], cfg.pc_range[1], cfg.pc_range[3], cfg.pc_range[4]
         patch = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])

@@ -135,7 +135,7 @@ class ParaSSRConfig:
     map_max_vec: int = 100          # GT slots
     map_num_pts_per_vec: int = 20
     map_num_orders: int = 20        # equivalent GT orderings, see report #09
-    map_num_classes: int = 3        # divider, ped_crossing, boundary
+    map_num_classes: int = 4        # road, walkway, centerline, crosswalk (MAP_CLASS_NAMES)
     map_num_decoder_layers: int = 3
     map_dir_interval: int = 1
     map_min_length: float = 1.0     # metres; shorter clipped fragments are dropped

@@ -200,7 +200,7 @@ class ParaSSRAgent(AbstractAgent):
             )
         if config.map_num_classes != len(MAP_CLASS_NAMES):
             raise ValueError(
-                "map_num_classes must match divider/crosswalk/boundary targets "
+                "map_num_classes must match MAP_CLASS_NAMES "
                 f"({len(MAP_CLASS_NAMES)}), got {config.map_num_classes}"
             )
         if config.map_num_orders < 1:

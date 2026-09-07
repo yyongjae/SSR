@@ -36,6 +36,8 @@ from navsim.agents.abstract_agent import AbstractAgent  # noqa: F401  (typing ai
 from navsim.common.dataclasses import AgentInput
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder
 
+from .cache_key import cache_key
+
 # SSR-BEV (x right, y forward, z up) -> nuPlan lidar (x forward, y left, z up)
 T_LIDAR_FROM_SSR = np.array(
     [
@@ -90,7 +92,21 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
         self._config = config
 
     def get_unique_name(self) -> str:
-        return "para_ssr_feature"
+        """Cache name, invalidated by any config that changes the tensors."""
+        cfg = self._config
+        return cache_key(
+            "para_ssr_feature",
+            (
+                ("bev_h", cfg.bev_h),
+                ("bev_w", cfg.bev_w),
+                ("camera_names", cfg.camera_names),
+                ("crop_top", cfg.crop_top),
+                ("ego_motion_dims", cfg.ego_motion_dims),
+                ("frame_indices", cfg.frame_indices),
+                ("image_scale", cfg.image_scale),
+                ("pc_range", cfg.pc_range),
+            ),
+        )
 
     # ------------------------------------------------------------------ #
     def compute_features(self, agent_input: AgentInput) -> Dict[str, torch.Tensor]:

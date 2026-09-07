@@ -60,6 +60,8 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import Trajectory
 from navsim.common.dataclasses import Annotations, Scene
 from navsim.planning.training.abstract_feature_target_builder import AbstractTargetBuilder
 
+from .cache_key import cache_key
+
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +202,30 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         self._trajectory_sampling = trajectory_sampling
 
     def get_unique_name(self) -> str:
-        return "para_ssr_target"
+        """Cache name, invalidated by any config that changes the tensors.
+
+        See ``cache_key`` -- the map class set lives in here because the
+        divider/boundary -> NAVSIM-layer switch is exactly the change a constant
+        name would have hidden.
+        """
+        cfg = self._config
+        ts = self._trajectory_sampling
+        return cache_key(
+            "para_ssr_target",
+            (
+                ("map_classes", MAP_CLASS_NAMES),
+                ("pc_range", cfg.pc_range),
+                ("fut_ts", cfg.fut_ts),
+                ("max_agents", cfg.max_agents),
+                ("map_max_vec", cfg.map_max_vec),
+                ("map_min_length", cfg.map_min_length),
+                ("map_num_orders", cfg.map_num_orders),
+                ("map_num_pts_per_vec", cfg.map_num_pts_per_vec),
+                ("use_det_motion_head", cfg.use_det_motion_head),
+                ("use_map_head", cfg.use_map_head),
+                ("traj", (ts.time_horizon, ts.interval_length, ts.num_poses)),
+            ),
+        )
 
     # ------------------------------------------------------------------ #
     def compute_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:

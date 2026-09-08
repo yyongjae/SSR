@@ -29,6 +29,7 @@ from .transformer_blocks import (
     LearnedPositionalEncoding,
     build_self_attn_decoder,
 )
+from .candidate_planner import load_plan_anchors, poses_to_offsets, commanded_candidates
 
 
 class SELayer(nn.Module):
@@ -62,7 +63,7 @@ class ParaSSRPlannerHead(nn.Module):
         bev_h: int = 100,
         bev_w: int = 100,
         embed_dims: int = 256,
-        pc_range: Sequence[float] = (-15.0, -30.0, -2.0, 15.0, 30.0, 2.0),
+        pc_range: Sequence[float] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
         num_scenes: int = 16,
         num_reg_fcs: int = 2,
         fut_ts: int = 8,
@@ -73,6 +74,9 @@ class ParaSSRPlannerHead(nn.Module):
         way_num_layers: int = 1,
         num_heads: int = 8,
         feedforward_channels: int = 512,
+        use_metric_planner: bool = False,
+        num_plan_candidates: int = 16,
+        plan_anchor_path: str = "",
     ):
         super().__init__()
         self.bev_h = bev_h
@@ -87,6 +91,8 @@ class ParaSSRPlannerHead(nn.Module):
         self.ego_fut_mode = ego_fut_mode
         self.num_navi_cmd = num_navi_cmd
         self.traj_dims = traj_dims
+        self.use_metric_planner = use_metric_planner
+        self.num_plan_candidates = num_plan_candidates if use_metric_planner else 1
 
         self.transformer = transformer
         self.positional_encoding = LearnedPositionalEncoding(
@@ -108,7 +114,9 @@ class ParaSSRPlannerHead(nn.Module):
             ffn_dropout=0.0,
         )
 
-        self.way_point = nn.Embedding(ego_fut_mode * fut_ts, embed_dims * 2)
+        self.way_point = nn.Embedding(
+            ego_fut_mode * self.num_plan_candidates * fut_ts, embed_dims * 2
+        )
         self.way_decoder = build_self_attn_decoder(
             way_num_layers,
             embed_dims,
@@ -133,6 +141,16 @@ class ParaSSRPlannerHead(nn.Module):
             for parameter in decoder.parameters():
                 if parameter.dim() > 1:
                     nn.init.xavier_uniform_(parameter)
+
+        if self.use_metric_planner:
+            anchors = (load_plan_anchors(plan_anchor_path, num_plan_candidates, fut_ts)
+                       if plan_anchor_path else torch.zeros(num_plan_candidates, fut_ts, 3))
+            self.register_buffer("plan_anchors", anchors)
+            self.register_buffer("anchors_ready", torch.tensor(bool(plan_anchor_path)))
+            self.candidate_cls = nn.Linear(embed_dims, 1)
+            # Start at physically valid, distinct train-derived trajectories.
+            nn.init.zeros_(self.ego_fut_decoder[-1].weight)
+            nn.init.zeros_(self.ego_fut_decoder[-1].bias)
 
     def forward(
         self,
@@ -223,6 +241,28 @@ class ParaSSRPlannerHead(nn.Module):
         )
 
         outputs_ego_trajs = self.ego_fut_decoder(way_point)
+        if self.use_metric_planner:
+            if not self.anchors_ready.item():
+                raise RuntimeError(
+                    "metric planner needs a train-only plan_anchor_path or an initialized checkpoint"
+                )
+            residuals = outputs_ego_trajs.permute(1, 0, 2).reshape(
+                bs, self.ego_fut_mode, self.num_plan_candidates, self.fut_ts, self.traj_dims
+            )
+            candidates = residuals + poses_to_offsets(self.plan_anchors)[None, None]
+            candidate_features = way_point.permute(1, 0, 2).reshape(
+                bs, self.ego_fut_mode, self.num_plan_candidates, self.fut_ts, self.embed_dims
+            ).mean(dim=-2)
+            logits = self.candidate_cls(candidate_features).squeeze(-1)
+            return {
+                "bev_embed": bev_embed,
+                "bev_pos": pos_embd,
+                "scene_query": latent_query,
+                "token_attn": selected,
+                "candidate_offsets": candidates,
+                "candidate_logits": commanded_candidates(logits, cmd),
+                "plan_anchors": self.plan_anchors,
+            }
         outputs_ego_trajs = outputs_ego_trajs.permute(1, 0, 2).view(
             bs, self.ego_fut_mode, self.fut_ts, self.traj_dims
         )

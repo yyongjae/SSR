@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PARA-SSR on navsim -- PDM score on navtest.
+# PARA-SSR on navsim -- PDM score on navtest (front 3 cameras by default).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -18,7 +18,7 @@ shift || true
 python "${REPO}/navsim/planning/script/run_pdm_score_gpu.py" \
   agent=para_ssr_agent \
   agent.checkpoint_path="${CKPT}" \
-  experiment_name=eval/para_ssr \
+  experiment_name=eval/para_ssr_front3 \
   scene_filter=navtest \
   split=test \
   metric_cache_path="${REPO}/data/exp/metric_cache" \

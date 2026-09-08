@@ -235,7 +235,7 @@ class BEVFormerEncoder(nn.Module):
         embed_dims: int = 256,
         num_heads: int = 8,
         num_cams: int = 6,
-        pc_range: Sequence[float] = (-15.0, -30.0, -2.0, 15.0, 30.0, 2.0),
+        pc_range: Sequence[float] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
         num_points_in_pillar: int = 4,
         num_points_sca: int = 8,
         num_levels: int = 1,

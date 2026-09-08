@@ -12,7 +12,7 @@ export NAVSIM_DEVKIT_ROOT="${AUX_REPO}"
 export NAVSIM_EXP_ROOT="${AUX_REPO}/work_dirs"
 export HYDRA_FULL_ERROR=1
 
-AUX_PYTHON="${SSR_NAVSIM_PYTHON:-/home/yongjae/miniconda3/envs/ssr-navsim/bin/python}"
+AUX_PYTHON="${SSR_NAVSIM_PYTHON:-python}"
 AUX_CHECKPOINT="${AUX_CHECKPOINT:-${AUX_REPO}/work_dirs/para_ssr/para_ssr_ep30_final.ckpt}"
 AUX_TRAINING_CONFIG="${AUX_TRAINING_CONFIG:-${AUX_REPO}/work_dirs/para_ssr/code/hydra/config.yaml}"
 AUX_EXPERIMENT="${AUX_EXPERIMENT:-eval/para_ssr_ep30_aux}"
@@ -22,6 +22,7 @@ AUX_GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,1}}"
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "usage: $0 [checkpoint.ckpt] [Hydra overrides...]"
   echo "env: GPU_IDS=0,1 AUX_EXPERIMENT=eval/name AUX_BATCH_SIZE=4"
+  echo "     SSR_NAVSIM_PYTHON=/path/to/python (default: active environment's python)"
   exit 0
 fi
 if [[ $# -gt 0 && "$1" != *=* ]]; then
@@ -29,8 +30,9 @@ if [[ $# -gt 0 && "$1" != *=* ]]; then
   shift
 fi
 
-if [[ ! -x "${AUX_PYTHON}" ]]; then
-  echo "ssr-navsim Python is not executable: ${AUX_PYTHON}" >&2
+if ! command -v "${AUX_PYTHON}" >/dev/null 2>&1; then
+  echo "Python interpreter is unavailable: ${AUX_PYTHON}" >&2
+  echo "activate the project environment or set SSR_NAVSIM_PYTHON" >&2
   exit 2
 fi
 if [[ ! -f "${AUX_CHECKPOINT}" ]]; then

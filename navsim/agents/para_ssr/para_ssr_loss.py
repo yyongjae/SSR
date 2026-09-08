@@ -145,18 +145,47 @@ class ParaSSRLoss(torch.nn.Module):
         task_losses: Dict[str, torch.Tensor] = {}
 
         # ---- planning -------------------------------------------------
-        plan_loss, plan_metrics = compute_plan_loss(
-            predictions["ego_fut_preds"],
-            targets["trajectory_offsets"],
-            targets["trajectory_mask"],
-            targets["command"],
-            heading_weight=cfg.heading_weight,
-        )
-        task_losses["plan"] = plan_loss * tw.get("plan", 1.0)
+        if getattr(cfg, "use_metric_planner", False):
+            from .modules.candidate_planner import candidate_imitation_loss, candidate_metric_loss
+            plan_loss, cls_loss, plan_metrics = candidate_imitation_loss(
+                predictions, targets, cfg.heading_weight
+            )
+            if cfg.metric_loss_weight > 0:
+                if "candidate_metric_targets" not in targets:
+                    raise ValueError("metric planner loss requires simulator-scored candidate_metric_targets")
+                metric_loss, metric_logs = candidate_metric_loss(
+                    predictions["metric_logits"], targets["candidate_metric_targets"],
+                    cfg.metric_loss_weights,
+                )
+            else:
+                # Same-K imitation-only ablation: no rollout/no invented labels.
+                # A zero graph edge keeps the optional critic DDP-compatible.
+                metric_loss = predictions["metric_logits"].sum() * 0.0
+                metric_logs = {}
+            # All three objectives steer the planning branch. Group them before
+            # shared-BEV diagnostics so balancing measures the actual gradient.
+            plan_total = (plan_loss + cfg.candidate_cls_loss_weight * cls_loss
+                          + cfg.metric_loss_weight * metric_loss)
+            logs["loss_plan_cls"] = cls_loss.detach()
+            logs["loss_plan_metric"] = metric_loss.detach()
+            logs["loss_plan_cls_weighted"] = (cls_loss * cfg.candidate_cls_loss_weight * tw.get("plan", 1.0)).detach()
+            logs["loss_plan_metric_weighted"] = (metric_loss * cfg.metric_loss_weight * tw.get("plan", 1.0)).detach()
+            logs.update(metric_logs)
+        else:
+            plan_loss, plan_metrics = compute_plan_loss(
+                predictions["ego_fut_preds"],
+                targets["trajectory_offsets"],
+                targets["trajectory_mask"],
+                targets["command"],
+                heading_weight=cfg.heading_weight,
+            )
+            plan_total = plan_loss
+        task_losses["plan"] = plan_total * tw.get("plan", 1.0)
         logs["loss_plan_reg"] = plan_loss.detach()
         # Keep the historical raw metric, but expose the value that actually
         # enters total_loss so plan=2.0 is not hidden in dashboards.
-        logs["loss_plan_reg_weighted"] = task_losses["plan"].detach()
+        logs["loss_plan_reg_weighted"] = (plan_loss * tw.get("plan", 1.0)).detach()
+        logs["loss_plan_total"] = task_losses["plan"].detach()
         logs.update(plan_metrics)
 
         # ---- detection + motion ---------------------------------------

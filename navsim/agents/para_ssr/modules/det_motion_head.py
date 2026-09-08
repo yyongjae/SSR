@@ -182,7 +182,7 @@ class ParaDetMotionHead(nn.Module):
         embed_dims: int = 256,
         bev_h: int = 100,
         bev_w: int = 100,
-        pc_range: Sequence[float] = (-15.0, -30.0, -2.0, 15.0, 30.0, 2.0),
+        pc_range: Sequence[float] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
         code_size: int = 10,
         code_weights: Optional[Sequence[float]] = None,
         num_reg_fcs: int = 2,

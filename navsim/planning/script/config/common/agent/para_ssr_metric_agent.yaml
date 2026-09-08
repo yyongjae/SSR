@@ -1,0 +1,18 @@
+defaults:
+  - para_ssr_agent
+  - _self_
+
+config:
+  use_metric_planner: true
+  num_plan_candidates: 16
+  # Environment paths are needed for fresh training only. The anchor buffer is
+  # checkpointed; inference can override plan_anchor_path='' after training.
+  plan_anchor_path: ${oc.env:PARA_SSR_PLAN_ANCHORS,''}
+  metric_cache_path: ${oc.env:PARA_SSR_METRIC_CACHE,''}
+  candidate_cls_loss_weight: 1.0
+  metric_loss_weight: 1.0
+  metric_loss_weights: [3.0, 3.0, 1.0, 2.0, 4.0, 1.0, 1.0]
+  candidate_score_weight: 0.1
+  metric_score_weight: 1.0
+  metric_detach_bev: false
+  metric_cache_size: 8

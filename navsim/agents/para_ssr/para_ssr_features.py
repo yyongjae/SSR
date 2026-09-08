@@ -2,7 +2,7 @@
 
 Produces, per sample:
 
-``camera_feature``  ``[T, N_cam, 3, H, W]``   normalised surround images
+``camera_feature``  ``[T, N_cam, 3, H, W]``   normalised selected camera images
 ``lidar2img``       ``[N_cam, 4, 4]``         SSR-BEV frame -> image pixels
 ``image_hw``        ``[N_cam, 2]``            (H, W) after resize/crop
 ``bev_shift``       ``[T, 2]``                normalised ego motion per step

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PARA-SSR on navsim -- 2 GPU training.
+# PARA-SSR on navsim -- front 3 cameras, 2 GPU training.
 #
 # Batch size: use the final-model smoke-tested B=4/GPU. Earlier peak-memory
 # numbers came from a pre-audit motion head and are intentionally not repeated
@@ -24,7 +24,7 @@ export NAVSIM_DEVKIT_ROOT="${REPO}"
 export NAVSIM_EXP_ROOT="${REPO}/work_dirs"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
-EXPERIMENT="${EXPERIMENT:-para_ssr}"
+EXPERIMENT="${EXPERIMENT:-para_ssr_front3}"
 BATCH_SIZE="${BATCH_SIZE:-4}"        # per GPU
 ACCUMULATE="${ACCUMULATE:-16}"       # -> global 128 on 2 GPUs
 MAX_EPOCHS="${MAX_EPOCHS:-30}"

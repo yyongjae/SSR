@@ -1,7 +1,9 @@
 # PARA-SSR NAVSIM vector mapping 구현·GT convention·포팅 참고서
 
-작성일: 2026-09-01  
-대상 저장소: `/home/yongjae/e2e/SSR-para-navsim`  
+작성일: 2026-09-01
+
+대상 코드: SSR repository의 `para-navsim` branch
+
 목적: 다른 online mapping 모델을 NAVSIM으로 포팅할 때 현재 PARA-SSR의 map GT,
 좌표계, tensor contract, loss, 평가기를 재사용하거나 비교하기 위한 기준 문서
 
@@ -30,7 +32,7 @@
 | 입력 | 8 surround cameras, history index `[2, 3]` |
 | map 기준 시점 | current history frame, 기본 index `3` |
 | 모델 좌표 | `x=right`, `y=forward` |
-| ROI | `x_right ∈ [-15,15] m`, `y_forward ∈ [-30,30] m` |
+| ROI | `x_right ∈ [-32,32] m`, `y_forward ∈ [0,32] m` |
 | 공유 BEV | `100×100×256`, 10,000 tokens |
 | map 표현 | vector polyline instance |
 | 클래스 | `divider(0)`, `ped_crossing(1)`, `boundary(2)` |
@@ -53,7 +55,7 @@ vector map을 제공하고, 각 모델의 target builder가 필요한 표현으�
 | 표현 | raster semantic segmentation | vector polyline detection |
 | target/output shape | GT `[128,256]`, logit `[B,7,128,256]` | class `[L,B,100,3]`, point `[L,B,100,20,2]` |
 | 좌표 | NAVSIM `x_forward,y_left` | SSR/VAD `x_right,y_forward` |
-| ROI | 전방 `0~32 m`, 좌우 `±32 m` | 앞뒤 `±30 m`, 좌우 `±15 m` |
+| ROI | 전방 `0~32 m`, 좌우 `±32 m` | 전방 `0~32 m`, 좌우 `±32 m` |
 | 해상도 | `0.25 m/pixel` | 연속 좌표; 20-point polyline |
 | 클래스 | background/road/walkway/centerline/static/vehicle/pedestrian | divider/crosswalk/boundary |
 | loss | pixel cross entropy, weight 10 | query focal + point L1 + direction |
@@ -887,9 +889,10 @@ FP가 되어 metric이 오염된다.
 현재 PARA-SSR checkpoint를 동일 protocol로 재실행하는 명령은 다음과 같다.
 
 ```bash
-cd /home/yongjae/e2e/SSR-para-navsim
+cd "$(git rev-parse --show-toplevel)"
 conda activate ssr-navsim
-GPU_IDS=2,3 AUX_EXPERIMENT=eval/para_ssr_ep30_aux \
+AUX_GPUS=0,1  # 각 환경에서 사용할 GPU ID로 교체
+GPU_IDS="$AUX_GPUS" AUX_EXPERIMENT=eval/my_model_aux \
   AUX_TRAINING_CONFIG=/path/to/code/hydra/config.yaml \
   scripts/evaluation/eval_para_ssr_aux.sh /path/to/model.ckpt
 ```
@@ -934,11 +937,14 @@ Raster 모델은 이 vector record와 Chamfer AP를 사용하지 말고 class별
 
 ## 13. SceneFilter와 dataset contract
 
-현재 checkout은 `data -> /data/navsim` symlink를 사용하며 기본 경로는 다음과 같다.
+Train/eval wrapper는 repository 상대경로 `data/`를 NAVSIM logical root로 사용한다. 물리
+데이터 위치는 사용자마다 달라도 되며, 일반적으로 `data -> /path/to/navsim` symlink 또는 같은
+구조의 local directory를 둔다. 코드가 사용하는 경로 contract는 다음과 같다.
+여기서 `$REPO_ROOT`는 각 사용자가 clone한 repository의 root다.
 
 ```text
-OPENSCENE_DATA_ROOT=$REPO/data/dataset
-NUPLAN_MAPS_ROOT=$REPO/data/dataset/maps
+OPENSCENE_DATA_ROOT=$REPO_ROOT/data/dataset
+NUPLAN_MAPS_ROOT=$REPO_ROOT/data/dataset/maps
 map version=nuplan-maps-v1.0
 ```
 

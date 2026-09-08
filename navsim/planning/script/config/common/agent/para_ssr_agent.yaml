@@ -6,6 +6,8 @@ config:
   _convert_: 'all'
 
   # --- shared BEV encoder -------------------------------------------------
+  # SSR axes: x is right, y is forward.  All heads share this front-only ROI:
+  # x in [-32, 32] m, y in [0, 32] m.  The dataclass owns both range values.
   bev_h: 100
   bev_w: 100
   embed_dims: 256
@@ -19,7 +21,8 @@ config:
   # navsim gives history frames 0..3; 3 is the current one and must come last.
   # A longer queue costs one image load + one no-grad BEV pass per extra frame.
   frame_indices: [2, 3]
-  camera_names: [cam_f0, cam_l0, cam_l1, cam_l2, cam_r0, cam_r1, cam_r2, cam_b0]
+  # WoTE's three front cameras; separate calibrated views for BEVFormer.
+  camera_names: [cam_f0, cam_l0, cam_r0]
   # 1920x1080 * 0.4 -> 768x432, then drop 16 rows of sky -> 768x416
   image_scale: 0.4
   crop_top: 16
@@ -28,6 +31,8 @@ config:
   use_det_motion_head: true
   use_map_head: true
   num_query: 300
+  # Half-angle about the forward axis; shared by training and auxiliary mAP GT.
+  det_fov_half_angle_deg: 80.0
   map_num_vec: 100
   test_aux_heads: false
 

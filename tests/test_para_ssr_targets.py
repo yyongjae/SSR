@@ -6,6 +6,8 @@ import pytest
 from navsim.agents.para_ssr.para_ssr_targets import (
     ParaSSRTargetBuilder,
     _equivalent_orders,
+    detection_box_in_roi,
+    navsim_box_to_ssr,
 )
 
 
@@ -78,7 +80,8 @@ def test_agent_targets_convert_conventions_and_keep_nearest_top_k() -> None:
     config = SimpleNamespace(
         max_agents=2,
         fut_ts=0,
-        pc_range=(-30.0, -30.0, -2.0, 30.0, 30.0, 2.0),
+        pc_range=(-30.0, 0.0, -2.0, 30.0, 30.0, 2.0),
+        det_fov_half_angle_deg=80.0,
     )
     builder = ParaSSRTargetBuilder(config, trajectory_sampling=SimpleNamespace())
 
@@ -114,6 +117,30 @@ def test_agent_targets_convert_conventions_and_keep_nearest_top_k() -> None:
         dtype=np.float32,
     )
     np.testing.assert_allclose(actual, expected, atol=1e-6)
+
+
+def test_detection_roi_is_front_only_and_clips_at_eighty_degrees() -> None:
+    config = SimpleNamespace(
+        pc_range=(-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
+        det_fov_half_angle_deg=80.0,
+    )
+
+    def converted(distance: float, bearing_deg: float):
+        angle = np.deg2rad(bearing_deg)
+        # NAVSIM x is forward and y is left.  Sign is immaterial for this
+        # symmetric boundary test, but conversion itself is exercised too.
+        nav_box = np.array(
+            [distance * np.cos(angle), distance * np.sin(angle), 0.5,
+             4.0, 2.0, 1.5, 0.0],
+            dtype=np.float32,
+        )
+        return navsim_box_to_ssr(nav_box, np.zeros(3, dtype=np.float32))
+
+    assert detection_box_in_roi(converted(10.0, 0.0), config)
+    assert detection_box_in_roi(converted(10.0, 80.0), config)
+    assert not detection_box_in_roi(converted(10.0, 80.1), config)
+    assert not detection_box_in_roi(converted(10.0, -80.1), config)
+    assert not detection_box_in_roi(converted(10.0, 180.0), config)
 
 
 def test_future_track_is_reexpressed_through_moving_rotating_ego_frames() -> None:

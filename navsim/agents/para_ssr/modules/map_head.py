@@ -149,7 +149,7 @@ class ParaMapHead(nn.Module):
         embed_dims: int = 256,
         bev_h: int = 100,
         bev_w: int = 100,
-        # front-half extent: see ParaSSRConfig.map_pc_range
+        # front-only extent shared with the encoder: see ParaSSRConfig.map_pc_range
         pc_range: Sequence[float] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
         num_reg_fcs: int = 2,
         num_decoder_layers: int = 3,

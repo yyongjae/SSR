@@ -125,6 +125,28 @@ def navsim_box_to_ssr(
     )
 
 
+def detection_box_in_roi(box_ssr: npt.NDArray[np.floating], config) -> bool:
+    """Whether a box centre is inside the detector's metric ROI and camera FOV.
+
+    ``box_ssr`` uses ``(x_right, y_forward, ...)``.  Bearing is measured from
+    the forward axis so that zero is straight ahead and positive is right.
+    Keeping this predicate shared by training and held-out evaluation prevents
+    their GT populations from drifting apart.
+    """
+
+    box_ssr = np.asarray(box_ssr)
+    x_right, y_forward = float(box_ssr[0]), float(box_ssr[1])
+    x0, y0, _, x1, y1, _ = config.pc_range
+    if not (x0 <= x_right <= x1 and y0 <= y_forward <= y1):
+        return False
+
+    half_fov = math.radians(float(config.det_fov_half_angle_deg))
+    bearing = math.atan2(x_right, y_forward)
+    # Annotation boxes are float32; allow only their sub-micro-radian boundary
+    # rounding, not a meaningful expansion of the requested FOV.
+    return abs(bearing) <= half_fov + 1e-6
+
+
 def _geometry_local_coords(geometry, origin: StateSE2):
     """Shapely geometry from global frame into ``origin``'s local frame."""
     a, b = np.cos(origin.heading), np.sin(origin.heading)
@@ -218,6 +240,7 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
                 ("map_classes", MAP_CLASS_NAMES),
                 ("pc_range", cfg.pc_range),
                 ("map_pc_range", cfg.map_pc_range),
+                ("det_fov_half_angle_deg", cfg.det_fov_half_angle_deg),
                 ("fut_ts", cfg.fut_ts),
                 ("max_agents", cfg.max_agents),
                 ("map_max_vec", cfg.map_max_vec),
@@ -227,6 +250,7 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
                 ("use_det_motion_head", cfg.use_det_motion_head),
                 ("use_map_head", cfg.use_map_head),
                 ("traj", (ts.time_horizon, ts.interval_length, ts.num_poses)),
+                ("metric_planner_token", cfg.use_metric_planner),
             ),
         )
 
@@ -256,6 +280,9 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             "trajectory_mask": torch.ones(num_poses, dtype=torch.float32),
             "command": torch.tensor(command),
         }
+        if cfg.use_metric_planner:
+            # Privileged scene identity belongs only to targets, never features.
+            targets["scene_token"] = cur_frame.token
 
         if cfg.use_det_motion_head:
             targets.update(self._compute_agent_targets(scene, cur_idx))
@@ -275,8 +302,6 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         names = list(ann.names)
         tracks = list(ann.track_tokens)
 
-        x0, y0, x1, y1 = cfg.pc_range[0], cfg.pc_range[1], cfg.pc_range[3], cfg.pc_range[4]
-
         gt_boxes = np.zeros((max_agents, 9), dtype=np.float32)
         gt_labels = np.zeros(max_agents, dtype=np.int64)
         gt_valid = np.zeros(max_agents, dtype=bool)
@@ -293,9 +318,8 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         for i, (box, name) in enumerate(zip(boxes, names)):
             if name not in DET_NAME_TO_INDEX:
                 continue
-            # navsim boxes are (x fwd, y left); SSR BEV is (x right, y fwd)
-            sx, sy = -box[1], box[0]
-            if not (x0 <= sx <= x1 and y0 <= sy <= y1):
+            converted = navsim_box_to_ssr(box, vel[i])
+            if not detection_box_in_roi(converted, cfg):
                 continue
             candidates.append(i)
 
@@ -354,21 +378,13 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
                 f"token={scene.frames[cur_idx].token!r}: "
                 f"{len(boxes)}/{len(names)}/{len(velocities)}"
             )
-        x0, y0, x1, y1 = (
-            self._config.pc_range[0],
-            self._config.pc_range[1],
-            self._config.pc_range[3],
-            self._config.pc_range[4],
-        )
-
         eval_boxes: List[npt.NDArray[np.float32]] = []
         eval_labels: List[int] = []
         for box, velocity, name in zip(boxes, velocities, names):
             if name not in DET_NAME_TO_INDEX:
                 continue
             converted = navsim_box_to_ssr(box, velocity)
-            sx, sy = float(converted[0]), float(converted[1])
-            if not (x0 <= sx <= x1 and y0 <= sy <= y1):
+            if not detection_box_in_roi(converted, self._config):
                 continue
             if not np.isfinite(converted).all() or np.any(converted[3:6] <= 0):
                 raise ValueError(

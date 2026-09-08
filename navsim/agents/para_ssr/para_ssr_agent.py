@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Union
 
 import pytorch_lightning as pl
@@ -131,9 +132,19 @@ class ParaSSRAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self._lr = lr
 
-        self.para_ssr_model = ParaSSRModel(config)
+        # Strict checkpoint restoration supplies every model tensor, including
+        # the anchor bank. Inference must not download pretrained backbone
+        # weights or require an old training machine's anchor file.
+        model_config = config
+        if checkpoint_path:
+            checkpoint_overrides = {"backbone_pretrained": False}
+            if config.use_metric_planner:
+                checkpoint_overrides["plan_anchor_path"] = ""
+            model_config = replace(config, **checkpoint_overrides)
+        self.para_ssr_model = ParaSSRModel(model_config)
         self._loss = ParaSSRLoss(config)
         self.latest_logs: Dict[str, torch.Tensor] = {}
+        self._metric_supervisor = None
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
@@ -232,11 +243,51 @@ class ParaSSRAgent(AbstractAgent):
                 "max_agents cannot exceed detection queries, got "
                 f"{config.max_agents} > {config.num_query}"
             )
+        if tuple(config.map_pc_range) != tuple(config.pc_range):
+            raise ValueError(
+                "shared BEV/detection/map must use one physical ROI; got "
+                f"pc_range={tuple(config.pc_range)} and "
+                f"map_pc_range={tuple(config.map_pc_range)}"
+            )
+        if config.pc_range[1] < 0.0:
+            raise ValueError(
+                "the front-camera-only ROI cannot include rear supervision; "
+                f"got y_forward_min={config.pc_range[1]}"
+            )
+        if not 0.0 < float(config.det_fov_half_angle_deg) <= 90.0:
+            raise ValueError(
+                "det_fov_half_angle_deg must be in (0, 90], got "
+                f"{config.det_fov_half_angle_deg}"
+            )
         if not 1 <= config.map_dir_interval < config.map_num_pts_per_vec:
             raise ValueError(
                 "map_dir_interval must satisfy 1 <= interval < points/vector, "
                 f"got {config.map_dir_interval} and {config.map_num_pts_per_vec}"
             )
+        if getattr(config, "use_metric_planner", False):
+            if not math.isclose(float(trajectory_sampling.time_horizon), 4.0, abs_tol=1e-6):
+                raise ValueError("metric planner requires the NAVSIM v1 four-second horizon")
+            if isinstance(config.num_plan_candidates, bool) or not isinstance(config.num_plan_candidates, int) or config.num_plan_candidates < 2:
+                raise ValueError("num_plan_candidates must be an integer >= 2")
+            if isinstance(config.metric_cache_size, bool) or not isinstance(config.metric_cache_size, int) or config.metric_cache_size < 1:
+                raise ValueError("metric_cache_size must be a positive integer")
+            weights = tuple(config.metric_loss_weights)
+            if len(weights) != 7 or any(not math.isfinite(w) or w < 0 for w in weights) or weights[-1] <= 0:
+                raise ValueError("metric_loss_weights must be seven finite nonnegative values with positive final-score weight")
+            for name in ("candidate_cls_loss_weight",):
+                value = float(getattr(config, name))
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"{name} must be finite and positive")
+            for name in ("metric_loss_weight", "metric_score_weight"):
+                value = float(getattr(config, name))
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"{name} must be finite and nonnegative")
+            if not math.isfinite(config.candidate_score_weight) or config.candidate_score_weight < 0:
+                raise ValueError("candidate_score_weight must be finite and nonnegative")
+            if config.candidate_score_weight + config.metric_score_weight <= 0:
+                raise ValueError("at least one candidate ranking weight must be positive")
+            if config.metric_loss_weight == 0 and config.metric_score_weight > 0:
+                raise ValueError("metric_score_weight must be zero for the untrained metric-loss-free ablation")
         if trajectory_sampling.num_poses != config.fut_ts:
             raise ValueError(
                 "trajectory_sampling and fut_ts disagree: "
@@ -339,9 +390,41 @@ class ParaSSRAgent(AbstractAgent):
         returning it would double-count. The breakdown is published on
         ``latest_logs`` and picked up by :class:`ParaSSRLoggingCallback`.
         """
+        if self._config.use_metric_planner and self._config.metric_loss_weight > 0:
+            import time
+            start = time.perf_counter()
+            supervisor = self._get_metric_supervisor()
+            # Validation also scores candidates so val metric loss is meaningful.
+            # Neither this cache nor scene tokens are consumed by forward().
+            if "scene_token" not in targets:
+                raise ValueError("metric planner targets need scene_token; regenerate the target cache")
+            labels = supervisor.score(targets["scene_token"], predictions["trajectory_candidates"])
+            targets = dict(targets, candidate_metric_targets=labels)
+            elapsed = time.perf_counter() - start
         loss, logs = self._loss(self.para_ssr_model, features, targets, predictions)
+        if self._config.use_metric_planner and self._config.metric_loss_weight > 0:
+            logs["metric/rollout_seconds"] = loss.new_tensor(elapsed)
         self.latest_logs = logs
         return loss
+
+    def _get_metric_supervisor(self):
+        if self._metric_supervisor is None:
+            from .metric_supervision import CandidateMetricSupervisor
+            self._metric_supervisor = CandidateMetricSupervisor(
+                self._config.metric_cache_path, self._trajectory_sampling,
+                cache_size=self._config.metric_cache_size,
+            )
+        return self._metric_supervisor
+
+    def validate_metric_cache(self, datasets) -> None:
+        """Fail before training if any requested train/val world is missing."""
+        if not self._config.use_metric_planner or self._config.metric_loss_weight == 0:
+            return
+        supervisor = self._get_metric_supervisor()
+        for dataset in datasets:
+            tokens = (dataset.tokens if hasattr(dataset, "tokens")
+                      else dataset._scene_loader.tokens)
+            supervisor.validate_tokens(tokens)
 
     def get_training_callbacks(self) -> List["pl.Callback"]:
         return [ParaSSRLoggingCallback()]

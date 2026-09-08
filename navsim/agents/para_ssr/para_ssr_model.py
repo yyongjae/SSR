@@ -169,7 +169,16 @@ class ParaSSRModel(nn.Module):
             way_num_layers=cfg.way_num_layers,
             num_heads=cfg.num_heads,
             feedforward_channels=cfg.ffn_channels,
+            use_metric_planner=cfg.use_metric_planner,
+            num_plan_candidates=cfg.num_plan_candidates,
+            plan_anchor_path=cfg.plan_anchor_path,
         )
+
+        if cfg.use_metric_planner:
+            from .modules.candidate_planner import CandidateMetricHead
+            self.metric_head = CandidateMetricHead(
+                cfg.embed_dims, cfg.num_heads, cfg.fut_ts, cfg.metric_detach_bev
+            )
 
         self.det_motion_head = (
             ParaDetMotionHead(
@@ -205,7 +214,7 @@ class ParaSSRModel(nn.Module):
                 embed_dims=cfg.embed_dims,
                 bev_h=cfg.bev_h,
                 bev_w=cfg.bev_w,
-                # the map lives on the front half; see ParaSSRConfig.map_pc_range
+                # map and shared BEV use the same front-only physical extent
                 pc_range=cfg.map_pc_range,
                 num_reg_fcs=cfg.num_reg_fcs,
                 num_decoder_layers=cfg.map_num_decoder_layers,
@@ -320,12 +329,39 @@ class ParaSSRModel(nn.Module):
         bev_embed = outs["bev_embed"]
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
-            "ego_fut_preds": outs["ego_fut_preds"],
             "token_attn": outs["token_attn"],
-            "trajectory": self.pts_bbox_head.select_trajectory(
-                outs["ego_fut_preds"], features["command"]
-            ),
         }
+        if cfg.use_metric_planner:
+            from .modules.candidate_planner import (
+                commanded_candidates, offsets_to_poses, rank_candidates,
+            )
+            candidates = offsets_to_poses(commanded_candidates(
+                outs["candidate_offsets"], features["command"]
+            ))
+            metric_logits = self.metric_head(
+                bev_embed, outs["bev_pos"], candidates, features["status_feature"]
+            )
+            trajectory, selected, ranks = rank_candidates(
+                candidates, outs["candidate_logits"], metric_logits,
+                cfg.candidate_score_weight, cfg.metric_score_weight,
+            )
+            predictions.update({
+                "candidate_offsets": outs["candidate_offsets"],
+                "candidate_logits": outs["candidate_logits"],
+                "plan_anchors": outs["plan_anchors"],
+                "trajectory_candidates": candidates,
+                "metric_logits": metric_logits,
+                "candidate_rank_scores": ranks,
+                "selected_candidate": selected,
+                "trajectory": trajectory,
+            })
+        else:
+            predictions.update({
+                "ego_fut_preds": outs["ego_fut_preds"],
+                "trajectory": self.pts_bbox_head.select_trajectory(
+                    outs["ego_fut_preds"], features["command"]
+                ),
+            })
 
         if run_aux and self.det_motion_head is not None:
             s = self.aux_grad_scale.get("det", 1.0)

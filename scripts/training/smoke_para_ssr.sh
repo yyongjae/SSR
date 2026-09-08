@@ -12,7 +12,7 @@ export NAVSIM_EXP_ROOT="${REPO}/work_dirs"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 python "${REPO}/navsim/planning/script/run_training.py" \
-  agent=para_ssr_agent experiment_name=smoke \
+  agent=para_ssr_agent experiment_name=smoke_front3 \
   scene_filter=navtrain split=trainval scene_filter.max_scenes=8 \
   dataloader.params.batch_size=1 dataloader.params.num_workers=2 \
   trainer.params.fast_dev_run=true trainer.params.precision=32 \
@@ -21,5 +21,4 @@ python "${REPO}/navsim/planning/script/run_training.py" \
   agent.config.bev_h=25 agent.config.bev_w=25 \
   agent.config.image_scale=0.125 agent.config.crop_top=5 \
   agent.config.encoder_num_layers=1 \
-  agent.config.camera_names="[cam_f0,cam_l0,cam_r0]" \
   "$@"

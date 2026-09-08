@@ -28,15 +28,13 @@ class ParaSSRConfig:
     # frame, so this is the first knob to turn if dataloading is the bottleneck.
     frame_indices: Tuple[int, ...] = (2, 3)
 
+    # Same front-camera set as WoTE. Keep each view separate for BEVFormer's
+    # calibrated projection; camera tensors, lidar2img and embeddings all use
+    # this order. num_cams is derived from this tuple below.
     camera_names: Tuple[str, ...] = (
         "cam_f0",
         "cam_l0",
-        "cam_l1",
-        "cam_l2",
         "cam_r0",
-        "cam_r1",
-        "cam_r2",
-        "cam_b0",
     )
 
     # navsim images are 1920x1080. 0.4 -> 768x432, then drop 16 rows of sky.
@@ -56,11 +54,10 @@ class ParaSSRConfig:
     # shared BEV encoder
     # ------------------------------------------------------------------ #
     # VAD/SSR ego frame: x lateral (+right), y longitudinal (+forward).
-    #
-    # The EXTENT is NAVSIM TransFuser's, so the agent is compared on the region
-    # its baselines use: TransFuser rasterises LiDAR over +-32 m in both axes
-    # (transfuser_config.py: lidar_min/max_x/y) and filters detection GT by the
-    # same bounds.
+    # The camera-only front-view model must not receive supervision for an
+    # unobserved rear half-plane.  One front-facing ROI is therefore shared by
+    # the BEV encoder, detector/motion head and vector-map head:
+    # x_right in [-32, 32] m and y_forward in [0, 32] m.
     #
     # The RESOLUTION is not TransFuser's, because TransFuser has no single BEV
     # to copy.  It carries two: the LiDAR C5 at 8x8, which is what its 31
@@ -71,22 +68,17 @@ class ParaSSRConfig:
     # distance at 0.5 / 1.0 / 1.5 m.  A one-metre cell would leave the feature
     # coarser than the strictest threshold it is graded on.
     #
-    # 100 x 100 gives 0.64 m square cells, which is also the ReSMap teacher's
-    # cell size over the same front extent (its 50 x 100 grid at 0.64 m), so the
-    # front half of this BEV lands on the teacher's grid one-to-one and
-    # distillation is a crop rather than a resample.  Token count is 10,000,
-    # unchanged from the SSR configuration this replaces.
-    pc_range: Tuple[float, ...] = (-32.0, -32.0, -2.0, 32.0, 32.0, 2.0)
+    # Keep 100 x 100 for the first controlled experiment: it preserves the
+    # original 10,000-query architecture while changing only the physical ROI.
+    # This makes cells 0.64 m lateral x 0.32 m longitudinal; see the report for
+    # the square-cell 50 x 100 ablation that should follow.
+    pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
     bev_h: int = 100
     bev_w: int = 100
 
-    # The map is supervised over the FRONT half only.  TransFuser's
-    # `bev_semantic_map` is (128, 256) at 0.25 m and its `_coords_to_pixel`
-    # offsets the lateral axis alone ("remove half in backward direction"), so
-    # its map GT covers y in [0, 32] and x in [-32, 32] -- the same extent the
-    # ReSMap teacher is trained on, since a three-front-camera teacher has no
-    # rear observation to build a rear map from.  The BEV feature keeps the full
-    # +-32 m because this agent, unlike the teacher, has a rear camera.
+    # Deliberately identical to pc_range.  A different map range would make the
+    # map decoder's normalized reference points address the wrong physical BEV
+    # cells, even if both tensors happened to have compatible shapes.
     map_pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
     embed_dims: int = 256
     num_heads: int = 8
@@ -134,6 +126,21 @@ class ParaSSRConfig:
     traj_dims: int = 3
     heading_weight: float = 0.5
 
+    # Optional NAVSIM metric-supervised candidate planner. Enabled separately by
+    # agent=para_ssr_metric_agent, so the single-trajectory baseline is retained.
+    use_metric_planner: bool = False
+    num_plan_candidates: int = 16   # per command, independent of ego_fut_mode
+    plan_anchor_path: str = ""      # train-only npz; anchors persist in checkpoint
+    candidate_cls_loss_weight: float = 1.0
+    metric_loss_weight: float = 1.0
+    # NC, DAC, DDC, EP, TTC, comfort, aggregate score (NAVSIM v1 PDM)
+    metric_loss_weights: Tuple[float, ...] = (3.0, 3.0, 1.0, 2.0, 4.0, 1.0, 1.0)
+    candidate_score_weight: float = 0.1  # log imitation probability at selection
+    metric_score_weight: float = 1.0     # log predicted aggregate PDM score
+    metric_detach_bev: bool = False
+    metric_cache_path: str = ""     # world cache for BOTH training/validation
+    metric_cache_size: int = 8      # max decompressed scenes per training process
+
     # ------------------------------------------------------------------ #
     # auxiliary head 1: detection + motion
     # ------------------------------------------------------------------ #
@@ -144,6 +151,11 @@ class ParaSSRConfig:
     # Measured over 20 navtrain scenes: in-range agents median 53, max 80,
     # and 7/20 scenes exceed 60. 100 leaves headroom without truncating.
     max_agents: int = 100
+    # Half-angle about the forward axis.  The three front NAVSIM cameras cover
+    # approximately -80..+80 degrees; out-of-FOV boxes must not become false
+    # negative supervision for this camera-only detector.  This filter applies
+    # to detection/motion GT and its auxiliary evaluator, not to HD-map GT.
+    det_fov_half_angle_deg: float = 80.0
     det_num_decoder_layers: int = 3
     det_code_size: int = 10
     det_code_weights: Tuple[float, ...] = (

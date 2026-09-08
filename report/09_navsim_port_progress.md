@@ -1097,3 +1097,231 @@ manifest에 기록된 runtime package 버전 또는 batch/protocol 설정이 달
 달라져 잘못된 resume을 거부한다. 다만 resolved data path와 token 집합은 묶지만 약 219 GB
 sensor/map/log 파일 전체를 byte-hash하지는 않으므로, 같은 경로의 데이터가 in-place로
 교체되는 경우까지 자동 검출하지는 않는다.
+
+---
+
+## 18. 2026-09-08 WoTE 기준 전방 3-camera 입력으로 기본 설정 변경
+
+`ParaSSRConfig.camera_names`와 Hydra `para_ssr_agent.yaml`의 기본값을
+`[cam_f0, cam_l0, cam_r0]`로 변경했다. WoTE의
+`navsim/agents/WoTE/WoTE_features.py::_get_camera_feature`가 사용하는 카메라 집합과 같다.
+WoTE는 세 영상을 crop/stitch하지만 PARA-SSR은 BEVFormer의 기하 투영을 위해 각 영상을
+분리하고 각자의 calibration을 사용한다.
+
+- 입력: `[B, 2, 3, 3, 416, 768]`, history `[2, 3]`, fp32.
+- `get_sensor_config()`가 선택한 카메라만 로드한다. 나머지 5개 카메라와 LiDAR는 꺼진다.
+- `num_cams=len(camera_names)`가 encoder와 spatial attention에 전달되며 카메라 임베딩은
+  `[3, 256]`이 된다. 이미지와 `lidar2img`는 같은 `camera_names` 순서를 따른다.
+- feature cache key에 카메라 이름과 순서가 이미 포함돼 있으므로 기존 8-camera 캐시와
+  새 입력 캐시는 분리된다.
+- 기본 학습 output은 `work_dirs/para_ssr_front3`, 기본 PDM output은
+  `work_dirs/eval/para_ssr_front3`로 변경했다. Smoke도 본 학습의 카메라 기본값을 직접 쓴다.
+
+이 절을 작성한 시점에는 카메라 입력만 바꾸고 shared BEV/detection을 전후방 ±32 m로
+유지했다. 이 결정은 아래 §19에서 폐기했다. 현재 기본값은 shared BEV/detection/map을
+모두 전방 ROI로 통일하고 detection GT에 ±80° FOV를 적용한다. WoTE와의 전체 조건
+일치를 의미하지 않는 점은 그대로다. WoTE 기본값은 현재-frame panorama + LiDAR이고
+PARA-SSR은 2-frame multi-view camera-only다.
+
+기존 8-camera checkpoint는 카메라 임베딩 shape가 달라 새 3-camera 모델에 strict load할
+수 없다. 전방 3-camera 결과는 새로 학습해야 하며, 기존 checkpoint의 평가/resume에는
+그 학습의 원래 카메라 순서와 architecture/ROI config를 복원해야 한다. Auxiliary evaluator는
+이미 archived training config를 읽으므로 해당 checkpoint의 카메라 설정을 따른다.
+
+검증 (`ssr-navsim`, PyTorch 2.0.1+cu118):
+
+- `python -m pytest -q tests`: **76 passed** (새 전방 카메라 회귀 테스트 6개 포함).
+- 회귀 테스트: Python/Hydra 기본값 일치, 선택한 frame의 sensor loading, 후방 camera
+  object 없이 feature 생성, 이미지/calibration 순서, cache 분리, 후방 비가시 BEV query가
+  있는 모델의 모든 head forward 및 finite backward.
+- 실제 `navtrain` train/val 각 8개 scene을 로드해 작은 모델과 본 모델 크기에서 각각
+  batch 1의 train forward/loss/backward/optimizer step + validation을 통과했다.
+  본 모델 검증은 BEV `100×100`, 이미지 `768×416`, encoder 3층, aux head 모두 활성화다.
+- 스모크는 CPU fp32, `backbone_pretrained=false`로 수행했다. GPU 4장은 기존 학습 중이라
+  GPU/DDP 및 throughput은 이번 검증 범위에 포함하지 않았다.
+- train/smoke/PDM shell syntax와 `git diff --check` 통과.
+
+실행법과 checkpoint 주의사항은 `report/README.md` 및 `docs/PARA_SSR_NAVSIM.md`에 반영했다.
+
+---
+
+## 19. 2026-09-08 전방 공통 ROI와 detection ±80° FOV
+
+### 19.1 최종 기본 공간 범위
+
+전방 3-camera 입력과 supervision 범위를 일치시키기 위해 다음으로 통일했다.
+
+| 구성요소 | SSR 좌표 범위 |
+|---|---|
+| shared BEV | `x_right ∈ [-32, 32] m`, `y_forward ∈ [0, 32] m` |
+| detection/motion | 위 사각 ROI + box center 방위각 `[-80°, 80°]` |
+| vector map | shared BEV와 동일한 사각 ROI |
+
+`pc_range`와 `map_pc_range`가 다르거나 rear 영역을 포함하면 agent 초기화에서 즉시
+실패하도록 검사를 추가했다. 이는 map decoder가 정규화한 reference point와 shared BEV의
+실제 좌표가 다른 조용한 오류를 막는다. HD map은 정적 vector-map target이므로 각도 mask를
+추가하지 않고 공통 사각 ROI만 사용한다.
+
+detection FOV는 `atan2(x_right, y_forward)`로 계산한 box-center 방위각이다. 학습 target과
+auxiliary detection mAP GT가 `detection_box_in_roi()`를 함께 호출하므로 평가 때만 GT
+모집단이 달라지지 않는다. `det_fov_half_angle_deg`는 target cache identity에도 포함되어
+이전 360°/rear target cache가 재사용되지 않는다.
+
+### 19.2 BEV grid 결정
+
+이번 변경에서는 `bev_h=100`, `bev_w=100`과 10,000 query를 유지했다. 따라서 셀의 실제
+크기는 종방 0.32 m × 측방 0.64 m로 등방이 아니다. 이것은 카메라/ROI 변경과 token 수
+변경을 한 번에 섞지 않기 위한 1차 대조군이지, 최종적으로 등방 grid가 최적이라는 결론이
+아니다. 후속 실험은 같은 32×64 m ROI에서 `50×100`(0.64 m square cell)을 분리된 ablation으로
+비교해야 한다. 이 설정은 ReSMap teacher grid와도 맞고 BEV token을 절반으로 줄인다.
+
+### 19.3 의도적으로 넣지 않은 변경
+
+SafeDrive의 bridge/safety head는 추가하지 않았다. 현재 변경은 sensor/ROI 일치성만 다루며,
+NAVSIM metric-aware planning은 별도 실험 변수로 남긴다. 정확한 PDM score 계산은 NumPy
+simulation, polygon collision, threshold/곱셈 metric을 포함해 그대로는 미분 가능한 loss가
+아니다. WoTE/GTRS 계열은 고정 trajectory 후보의 사전 계산 metric을 reward/score head의
+teacher label로 사용한다. PARA-SSR의 현재 연속 trajectory 출력에 scalar PDM 값을 단순히
+loss로 더하는 것은 planning trajectory에 gradient를 전달하지 않으므로 적용하지 않았다.
+
+### 19.4 검증
+
+- 관련 ROI/FOV/aux 회귀 테스트: **55 passed**.
+- 전체 test suite: **81 passed**.
+- 실제 `navtrain` 8개 train/validation scene, 3-camera, front-only target으로 CPU fp32
+  `fast_dev_run`을 수행해 forward, 전체 loss, backward, optimizer step, validation을 통과했다.
+- 정확히 ±80°는 포함하고 ±80.1°, 후방 180°는 제외한다.
+- 잘못된 map/shared ROI, rear ROI, 0° 또는 90° 초과 FOV는 초기화 단계에서 거부한다.
+
+기존 checkpoint는 camera embedding뿐 아니라 physical ROI와 detection GT 모집단도 다르다.
+따라서 새 기본값은 새 학습으로 평가해야 한다. mismatched/rear ROI인 과거 checkpoint는
+보관된 config만 현재 코드에 넣는 것으로 충분하지 않으며 당시 code revision과 config를 함께
+복원해야 한다. 현재 agent는 이 공간 protocol을 초기화 단계에서 의도적으로 거부한다.
+
+---
+
+## 20. 2026-09-08 WoTE/SafeDrive 참조 metric-supervised candidate planner
+
+### 20.1 구현 범위
+
+§19에서 별도 실험 변수로 남긴 metric-aware planning을 선택형
+`agent=para_ssr_metric_agent`로 구현했다. 기존 `para_ssr_agent` single-trajectory baseline은
+그대로 유지한다. 전방 3-camera, camera-only, shared BEV/detection/map 공통 front ROI,
+detection ±80° 조건은 변경하지 않았다. SafeDrive의 bridge, pair collision head,
+time-wise DAC head는 추가하지 않았다.
+
+WoTE의 train-derived anchor/imitation assignment와 score prediction, SafeDrive의 현재
+refined candidate를 실제 simulator로 채점하는 방식을 참조했다. 양 모델의 전체 구조나
+custom metric을 그대로 이식한 것은 아니다.
+
+- train log에서만 생성한 K=16 anchor를 4 navigation command branch별로 refine한다.
+  실제 command의 후보 16개를 learned PDM metric critic과 imitation logit으로 ranking해
+  NAVSIM 형식 `[B,8,3]` trajectory 하나를 출력한다.
+- anchor와 planning 출력은 NAVSIM `(x_forward,y_left,heading)`, 현재 ego 기준 절대 poses다.
+  0.5초 간격 4초이며 현재 pose는 제외한다. 내부 회귀는 per-step offsets이고 heading은
+  원형 각도로 처리한다. BEV의 SSR 좌표계와 섞지 않으며 archive metadata도 검사한다.
+- vocabulary 생성에 navtrain token allowlist와 training-log split을 모두 적용한다.
+  validation/test로 anchor를 fitting하지 않는다. source token/log/hash/seed를 저장한다.
+- metric supervisor는 `compute_loss()`에서만 world cache와 token을 사용한다.
+  현재 refined candidate에 대한 NC/DAC/DDC/EP/TTC/comfort/final-score 정답을 생성한다.
+  validation은 held-out world에서 loss만 계산한다. inference에는 GT/cache가 필요 없다.
+- loss는 winner regression + candidate CE + metric BCE다. 기존 `plan=2.0`은 세 항을
+  합친 planning task에 적용하며, regression의 기존 denominator를 유지하고 K로 나누지
+  않는다. 다만 CE/BCE 추가 이후 **전체 planning loss scale까지 parity라는 뜻은 아니다**.
+- metric loss는 candidate coordinate를 detach해 회귀기 쪽의 잘못된 gradient를 차단한다.
+  critic에서 shared BEV로는 gradient가 흐른다. `metric_detach_bev=true` ablation과
+  같은 K의 imitation-only ablation을 제공한다.
+- anchor는 persistent checkpoint buffer다. 평가용 checkpoint를 지정하면 외부 anchor
+  원본과 backbone pretrained download 없이 strict restore한다.
+
+주요 신규 파일:
+
+```text
+navsim/agents/para_ssr/modules/candidate_planner.py
+navsim/agents/para_ssr/metric_supervision.py
+navsim/planning/script/config/common/agent/para_ssr_metric_agent.yaml
+scripts/training/train_para_ssr_metric.sh
+tools/build_para_ssr_anchors.py
+tools/smoke_para_ssr_metric.py
+tests/test_para_ssr_candidate_planner.py
+tests/test_para_ssr_metric_supervision.py
+tests/test_para_ssr_anchors.py
+report/11_para_ssr_metric_planner.md
+```
+
+### 20.2 점수 convention 검증
+
+현재 checkout의 공식 NAVSIM v1 PDM 정의를 사용한다. SafeDrive의 custom EPDMS/TLC/LK는
+추가하지 않는다. 공식 scorer의 `40×0.1 s`, progress threshold **5 m**를 사용한다.
+클래스 기본값 0.1 m를 그대로 쓰면 공식 YAML과 달라지므로 명시적으로 일치시켰다.
+
+모든 후보를 한 번에 scorer에 넣으면 progress 정규화 분모가 후보 집합에 의존한다.
+따라서 공식 평가와 동일하게 후보마다 `[cached reference,candidate]` 쌍을 독립 평가한다.
+NC/DDC의 0.5는 soft label로 보존한다. 누락 cache나 non-finite 출력에 가짜 0점 정답을
+만들지 않고 오류로 중단하며, train/validation 전체 token cache 유무를 학습 전에 검사한다.
+
+### 20.3 검증 결과
+
+`ssr-navsim` 환경에서 다음을 실행했다.
+
+```bash
+PARA_SSR_METRIC_TEST_CACHE=/data/navsim/exp/metric_cache \
+  python -m pytest -q tests navsim/agents/para_ssr/test_loss_parity.py
+```
+
+- **160 passed**, skip 없음. 위 navtest cache는 공식 점수 일치 검증에만 읽었다.
+  실제 학습 스모크의 world/anchor는 trainval에서 별도로 생성했다.
+- candidate 독립 회귀 21개: command gating, K와 무관한 regression loss/gradient 배율,
+  circular heading, soft BCE, candidate/BEV detach 경로, invalid config/convention,
+  checkpoint 복원과 inference, imitation-only ablation.
+- 축소 모델과 본 모델 크기에서 모두 실제 train 2개/validation 2개 scene을 사용해
+  Lightning optimizer 2회 + validation 2회를 통과했다.
+- 본 모델은 **39,070,262 parameters**, BEV `100×100`, front3, fp32, aux head 활성화다.
+  후보 `[1,16,8,3]`, 정답 `[1,16,7]`, 모든 loss/gradient finite이며 critic/classifier/
+  refinement gradient와 실제 parameter update를 확인했다.
+- 공식 평가기와 refined candidate metric 최대 차이 **2.48e-8**.
+- strict checkpoint load, 외부 anchor/cache 없이 public inference 통과.
+- Hydra training/PDM override composition, shell syntax, `git diff --check` 통과.
+
+GPU 네 장에서 기존 학습이 진행 중이므로 CPU fp32로 검증했다. GPU/DDP, batch4 peak memory,
+본 모델 장기 수렴이나 성능 향상, 새 모델의 전체 navtest PDM 점수는 검증하지 않았다.
+K=16 vocabulary는 train 256-scene 표본으로 만든 smoke용이며 최종 후보 커버리지를
+검증한 vocabulary는 아니다. 본 학습과 전체 navtrain metric caching은 시작하지 않았다.
+
+### 20.4 산출물과 실행 준비
+
+초기 본 모델 스모크 결과와 사용한 vocabulary:
+
+```text
+work_dirs/smoke_metric_k16_full_20260908/summary.json
+work_dirs/smoke_metric_k16_full_20260908/config.yaml
+work_dirs/smoke_metric_k16_full_20260908/smoke.ckpt
+work_dirs/smoke_metric_k16_full_20260908/anchors_smoke_k16.npz
+
+anchor archive SHA-256:
+7514c1fe6ff8c1b4e738a72e53593968821b968820f5a487193b3334a95e78ff
+```
+
+Anchor 파일을 옮겨 보존했으며 초기 summary/config의 `/tmp` 원본과 위 archive 내용은 같다.
+Smoke checkpoint는 smoke parameter update 확인용 state_dict이며 본 학습 resume용이 아니다.
+
+좌표 metadata 검사와 pretrained-download 차단을 포함한 최종 코드로 본 모델 스모크를
+재실행해 동일하게 통과했다. 최종 결과는
+`work_dirs/smoke_metric_k16_full_final_20260908/summary.json`, `config.yaml`, `smoke.ckpt`다.
+이 재실행은 위 보존된 anchor 파일을 직접 읽었다. World 4개 생성 21.88초, Lightning
+fit 23.42초이며 train batch1은 8.70/7.68초다. 이는 CPU smoke 시간이며 본 학습의 GPU
+throughput 추정치로 사용하면 안 된다.
+
+본 학습 전에는 train-only anchor bank와 **navtrain train/validation을 모두 포함하는** metric
+world cache가 필요하다. 기존 navtest 평가 cache로 대체할 수 없다. 전체 준비/학습/PDM 평가,
+imitation-only/BEV-detach ablation, checkpoint resume 명령은
+[`11_para_ssr_metric_planner.md`](11_para_ssr_metric_planner.md)에 정리했다.
+
+### 20.5 별도로 발견한 기존 auxiliary evaluator 제약
+
+기존 `run_aux_evaluation.py`는 detection 전후방 ±32 m와 V2 GT-count reference를 고정해
+현재 front-only baseline/metric checkpoint를 거부한다. 이는 §19 ROI 변경과 기존 evaluator
+protocol의 충돌이며 metric supervisor/PDM inference 경로와는 별개다. 새 ROI/FOV에 대한
+protocol version, prediction/GT 처리와 reference GT 수를 별도로 검증해 이관해야 하므로
+이번 변경에서 상수만 바꾸어 검사를 우회하지 않았다. README와 실행 가이드에 지원 범위를
+명시했다. 현재 검증 결과를 새 모델의 detection/map mAP 실행 검증으로 해석하면 안 된다.

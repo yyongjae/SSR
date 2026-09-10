@@ -5,8 +5,9 @@ as a cache-pair ablation; the main RPED line is 100x100 pair B.
 """
 _base_ = ['./RPED_teacher_bevfusion_maptrv2.py']
 
-feature_root = \
-    '/data2/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache'
+feature_root = __import__('os').environ.get(
+    'DISTILL_FEATURE_ROOT',
+    '/data2/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache')
 
 model = dict(
     feature_root=feature_root,

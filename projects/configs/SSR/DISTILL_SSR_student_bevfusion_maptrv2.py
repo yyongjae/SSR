@@ -7,8 +7,9 @@ train.
 """
 _base_ = ['./DISTILL_SSR_student.py']
 
-feature_root = \
-    '/data3/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache'
+feature_root = __import__('os').environ.get(
+    'DISTILL_FEATURE_ROOT',
+    '/data3/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache')
 adapter_checkpoints = dict(
     _delete_=True,
     bevfusion=(

@@ -9,8 +9,9 @@ distills answers.  Same-question ablation sets query_source='student'.
 """
 _base_ = ['./DISTILL_SSR_student.py']
 
-feature_root = \
-    '/data3/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache'
+feature_root = __import__('os').environ.get(
+    'DISTILL_FEATURE_ROOT',
+    '/data3/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache')
 rped_checkpoint = (
     '/data2/byounggun/rideflux/pretrained_checkpoints/'
     'planning_distill_checkpoints/rped_teacher_bevfusion_maptrv2/epoch_6.pth')

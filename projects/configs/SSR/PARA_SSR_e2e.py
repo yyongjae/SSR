@@ -187,7 +187,7 @@ model = dict(
     # that catch a dead head in epoch 1 instead of after a 15-hour run.
     # Costs one extra sigmoid + a few reductions on tensors already in memory.
     aux_metric_log_interval=200,
-    pretrained=dict(img='torchvision://resnet50'),
+    pretrained=dict(img='ckpts/resnet50-19c8e357.pth'),
     img_backbone=dict(
         type='ResNet',
         depth=50,

@@ -95,7 +95,6 @@ GLOBAL_BATCH=8
 WORKERS_PER_GPU=${SSR_WORKERS_PER_GPU:-8}
 DISTILL_CKPT_OUT_ROOT=${DISTILL_CKPT_OUT_ROOT:-/data2/byounggun/rideflux/pretrained_checkpoints/planning_distill_checkpoints}
 DISTILL_STUDENT_WORK_DIR=${DISTILL_STUDENT_WORK_DIR:-$DISTILL_CKPT_OUT_ROOT/student}
-4
 usage() { sed -n '2,57p' "$0" | sed 's/^# \?//'; exit "${1:-1}"; }
 [ -z "$WHAT" ] && usage 0
 

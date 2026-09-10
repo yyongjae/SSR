@@ -13,8 +13,9 @@ trajectory offsets by default and also retains each branch prediction.
 """
 _base_ = ['./PARA_SSR_e2e.py']
 
-feature_root = \
-    '/data2/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache'
+feature_root = __import__('os').environ.get(
+    'DISTILL_FEATURE_ROOT',
+    '/data2/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache')
 total_epochs = 6
 
 _latent_decoder = dict(

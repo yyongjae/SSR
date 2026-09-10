@@ -9,8 +9,9 @@ module.
 """
 _base_ = ['./PARA_SSR_e2e_12ep.py']
 
-feature_root = \
-    '/data2/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache'
+feature_root = __import__('os').environ.get(
+    'DISTILL_FEATURE_ROOT',
+    '/data2/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache')
 adapter_checkpoints = dict(
     bevdepth=(
         '/data2/byounggun/rideflux/pretrained_checkpoints/'

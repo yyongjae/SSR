@@ -10,8 +10,9 @@ moves.
 """
 _base_ = ['./DISTILL_teacher_adapters.py']
 
-feature_root = \
-    '/data3/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache'
+feature_root = __import__('os').environ.get(
+    'DISTILL_FEATURE_ROOT',
+    '/data3/byounggun/rideflux/pretrained_checkpoints/distill_bev_cache')
 
 _latent_decoder = dict(
     type='CustomTransformerDecoder',

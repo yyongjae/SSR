@@ -236,3 +236,49 @@ def test_real_cache_matches_the_student_geometry(config):
     manifest = store.manifests()["cache_train_100x100"]
     assert manifest["bev_channels"] == config.embed_dims
     assert tuple(manifest["target_bev_shape"]) == (config.bev_h, config.bev_w)
+
+
+# --------------------------------------------------------------------- #
+# launchability
+# --------------------------------------------------------------------- #
+def test_both_stages_instantiate_through_hydra(tmp_path, config, cache, monkeypatch):
+    """navsim builds agents from yaml, so an unregistered agent is unreachable."""
+    from hydra import compose, initialize_config_dir
+    from hydra.utils import instantiate
+
+    cfg_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "navsim", "planning", "script", "config", "common", "agent",
+    )
+    monkeypatch.setenv("DISTILL_FEATURE_ROOT", cache)
+
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        stage1 = instantiate(compose(config_name="para_ssr_teacher_adapter_agent"))
+    assert stage1.get_sensor_config().cam_f0 is False, "stage 1 reads no sensors"
+
+    ckpt = str(tmp_path / "hydra_stage1.ckpt")
+    torch.save(
+        {"state_dict": {"agent." + k: v for k, v in stage1.state_dict().items()}},
+        ckpt,
+    )
+    monkeypatch.setenv("BEVFUSION_ADAPTER_CKPT", ckpt)
+
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        stage2 = instantiate(compose(config_name="para_ssr_distill_agent"))
+    assert stage2._distill is not None
+    assert not any(p.requires_grad for p in stage2._distill.adapters.parameters())
+
+
+def test_stage1_has_no_unused_parameters(config, cache):
+    """An unreduced parameter makes DDP abort; single-process runs never show it."""
+    cfg = replace(config, use_distill=True, input_target=True,
+                  distill_feature_root=cache)
+    model = TeacherAdapterPlanner(cfg)
+    bev = TeacherFeatureStore(cache, "bevfusion").load_batch(
+        TOKENS[:1], torch.device("cpu"), torch.float32)
+    cmd = torch.zeros(1, cfg.num_navi_cmd)
+    cmd[:, 1] = 1.0
+    model(bev, cmd)["ego_fut_preds"].abs().mean().backward()
+    dead = [n for n, p in model.named_parameters()
+            if p.requires_grad and p.grad is None]
+    assert dead == [], f"parameters receive no gradient: {dead}"

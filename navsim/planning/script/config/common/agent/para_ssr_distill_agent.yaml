@@ -1,0 +1,22 @@
+# Stage 2 of planning distillation: the ordinary PARA-SSR agent plus frozen
+# stage-1 adapters pulling the student BEV towards the cached teacher BEV.
+#
+# Requires a stage-1 checkpoint; PlanningDistillation refuses to build without
+# one, because distilling towards a randomly initialised adapter is not the
+# experiment.
+#
+#   DISTILL_FEATURE_ROOT=/path/to/teacher_cache \
+#   BEVFUSION_ADAPTER_CKPT=/path/to/stage1.ckpt \
+#     ./scripts/training/train_para_ssr.sh agent=para_ssr_distill_agent
+defaults:
+  - para_ssr_agent
+  - _self_
+
+config:
+  use_distill: true
+  distill_feature_root: ${oc.env:DISTILL_FEATURE_ROOT,''}
+  # Only BEVFusion is cached today.  Add a maptrv2 entry here and in
+  # distill_branches once that cache exists.
+  distill_adapter_checkpoints:
+    bevfusion: ${oc.env:BEVFUSION_ADAPTER_CKPT,''}
+  distill_loss_weight: 1.0

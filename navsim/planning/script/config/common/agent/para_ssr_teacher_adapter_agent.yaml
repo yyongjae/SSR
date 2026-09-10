@@ -1,0 +1,28 @@
+# Stage 1 of planning distillation: train one BEV adapter and the unchanged
+# PARA-SSR planning decoder from a frozen teacher's cached BEV.
+#
+# No sensors are read, so this is cheap.  What it produces is the adapter
+# checkpoint that stage 2 freezes.
+#
+#   DISTILL_FEATURE_ROOT=/path/to/teacher_cache \
+#     ./scripts/training/train_para_ssr.sh agent=para_ssr_teacher_adapter_agent
+defaults:
+  - para_ssr_agent
+  - _self_
+
+_target_: navsim.agents.para_ssr.distill.teacher_adapter.ParaSSRTeacherAdapterAgent
+
+config:
+  # use_distill emits targets[scene_token]; input_target hands targets to
+  # forward(), which is how the cache is addressed.
+  use_distill: true
+  input_target: true
+  distill_feature_root: ${oc.env:DISTILL_FEATURE_ROOT,''}
+  teacher_adapter_branch: bevfusion
+
+  # Stage 1 supervises the trajectory only.  Leaving the auxiliary heads on
+  # would build agent and map targets that nothing consumes.
+  use_det_motion_head: false
+  use_map_head: false
+  # There is no image backbone on this path.
+  backbone_pretrained: false

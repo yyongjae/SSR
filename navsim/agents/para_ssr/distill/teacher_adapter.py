@@ -95,6 +95,12 @@ class TeacherAdapterPlanner(nn.Module):
             num_plan_candidates=cfg.num_plan_candidates,
             plan_anchor_path="",
         )
+        # ``forward_from_bev`` takes the BEV from the adapter, so the learned BEV
+        # queries that ``forward`` would hand to the transformer are unused here.
+        # A parameter that never receives a gradient makes DDP abort, and it is
+        # invisible in single-process testing. requires_grad is not part of
+        # state_dict, so a stage-1 checkpoint still loads into the full model.
+        self.planner.bev_embedding.weight.requires_grad_(False)
 
     def forward(self, teacher_bev: torch.Tensor, cmd: torch.Tensor) -> Dict[str, torch.Tensor]:
         """``teacher_bev`` is ``[B, C, H, W]`` straight from the cache."""
@@ -115,6 +121,7 @@ class ParaSSRTeacherAdapterAgent(AbstractAgent):
         trajectory_sampling: TrajectorySampling,
         lr: float = 1e-4,
         checkpoint_path: Optional[str] = None,
+        resume_from_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if not config.distill_feature_root:
@@ -150,6 +157,9 @@ class ParaSSRTeacherAdapterAgent(AbstractAgent):
 
         self.model = TeacherAdapterPlanner(config)
         self.latest_logs: Dict[str, torch.Tensor] = {}
+
+        if resume_from_checkpoint and checkpoint_path:
+            self.initialize()
 
     # ------------------------------------------------------------------ #
     def name(self) -> str:

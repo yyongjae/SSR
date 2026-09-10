@@ -1,0 +1,12 @@
+# conda env create -f environment.yml
+# conda activate ssr-navsim
+# Install the CUDA 11.8 torch/torchvision wheels first; see docs/PARA_SSR_NAVSIM.md.
+# python -m pip install -r requirements_navsim.txt
+# python -m pip install -e . --no-deps
+name: ssr-navsim
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip=23.3.1
+  - nb_conda_kernels

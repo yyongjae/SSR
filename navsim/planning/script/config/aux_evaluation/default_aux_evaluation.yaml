@@ -1,0 +1,49 @@
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: ${output_dir}
+  output_subdir: ${output_dir}/code/hydra
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+
+defaults:
+  - default_common
+  - default_evaluation
+  - override scene_filter: navtest
+  - _self_
+
+# Held-out NAVSIM auxiliary-head protocol.  These are not official NAVSIM
+# planning metrics; see navsim/evaluate/aux_metrics.py for the exact contract.
+experiment_name: eval/para_ssr_ep30_aux
+split: test
+scene_filter_name: navtest
+
+# The checkpoint has no self-contained hyperparameters, so inference is bound
+# to the exact archived Hydra config and both files are hashed into the manifest.
+checkpoint_path: ${oc.env:NAVSIM_DEVKIT_ROOT}/work_dirs/para_ssr/para_ssr_ep30_final.ckpt
+training_config_path: ${oc.env:NAVSIM_DEVKIT_ROOT}/work_dirs/para_ssr/code/hydra/config.yaml
+
+device: cuda:0
+production_guard: true
+dry_run: false
+
+# Protocol V1 fixes both decoded heads at flattened sigmoid top-100.  The
+# runner rejects overrides rather than silently producing a different metric.
+det_max_predictions: 100
+map_max_predictions: 100
+
+# Single-process default.  For multiple GPUs, each process uses a disjoint
+# deterministic token shard with extract_only=true, followed by one
+# aggregate_only=true process over the shared record directory.
+num_shards: 1
+shard_index: 0
+extract_only: false
+aggregate_only: false
+
+dataloader:
+  batch_size: 4
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true

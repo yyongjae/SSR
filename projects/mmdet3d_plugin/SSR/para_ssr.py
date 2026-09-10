@@ -36,7 +36,7 @@ from projects.mmdet3d_plugin.SSR.planner.metric_stp3 import PlanningMetric
 from projects.mmdet3d_plugin.SSR.utils.grad_balance import (
     GradBalancer, all_reduce_mean)
 from projects.mmdet3d_plugin.SSR.utils.planning_distill import \
-    PlanningDistillation
+    build_planning_distillation
 
 # ``self.CLASSES`` is injected by tools/train.py and tools/test.py from the
 # dataset. Fall back to the standard nuScenes detection order so the motion
@@ -169,7 +169,7 @@ class ParaSSR(MVXTwoStageDetector):
         # image/BEV trunk and SSR planning head.
         self.planning_distillation = None
         if distill is not None:
-            self.planning_distillation = PlanningDistillation(**distill)
+            self.planning_distillation = build_planning_distillation(distill)
 
     @staticmethod
     def _build_aux(cfg, train_cfg_pts):
@@ -327,8 +327,16 @@ class ParaSSR(MVXTwoStageDetector):
         # BEV encoder without letting an independently trainable adapter absorb
         # the mismatch.
         if self.planning_distillation is not None:
+            distill_kwargs = dict(student_bev=bev_embed, img_metas=img_metas)
+            if getattr(self.planning_distillation, 'uses_planning_queries',
+                       False):
+                distill_kwargs.update(
+                    scene_query=outs.get('scene_query'),
+                    pooled_query=outs.get('pooled_query'),
+                    token_attn=outs.get('token_attn'),
+                    ego_fut_cmd=ego_fut_cmd)
             distill_losses, distill_metrics = \
-                self.planning_distillation.forward_train(bev_embed, img_metas)
+                self.planning_distillation.forward_train(**distill_kwargs)
             groups['distill'] = distill_losses
             losses.update(distill_losses)
             losses.update(distill_metrics)

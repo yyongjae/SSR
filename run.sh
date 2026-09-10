@@ -24,6 +24,17 @@
 #   ./run.sh distill 3,6       planning-only SSR student + feature distillation
 #   ./run.sh distill-bevfusion-maptr 3,6
 #                              same, from frozen BEVFusion + MapTRv2 adapters
+#   ./run.sh rped-teacher 0,1  stage-1 RPED readout planner (BEVFusion+MapTRv2)
+#   ./run.sh rped-teacher-pair-a 0,1
+#                              same, on BEVDepth+HDMapNet 25x25 caches
+#   ./run.sh rped-distill 3,6  stage-2 RPED student (rank-N evidence, no dense MSE)
+#   ./run.sh rped-same-question 3,6
+#   ./run.sh rped-triplet 3,6
+#   ./run.sh rped-shuffle 3,6  negative control: shuffled teacher memory
+#   ./run.sh rped-dense 3,6    punchline ablation: dense adapter-MSE on pair B
+#   ./run.sh eval-rped-teacher [CKPT] [gpu]
+#                              stage-1 privileged planner L2 / collision gate
+#   ./run.sh eval-rped-teacher-pair-a [CKPT] [gpu]
 #
 #   ./run.sh smoke 3,6         validation path, 8 samples (~10 min) -- run this
 #                              BEFORE committing days to a training run
@@ -84,8 +95,8 @@ GLOBAL_BATCH=8
 WORKERS_PER_GPU=${SSR_WORKERS_PER_GPU:-8}
 DISTILL_CKPT_OUT_ROOT=${DISTILL_CKPT_OUT_ROOT:-/data2/byounggun/rideflux/pretrained_checkpoints/planning_distill_checkpoints}
 DISTILL_STUDENT_WORK_DIR=${DISTILL_STUDENT_WORK_DIR:-$DISTILL_CKPT_OUT_ROOT/student}
-
-usage() { sed -n '2,40p' "$0" | sed 's/^# \?//'; exit "${1:-1}"; }
+4
+usage() { sed -n '2,57p' "$0" | sed 's/^# \?//'; exit "${1:-1}"; }
 [ -z "$WHAT" ] && usage 0
 
 validate_gpu_list() {
@@ -238,6 +249,78 @@ case "$WHAT" in
       model.distill.adapter_checkpoint.bevfusion="$BEVFUSION_ADAPTER_CKPT" \
       model.distill.adapter_checkpoint.maptrv2="$MAPTRV2_ADAPTER_CKPT"
     ;;
+
+  rped-teacher)
+    train RPED_teacher_bevfusion_maptrv2 \
+      "$DISTILL_CKPT_OUT_ROOT/rped_teacher_bevfusion_maptrv2" "${3:-}"
+    ;;
+  rped-teacher-pair-a)
+    train RPED_teacher_bevdepth_hdmapnet \
+      "$DISTILL_CKPT_OUT_ROOT/rped_teacher_bevdepth_hdmapnet" "${3:-}"
+    ;;
+
+  rped-distill)
+    RPED_TEACHER_CKPT=${RPED_TEACHER_CKPT:-$DISTILL_CKPT_OUT_ROOT/rped_teacher_bevfusion_maptrv2/epoch_6.pth}
+    RPED_STUDENT_WORK_DIR=${RPED_STUDENT_WORK_DIR:-$DISTILL_CKPT_OUT_ROOT/rped_student}
+    if [ ! -e "$RPED_TEACHER_CKPT" ]; then
+      echo "RPED student needs $RPED_TEACHER_CKPT." >&2
+      echo "Run './run.sh rped-teacher 0,1' first, then eval-rped-teacher." >&2
+      exit 1
+    fi
+    train RPED_SSR_student "$RPED_STUDENT_WORK_DIR" "${3:-}" \
+      model.distill.readout_checkpoint="$RPED_TEACHER_CKPT"
+    ;;
+  rped-same-question)
+    RPED_TEACHER_CKPT=${RPED_TEACHER_CKPT:-$DISTILL_CKPT_OUT_ROOT/rped_teacher_bevfusion_maptrv2/epoch_6.pth}
+    if [ ! -e "$RPED_TEACHER_CKPT" ]; then
+      echo "RPED student needs $RPED_TEACHER_CKPT." >&2
+      exit 1
+    fi
+    train RPED_SSR_student_same_question \
+      "$DISTILL_CKPT_OUT_ROOT/rped_student_same_question" "${3:-}" \
+      model.distill.readout_checkpoint="$RPED_TEACHER_CKPT"
+    ;;
+  rped-triplet)
+    RPED_TEACHER_CKPT=${RPED_TEACHER_CKPT:-$DISTILL_CKPT_OUT_ROOT/rped_teacher_bevfusion_maptrv2/epoch_6.pth}
+    if [ ! -e "$RPED_TEACHER_CKPT" ]; then
+      echo "RPED student needs $RPED_TEACHER_CKPT." >&2
+      exit 1
+    fi
+    train RPED_SSR_student_triplet \
+      "$DISTILL_CKPT_OUT_ROOT/rped_student_triplet" "${3:-}" \
+      model.distill.readout_checkpoint="$RPED_TEACHER_CKPT"
+    ;;
+  rped-shuffle)
+    RPED_TEACHER_CKPT=${RPED_TEACHER_CKPT:-$DISTILL_CKPT_OUT_ROOT/rped_teacher_bevfusion_maptrv2/epoch_6.pth}
+    if [ ! -e "$RPED_TEACHER_CKPT" ]; then
+      echo "RPED student needs $RPED_TEACHER_CKPT." >&2
+      exit 1
+    fi
+    train RPED_SSR_student_shuffle \
+      "$DISTILL_CKPT_OUT_ROOT/rped_student_shuffle" "${3:-}" \
+      model.distill.readout_checkpoint="$RPED_TEACHER_CKPT"
+    ;;
+  rped-dense)
+    BEVFUSION_ADAPTER_CKPT=${BEVFUSION_ADAPTER_CKPT:-$DISTILL_CKPT_OUT_ROOT/teacher_bevfusion/epoch_6.pth}
+    MAPTRV2_ADAPTER_CKPT=${MAPTRV2_ADAPTER_CKPT:-$DISTILL_CKPT_OUT_ROOT/teacher_maptrv2/epoch_6.pth}
+    missing=0
+    for checkpoint in "$BEVFUSION_ADAPTER_CKPT" "$MAPTRV2_ADAPTER_CKPT"; do
+      if [ ! -e "$checkpoint" ]; then
+        echo "dense ablation needs $checkpoint." >&2
+        missing=1
+      fi
+    done
+    if [ "$missing" -ne 0 ]; then
+      echo "Run './run.sh teacher-bevfusion 0' and " \
+           "'./run.sh teacher-maptrv2 1' first. Dense MSE is an ablation, " \
+           "not the RPED method." >&2
+      exit 1
+    fi
+    train RPED_SSR_student_dense_ablation \
+      "$DISTILL_CKPT_OUT_ROOT/rped_student_dense" "${3:-}" \
+      model.distill.adapter_checkpoint.bevfusion="$BEVFUSION_ADAPTER_CKPT" \
+      model.distill.adapter_checkpoint.maptrv2="$MAPTRV2_ADAPTER_CKPT"
+    ;;
   stage1)   train PARA_SSR_stage1_detmap     para_ssr_stage1   "${3:-}" ;;
 
   stage2)
@@ -325,6 +408,18 @@ EOF
     CKPT=${2:-$DISTILL_CKPT_OUT_ROOT/teacher_maptrv2/epoch_6.pth}
     EXPECT_RAW=1 tools/final_eval.sh \
       "$C/DISTILL_teacher_maptrv2.py" "$CKPT" "${3:-1}"
+    ;;
+
+  eval-rped-teacher)
+    CKPT=${2:-$DISTILL_CKPT_OUT_ROOT/rped_teacher_bevfusion_maptrv2/epoch_6.pth}
+    EXPECT_RAW=1 tools/final_eval.sh \
+      "$C/RPED_teacher_bevfusion_maptrv2.py" "$CKPT" "${3:-0}"
+    ;;
+
+  eval-rped-teacher-pair-a)
+    CKPT=${2:-$DISTILL_CKPT_OUT_ROOT/rped_teacher_bevdepth_hdmapnet/epoch_6.pth}
+    EXPECT_RAW=1 tools/final_eval.sh \
+      "$C/RPED_teacher_bevdepth_hdmapnet.py" "$CKPT" "${3:-0}"
     ;;
 
   test)

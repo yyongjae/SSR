@@ -1,9 +1,9 @@
 """Teacher-adapter pretraining model and SSR-compatible planning decoder."""
+from collections import OrderedDict
 import copy
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 from mmcv.cnn import Linear
 from mmcv.cnn.bricks.transformer import (build_positional_encoding,
                                          build_transformer_layer_sequence)
@@ -15,7 +15,8 @@ from .planner.metric_stp3 import PlanningMetric
 from .tokenlearner import TokenLearnerV11
 from .utils.planning_distill import (
     PlanningBEVAdapter, TeacherFeatureStore, _STORE_CFG_KEYS,
-    current_sample_tokens, resize_bev_tokens)
+    current_sample_tokens, resize_bev_tokens,
+    TeacherMemoryProjector, PrivilegedEvidenceReadout)
 
 
 class _NavigationSE(nn.Module):
@@ -329,6 +330,317 @@ class CachedTeacherAdapterPlanner(BaseDetector):
         for name, value in predictions.items():
             result[f'ego_fut_preds_{name}'] = value[0].cpu()
 
+        metric = self._planning_metrics(
+            result['ego_fut_preds'], ego_fut_trajs, ego_fut_cmd,
+            gt_bboxes_3d, map_gt_bboxes_3d, map_gt_labels_3d,
+            gt_attr_labels, fut_valid_flag)
+        return [dict(pts_bbox=result, metric_results=metric)]
+
+    @torch.no_grad()
+    def _planning_metrics(self, prediction, gt_traj, command, gt_boxes,
+                          map_boxes, map_labels, gt_attr, valid):
+        gt_bbox = gt_boxes[0][0]
+        gt_map_bbox = map_boxes[0]
+        gt_map_label = map_labels[0].cpu()
+        gt_attr_label = gt_attr[0][0].cpu()
+        valid = bool(valid[0][0])
+        gt_traj = gt_traj[0, 0]
+        command_vector = command[0, 0, 0]
+        command_index = torch.nonzero(command_vector)[0, 0]
+        pred = prediction[command_index].cumsum(dim=-2)
+        gt = gt_traj.cumsum(dim=-2)
+        return self.compute_planner_metric_stp3(
+            pred[None], gt[None], gt_bbox, gt_attr_label.unsqueeze(0),
+            gt_map_bbox, gt_map_label, valid)
+
+    def compute_planner_metric_stp3(self, pred_ego_fut_trajs,
+                                    gt_ego_fut_trajs, gt_agent_boxes,
+                                    gt_agent_feats, gt_map_boxes,
+                                    gt_map_labels, fut_valid_flag):
+        metric = {'fut_valid_flag': fut_valid_flag}
+        for second in range(1, 4):
+            for name in ('plan_L2', 'plan_obj_col', 'plan_obj_box_col',
+                         'plan_L2_stp3', 'plan_obj_col_stp3',
+                         'plan_obj_box_col_stp3'):
+                metric[f'{name}_{second}s'] = 0.0
+        if not fut_valid_flag:
+            return metric
+        if self.planning_metric is None:
+            self.planning_metric = PlanningMetric()
+        segmentation, pedestrian, _ = self.planning_metric.get_label(
+            gt_agent_boxes, gt_agent_feats, gt_map_boxes, gt_map_labels)
+        occupancy = torch.logical_or(segmentation, pedestrian)
+        for i in range(3):
+            current = (i + 1) * 2
+            pred = pred_ego_fut_trajs[0, :current].detach().to(
+                gt_ego_fut_trajs.device)
+            gt = gt_ego_fut_trajs[0, :current]
+            obj_col, box_col = self.planning_metric.evaluate_coll(
+                pred_ego_fut_trajs[:, :current].detach(),
+                gt_ego_fut_trajs[:, :current], occupancy)
+            suffix = f'{i + 1}s'
+            metric[f'plan_L2_{suffix}'] = \
+                self.planning_metric.compute_L2(pred, gt)
+            metric[f'plan_L2_stp3_{suffix}'] = \
+                self.planning_metric.compute_L2_stp3(pred, gt)
+            metric[f'plan_obj_col_{suffix}'] = obj_col.mean().item()
+            metric[f'plan_obj_box_col_{suffix}'] = box_col.mean().item()
+            metric[f'plan_obj_col_stp3_{suffix}'] = obj_col[-1].item()
+            metric[f'plan_obj_box_col_stp3_{suffix}'] = box_col[-1].item()
+        return metric
+
+    def aug_test(self, imgs, img_metas, **kwargs):
+        raise NotImplementedError('test-time augmentation is not supported')
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+
+@HEADS.register_module()
+class PrivilegedWaypointDecoder(BaseModule):
+    """SSR waypoint decoder on rank-N privileged evidence tokens.
+
+    Stage 1 RPED does not TokenLearn a dense BEV.  The 16 evidence tokens
+    already are the planning interface; this module only self-attends them
+    and reads waypoints, matching the student planner from that point on.
+    """
+
+    def __init__(self,
+                 embed_dims=256,
+                 num_scenes=16,
+                 num_reg_fcs=2,
+                 fut_ts=6,
+                 ego_fut_mode=3,
+                 latent_decoder=None,
+                 way_decoder=None,
+                 loss_plan_reg=dict(type='L1Loss', loss_weight=1.0),
+                 init_cfg=None):
+        super().__init__(init_cfg=init_cfg)
+        self.embed_dims = int(embed_dims)
+        self.num_scenes = int(num_scenes)
+        self.num_reg_fcs = int(num_reg_fcs)
+        self.fut_ts = int(fut_ts)
+        self.ego_fut_mode = int(ego_fut_mode)
+        self.fp16_enabled = False
+        self.query_pos = nn.Embedding(self.num_scenes, self.embed_dims)
+        self.latent_decoder = build_transformer_layer_sequence(latent_decoder)
+        self.way_point = nn.Embedding(
+            self.ego_fut_mode * self.fut_ts, self.embed_dims * 2)
+        self.way_decoder = build_transformer_layer_sequence(way_decoder)
+        layers = []
+        for _ in range(self.num_reg_fcs):
+            layers.extend((Linear(self.embed_dims, self.embed_dims), nn.ReLU()))
+        layers.append(Linear(self.embed_dims, 2))
+        self.ego_fut_decoder = nn.Sequential(*layers)
+        self.loss_plan_reg = build_loss(loss_plan_reg)
+
+    def init_weights(self):
+        nn.init.normal_(self.query_pos.weight, std=0.02)
+        for decoder in (self.latent_decoder, self.way_decoder):
+            for parameter in decoder.parameters():
+                if parameter.dim() > 1:
+                    nn.init.xavier_uniform_(parameter)
+
+    def forward(self, evidence):
+        if evidence.dim() != 3:
+            raise ValueError(
+                f'evidence must be NBC, got {tuple(evidence.shape)}')
+        if evidence.size(0) != self.num_scenes:
+            raise ValueError(
+                f'expected {self.num_scenes} evidence tokens, got '
+                f'{evidence.size(0)}')
+        num_queries, batch, _ = evidence.shape
+        dtype = evidence.dtype
+        pos = self.query_pos.weight.to(dtype).unsqueeze(1).expand(
+            -1, batch, -1)
+        latent = self.latent_decoder(
+            query=evidence, key=evidence, value=evidence,
+            query_pos=pos, key_pos=pos)
+        waypoint_pos, waypoint = torch.split(
+            self.way_point.weight.to(dtype), self.embed_dims, dim=1)
+        waypoint_pos = waypoint_pos.unsqueeze(0).expand(
+            batch, -1, -1).permute(1, 0, 2)
+        waypoint = waypoint.unsqueeze(0).expand(
+            batch, -1, -1).permute(1, 0, 2)
+        waypoint = self.way_decoder(
+            query=waypoint, key=latent, value=latent,
+            query_pos=waypoint_pos, key_pos=pos)
+        trajectories = self.ego_fut_decoder(waypoint)
+        trajectories = trajectories.permute(1, 0, 2).reshape(
+            batch, self.ego_fut_mode, self.fut_ts, 2)
+        return dict(
+            scene_query=latent,
+            evidence=evidence,
+            ego_fut_preds=trajectories)
+
+    @force_fp32(apply_to=('preds_dicts',))
+    def loss(self, preds_dicts, ego_fut_gt, ego_fut_masks, ego_fut_cmd):
+        prediction = preds_dicts['ego_fut_preds']
+        gt = ego_fut_gt.squeeze(1)
+        mask = ego_fut_masks.squeeze(1).squeeze(1)
+        command = ego_fut_cmd.squeeze(1).squeeze(1)
+        gt = gt.unsqueeze(1).repeat(1, self.ego_fut_mode, 1, 1)
+        weight = command[..., None, None] * mask[:, None, :, None]
+        weight = weight.repeat(1, 1, 1, 2)
+        return dict(loss_plan_reg=self.loss_plan_reg(prediction, gt, weight))
+
+
+@DETECTORS.register_module()
+class PrivilegedReadoutPlanner(BaseDetector):
+    """Stage-1 RPED: plan from a joint privileged det+map memory.
+
+    Unlike :class:`CachedTeacherAdapterPlanner`, the two teachers are one KV
+    memory.  Fusion happens only when command-conditioned queries read that
+    memory.  The dense grids themselves are never a planning loss target.
+    """
+
+    def __init__(self, feature_root, teachers, readout, planner,
+                 memory=None, train_cfg=None, test_cfg=None,
+                 pretrained=None, init_cfg=None):
+        super().__init__(init_cfg=init_cfg)
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+        if pretrained is not None:
+            raise ValueError(
+                'PrivilegedReadoutPlanner does not use pretrained=; '
+                'load its stage-1 checkpoint through the runner')
+        teacher_cfgs = OrderedDict(teachers) if not isinstance(
+            teachers, OrderedDict) else teachers
+        # ConfigDict is insertion-ordered; keep that teacher sequence as the
+        # memory concatenation order so stage 2 can reload the projector.
+        self.teacher_names = list(teacher_cfgs)
+        if not self.teacher_names:
+            raise ValueError('PrivilegedReadoutPlanner needs teachers')
+        readout_cfg = copy.deepcopy(dict(readout))
+        memory_cfg = copy.deepcopy(dict(memory or {}))
+        channels = int(memory_cfg.pop('channels', readout_cfg.get(
+            'embed_dims', 256)))
+        if memory_cfg:
+            raise TypeError(f'unused memory options: {memory_cfg}')
+        self.memory = TeacherMemoryProjector(
+            self.teacher_names, channels=channels)
+        self.readout = PrivilegedEvidenceReadout(**readout_cfg)
+        planner_cfg = copy.deepcopy(dict(planner))
+        planner_cfg.setdefault('num_scenes', self.readout.num_queries)
+        planner_cfg.setdefault('embed_dims', self.readout.embed_dims)
+        if planner_cfg['num_scenes'] != self.readout.num_queries:
+            raise ValueError(
+                'planner.num_scenes must equal readout.num_queries '
+                f'({self.readout.num_queries})')
+        self.planner = PrivilegedWaypointDecoder(**planner_cfg)
+        self.stores = {}
+        for name, cfg in teacher_cfgs.items():
+            cfg = copy.deepcopy(dict(cfg))
+            store_kwargs = {}
+            for src, dst in _STORE_CFG_KEYS.items():
+                if src in cfg:
+                    store_kwargs[dst] = cfg.pop(src)
+            self.stores[name] = TeacherFeatureStore(
+                feature_root, cfg.pop('cache_name', name), **store_kwargs)
+            if cfg:
+                raise TypeError(f'unused teacher options for {name}: {cfg}')
+        self.planning_metric = None
+        self.fp16_enabled = False
+
+    def init_weights(self, pretrained=None):
+        self.memory.reset_parameters()
+        self.readout.reset_parameters()
+        self.planner.init_weights()
+
+    def extract_feat(self, imgs):
+        raise RuntimeError('RPED stage-1 training consumes cached BEVs')
+
+    @staticmethod
+    def _current_targets(ego_fut_trajs, ego_fut_masks, ego_fut_cmd):
+        if ego_fut_trajs.dim() >= 5:
+            ego_fut_trajs = ego_fut_trajs[:, -1]
+        if ego_fut_masks.dim() >= 5:
+            ego_fut_masks = ego_fut_masks[:, -1]
+        if ego_fut_cmd.dim() >= 5:
+            ego_fut_cmd = ego_fut_cmd[:, -1]
+        return ego_fut_trajs, ego_fut_masks, ego_fut_cmd
+
+    def _load_memory(self, tokens, device, dtype):
+        features, valids = {}, {}
+        for name, store in self.stores.items():
+            feature, valid = store.load_batch(tokens, device, dtype)
+            features[name] = feature
+            valids[name] = valid
+        memory, padding = self.memory(features, valids)
+        return memory, padding, valids
+
+    def forward_train(self,
+                      img_metas,
+                      img=None,
+                      ego_fut_trajs=None,
+                      ego_fut_masks=None,
+                      ego_fut_cmd=None,
+                      **kwargs):
+        ego_fut_trajs, ego_fut_masks, ego_fut_cmd = self._current_targets(
+            ego_fut_trajs, ego_fut_masks, ego_fut_cmd)
+        tokens = current_sample_tokens(img_metas)
+        parameter = next(self.parameters())
+        memory, padding, valids = self._load_memory(
+            tokens, parameter.device, parameter.dtype)
+        evidence, attn = self.readout(
+            memory, ego_fut_cmd, key_padding_mask=padding)
+        outs = self.planner(evidence)
+        losses = self.planner.loss(
+            outs, ego_fut_trajs, ego_fut_masks, ego_fut_cmd)
+        with torch.no_grad():
+            losses['rped_evidence_std'] = evidence.float().std()
+            losses['rped_attn_entropy'] = (
+                -(attn.clamp_min(1e-8).log() * attn).sum(-1).mean())
+            for name, valid in valids.items():
+                losses[f'cache_valid/{name}'] = valid.float().mean()
+        return losses
+
+    def forward(self, return_loss=True, **kwargs):
+        if return_loss:
+            return self.forward_train(**kwargs)
+        return self.forward_test(**kwargs)
+
+    def forward_test(self,
+                     img_metas,
+                     img=None,
+                     ego_fut_trajs=None,
+                     ego_fut_cmd=None,
+                     **kwargs):
+        if not isinstance(img_metas, list):
+            raise TypeError(f'img_metas must be a list, got {type(img_metas)}')
+        metas = img_metas[0]
+        trajs = ego_fut_trajs[0] if isinstance(ego_fut_trajs, list) \
+            else ego_fut_trajs
+        command = ego_fut_cmd[0] if isinstance(ego_fut_cmd, list) \
+            else ego_fut_cmd
+        return self.simple_test(
+            img_metas=metas, ego_fut_trajs=trajs, ego_fut_cmd=command,
+            **kwargs)
+
+    def simple_test(self,
+                    img_metas,
+                    ego_fut_trajs,
+                    ego_fut_cmd,
+                    gt_bboxes_3d=None,
+                    gt_labels_3d=None,
+                    map_gt_bboxes_3d=None,
+                    map_gt_labels_3d=None,
+                    gt_attr_labels=None,
+                    fut_valid_flag=None,
+                    **kwargs):
+        tokens = current_sample_tokens(img_metas)
+        parameter = next(self.parameters())
+        memory, padding, _ = self._load_memory(
+            tokens, parameter.device, parameter.dtype)
+        evidence, _ = self.readout(
+            memory, ego_fut_cmd, key_padding_mask=padding)
+        prediction = self.planner(evidence)['ego_fut_preds']
+        if prediction.size(0) != 1:
+            raise AssertionError('evaluation supports batch_size=1')
+        result = dict(
+            ego_fut_preds=prediction[0].cpu(),
+            ego_fut_cmd=ego_fut_cmd.cpu(),
+            sample_token=tokens[0])
         metric = self._planning_metrics(
             result['ego_fut_preds'], ego_fut_trajs, ego_fut_cmd,
             gt_bboxes_3d, map_gt_bboxes_3d, map_gt_labels_3d,

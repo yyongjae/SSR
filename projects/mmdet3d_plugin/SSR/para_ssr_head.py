@@ -217,6 +217,7 @@ class ParaSSRHead(BaseModule):
         learned_latent_query = learned_latent_query.permute(1, 0, 2)
         latent_query, latent_pos = torch.split(
             learned_latent_query, self.embed_dims, dim=2)
+        pooled_query = latent_query
 
         latent_query = self.latent_decoder(
             query=latent_query,
@@ -243,6 +244,7 @@ class ParaSSRHead(BaseModule):
 
         return {
             'bev_embed': bev_embed,
+            'pooled_query': pooled_query,
             'scene_query': latent_query,
             'token_attn': selected,
             'ego_fut_preds': outputs_ego_trajs,

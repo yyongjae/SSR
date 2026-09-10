@@ -251,6 +251,7 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
                 ("use_map_head", cfg.use_map_head),
                 ("traj", (ts.time_horizon, ts.interval_length, ts.num_poses)),
                 ("metric_planner_token", cfg.use_metric_planner),
+                ("scene_token", cfg.needs_scene_token),
             ),
         )
 
@@ -280,8 +281,10 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             "trajectory_mask": torch.ones(num_poses, dtype=torch.float32),
             "command": torch.tensor(command),
         }
-        if cfg.use_metric_planner:
+        if cfg.needs_scene_token:
             # Privileged scene identity belongs only to targets, never features.
+            # The metric planner scores candidates with it; planning
+            # distillation addresses the frozen-teacher BEV cache with it.
             targets["scene_token"] = cur_frame.token
 
         if cfg.use_det_motion_head:

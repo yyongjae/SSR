@@ -44,8 +44,9 @@ source env.blackwell.sh
 `env.blackwell.sh` sets:
 
 - `SSR_PYTHON` -- **required**. `run.sh`'s `pick_python` only probes envs named
-  `ssr`, and the `ssr` env on this box belongs to a different project and has
-  no mmcv, so autodetection picks nothing.
+  `ssr`. The `ssr` env on this box is the **navsim** env for this same repo's
+  NavSim port (torch 2.8, `nuplan` + `navsim`, no mmcv), so autodetection finds
+  it, fails the `import mmcv, mmdet3d` probe, and picks nothing.
 - `DISTILL_CKPT_OUT_ROOT` -> `~/byounggun/checkpoints/planning_distill_checkpoints`
 - `DISTILL_FEATURE_ROOT` -> `~/datasets/teacher_cache`
 - `NUMBA_CPU_NAME=generic`, `WANDB_MODE=offline`

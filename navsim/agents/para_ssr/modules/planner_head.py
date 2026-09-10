@@ -195,6 +195,29 @@ class ParaSSRPlannerHead(nn.Module):
         )
         if only_bev:
             return bev_embed
+        return self.forward_from_bev(bev_embed, cmd, bev_pos=bev_pos)
+
+    def forward_from_bev(
+        self,
+        bev_embed: torch.Tensor,
+        cmd: Optional[torch.Tensor],
+        bev_pos: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Run the planning decoder on an existing BEV feature.
+
+        Split out of :meth:`forward` so stage-1 planning distillation can drive
+        the *unchanged* decoder from a cached teacher BEV instead of one built
+        from images. ``forward`` passes the ``bev_pos`` it already computed;
+        when called directly it is recomputed, which is deterministic for a
+        given batch size and grid.
+        """
+        bs = bev_embed.size(0)
+        dtype = bev_embed.dtype
+        if bev_pos is None:
+            bev_mask = torch.zeros(
+                (bs, self.bev_h, self.bev_w), device=bev_embed.device, dtype=dtype
+            )
+            bev_pos = self.positional_encoding(bev_mask).to(dtype)
 
         pos_embd = bev_pos.flatten(2).permute(0, 2, 1)
 

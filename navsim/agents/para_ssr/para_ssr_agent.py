@@ -146,6 +146,13 @@ class ParaSSRAgent(AbstractAgent):
         self.latest_logs: Dict[str, torch.Tensor] = {}
         self._metric_supervisor = None
 
+        # Stage-2 planning distillation.  A submodule so the frozen adapters
+        # follow the agent onto the training device; its parameters are excluded
+        # from the optimiser because ``get_optimizers`` walks para_ssr_model only.
+        from .distill.distillation import build_planning_distillation
+
+        self._distill = build_planning_distillation(config)
+
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
 
@@ -404,6 +411,22 @@ class ParaSSRAgent(AbstractAgent):
         loss, logs = self._loss(self.para_ssr_model, features, targets, predictions)
         if self._config.use_metric_planner and self._config.metric_loss_weight > 0:
             logs["metric/rollout_seconds"] = loss.new_tensor(elapsed)
+
+        if self._distill is not None:
+            if "scene_token" not in targets:
+                raise ValueError(
+                    "planning distillation needs targets['scene_token']; "
+                    "regenerate the target cache with use_distill=True"
+                )
+            distill_losses, distill_metrics = self._distill(
+                predictions["bev_embed"], targets["scene_token"]
+            )
+            weight = self._config.distill_loss_weight
+            for name, value in distill_losses.items():
+                loss = loss + weight * value
+                logs[name] = value.detach()
+            logs.update({k: v.detach() for k, v in distill_metrics.items()})
+
         self.latest_logs = logs
         return loss
 

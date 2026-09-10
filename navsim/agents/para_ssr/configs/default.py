@@ -227,6 +227,41 @@ class ParaSSRConfig:
     backbone_lr_mult: float = 0.1
     grad_clip_norm: float = 35.0
 
+    # ------------------------------------------------------------------ #
+    # planning distillation (docs/PLANNING_DISTILLATION.md, NAVSIM caches)
+    # ------------------------------------------------------------------ #
+    # Stage 2: frozen stage-1 adapters pull the student BEV towards a frozen
+    # teacher's cached BEV.  Off by default; nothing below is read when off.
+    use_distill: bool = False
+    # Root holding ``<teacher>/cache_{train,val}_100x100/samples/...``.
+    distill_feature_root: str = ""
+    # ``{branch: {cache_name, adapter: {...}, loss_weight}}``.  A single teacher
+    # is supported deliberately: the MapTRv2 cache does not exist yet, and
+    # requiring both would block the BEVFusion-only experiment that can run now.
+    distill_branches: Dict[str, Dict] = field(
+        default_factory=lambda: {
+            "bevfusion": {
+                "cache_name": "bevfusion",
+                "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
+                "loss_weight": 1.0,
+            }
+        }
+    )
+    # ``{branch: /path/to/stage1_adapter.ckpt}``
+    distill_adapter_checkpoints: Dict[str, str] = field(default_factory=dict)
+    # Grid the cache was written on; the student BEV is resampled to it.
+    distill_cache_size: Tuple[int, int] = (100, 100)
+    distill_loss_weight: float = 1.0
+
+    # Stage 1: train one adapter + the unchanged planning decoder from the
+    # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.
+    teacher_adapter_branch: str = "bevfusion"
+
+    @property
+    def needs_scene_token(self) -> bool:
+        """Targets must carry the frame token for any cache-addressed path."""
+        return bool(self.use_metric_planner or self.use_distill)
+
     @property
     def bev_grid_length(self) -> Tuple[float, float]:
         """(metres per cell longitudinal, metres per cell lateral)."""

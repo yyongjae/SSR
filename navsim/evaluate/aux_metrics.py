@@ -16,7 +16,7 @@ matching at 0.5/1.0/1.5 m, and precision-envelope area AP.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -30,7 +30,12 @@ from navsim.agents.para_ssr.para_ssr_targets import (
 
 # V2: BEV geometry moved onto NAVSIM TransFuser's -- pc_range +-32 m in both
 # axes and a front-only map extent -- so V1 numbers are not comparable.
-AUX_METRIC_PROTOCOL_VERSION = 2
+# V3: the shared front-only ROI (x_right [-32,32], y_forward [0,32]) with the
+# +-80 degree detection FOV, and per-task evaluation so a head ablation can be
+# scored on the head it kept.  V2 numbers came from the rear-inclusive
+# detection ROI and are not comparable.
+AUX_METRIC_PROTOCOL_VERSION = 3
+AUX_TASKS: Tuple[str, ...] = ("detection", "map")
 DEFAULT_DET_THRESHOLDS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_MAP_THRESHOLDS = (0.5, 1.0, 1.5)
 
@@ -529,13 +534,24 @@ def evaluate_auxiliary_records(
     det_thresholds: Sequence[float] = DEFAULT_DET_THRESHOLDS,
     map_thresholds: Sequence[float] = DEFAULT_MAP_THRESHOLDS,
     map_resample_points: int = 100,
+    tasks: Sequence[str] = AUX_TASKS,
 ) -> Dict[str, object]:
     """Aggregate exact token-keyed records into detection and map mAP.
 
     Records must be supplied in strictly increasing token order.  This makes
     tied confidence scores deterministic without retaining millions of token
     strings in memory and lets the full evaluation stream compressed shards.
+
+    ``tasks`` names the heads the model actually has.  A head ablation keeps
+    the record schema (the absent task's arrays are empty) but must not be
+    reported as scoring 0 on a task it never had, so the absent task is left
+    out of the result entirely.
     """
+
+    tasks = tuple(dict.fromkeys(str(task) for task in tasks))
+    unknown = [task for task in tasks if task not in AUX_TASKS]
+    if unknown or not tasks:
+        raise ValueError(f"tasks must be a non-empty subset of {AUX_TASKS}, got {tasks}")
 
     if (
         isinstance(map_resample_points, bool)
@@ -660,6 +676,8 @@ def evaluate_auxiliary_records(
         )
         resampled_gt = _resample_polylines(map_gt_points, map_resample_points)
         max_map_threshold = float(max(map_thresholds))
+        if "map" not in tasks:
+            continue
         map_accumulator.update(
             map_pred_scores,
             map_pred_labels,
@@ -673,10 +691,12 @@ def evaluate_auxiliary_records(
 
     if num_tokens == 0:
         raise ValueError("cannot evaluate an empty record set")
-    return {
+    result: Dict[str, object] = {
         "protocol_version": AUX_METRIC_PROTOCOL_VERSION,
         "num_tokens": num_tokens,
-        "detection": {
+        "tasks": list(tasks),
+    }
+    detection_metrics = {
             "name": "NAVSIMAuxDet/center_mAP",
             "official_navsim_metric": False,
             "decode": "sigmoid_flattened_query_class_top100",
@@ -684,8 +704,8 @@ def evaluate_auxiliary_records(
             "ap": "nuscenes_101_min_recall_0.1_min_precision_0.1",
             "thresholds_m": [float(value) for value in det_thresholds],
             **det_accumulator.compute(),
-        },
-        "map": {
+    }
+    map_metrics = {
             "name": "NAVSIMAuxMap/chamfer_mAP",
             "official_navsim_metric": False,
             "decode": "sigmoid_flattened_query_class_top100",
@@ -695,5 +715,9 @@ def evaluate_auxiliary_records(
             "resample_points": int(map_resample_points),
             "scenes_over_training_gt_cap_100": scenes_over_map_training_cap,
             **map_accumulator.compute(),
-        },
     }
+    if "detection" in tasks:
+        result["detection"] = detection_metrics
+    if "map" in tasks:
+        result["map"] = map_metrics
+    return result

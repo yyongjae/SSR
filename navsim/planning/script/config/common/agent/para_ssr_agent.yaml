@@ -8,7 +8,9 @@ config:
   # --- shared BEV encoder -------------------------------------------------
   # SSR axes: x is right, y is forward.  All heads share this front-only ROI:
   # x in [-32, 32] m, y in [0, 32] m.  The dataclass owns both range values.
-  bev_h: 100
+  # 50 rows over 32 m forward x 100 columns over 64 m lateral: square 0.64 m
+  # cells, the BEVFusion teacher's 50 x 100 grid (teacher_cache/*_50x100).
+  bev_h: 50
   bev_w: 100
   embed_dims: 256
   encoder_num_layers: 3
@@ -26,6 +28,32 @@ config:
   # 1920x1080 * 0.4 -> 768x432, then drop 16 rows of sky -> 768x416
   image_scale: 0.4
   crop_top: 16
+
+  # --- LiDAR (SafeDrive wiring) -------------------------------------------
+  # The merged point cloud at each history frame is clipped to the front ROI
+  # and encoded to a [256, 50, 100] BEV that seeds the BEV queries and is
+  # read by a gated deformable cross-attention in every encoder layer.
+  # lidar_encoder: "sparse" = SafeDrive's SpMiddleResNetFHD (needs spconv:
+  # pip install spconv-cu126); "pillar" = spconv-free fallback.
+  # sparse voxels must be cell / 8 = 0.08 m; pillars must divide the 0.64 m
+  # cell by one power of two on both axes.
+  use_lidar: true
+  lidar_encoder: sparse
+  lidar_max_points: 65536
+  lidar_z_range: [-3.0, 5.0]
+  lidar_voxel_size: [0.08, 0.08, 0.2]
+  lidar_pillar_size: [0.16, 0.16]
+  lidar_pillar_channels: 64
+  lidar_backbone_channels: [64, 128, 256]
+  lidar_backbone_layers: [3, 5, 5]
+  lidar_neck_channels: 128
+  lidar_attn_points: 8
+
+  # --- planner ------------------------------------------------------------
+  # true: SSR scene-token planner.  false: PARA-Drive planner (plan query +
+  # command embedding -> cross-attention over the full BEV -> MLP).
+  use_stl: true
+  plan_num_layers: 3
 
   # --- heads --------------------------------------------------------------
   use_det_motion_head: true
@@ -48,7 +76,9 @@ config:
   # Same target as the nuScenes 60-epoch arm (PARA_SSR_e2e_60ep.py:114).
   # Measured unscaled on real navsim batches: plan 0.25% / det 73.5% /
   # map 26.2% -- the planner barely steers the shared feature without this.
-  # Set to null to train the unscaled reference arm instead.
+  # Set to null to train the unscaled reference arm instead.  Head ablations
+  # (use_*_head: false) drop the absent valve automatically; the ablation
+  # wrappers override this to plan : remaining task = 1 : 1.
   grad_balance_target:
     plan: 0.4
     det: 0.3

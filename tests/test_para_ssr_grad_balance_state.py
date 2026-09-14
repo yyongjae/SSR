@@ -131,3 +131,19 @@ def test_invalid_balancer_schedule_fails_fast(kwargs):
 def test_unsupported_valve_target_fails_fast(key):
     with pytest.raises(ValueError, match="unsupported"):
         ParaSSRLoss(_loss_config({"plan": 1.0, key: 1.0}))
+
+
+@pytest.mark.parametrize(
+    "disabled, remaining",
+    [({"use_map_head": False}, {"plan", "det"}), ({"use_det_motion_head": False}, {"plan", "map"})],
+)
+def test_head_ablations_drop_the_missing_valve_from_the_balancer(disabled, remaining):
+    from navsim.agents.para_ssr.para_ssr_loss import ParaSSRLoss
+
+    config = _loss_config(target={"plan": 0.4, "det": 0.3, "map": 0.3}, **disabled)
+    loss_fn = ParaSSRLoss(config)
+    assert set(loss_fn.balancer.target) == remaining
+    # ratios against plan are what the balancer solves with; they are unchanged
+    other = (remaining - {"plan"}).pop()
+    assert loss_fn.balancer.target[other] / loss_fn.balancer.target["plan"] == pytest.approx(0.75)
+    assert set(loss_fn.balancer.log_dict()) == {f"gscale/{other}"}

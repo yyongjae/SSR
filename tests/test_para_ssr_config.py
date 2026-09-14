@@ -30,6 +30,17 @@ def _config(**overrides):
         "map_dir_interval": 1,
         "map_num_pts_per_vec": 20,
         "fut_ts": 8,
+        "bev_h": 50,
+        "bev_w": 100,
+        "use_lidar": True,
+        "lidar_encoder": "sparse",
+        "lidar_z_range": (-3.0, 5.0),
+        "lidar_max_points": 65536,
+        "lidar_voxel_size": (0.08, 0.08, 0.2),
+        "lidar_pillar_size": (0.16, 0.16),
+        "lidar_backbone_channels": (64, 128, 256),
+        "lidar_backbone_layers": (3, 5, 5),
+        "lidar_attn_points": 8,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -72,11 +83,42 @@ def test_default_config_contract_is_valid():
         ({"map_dir_interval": 0}, "map_dir_interval"),
         ({"map_dir_interval": 20}, "map_dir_interval"),
         ({"fut_ts": 6}, "disagree"),
+        ({"lidar_z_range": (5.0, -3.0)}, "lidar_z_range"),
+        ({"lidar_max_points": 0}, "lidar_max_points"),
+        ({"lidar_max_points": True}, "lidar_max_points"),
+        ({"lidar_encoder": "voxelnet"}, "lidar_encoder must be one of"),
+        ({"lidar_voxel_size": (0.16, 0.08, 0.2)}, "x_right needs 800 voxels"),
+        ({"lidar_voxel_size": (0.08, 0.08, 4.0)}, "collapse to nothing"),
+        ({"bev_h": 100, "lidar_voxel_size": (0.08, 0.08, 0.2)}, "y_forward needs 800 voxels"),
+        ({"lidar_encoder": "pillar", "lidar_pillar_size": (0.16, 0.32)}, "same factor"),
+        ({"lidar_encoder": "pillar", "lidar_pillar_size": (0.2, 0.2)}, "integer multiple"),
+        ({"lidar_encoder": "pillar", "bev_h": 100, "lidar_pillar_size": (0.16, 0.16)}, "same factor"),
+        ({"lidar_encoder": "pillar", "lidar_backbone_layers": (3, 5)}, "per backbone stage"),
+        ({"lidar_attn_points": 0}, "lidar_attn_points"),
     ],
 )
 def test_invalid_config_contract_fails_fast(override, message):
     with pytest.raises(ValueError, match=message):
         ParaSSRAgent._validate_config(_config(**override), _sampling())
+
+
+def test_lidar_settings_are_ignored_for_the_camera_only_arm():
+    ParaSSRAgent._validate_config(
+        _config(use_lidar=False, lidar_encoder="voxelnet", lidar_voxel_size=(1.0, 1.0, 1.0),
+                lidar_pillar_size=(0.2, 0.2), lidar_max_points=0),
+        _sampling(),
+    )
+
+
+def test_each_lidar_encoder_only_checks_its_own_grid():
+    # Sparse voxels are irrelevant to the pillar encoder and vice versa.
+    ParaSSRAgent._validate_config(
+        _config(lidar_encoder="pillar", lidar_voxel_size=(1.0, 1.0, 1.0)), _sampling()
+    )
+    ParaSSRAgent._validate_config(
+        _config(lidar_encoder="sparse", lidar_pillar_size=(0.2, 0.2), lidar_backbone_layers=(1,)),
+        _sampling(),
+    )
 
 
 def test_non_navsim_sampling_interval_fails_fast():

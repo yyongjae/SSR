@@ -11,7 +11,11 @@ Mirrors ``projects/mmdet3d_plugin/SSR/para_ssr.py``:
   feature (PARA-Drive Fig. 5);
 * every auxiliary head sees ``bev_embed`` through ``_ScaleGrad``, so its own
   parameters train at full strength while its influence on the shared feature
-  is throttled independently.
+  is throttled independently;
+* with ``use_lidar`` (SafeDrive) each frame's point cloud is encoded into a
+  LiDAR BEV first, which seeds the BEV queries and feeds the per-layer LiDAR
+  cross-attention -- for history frames as well, so ``prev_bev`` is the same
+  kind of feature as the current BEV it is aligned with.
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import torch.nn.functional as F
 
 from .modules.bevformer import BEVFormerEncoder, SSRPerceptionTransformer
 from .modules.det_motion_head import ParaDetMotionHead
+from .modules.lidar_encoder import build_lidar_encoder
 from .modules.map_head import ParaMapHead
 from .modules.planner_head import ParaSSRPlannerHead
 
@@ -141,6 +146,8 @@ class ParaSSRModel(nn.Module):
             feedforward_channels=cfg.ffn_channels,
             ffn_dropout=cfg.encoder_ffn_dropout,
             attn_dropout=cfg.encoder_attn_dropout,
+            use_lidar=cfg.use_lidar,
+            num_points_lidar=cfg.lidar_attn_points,
         )
         transformer = SSRPerceptionTransformer(
             embed_dims=cfg.embed_dims,
@@ -169,16 +176,11 @@ class ParaSSRModel(nn.Module):
             way_num_layers=cfg.way_num_layers,
             num_heads=cfg.num_heads,
             feedforward_channels=cfg.ffn_channels,
-            use_metric_planner=cfg.use_metric_planner,
-            num_plan_candidates=cfg.num_plan_candidates,
-            plan_anchor_path=cfg.plan_anchor_path,
+            use_lidar=cfg.use_lidar,
+            use_stl=cfg.use_stl,
+            plan_num_layers=cfg.plan_num_layers,
         )
-
-        if cfg.use_metric_planner:
-            from .modules.candidate_planner import CandidateMetricHead
-            self.metric_head = CandidateMetricHead(
-                cfg.embed_dims, cfg.num_heads, cfg.fut_ts, cfg.metric_detach_bev
-            )
+        self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
 
         self.det_motion_head = (
             ParaDetMotionHead(
@@ -278,6 +280,19 @@ class ParaSSRModel(nn.Module):
         _, C, h, w = feat.shape
         return [feat.view(B, N, C, h, w)]
 
+    def lidar_bev(self, features: Dict[str, torch.Tensor], t: int) -> Optional[torch.Tensor]:
+        """LiDAR BEV ``[B, C, bev_h, bev_w]`` for queue step ``t``, or ``None``."""
+        if self.lidar_encoder is None:
+            return None
+        if "lidar_points" not in features or "lidar_num_points" not in features:
+            raise ValueError(
+                "a use_lidar model needs lidar_points/lidar_num_points features; "
+                "rebuild the feature cache with use_lidar enabled"
+            )
+        return self.lidar_encoder(
+            features["lidar_points"][:, t], features["lidar_num_points"][:, t]
+        )
+
     @torch.no_grad()
     def obtain_history_bev(self, features: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         """Run the encoder over the history frames without building a graph."""
@@ -288,6 +303,15 @@ class ParaSSRModel(nn.Module):
 
         was_training = self.training
         self.eval()
+        if was_training and self.lidar_encoder is not None:
+            # ``eval()`` exists for the frozen-BN image backbone and the
+            # attention dropout.  The LiDAR encoder trains from scratch with
+            # its own BatchNorm (momentum 0.01, as in SafeDrive): on running
+            # statistics it would produce a history BEV of a different scale
+            # from the batch-normalised current BEV it is aligned with, until
+            # the running estimates catch up.  SafeDrive processes every frame
+            # in the same mode; keep the LiDAR branch in train mode here too.
+            self.lidar_encoder.train()
         prev_bev = None
         for t in range(T - 1):
             feats = self.extract_img_feat(cams[:, t])
@@ -299,6 +323,7 @@ class ParaSSRModel(nn.Module):
                 bev_shift=features["bev_shift"][:, t],
                 prev_bev=prev_bev,
                 only_bev=True,
+                lidar_bev=self.lidar_bev(features, t),
             )
         if was_training:
             self.train()
@@ -324,44 +349,20 @@ class ParaSSRModel(nn.Module):
             bev_shift=features["bev_shift"][:, -1],
             prev_bev=prev_bev,
             cmd=features["command"],
+            lidar_bev=self.lidar_bev(features, -1),
         )
 
         bev_embed = outs["bev_embed"]
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
-            "token_attn": outs["token_attn"],
+            "ego_fut_preds": outs["ego_fut_preds"],
+            "trajectory": self.pts_bbox_head.select_trajectory(
+                outs["ego_fut_preds"], features["command"]
+            ),
         }
-        if cfg.use_metric_planner:
-            from .modules.candidate_planner import (
-                commanded_candidates, offsets_to_poses, rank_candidates,
-            )
-            candidates = offsets_to_poses(commanded_candidates(
-                outs["candidate_offsets"], features["command"]
-            ))
-            metric_logits = self.metric_head(
-                bev_embed, outs["bev_pos"], candidates, features["status_feature"]
-            )
-            trajectory, selected, ranks = rank_candidates(
-                candidates, outs["candidate_logits"], metric_logits,
-                cfg.candidate_score_weight, cfg.metric_score_weight,
-            )
-            predictions.update({
-                "candidate_offsets": outs["candidate_offsets"],
-                "candidate_logits": outs["candidate_logits"],
-                "plan_anchors": outs["plan_anchors"],
-                "trajectory_candidates": candidates,
-                "metric_logits": metric_logits,
-                "candidate_rank_scores": ranks,
-                "selected_candidate": selected,
-                "trajectory": trajectory,
-            })
-        else:
-            predictions.update({
-                "ego_fut_preds": outs["ego_fut_preds"],
-                "trajectory": self.pts_bbox_head.select_trajectory(
-                    outs["ego_fut_preds"], features["command"]
-                ),
-            })
+        # the PARA-Drive planner (use_stl=False) has no scene tokens
+        if outs["token_attn"] is not None:
+            predictions["token_attn"] = outs["token_attn"]
 
         if run_aux and self.det_motion_head is not None:
             s = self.aux_grad_scale.get("det", 1.0)

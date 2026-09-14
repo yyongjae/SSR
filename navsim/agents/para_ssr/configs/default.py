@@ -59,22 +59,17 @@ class ParaSSRConfig:
     # the BEV encoder, detector/motion head and vector-map head:
     # x_right in [-32, 32] m and y_forward in [0, 32] m.
     #
-    # The RESOLUTION is not TransFuser's, because TransFuser has no single BEV
-    # to copy.  It carries two: the LiDAR C5 at 8x8, which is what its 31
-    # trajectory/agent queries cross-attend to, and an FPN map at 64x64, which
-    # only the dense semantic head reads.  Here one `bev_embed` serves the
-    # planner, the detection head and the map head at once, so it has to satisfy
-    # the most demanding of them -- the vector map head, scored by chamfer
-    # distance at 0.5 / 1.0 / 1.5 m.  A one-metre cell would leave the feature
-    # coarser than the strictest threshold it is graded on.
-    #
-    # Keep 100 x 100 for the first controlled experiment: it preserves the
-    # original 10,000-query architecture while changing only the physical ROI.
-    # This makes cells 0.64 m lateral x 0.32 m longitudinal; see the report for
-    # the square-cell 50 x 100 ablation that should follow.
+    # The grid is 50 rows over the 32 m of y_forward by 100 columns over the
+    # 64 m of x_right: square 0.64 m cells, 5,000 queries.  This is the
+    # BEVFusion teacher's grid (bevfusion/configs/navsim/default.yaml: voxel
+    # 0.08 m, sparse_shape [400, 800, 41], out_size_factor 8 -> 50 x 100), so
+    # the teacher's cached ``bev_feature`` maps onto ``bev_embed`` cell for
+    # cell with a lateral flip and no resampling (teacher_cache/*_50x100).  The
+    # earlier 100 x 100 variant had 0.32 x 0.64 m cells and needed the
+    # longitudinal axis resampled against that teacher.
     pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
-    bev_h: int = 100
-    bev_w: int = 100
+    bev_h: int = 50     # y_forward: 32 m / 50 = 0.64 m per row
+    bev_w: int = 100    # x_right:  64 m / 100 = 0.64 m per column
 
     # Deliberately identical to pc_range.  A different map range would make the
     # map decoder's normalized reference points address the wrong physical BEV
@@ -112,8 +107,54 @@ class ParaSSRConfig:
     use_grid_mask: bool = True
 
     # ------------------------------------------------------------------ #
+    # LiDAR branch (SafeDrive wiring, see modules/lidar_encoder.py)
+    # ------------------------------------------------------------------ #
+    # The merged NAVSIM point cloud at every frame in ``frame_indices`` is
+    # clipped to the front ROI, converted to SSR axes and encoded into a
+    # ``[embed_dims, bev_h, bev_w]`` BEV.  That BEV replaces the learned BEV
+    # query embedding and is the value of a deformable ``lidar_cross_attn``
+    # in every encoder layer, gated against the camera cross-attention.
+    # History frames need it too, or ``prev_bev`` would be a different kind of
+    # feature from the current BEV it is aligned with.
+    use_lidar: bool = True
+    # Padded rows per frame.  Measured on trainval: ~50k points fall inside the
+    # 32 x 64 m front ROI of a ~91k-point frame (max 53k over the sample);
+    # longer clouds are thinned deterministically, never dropped at random.
+    lidar_max_points: int = 65536
+    # Metres, ego frame (rear axle ~0.3-0.5 m above ground).  99% of in-ROI
+    # points lie below 5.1 m and none below -3 m; same bounds as the teacher.
+    # Independent of pc_range's z, which only places the camera pillars.
+    lidar_z_range: Tuple[float, float] = (-3.0, 5.0)
+    # "sparse": SafeDrive's SpMiddleResNetFHD on spconv (pip install
+    # spconv-cu126 on this rig).  "pillar": spconv-free PointPillars-style
+    # fallback.  Both return [embed_dims, bev_h, bev_w].
+    lidar_encoder: str = "sparse"
+    # sparse: (x_right, y_forward, z) metres.  The backbone's stride is 8, so
+    # x/y voxels must be cell / 8 = 0.08 m -> a 400 x 800 x 40 grid (41 deep
+    # with SafeDrive's +1), which the four stride-2 stages take to 50 x 100 x 2
+    # -> 128 * 2 = 256 channels = embed_dims, no projection.  This is also the
+    # BEVFusion teacher's voxel size.
+    lidar_voxel_size: Tuple[float, float, float] = (0.08, 0.08, 0.2)
+    # pillar: (longitudinal, lateral) metres.  Must divide the BEV cell by one
+    # power of two on both axes; 0.64 / 0.16 = 4 -> a 200 x 400 pillar canvas
+    # that the 2D backbone reduces back to 50 x 100.
+    lidar_pillar_size: Tuple[float, float] = (0.16, 0.16)
+    lidar_pillar_channels: int = 64
+    lidar_backbone_channels: Tuple[int, ...] = (64, 128, 256)
+    lidar_backbone_layers: Tuple[int, ...] = (3, 5, 5)
+    lidar_neck_channels: int = 128
+    # Sampling points of the per-layer LiDAR deformable cross-attention.
+    lidar_attn_points: int = 8
+
+    # ------------------------------------------------------------------ #
     # planning head
     # ------------------------------------------------------------------ #
+    # True: SSR's scene-token planner (navi SE -> TokenLearner -> latent
+    # decoder -> waypoint decoder).  False: PARA-Drive's planner, a
+    # command-conditioned plan query cross-attending to the full BEV
+    # (plan_num_layers deep); num_scenes / latent / way layers are then unused.
+    use_stl: bool = True
+    plan_num_layers: int = 3
     num_scenes: int = 16
     num_reg_fcs: int = 2
     latent_num_layers: int = 3
@@ -125,21 +166,6 @@ class ParaSSRConfig:
     # navsim scores (x, y, heading); nuScenes SSR regressed (x, y) only
     traj_dims: int = 3
     heading_weight: float = 0.5
-
-    # Optional NAVSIM metric-supervised candidate planner. Enabled separately by
-    # agent=para_ssr_metric_agent, so the single-trajectory baseline is retained.
-    use_metric_planner: bool = False
-    num_plan_candidates: int = 16   # per command, independent of ego_fut_mode
-    plan_anchor_path: str = ""      # train-only npz; anchors persist in checkpoint
-    candidate_cls_loss_weight: float = 1.0
-    metric_loss_weight: float = 1.0
-    # NC, DAC, DDC, EP, TTC, comfort, aggregate score (NAVSIM v1 PDM)
-    metric_loss_weights: Tuple[float, ...] = (3.0, 3.0, 1.0, 2.0, 4.0, 1.0, 1.0)
-    candidate_score_weight: float = 0.1  # log imitation probability at selection
-    metric_score_weight: float = 1.0     # log predicted aggregate PDM score
-    metric_detach_bev: bool = False
-    metric_cache_path: str = ""     # world cache for BOTH training/validation
-    metric_cache_size: int = 8      # max decompressed scenes per training process
 
     # ------------------------------------------------------------------ #
     # auxiliary head 1: detection + motion

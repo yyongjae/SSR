@@ -24,6 +24,17 @@ export NAVSIM_DEVKIT_ROOT="${REPO}"
 export NAVSIM_EXP_ROOT="${REPO}/work_dirs"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
+# Every dataloader worker must stay single-threaded: the worker IS the unit of
+# parallelism, so each library's own thread pool only oversubscribes the host.
+# Left unset, OpenCV/OpenMP spawn one thread per core inside every worker --
+# measured at 2,685 threads on 32 cores, 491k context switches/s, and a step
+# 18x slower than its compute cost.  run_training.py pins cv2/torch per worker;
+# these cover the OpenMP runtimes behind numpy and shapely.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+
 EXPERIMENT="${EXPERIMENT:-para_ssr_front3}"
 BATCH_SIZE="${BATCH_SIZE:-4}"        # per GPU
 ACCUMULATE="${ACCUMULATE:-16}"       # -> global 128 on 2 GPUs

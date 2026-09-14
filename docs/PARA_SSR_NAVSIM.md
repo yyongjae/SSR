@@ -68,25 +68,41 @@ batch, backward pass, optimizer step and validation batch in fp32.
 
 ## 4. Training and evaluation
 
-An optional candidate planner with NAVSIM PDM supervision is available as
-`agent=para_ssr_metric_agent`. See [the metric planner guide](../report/11_para_ssr_metric_planner.md)
-for train-only anchors, world-cache preparation, smoke checks and ablation flags.
-
 New runs use the three front cameras `cam_f0`, `cam_l0`, `cam_r0`, matching
-WoTE's camera set. BEVFormer receives separate calibrated views at 768 x 416
-for history frames `[2, 3]`; the batch shape is `[B, 2, 3, 3, 416, 768]`.
-The other five cameras and LiDAR are disabled at sensor loading. WoTE's
-single-frame panorama preprocessing and LiDAR fusion are not used here.
+WoTE's camera set, plus the merged LiDAR point cloud at the same history
+frames `[2, 3]`. BEVFormer receives separate calibrated views at 768 x 416;
+the camera batch shape is `[B, 2, 3, 3, 416, 768]`. Each frame's point cloud
+is clipped to the front ROI and `lidar_z_range`, rotated into SSR axes and
+zero-padded to `lidar_max_points` rows: `lidar_points` is
+`[B, 2, 65536, 5]` (x_right, y_forward, z, intensity, ring) with the real row
+count in `lidar_num_points` `[B, 2]`. The other five cameras are disabled at
+sensor loading. `use_lidar: false` restores the camera-only arm, whose
+feature cache is kept apart by name.
+
+The LiDAR wiring follows SafeDrive (see
+[report 12](../report/12_lidar_bev_encoder_50x100.md)): SafeDrive's
+`SpMiddleResNetFHD` (sparse 3D SECOND on spconv 2.x, 0.08 m voxels, stride 8)
+turns the cloud into a `[256, 50, 100]` BEV that replaces the learned BEV
+query table and is read by a gated deformable `lidar_cross_attn` in every
+encoder layer, for history frames as well as the current one. It needs
+`spconv`: the prebuilt `spconv-cu126==2.3.8` wheel (in
+`requirements_navsim.txt`) runs on torch 2.8+cu128 and the RTX 5090 (sm_120)
+without a source build. `lidar_encoder: pillar` selects an spconv-free
+PointPillars-style encoder with the same output contract.
 
 The shared BEV, detection/motion head and vector-map head all use one front ROI:
-`x_right` from -32 to 32 m and `y_forward` from 0 to 32 m. Detection/motion GT
+`x_right` from -32 to 32 m and `y_forward` from 0 to 32 m, on a `50 x 100`
+grid of square 0.64 m cells (`bev_h` rows over `y_forward`, `bev_w` columns
+over `x_right`). This is the BEVFusion teacher's 50 x 100 grid, so its cached
+BEV maps onto `bev_embed` cell for cell after a lateral flip. Detection/motion GT
 also uses a box-centre bearing filter of +/-80 degrees about the forward axis;
 training targets and auxiliary mAP targets call the same predicate. Map GT uses
 the common rectangular ROI without an angular mask.
 
-Start a new front-camera training run: the camera embedding now has 3 rows and
-the task ROI/GT population changed, so an old checkpoint cannot be loaded as an
-equivalent experiment under these defaults. Evaluating a legacy checkpoint with
+Start a new training run: the camera embedding has 3 rows, the BEV grid is
+50 x 100, the encoder carries a LiDAR branch and the task ROI/GT population
+changed, so an old checkpoint cannot be loaded as an equivalent experiment
+under these defaults. Evaluating a legacy checkpoint with
 a mismatched/rear ROI requires its original code revision as well as its archived
 config; the current agent deliberately rejects that spatial protocol. Feature
 and target cache identities include the relevant camera/ROI/FOV settings.
@@ -104,16 +120,21 @@ CUDA_VISIBLE_DEVICES="$EVAL_GPU" \
 resume, including optimizer, scheduler, epoch and GradBalancer state.  The
 agent's `checkpoint_path` is a weights-only load intended for evaluation.
 The default training experiment is `para_ssr_front3`, and the default PDM
-output is `eval/para_ssr_front3`. Override the experiment name for each run.
+output is `eval/para_ssr_front3`. Give every PDM evaluation its own
+`EVAL_EXPERIMENT=eval/<name>` (the wrapper sets `experiment_name` itself, so
+passing `experiment_name=` again is rejected by Hydra as a duplicate override).
+Build the navtest metric cache first with
+`bash scripts/evaluation/cache_metric_navtest.sh` if `data/exp/metric_cache` is
+empty.  NAVSIM v2 EPDMS for these checkpoints is described in
+`report/README.md` §4.3.
 
 ## 5. Auxiliary detection / vector-map mAP
 
-Current limitation: the auxiliary runner still fixes the legacy full detection
-ROI and V2 GT-count reference. It rejects the new front-only baseline/metric
-checkpoints until a separately validated ROI/FOV protocol migration is made.
-The instructions below describe the legacy protocol; reproduce old checkpoints
-with their original code revision and config. Official PDM evaluation above is
-not affected by this auxiliary-runner limitation.
+The auxiliary runner uses metric protocol V3: GT is restricted to the shared
+front ROI (`x_right` -32..32 m, `y_forward` 0..32 m), detection GT additionally
+passes the training-time +/-80 degree box-centre FOV filter, and only the tasks
+whose heads exist in the checkpoint are scored.  V2 numbers (rear-inclusive ROI)
+are not comparable; reproduce them with their original code revision and config.
 
 NAVSIM's official benchmark scores the predicted ego trajectory, not the
 detector or vector-map heads.  PARA-SSR's two perception heads can nevertheless
@@ -129,7 +150,12 @@ scripts/evaluation/eval_para_ssr_aux.sh /absolute/path/to/model.ckpt
 ```
 
 The checkpoint must be paired with the Hydra config archived by the same
-training run.  The evaluator processes all 12,146 `navtest` tokens, using one
+training run.  Its `use_det_motion_head`/`use_map_head` flags select the scored
+tasks (recorded as `metrics/tasks`); a plan-only checkpoint is rejected.  navtest
+data is read from `data/dataset/{navsim_logs,sensor_blobs}/test` unless
+`NAVSIM_DOWNLOAD` points at an unpacked download holding
+`test_navsim_logs/test` and `test_sensor_blobs/test` (the PDM and metric-cache
+wrappers honour the same variable).  The evaluator processes all 12,146 `navtest` tokens, using one
 deterministic shard per selected GPU for fp32 inference and then one CPU
 aggregation process.  Completed per-token records are resumable, so the same
 command safely continues an interrupted run.  The wrapper uses the active
@@ -150,7 +176,7 @@ Metric definitions:
 - `NAVSIMAuxDet/center_mAP`: 7 NAVSIM classes, sigmoid flattened query/class
   top-100 decoding, class-aware 2-D center-distance matching at 0.5, 1, 2 and
   4 m, followed by the nuScenes-style 101-bin AP calculation.
-- `NAVSIMAuxMap/chamfer_mAP`: divider, pedestrian-crossing and boundary
+- `NAVSIMAuxMap/chamfer_mAP`: road, walkway, centerline and crosswalk
   vectors, flattened top-100 decoding, 100-point arclength resampling,
   symmetric Chamfer matching at 0.5, 1.0 and 1.5 m, followed by
   precision-envelope area AP.

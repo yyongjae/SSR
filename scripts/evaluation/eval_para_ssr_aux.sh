@@ -22,6 +22,7 @@ AUX_GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,1}}"
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "usage: $0 [checkpoint.ckpt] [Hydra overrides...]"
   echo "env: GPU_IDS=0,1 AUX_EXPERIMENT=eval/name AUX_BATCH_SIZE=4"
+  echo "     NAVSIM_DOWNLOAD=/path/to/download (optional; holds test_navsim_logs/test, test_sensor_blobs/test)"
   echo "     SSR_NAVSIM_PYTHON=/path/to/python (default: active environment's python)"
   exit 0
 fi
@@ -73,6 +74,20 @@ AUX_COMMON_ARGS=(
   "split=test"
   "dataloader.batch_size=${AUX_BATCH_SIZE}"
 )
+# navtest data defaults to data/dataset/{navsim_logs,sensor_blobs}/test;
+# NAVSIM_DOWNLOAD points at an unpacked NAVSIM download directory instead.
+if [[ -n "${NAVSIM_DOWNLOAD:-}" ]]; then
+  for AUX_SUBDIR in test_navsim_logs/test test_sensor_blobs/test; do
+    if [[ ! -d "${NAVSIM_DOWNLOAD}/${AUX_SUBDIR}" ]]; then
+      echo "NAVSIM_DOWNLOAD=${NAVSIM_DOWNLOAD} has no ${AUX_SUBDIR}" >&2
+      exit 2
+    fi
+  done
+  AUX_COMMON_ARGS+=(
+    "navsim_log_path=${NAVSIM_DOWNLOAD}/test_navsim_logs/test"
+    "sensor_blobs_path=${NAVSIM_DOWNLOAD}/test_sensor_blobs/test"
+  )
+fi
 AUX_USER_OVERRIDES=("$@")
 AUX_NUM_SHARDS="${#AUX_GPU_ARRAY[@]}"
 AUX_PIDS=()

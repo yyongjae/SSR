@@ -11,9 +11,15 @@ does this.
 """
 from __future__ import annotations
 
+import inspect
+import json
+import logging
 import math
+import time
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import pytorch_lightning as pl
@@ -32,6 +38,12 @@ from navsim.planning.training.abstract_feature_target_builder import (
 
 from .para_ssr_features import ParaSSRFeatureBuilder
 from .para_ssr_loss import ParaSSRLoss
+from .modules.lidar_encoder import (
+    LIDAR_BACKBONE_STRIDES,
+    LIDAR_ENCODERS,
+    pillar_downsample_ratio,
+    sparse_grid,
+)
 from .para_ssr_model import ParaSSRModel
 from .para_ssr_targets import (
     DET_NAME_TO_INDEX,
@@ -57,7 +69,11 @@ class WarmupCosLR(_LRScheduler):
         self.lr = lr
         self.epochs = epochs
         self.warmup_epochs = warmup_epochs
-        super().__init__(optimizer, last_epoch, verbose)
+        # torch>=2.4 dropped the LRScheduler `verbose` argument.
+        if "verbose" in inspect.signature(_LRScheduler.__init__).parameters:
+            super().__init__(optimizer, last_epoch, verbose)
+        else:
+            super().__init__(optimizer, last_epoch)
 
     def state_dict(self):
         return {k: v for k, v in self.__dict__.items() if k != "optimizer"}
@@ -81,15 +97,39 @@ class WarmupCosLR(_LRScheduler):
         return [lr * group.get("lr_scale", 1.0) for group in self.optimizer.param_groups]
 
 
+logger = logging.getLogger(__name__)
+
+
 class ParaSSRLoggingCallback(pl.Callback):
-    """Publishes the per-term loss breakdown and the shared-BEV diagnostics.
+    """Publishes the per-term loss breakdown, BEV diagnostics and wall-clock time.
 
     ``AgentLightningModule`` only logs whatever ``compute_loss`` returns, and it
     sums that, so the breakdown has to reach the logger by another route.
     ``gshare/*`` in particular is the number to watch: it says which task is
     actually steering the shared BEV feature, which the loss curves do not.
+
+    Wall-clock time goes out as ``time/*`` scalars (elapsed, ETA, per-epoch and
+    per-validation hours) and, at the end of the session, as
+    ``train_time.json`` in the trainer's root directory.  A resumed run appends
+    a new session to that file, so ``total_hours`` is the whole training time
+    across resumes; a crash or interrupt still writes the session with
+    ``status: "interrupted"``.
     """
 
+    TIME_FILE = "train_time.json"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._train_start: Optional[float] = None
+        self._epoch_start: Optional[float] = None
+        self._val_start: Optional[float] = None
+        self._epoch_seconds: List[float] = []
+        self._val_seconds: List[float] = []
+        self._start_epoch = 0
+        self._start_step = 0
+        self._started_at = ""
+
+    # ---- per-term losses ------------------------------------------------- #
     def _log(self, pl_module: pl.LightningModule, prefix: str) -> None:
         logs = getattr(pl_module.agent, "latest_logs", None)
         if not logs:
@@ -108,9 +148,137 @@ class ParaSSRLoggingCallback(pl.Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self._log(pl_module, "train")
+        self._log_progress(trainer, pl_module)
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         self._log(pl_module, "val")
+
+    # ---- wall-clock time ------------------------------------------------- #
+    @staticmethod
+    def _log_time(pl_module, name: str, hours: float, on_step: bool) -> None:
+        pl_module.log(
+            f"time/{name}", float(hours), on_step=on_step, on_epoch=not on_step,
+            prog_bar=False, rank_zero_only=True,
+        )
+
+    def _elapsed(self) -> float:
+        return 0.0 if self._train_start is None else time.time() - self._train_start
+
+    def _eta_seconds(self, trainer) -> Optional[float]:
+        """Session-rate extrapolation to ``estimated_stepping_batches``."""
+        done = trainer.global_step - self._start_step
+        total = getattr(trainer, "estimated_stepping_batches", None)
+        if done <= 0 or not total or not math.isfinite(float(total)):
+            return None
+        return self._elapsed() / done * max(float(total) - trainer.global_step, 0.0)
+
+    def _log_progress(self, trainer, pl_module) -> None:
+        if self._train_start is None:
+            return
+        self._log_time(pl_module, "elapsed_hours", self._elapsed() / 3600.0, on_step=True)
+        eta = self._eta_seconds(trainer)
+        if eta is not None:
+            self._log_time(pl_module, "eta_hours", eta / 3600.0, on_step=True)
+
+    def on_train_start(self, trainer, pl_module) -> None:
+        self._train_start = time.time()
+        self._started_at = datetime.now().isoformat(timespec="seconds")
+        self._start_epoch = int(trainer.current_epoch)
+        self._start_step = int(trainer.global_step)
+        self._epoch_seconds = []
+        self._val_seconds = []
+        logger.info(
+            "training wall clock started %s at epoch %d, global step %d",
+            self._started_at, self._start_epoch, self._start_step,
+        )
+
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        self._epoch_start = time.time()
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if self._epoch_start is None:
+            return
+        seconds = time.time() - self._epoch_start
+        self._epoch_seconds.append(seconds)
+        self._log_time(pl_module, "epoch_hours", seconds / 3600.0, on_step=False)
+        self._log_time(pl_module, "elapsed_hours_at_epoch_end", self._elapsed() / 3600.0, on_step=False)
+        eta = self._eta_seconds(trainer)
+        logger.info(
+            "epoch %d took %.1f min; elapsed %.2f h%s",
+            trainer.current_epoch, seconds / 60.0, self._elapsed() / 3600.0,
+            "" if eta is None else f", eta {eta / 3600.0:.2f} h",
+        )
+
+    def on_validation_epoch_start(self, trainer, pl_module) -> None:
+        self._val_start = None if getattr(trainer, "sanity_checking", False) else time.time()
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        if self._val_start is None:
+            return
+        seconds = time.time() - self._val_start
+        self._val_seconds.append(seconds)
+        self._val_start = None
+        self._log_time(pl_module, "val_hours", seconds / 3600.0, on_step=False)
+
+    def on_train_end(self, trainer, pl_module) -> None:
+        self._finish(trainer, "completed")
+
+    def on_exception(self, trainer, pl_module, exception: BaseException) -> None:
+        self._finish(trainer, f"interrupted: {type(exception).__name__}")
+
+    def _finish(self, trainer, status: str) -> None:
+        if self._train_start is None:
+            return
+        seconds = self._elapsed()
+        session = {
+            "status": status,
+            "started": self._started_at,
+            "finished": datetime.now().isoformat(timespec="seconds"),
+            "seconds": round(seconds, 1),
+            "hours": round(seconds / 3600.0, 4),
+            "start_epoch": self._start_epoch,
+            "end_epoch": int(trainer.current_epoch),
+            "start_step": self._start_step,
+            "end_step": int(trainer.global_step),
+            "epochs_completed": len(self._epoch_seconds),
+            "epoch_seconds": [round(s, 1) for s in self._epoch_seconds],
+            "validation_seconds": [round(s, 1) for s in self._val_seconds],
+            "world_size": int(getattr(trainer, "world_size", 1)),
+        }
+        logger.info(
+            "training %s after %.2f h (%d epochs this session, mean epoch %.1f min, %d validation runs)",
+            status, seconds / 3600.0, len(self._epoch_seconds),
+            (sum(self._epoch_seconds) / len(self._epoch_seconds) / 60.0) if self._epoch_seconds else 0.0,
+            len(self._val_seconds),
+        )
+        self._train_start = None
+        if not getattr(trainer, "is_global_zero", True):
+            return
+        # The TensorBoard logger's save_dir is the experiment's output_dir;
+        # default_root_dir is the same directory under Hydra's chdir, and the
+        # fallback otherwise.
+        root = getattr(getattr(trainer, "logger", None), "save_dir", None) or getattr(trainer, "default_root_dir", None)
+        if not root:
+            return
+        path = Path(root) / self.TIME_FILE
+        record: Dict[str, Any] = {"sessions": []}
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text())
+                if isinstance(loaded, dict) and isinstance(loaded.get("sessions"), list):
+                    record = loaded
+            except (OSError, ValueError):
+                logger.warning("could not read %s; starting a new training-time record", path)
+        record["sessions"].append(session)
+        record["total_hours"] = round(sum(float(s.get("hours", 0.0)) for s in record["sessions"]), 4)
+        record["total_epochs_completed"] = int(sum(int(s.get("epochs_completed", 0)) for s in record["sessions"]))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record, indent=2))
+            logger.info("training time recorded in %s (total %.2f h over %d session(s))",
+                        path, record["total_hours"], len(record["sessions"]))
+        except OSError as exc:
+            logger.warning("could not write %s: %s", path, exc)
 
 
 class ParaSSRAgent(AbstractAgent):
@@ -132,19 +300,14 @@ class ParaSSRAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self._lr = lr
 
-        # Strict checkpoint restoration supplies every model tensor, including
-        # the anchor bank. Inference must not download pretrained backbone
-        # weights or require an old training machine's anchor file.
+        # Strict checkpoint restoration supplies every model tensor, so
+        # inference must not download pretrained backbone weights.
         model_config = config
         if checkpoint_path:
-            checkpoint_overrides = {"backbone_pretrained": False}
-            if config.use_metric_planner:
-                checkpoint_overrides["plan_anchor_path"] = ""
-            model_config = replace(config, **checkpoint_overrides)
+            model_config = replace(config, backbone_pretrained=False)
         self.para_ssr_model = ParaSSRModel(model_config)
         self._loss = ParaSSRLoss(config)
         self.latest_logs: Dict[str, torch.Tensor] = {}
-        self._metric_supervisor = None
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
@@ -259,35 +422,60 @@ class ParaSSRAgent(AbstractAgent):
                 "det_fov_half_angle_deg must be in (0, 90], got "
                 f"{config.det_fov_half_angle_deg}"
             )
+        if getattr(config, "use_lidar", False):
+            z_range = tuple(config.lidar_z_range)
+            if (
+                len(z_range) != 2
+                or not all(math.isfinite(float(v)) for v in z_range)
+                or not float(z_range[0]) < float(z_range[1])
+            ):
+                raise ValueError(
+                    f"lidar_z_range must be (low, high) metres with low < high, got {z_range}"
+                )
+            max_points = config.lidar_max_points
+            if isinstance(max_points, bool) or not isinstance(max_points, int) or max_points < 1:
+                raise ValueError(
+                    f"lidar_max_points must be a positive integer, got {max_points!r}"
+                )
+            encoder = str(config.lidar_encoder)
+            if encoder not in LIDAR_ENCODERS:
+                raise ValueError(
+                    f"lidar_encoder must be one of {LIDAR_ENCODERS}, got {encoder!r}"
+                )
+            if encoder == "sparse":
+                # Raises with the offending axis when the voxel grid is not the
+                # fixed-stride backbone's 8x of the BEV grid.  Pure arithmetic:
+                # spconv itself is only required when the model is built.
+                sparse_grid(
+                    config.pc_range, config.bev_h, config.bev_w,
+                    config.lidar_z_range, config.lidar_voxel_size,
+                )
+            else:
+                # Raises with the offending axis when the pillar grid cannot be
+                # reduced onto the BEV grid by one power-of-two stride.
+                pillar_downsample_ratio(
+                    config.pc_range, config.bev_h, config.bev_w, config.lidar_pillar_size
+                )
+                stages = len(LIDAR_BACKBONE_STRIDES)
+                if (
+                    len(config.lidar_backbone_channels) != stages
+                    or len(config.lidar_backbone_layers) != stages
+                ):
+                    raise ValueError(
+                        "lidar_backbone_channels and lidar_backbone_layers need one entry "
+                        f"per backbone stage ({stages}), got "
+                        f"{tuple(config.lidar_backbone_channels)} and "
+                        f"{tuple(config.lidar_backbone_layers)}"
+                    )
+            if int(config.lidar_attn_points) < 1:
+                raise ValueError(
+                    f"lidar_attn_points must be positive, got {config.lidar_attn_points}"
+                )
         if not 1 <= config.map_dir_interval < config.map_num_pts_per_vec:
             raise ValueError(
                 "map_dir_interval must satisfy 1 <= interval < points/vector, "
                 f"got {config.map_dir_interval} and {config.map_num_pts_per_vec}"
             )
-        if getattr(config, "use_metric_planner", False):
-            if not math.isclose(float(trajectory_sampling.time_horizon), 4.0, abs_tol=1e-6):
-                raise ValueError("metric planner requires the NAVSIM v1 four-second horizon")
-            if isinstance(config.num_plan_candidates, bool) or not isinstance(config.num_plan_candidates, int) or config.num_plan_candidates < 2:
-                raise ValueError("num_plan_candidates must be an integer >= 2")
-            if isinstance(config.metric_cache_size, bool) or not isinstance(config.metric_cache_size, int) or config.metric_cache_size < 1:
-                raise ValueError("metric_cache_size must be a positive integer")
-            weights = tuple(config.metric_loss_weights)
-            if len(weights) != 7 or any(not math.isfinite(w) or w < 0 for w in weights) or weights[-1] <= 0:
-                raise ValueError("metric_loss_weights must be seven finite nonnegative values with positive final-score weight")
-            for name in ("candidate_cls_loss_weight",):
-                value = float(getattr(config, name))
-                if not math.isfinite(value) or value <= 0:
-                    raise ValueError(f"{name} must be finite and positive")
-            for name in ("metric_loss_weight", "metric_score_weight"):
-                value = float(getattr(config, name))
-                if not math.isfinite(value) or value < 0:
-                    raise ValueError(f"{name} must be finite and nonnegative")
-            if not math.isfinite(config.candidate_score_weight) or config.candidate_score_weight < 0:
-                raise ValueError("candidate_score_weight must be finite and nonnegative")
-            if config.candidate_score_weight + config.metric_score_weight <= 0:
-                raise ValueError("at least one candidate ranking weight must be positive")
-            if config.metric_loss_weight == 0 and config.metric_score_weight > 0:
-                raise ValueError("metric_score_weight must be zero for the untrained metric-loss-free ablation")
         if trajectory_sampling.num_poses != config.fut_ts:
             raise ValueError(
                 "trajectory_sampling and fut_ts disagree: "
@@ -346,7 +534,11 @@ class ParaSSRAgent(AbstractAgent):
         self.load_state_dict(state_dict, strict=True)
 
     def get_sensor_config(self) -> SensorConfig:
-        """Load only the cameras and frames this config actually consumes."""
+        """Load only the cameras, LiDAR frames and history this config consumes.
+
+        LiDAR is loaded at every queue frame because the history BEV is built
+        from the same LiDAR-seeded encoder as the current one.
+        """
         frames = list(self._config.frame_indices)
         wanted = set(self._config.camera_names)
         return SensorConfig(
@@ -358,7 +550,7 @@ class ParaSSRAgent(AbstractAgent):
             cam_r1=frames if "cam_r1" in wanted else False,
             cam_r2=frames if "cam_r2" in wanted else False,
             cam_b0=frames if "cam_b0" in wanted else False,
-            lidar_pc=False,
+            lidar_pc=frames if self._config.use_lidar else False,
         )
 
     def get_feature_builders(self) -> List[AbstractFeatureBuilder]:
@@ -390,41 +582,9 @@ class ParaSSRAgent(AbstractAgent):
         returning it would double-count. The breakdown is published on
         ``latest_logs`` and picked up by :class:`ParaSSRLoggingCallback`.
         """
-        if self._config.use_metric_planner and self._config.metric_loss_weight > 0:
-            import time
-            start = time.perf_counter()
-            supervisor = self._get_metric_supervisor()
-            # Validation also scores candidates so val metric loss is meaningful.
-            # Neither this cache nor scene tokens are consumed by forward().
-            if "scene_token" not in targets:
-                raise ValueError("metric planner targets need scene_token; regenerate the target cache")
-            labels = supervisor.score(targets["scene_token"], predictions["trajectory_candidates"])
-            targets = dict(targets, candidate_metric_targets=labels)
-            elapsed = time.perf_counter() - start
         loss, logs = self._loss(self.para_ssr_model, features, targets, predictions)
-        if self._config.use_metric_planner and self._config.metric_loss_weight > 0:
-            logs["metric/rollout_seconds"] = loss.new_tensor(elapsed)
         self.latest_logs = logs
         return loss
-
-    def _get_metric_supervisor(self):
-        if self._metric_supervisor is None:
-            from .metric_supervision import CandidateMetricSupervisor
-            self._metric_supervisor = CandidateMetricSupervisor(
-                self._config.metric_cache_path, self._trajectory_sampling,
-                cache_size=self._config.metric_cache_size,
-            )
-        return self._metric_supervisor
-
-    def validate_metric_cache(self, datasets) -> None:
-        """Fail before training if any requested train/val world is missing."""
-        if not self._config.use_metric_planner or self._config.metric_loss_weight == 0:
-            return
-        supervisor = self._get_metric_supervisor()
-        for dataset in datasets:
-            tokens = (dataset.tokens if hasattr(dataset, "tokens")
-                      else dataset._scene_loader.tokens)
-            supervisor.validate_tokens(tokens)
 
     def get_training_callbacks(self) -> List["pl.Callback"]:
         return [ParaSSRLoggingCallback()]

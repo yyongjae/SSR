@@ -49,5 +49,10 @@ protobuf==4.25.3
 notebook
 timm==1.0.28
 
+# LiDAR branch (SafeDrive's SpMiddleResNetFHD). CUDA 12.x wheel; the cu126
+# build runs on torch 2.8+cu128 / RTX 5090 (report/12). Not needed for
+# agent.config.lidar_encoder=pillar.
+spconv-cu126==2.3.8
+
 # telemetry (optional; training runs without it -- see wandb_logging.py)
 wandb

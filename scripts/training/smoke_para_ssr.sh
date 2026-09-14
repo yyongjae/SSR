@@ -18,7 +18,8 @@ python "${REPO}/navsim/planning/script/run_training.py" \
   trainer.params.fast_dev_run=true trainer.params.precision=32 \
   +trainer.params.devices=1 trainer.params.strategy=auto \
   trainer.params.gradient_clip_val=35.0 \
-  agent.config.bev_h=25 agent.config.bev_w=25 \
+  agent.config.bev_h=10 agent.config.bev_w=20 \
+  agent.config.lidar_voxel_size=[0.4,0.4,0.2] agent.config.lidar_pillar_size=[0.8,0.8] \
   agent.config.image_scale=0.125 agent.config.crop_top=5 \
   agent.config.encoder_num_layers=1 \
   "$@"

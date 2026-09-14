@@ -9,12 +9,17 @@ Produces, per sample:
 ``ego_motion``      ``[T, ego_motion_dims]``  query conditioning vector
 ``command``         ``[4]``                   driving command one-hot
 ``status_feature``  ``[8]``                   command + velocity + acceleration
+``lidar_points``    ``[T, N_max, 5]``         (use_lidar) front-ROI points in SSR
+                                              axes, zero-padded
+``lidar_num_points`` ``[T]``                  (use_lidar) real rows per frame
 
 Coordinate frames
 -----------------
 SSR's BEV is VAD's ego frame: **x lateral (+right), y longitudinal (+forward)**.
 navsim/nuPlan lidar is **x forward, y left**.  ``T_LIDAR_FROM_SSR`` below folds
 that rotation into ``lidar2img`` so the model itself never sees the difference.
+LiDAR points have no matrix to hide behind, so ``_get_lidar`` rotates them into
+SSR axes explicitly: ``x_right = -y_left``, ``y_forward = x_forward``.
 
 Ego motion
 ----------
@@ -51,6 +56,14 @@ T_LIDAR_FROM_SSR = np.array(
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# Per-point layout of ``lidar_points``; part of the feature cache identity.
+# NAVSIM's merged cloud is (x, y, z, intensity, ring, lidar_id) per LidarIndex;
+# the sensor id is dropped, intensity (0..255) and ring (0..39 on this rig)
+# are scaled to roughly unit range for the pillar MLP.
+LIDAR_POINT_LAYOUT: Tuple[str, ...] = ("x_right", "y_forward", "z", "intensity", "ring")
+LIDAR_INTENSITY_SCALE = 255.0
+LIDAR_RING_SCALE = 40.0
 
 
 def build_lidar2img(
@@ -94,19 +107,26 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
     def get_unique_name(self) -> str:
         """Cache name, invalidated by any config that changes the tensors."""
         cfg = self._config
-        return cache_key(
-            "para_ssr_feature",
-            (
-                ("bev_h", cfg.bev_h),
-                ("bev_w", cfg.bev_w),
-                ("camera_names", cfg.camera_names),
-                ("crop_top", cfg.crop_top),
-                ("ego_motion_dims", cfg.ego_motion_dims),
-                ("frame_indices", cfg.frame_indices),
-                ("image_scale", cfg.image_scale),
-                ("pc_range", cfg.pc_range),
-            ),
-        )
+        fields = [
+            ("bev_h", cfg.bev_h),
+            ("bev_w", cfg.bev_w),
+            ("camera_names", cfg.camera_names),
+            ("crop_top", cfg.crop_top),
+            ("ego_motion_dims", cfg.ego_motion_dims),
+            ("frame_indices", cfg.frame_indices),
+            ("image_scale", cfg.image_scale),
+            ("pc_range", cfg.pc_range),
+            ("use_lidar", cfg.use_lidar),
+        ]
+        if cfg.use_lidar:
+            # Only what reaches the tensor: padding length, z clip and layout.
+            # Pillar/backbone sizes are model-side and do not touch the cache.
+            fields += [
+                ("lidar_layout", LIDAR_POINT_LAYOUT),
+                ("lidar_max_points", cfg.lidar_max_points),
+                ("lidar_z_range", cfg.lidar_z_range),
+            ]
+        return cache_key("para_ssr_feature", fields)
 
     # ------------------------------------------------------------------ #
     def compute_features(self, agent_input: AgentInput) -> Dict[str, torch.Tensor]:
@@ -135,7 +155,7 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
             ]
         )
 
-        return {
+        features = {
             "camera_feature": camera_feature,
             "lidar2img": l2i,
             "image_hw": hw,
@@ -144,6 +164,63 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
             "command": command,
             "status_feature": status_feature,
         }
+        if cfg.use_lidar:
+            clouds = [self._get_lidar(agent_input, t) for t in frame_indices]
+            features["lidar_points"] = torch.stack([points for points, _ in clouds])
+            features["lidar_num_points"] = torch.tensor(
+                [count for _, count in clouds], dtype=torch.int64
+            )
+        return features
+
+    # ------------------------------------------------------------------ #
+    def _get_lidar(self, agent_input: AgentInput, frame_idx: int) -> Tuple[torch.Tensor, int]:
+        """Front-ROI point cloud in SSR axes, padded to ``lidar_max_points``.
+
+        Returns the ``[N_max, 5]`` tensor and how many leading rows are real.
+        """
+        cfg = self._config
+        pc = getattr(agent_input.lidars[frame_idx], "lidar_pc", None)
+        if pc is None:
+            raise ValueError(
+                f"lidar_pc is missing at frame {frame_idx}; check use_lidar against "
+                "get_sensor_config()"
+            )
+        pc = np.asarray(pc, dtype=np.float32)
+        if pc.ndim != 2 or pc.shape[0] < 5:
+            raise ValueError(
+                "lidar_pc must be a (>=5, n) array (x, y, z, intensity, ring, ...), "
+                f"got {pc.shape}"
+            )
+        x_forward, y_left, z, intensity, ring = pc[0], pc[1], pc[2], pc[3], pc[4]
+        x_right = -y_left
+        y_forward = x_forward
+
+        x0, y0, _, x1, y1, _ = cfg.pc_range
+        z0, z1 = cfg.lidar_z_range
+        # Half-open bounds: a point exactly on the far edge would otherwise map
+        # to a pillar one past the canvas.
+        keep = (
+            (x_right >= x0) & (x_right < x1)
+            & (y_forward >= y0) & (y_forward < y1)
+            & (z >= z0) & (z < z1)
+            & np.isfinite(x_right) & np.isfinite(y_forward) & np.isfinite(z)
+        )
+        index = np.flatnonzero(keep)
+        if index.size > cfg.lidar_max_points:
+            # Uniform thinning along scan order: deterministic (the cache must
+            # not depend on a RNG) and spatially unbiased, since the merged scan
+            # interleaves the five sensors rather than sorting by position.
+            picks = np.linspace(0, index.size - 1, cfg.lidar_max_points).round().astype(np.int64)
+            index = index[picks]
+
+        points = np.zeros((cfg.lidar_max_points, len(LIDAR_POINT_LAYOUT)), dtype=np.float32)
+        count = int(index.size)
+        points[:count, 0] = x_right[index]
+        points[:count, 1] = y_forward[index]
+        points[:count, 2] = z[index]
+        points[:count, 3] = intensity[index] / LIDAR_INTENSITY_SCALE
+        points[:count, 4] = ring[index] / LIDAR_RING_SCALE
+        return torch.from_numpy(points), count
 
     # ------------------------------------------------------------------ #
     def _get_cameras(

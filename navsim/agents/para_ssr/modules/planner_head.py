@@ -16,6 +16,11 @@ Two adaptations, both forced by navsim's output contract:
 
 The horizon follows navsim's ``TrajectorySampling(time_horizon=4,
 interval_length=0.5)`` -> ``fut_ts = 8``, against nuScenes' 6.
+
+``use_stl=False`` replaces the scene-token path with PARA-Drive's planner
+(Weng et al., CVPR 2024, Sec. 4): a learnable plan query concatenated with the
+command embedding cross-attends to the full BEV, then an MLP regresses the
+trajectory.
 """
 from __future__ import annotations
 
@@ -29,7 +34,6 @@ from .transformer_blocks import (
     LearnedPositionalEncoding,
     build_self_attn_decoder,
 )
-from .candidate_planner import load_plan_anchors, poses_to_offsets, commanded_candidates
 
 
 class SELayer(nn.Module):
@@ -74,9 +78,9 @@ class ParaSSRPlannerHead(nn.Module):
         way_num_layers: int = 1,
         num_heads: int = 8,
         feedforward_channels: int = 512,
-        use_metric_planner: bool = False,
-        num_plan_candidates: int = 16,
-        plan_anchor_path: str = "",
+        use_lidar: bool = False,
+        use_stl: bool = True,
+        plan_num_layers: int = 3,
     ):
         super().__init__()
         self.bev_h = bev_h
@@ -91,66 +95,86 @@ class ParaSSRPlannerHead(nn.Module):
         self.ego_fut_mode = ego_fut_mode
         self.num_navi_cmd = num_navi_cmd
         self.traj_dims = traj_dims
-        self.use_metric_planner = use_metric_planner
-        self.num_plan_candidates = num_plan_candidates if use_metric_planner else 1
 
         self.transformer = transformer
         self.positional_encoding = LearnedPositionalEncoding(
             embed_dims // 2, bev_h, bev_w
         )
 
-        self.bev_embedding = nn.Embedding(bev_h * bev_w, embed_dims)
+        # With LiDAR the encoder starts from the LiDAR BEV (SafeDrive), so the
+        # learned query table is not built at all: an unused parameter would
+        # also trip DDP's unused-parameter check.
+        self.bev_embedding = None if use_lidar else nn.Embedding(bev_h * bev_w, embed_dims)
         self.navi_embedding = nn.Embedding(num_navi_cmd, embed_dims)
-        self.navi_se = SELayer(embed_dims)
+        self.use_stl = use_stl
 
-        self.tokenlearner = TokenLearnerV11(num_scenes, embed_dims * 2)
-        self.latent_decoder = build_self_attn_decoder(
-            latent_num_layers,
-            embed_dims,
-            num_heads,
-            feedforward_channels,
-            ("self_attn", "norm", "ffn", "norm"),
-            attn_dropout=0.0,
-            ffn_dropout=0.0,
-        )
+        def reg_fcs(out_dims: int) -> nn.Sequential:
+            layers = []
+            for _ in range(num_reg_fcs):
+                layers.append(nn.Linear(embed_dims, embed_dims))
+                layers.append(nn.ReLU())
+            layers.append(nn.Linear(embed_dims, out_dims))
+            return nn.Sequential(*layers)
 
-        self.way_point = nn.Embedding(
-            ego_fut_mode * self.num_plan_candidates * fut_ts, embed_dims * 2
-        )
-        self.way_decoder = build_self_attn_decoder(
-            way_num_layers,
-            embed_dims,
-            num_heads,
-            feedforward_channels,
-            ("cross_attn", "norm", "ffn", "norm"),
-            attn_dropout=0.0,
-            ffn_dropout=0.0,
-        )
+        # Branches construct modules in the same order as before use_stl
+        # existed, so a seeded STL run initialises identically.
+        if use_stl:
+            self.navi_se = SELayer(embed_dims)
 
-        ego_fut_decoder = []
-        for _ in range(num_reg_fcs):
-            ego_fut_decoder.append(nn.Linear(embed_dims, embed_dims))
-            ego_fut_decoder.append(nn.ReLU())
-        ego_fut_decoder.append(nn.Linear(embed_dims, traj_dims))
-        self.ego_fut_decoder = nn.Sequential(*ego_fut_decoder)
+            self.tokenlearner = TokenLearnerV11(num_scenes, embed_dims * 2)
+            self.latent_decoder = build_self_attn_decoder(
+                latent_num_layers,
+                embed_dims,
+                num_heads,
+                feedforward_channels,
+                ("self_attn", "norm", "ffn", "norm"),
+                attn_dropout=0.0,
+                ffn_dropout=0.0,
+            )
+
+            self.way_point = nn.Embedding(ego_fut_mode * fut_ts, embed_dims * 2)
+            self.way_decoder = build_self_attn_decoder(
+                way_num_layers,
+                embed_dims,
+                num_heads,
+                feedforward_channels,
+                ("cross_attn", "norm", "ffn", "norm"),
+                attn_dropout=0.0,
+                ffn_dropout=0.0,
+            )
+            self.ego_fut_decoder = reg_fcs(traj_dims)
+            decoders = (self.latent_decoder, self.way_decoder)
+        else:
+            # PARA-Drive / UniAD planner: one learnable plan query, fused with
+            # the command embedding, cross-attends to the full BEV and an MLP
+            # regresses the whole horizon.  The command conditions the query
+            # instead of selecting an output branch.
+            self.plan_query = nn.Embedding(1, embed_dims)
+            self.plan_query_pos = nn.Embedding(1, embed_dims)
+            self.plan_fuser = nn.Sequential(
+                nn.Linear(embed_dims * 2, embed_dims),
+                nn.LayerNorm(embed_dims),
+                nn.ReLU(inplace=True),
+            )
+            self.plan_decoder = build_self_attn_decoder(
+                plan_num_layers,
+                embed_dims,
+                num_heads,
+                feedforward_channels,
+                ("cross_attn", "norm", "ffn", "norm"),
+                attn_dropout=0.0,
+                ffn_dropout=0.0,
+            )
+            self.ego_fut_decoder = reg_fcs(fut_ts * traj_dims)
+            decoders = (self.plan_decoder,)
 
         # BaseModule called this in the original implementation.  Keep the
-        # sparse-token decoders on the same Xavier initialization rather than
+        # planner decoders on the same Xavier initialization rather than
         # PyTorch Linear's default Kaiming-uniform initialization.
-        for decoder in (self.latent_decoder, self.way_decoder):
+        for decoder in decoders:
             for parameter in decoder.parameters():
                 if parameter.dim() > 1:
                     nn.init.xavier_uniform_(parameter)
-
-        if self.use_metric_planner:
-            anchors = (load_plan_anchors(plan_anchor_path, num_plan_candidates, fut_ts)
-                       if plan_anchor_path else torch.zeros(num_plan_candidates, fut_ts, 3))
-            self.register_buffer("plan_anchors", anchors)
-            self.register_buffer("anchors_ready", torch.tensor(bool(plan_anchor_path)))
-            self.candidate_cls = nn.Linear(embed_dims, 1)
-            # Start at physically valid, distinct train-derived trajectories.
-            nn.init.zeros_(self.ego_fut_decoder[-1].weight)
-            nn.init.zeros_(self.ego_fut_decoder[-1].bias)
 
     def forward(
         self,
@@ -162,11 +186,14 @@ class ParaSSRPlannerHead(nn.Module):
         prev_bev: Optional[torch.Tensor] = None,
         only_bev: bool = False,
         cmd: Optional[torch.Tensor] = None,
+        lidar_bev: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor] | torch.Tensor:
         """
         Args:
             mlvl_feats: list of ``[bs, num_cam, C, H, W]``
             cmd: one-hot navigation command ``[bs, num_navi_cmd]``
+            lidar_bev: ``[bs, C, bev_h, bev_w]``; required iff built with
+                ``use_lidar``
         Returns:
             ``only_bev``: the BEV feature. Otherwise a dict with ``bev_embed``
             ``[bs, bev_h*bev_w, C]``, ``scene_query``, ``token_attn`` and
@@ -174,11 +201,18 @@ class ParaSSRPlannerHead(nn.Module):
         """
         bs = mlvl_feats[0].shape[0]
         dtype = mlvl_feats[0].dtype
+        device = mlvl_feats[0].device
 
-        bev_queries = self.bev_embedding.weight.to(dtype)
-        bev_mask = torch.zeros(
-            (bs, self.bev_h, self.bev_w), device=bev_queries.device, dtype=dtype
-        )
+        if self.bev_embedding is None:
+            if lidar_bev is None:
+                raise ValueError("planner head built with use_lidar needs lidar_bev")
+            bev_queries = None
+            lidar_bev = lidar_bev.to(dtype)
+        else:
+            if lidar_bev is not None:
+                raise ValueError("camera-only planner head received lidar_bev")
+            bev_queries = self.bev_embedding.weight.to(dtype)
+        bev_mask = torch.zeros((bs, self.bev_h, self.bev_w), device=device, dtype=dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
 
         bev_embed = self.transformer.get_bev_features(
@@ -192,6 +226,7 @@ class ParaSSRPlannerHead(nn.Module):
             ego_motion=ego_motion,
             bev_shift=bev_shift,
             prev_bev=prev_bev,
+            lidar_bev=lidar_bev,
         )
         if only_bev:
             return bev_embed
@@ -207,6 +242,32 @@ class ParaSSRPlannerHead(nn.Module):
             )
         cmd = cmd.reshape(bs, self.num_navi_cmd)
         cmd_idx = cmd.argmax(dim=-1)
+
+        if not self.use_stl:
+            navi = self.navi_embedding(cmd_idx)  # [B, C]
+            plan_query = self.plan_query.weight.to(dtype).expand(bs, -1)
+            plan_query = self.plan_fuser(torch.cat((plan_query, navi), -1))
+            plan_query_pos = self.plan_query_pos.weight.to(dtype).expand(bs, -1)
+            plan_query = self.plan_decoder(
+                query=plan_query.unsqueeze(0),  # [1, B, C]
+                key=bev_embed.permute(1, 0, 2),  # [HW, B, C]
+                value=bev_embed.permute(1, 0, 2),
+                query_pos=plan_query_pos.unsqueeze(0),
+                key_pos=pos_embd.permute(1, 0, 2),
+            )
+            plan = self.ego_fut_decoder(plan_query[0]).view(
+                bs, 1, self.fut_ts, self.traj_dims
+            )
+            # The plan is already command-conditioned; filling every command
+            # slot keeps the [B, mode, T, D] contract, so the commanded-branch
+            # loss (and its mean over all slots) and select_trajectory are
+            # unchanged from the STL planner.
+            return {
+                "bev_embed": bev_embed,
+                "scene_query": plan_query,
+                "token_attn": None,
+                "ego_fut_preds": plan.expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
+            }
 
         navi_embed = self.navi_embedding(cmd_idx).unsqueeze(1)  # [B, 1, C]
         bev_navi_embed = self.navi_se(bev_embed, navi_embed)
@@ -241,28 +302,6 @@ class ParaSSRPlannerHead(nn.Module):
         )
 
         outputs_ego_trajs = self.ego_fut_decoder(way_point)
-        if self.use_metric_planner:
-            if not self.anchors_ready.item():
-                raise RuntimeError(
-                    "metric planner needs a train-only plan_anchor_path or an initialized checkpoint"
-                )
-            residuals = outputs_ego_trajs.permute(1, 0, 2).reshape(
-                bs, self.ego_fut_mode, self.num_plan_candidates, self.fut_ts, self.traj_dims
-            )
-            candidates = residuals + poses_to_offsets(self.plan_anchors)[None, None]
-            candidate_features = way_point.permute(1, 0, 2).reshape(
-                bs, self.ego_fut_mode, self.num_plan_candidates, self.fut_ts, self.embed_dims
-            ).mean(dim=-2)
-            logits = self.candidate_cls(candidate_features).squeeze(-1)
-            return {
-                "bev_embed": bev_embed,
-                "bev_pos": pos_embd,
-                "scene_query": latent_query,
-                "token_attn": selected,
-                "candidate_offsets": candidates,
-                "candidate_logits": commanded_candidates(logits, cmd),
-                "plan_anchors": self.plan_anchors,
-            }
         outputs_ego_trajs = outputs_ego_trajs.permute(1, 0, 2).view(
             bs, self.ego_fut_mode, self.fut_ts, self.traj_dims
         )

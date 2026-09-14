@@ -46,6 +46,7 @@ from navsim.common.dataloader import SceneLoader
 from navsim.common.dataclasses import SensorConfig
 from navsim.evaluate.aux_metrics import (
     AUX_METRIC_PROTOCOL_VERSION,
+    AUX_TASKS,
     decode_detection_predictions,
     decode_map_predictions,
     denormalize_map_ground_truth,
@@ -64,22 +65,40 @@ PROTOCOL_TOP_K = 100
 PROTOCOL_MAP_POINTS = 20
 PROTOCOL_MAP_ORDERS = 20
 PROTOCOL_MAP_MIN_LENGTH = 1.0
-# Detection and the BEV encoder use the full extent; the map is scored on the
-# front half only.  Both mirror NAVSIM TransFuser -- see ParaSSRConfig.
-PROTOCOL_PC_RANGE = (-32.0, -32.0, -2.0, 32.0, 32.0, 2.0)
+# V3: one front-only ROI is shared by the BEV encoder, the detector and the
+# map head, and detection GT additionally passes the +-80 degree camera FOV
+# filter -- exactly what ParaSSRConfig trains against.  V2 scored detection on
+# a rear-inclusive ROI, so its numbers are a different population.
+PROTOCOL_PC_RANGE = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
 PROTOCOL_MAP_PC_RANGE = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
+PROTOCOL_DET_FOV_HALF_ANGLE_DEG = 80.0
 PRODUCTION_TOKEN_COUNT = 12_146
 PRODUCTION_TOKEN_SHA256 = (
     "19cf783cbae935fce54cc459f05be508cfb546b0d92e7a5a122d0fc0d8bd4419"
 )
+# Uncapped navtest GT under the V3 front-only ROI + 80 degree FOV, counted once
+# over all 12,146 tokens with the target builder's own filters.  These are
+# self-checks: a silent change to the
+# target builder, the ROI or the FOV shows up here instead of as a quietly
+# different mAP.  V2's rear-inclusive counts (vehicle 69,142 ...) do not apply.
 PRODUCTION_DET_GT_COUNTS = {
-    "vehicle": 69_142,
-    "pedestrian": 34_653,
-    "bicycle": 931,
-    "traffic_cone": 20_942,
-    "barrier": 8_073,
-    "czone_sign": 753,
-    "generic_object": 61_214,
+    "vehicle": 49_705,
+    "pedestrian": 24_918,
+    "bicycle": 545,
+    "traffic_cone": 16_974,
+    "barrier": 5_646,
+    "czone_sign": 503,
+    "generic_object": 43_282,
+}
+# Replaces V2's "some scene exceeded the training cap of 100" heuristic: under
+# the front-only map ROI no scene reaches 100 vectors, so that check could no
+# longer prove the uncapped evaluation path was active.  Matching the measured
+# uncapped totals proves it directly.
+PRODUCTION_MAP_GT_COUNTS = {
+    "road": 46_007,
+    "walkway": 47_115,
+    "centerline": 187_039,
+    "crosswalk": 17_904,
 }
 RECORD_KEYS = {
     "token",
@@ -197,7 +216,11 @@ def _atomic_create_bytes(path: Path, payload: bytes) -> bool:
             temporary_path.unlink()
 
 
-def _atomic_write_record(path: Path, record: Mapping[str, np.ndarray]) -> None:
+def _atomic_write_record(
+    path: Path,
+    record: Mapping[str, np.ndarray],
+    tasks: Sequence[str] = AUX_TASKS,
+) -> None:
     expected_token = _as_token(record["token"])
     expected_identity = _as_scalar_text(
         record["manifest_identity_sha256"], "manifest_identity_sha256"
@@ -213,16 +236,16 @@ def _atomic_write_record(path: Path, record: Mapping[str, np.ndarray]) -> None:
             file.flush()
             os.fsync(file.fileno())
         # Validate exactly what was serialized before making it a resume point.
-        loaded, _ = _load_record(temporary_path, expected_token, expected_identity)
-        _validate_record(loaded, expected_token, expected_identity)
+        loaded, _ = _load_record(temporary_path, expected_token, expected_identity, tasks)
+        _validate_record(loaded, expected_token, expected_identity, tasks)
         try:
             # Hard-link publication is no-clobber.  Two accidentally duplicated
             # shard workers can never overwrite one another between an
             # existence check and rename.
             os.link(temporary_path, path)
         except FileExistsError:
-            existing, _ = _load_record(path, expected_token, expected_identity)
-            _validate_record(existing, expected_token, expected_identity)
+            existing, _ = _load_record(path, expected_token, expected_identity, tasks)
+            _validate_record(existing, expected_token, expected_identity, tasks)
             differing_keys = [
                 key
                 for key in sorted(RECORD_KEYS)
@@ -235,7 +258,7 @@ def _atomic_write_record(path: Path, record: Mapping[str, np.ndarray]) -> None:
                 )
             return
         # Validate the winning pathname, not only the temporary inode name.
-        _load_record(path, expected_token, expected_identity)
+        _load_record(path, expected_token, expected_identity, tasks)
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
@@ -267,7 +290,14 @@ def _validate_record(
     record: Mapping[str, np.ndarray],
     expected_token: str,
     expected_manifest_identity_sha256: str,
+    tasks: Sequence[str] = AUX_TASKS,
 ) -> None:
+    """Shape/range contract for one record.
+
+    The schema is fixed so shards stay interchangeable, but an arm without a
+    head writes that task's arrays empty; the top-100 prediction contract then
+    applies only to the tasks the model actually has.
+    """
     keys = set(record)
     if keys != RECORD_KEYS:
         raise ValueError(
@@ -320,16 +350,22 @@ def _validate_record(
         raise ValueError(f"{token}: map label count does not match polylines")
     if map_gt_labels.shape != (len(map_gt_points),):
         raise ValueError(f"{token}: map GT label count does not match polylines")
-    if len(det_pred_boxes) != PROTOCOL_TOP_K:
+    expected_det = PROTOCOL_TOP_K if "detection" in tasks else 0
+    if len(det_pred_boxes) != expected_det:
         raise ValueError(
-            f"{token}: protocol requires exactly {PROTOCOL_TOP_K} detection "
+            f"{token}: protocol requires exactly {expected_det} detection "
             f"predictions, got {len(det_pred_boxes)}"
         )
-    if len(map_pred_points) != PROTOCOL_TOP_K:
+    expected_map = PROTOCOL_TOP_K if "map" in tasks else 0
+    if len(map_pred_points) != expected_map:
         raise ValueError(
-            f"{token}: protocol requires exactly {PROTOCOL_TOP_K} map "
+            f"{token}: protocol requires exactly {expected_map} map "
             f"predictions, got {len(map_pred_points)}"
         )
+    if "detection" not in tasks and len(det_gt_boxes):
+        raise ValueError(f"{token}: detection GT present for a model without that head")
+    if "map" not in tasks and len(map_gt_points):
+        raise ValueError(f"{token}: map GT present for a model without that head")
     if map_pred_points.shape[1] != PROTOCOL_MAP_POINTS:
         raise ValueError(
             f"{token}: map predictions must have {PROTOCOL_MAP_POINTS} raw points, "
@@ -383,7 +419,10 @@ def _validate_record(
 
 
 def _load_record(
-    path: Path, expected_token: str, expected_manifest_identity_sha256: str
+    path: Path,
+    expected_token: str,
+    expected_manifest_identity_sha256: str,
+    tasks: Sequence[str] = AUX_TASKS,
 ) -> Tuple[Dict[str, np.ndarray], str]:
     payload = path.read_bytes()
     try:
@@ -391,7 +430,7 @@ def _load_record(
             record = {key: archive[key] for key in archive.files}
     except Exception as exc:
         raise RuntimeError(f"cannot read auxiliary record {path}") from exc
-    _validate_record(record, expected_token, expected_manifest_identity_sha256)
+    _validate_record(record, expected_token, expected_manifest_identity_sha256, tasks)
     return record, _sha256_bytes(payload)
 
 
@@ -410,10 +449,12 @@ class _AuxiliaryTokenDataset(TorchDataset):
         feature_builders: Sequence[AbstractFeatureBuilder],
         evaluation_target_builder: ParaSSRTargetBuilder,
         tokens: Sequence[str],
+        tasks: Sequence[str],
     ):
         self._scene_loader = scene_loader
         self._feature_builders = list(feature_builders)
         self._evaluation_target_builder = evaluation_target_builder
+        self._tasks = tuple(tasks)
         loader_tokens = list(scene_loader.tokens)
         if len(set(loader_tokens)) != len(loader_tokens):
             raise RuntimeError("SceneLoader contains duplicate tokens")
@@ -433,12 +474,15 @@ class _AuxiliaryTokenDataset(TorchDataset):
         features: Dict[str, torch.Tensor] = {}
         for builder in self._feature_builders:
             features.update(builder.compute_features(agent_input))
-        targets = {
-            **self._evaluation_target_builder.compute_detection_evaluation_targets(
-                scene
-            ),
-            **self._evaluation_target_builder.compute_map_evaluation_targets(scene),
-        }
+        targets: Dict[str, torch.Tensor] = {}
+        if "detection" in self._tasks:
+            targets.update(
+                self._evaluation_target_builder.compute_detection_evaluation_targets(scene)
+            )
+        if "map" in self._tasks:
+            targets.update(
+                self._evaluation_target_builder.compute_map_evaluation_targets(scene)
+            )
         return token, features, targets
 
 
@@ -585,8 +629,11 @@ def _build_agent(
     agent = instantiate(_load_training_agent_config(training_config_path, checkpoint_path))
     if not isinstance(agent, ParaSSRAgent):
         raise TypeError(f"archived config instantiated {type(agent).__name__}, not ParaSSRAgent")
-    if not bool(agent.config.use_det_motion_head) or not bool(agent.config.use_map_head):
-        raise RuntimeError("auxiliary evaluation requires both detection and map heads")
+    if not bool(agent.config.use_det_motion_head) and not bool(agent.config.use_map_head):
+        raise RuntimeError(
+            "auxiliary evaluation needs at least one of the detection and map heads; "
+            "this checkpoint has neither (plan-only arm)"
+        )
     if int(agent.config.map_num_pts_per_vec) != PROTOCOL_MAP_POINTS:
         raise RuntimeError(
             "metric protocol V1 requires archived map_num_pts_per_vec="
@@ -594,27 +641,36 @@ def _build_agent(
         )
     if int(agent.config.map_num_orders) != PROTOCOL_MAP_ORDERS:
         raise RuntimeError(
-            f"metric protocol V2 fixes map_num_orders={PROTOCOL_MAP_ORDERS}, "
+            f"metric protocol V{AUX_METRIC_PROTOCOL_VERSION} fixes map_num_orders={PROTOCOL_MAP_ORDERS}, "
             f"got {agent.config.map_num_orders}"
         )
     if float(agent.config.map_min_length) != PROTOCOL_MAP_MIN_LENGTH:
         raise RuntimeError(
-            f"metric protocol V2 fixes map_min_length={PROTOCOL_MAP_MIN_LENGTH}, "
+            f"metric protocol V{AUX_METRIC_PROTOCOL_VERSION} fixes map_min_length={PROTOCOL_MAP_MIN_LENGTH}, "
             f"got {agent.config.map_min_length}"
         )
     if tuple(float(value) for value in agent.config.pc_range) != PROTOCOL_PC_RANGE:
         raise RuntimeError(
-            f"metric protocol V2 fixes pc_range={PROTOCOL_PC_RANGE}, "
+            f"metric protocol V3 fixes pc_range={PROTOCOL_PC_RANGE}, "
             f"got {tuple(agent.config.pc_range)}"
+        )
+    if float(agent.config.det_fov_half_angle_deg) != PROTOCOL_DET_FOV_HALF_ANGLE_DEG:
+        raise RuntimeError(
+            "metric protocol V3 fixes det_fov_half_angle_deg="
+            f"{PROTOCOL_DET_FOV_HALF_ANGLE_DEG}, got {agent.config.det_fov_half_angle_deg}"
         )
     if tuple(float(value) for value in agent.config.map_pc_range) != PROTOCOL_MAP_PC_RANGE:
         raise RuntimeError(
-            f"metric protocol V2 fixes map_pc_range={PROTOCOL_MAP_PC_RANGE}, "
+            f"metric protocol V{AUX_METRIC_PROTOCOL_VERSION} fixes map_pc_range={PROTOCOL_MAP_PC_RANGE}, "
             f"got {tuple(agent.config.map_pc_range)}"
         )
-    if int(agent.config.num_query) * int(agent.config.num_det_classes) < PROTOCOL_TOP_K:
+    if bool(agent.config.use_det_motion_head) and (
+        int(agent.config.num_query) * int(agent.config.num_det_classes) < PROTOCOL_TOP_K
+    ):
         raise RuntimeError("detection head has fewer logits than protocol top-100")
-    if int(agent.config.map_num_vec) * int(agent.config.map_num_classes) < PROTOCOL_TOP_K:
+    if bool(agent.config.use_map_head) and (
+        int(agent.config.map_num_vec) * int(agent.config.map_num_classes) < PROTOCOL_TOP_K
+    ):
         raise RuntimeError("map head has fewer logits than protocol top-100")
     agent.initialize()
     agent.float().to(device)
@@ -629,14 +685,24 @@ def _build_agent(
     return agent
 
 
+def _agent_tasks(config) -> Tuple[str, ...]:
+    """Which auxiliary tasks this checkpoint actually has heads for."""
+    tasks = []
+    if bool(config.use_det_motion_head):
+        tasks.append("detection")
+    if bool(config.use_map_head):
+        tasks.append("map")
+    return tuple(tasks)
+
+
 def _validate_protocol_options(cfg: DictConfig) -> None:
     if int(cfg.det_max_predictions) != PROTOCOL_TOP_K:
         raise ValueError(
-            f"metric protocol V2 fixes det_max_predictions={PROTOCOL_TOP_K}"
+            f"metric protocol V{AUX_METRIC_PROTOCOL_VERSION} fixes det_max_predictions={PROTOCOL_TOP_K}"
         )
     if int(cfg.map_max_predictions) != PROTOCOL_TOP_K:
         raise ValueError(
-            f"metric protocol V2 fixes map_max_predictions={PROTOCOL_TOP_K}"
+            f"metric protocol V{AUX_METRIC_PROTOCOL_VERSION} fixes map_max_predictions={PROTOCOL_TOP_K}"
         )
     if isinstance(cfg.num_shards, bool) or int(cfg.num_shards) < 1:
         raise ValueError(f"num_shards must be a positive integer, got {cfg.num_shards}")
@@ -668,13 +734,24 @@ def _record_from_batch_item(
     targets: Mapping[str, torch.Tensor],
     map_pc_range: Sequence[float],
     manifest_identity_sha256: str,
+    tasks: Sequence[str] = AUX_TASKS,
 ) -> Dict[str, np.ndarray]:
-    det_gt_boxes = targets["gt_boxes"].detach().cpu().numpy()
-    det_gt_labels = targets["gt_labels"].detach().cpu().numpy()
-    normalized_map_gt = targets["gt_map_pts"].detach().cpu().numpy()
-    # map GT is normalised over the front-half extent, not the BEV extent
-    map_gt_points = denormalize_map_ground_truth(normalized_map_gt, map_pc_range)
-    map_gt_labels = targets["gt_map_labels"].detach().cpu().numpy()
+    # A head ablation keeps the record schema and leaves the absent task empty;
+    # the aggregator is told which tasks are real and omits the other one.
+    if "detection" in tasks:
+        det_gt_boxes = targets["gt_boxes"].detach().cpu().numpy()
+        det_gt_labels = targets["gt_labels"].detach().cpu().numpy()
+    else:
+        det_gt_boxes = np.zeros((0, 9), dtype=np.float32)
+        det_gt_labels = np.zeros((0,), dtype=np.int64)
+    if "map" in tasks:
+        normalized_map_gt = targets["gt_map_pts"].detach().cpu().numpy()
+        # map GT is normalised over the front-half extent, not the BEV extent
+        map_gt_points = denormalize_map_ground_truth(normalized_map_gt, map_pc_range)
+        map_gt_labels = targets["gt_map_labels"].detach().cpu().numpy()
+    else:
+        map_gt_points = np.zeros((0, PROTOCOL_MAP_POINTS, 2), dtype=np.float32)
+        map_gt_labels = np.zeros((0,), dtype=np.int64)
     record = {
         "token": np.asarray(token),
         "manifest_identity_sha256": np.asarray(manifest_identity_sha256),
@@ -689,7 +766,7 @@ def _record_from_batch_item(
         "map_gt_points": np.asarray(map_gt_points, dtype=np.float32),
         "map_gt_labels": np.asarray(map_gt_labels, dtype=np.int64),
     }
-    _validate_record(record, token, manifest_identity_sha256)
+    _validate_record(record, token, manifest_identity_sha256, tasks)
     return record
 
 
@@ -708,6 +785,7 @@ def _run_missing_inference(
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {device}")
     agent = _build_agent(training_config_path, checkpoint_path, device)
+    tasks = _agent_tasks(agent.config)
 
     inference_scene_filter = replace(
         scene_filter, tokens=list(missing_tokens), max_scenes=None
@@ -731,6 +809,7 @@ def _run_missing_inference(
         agent.get_feature_builders(),
         target_builders[0],
         missing_tokens,
+        tasks,
     )
     loader_kwargs = {
         "batch_size": int(cfg.dataloader.batch_size),
@@ -761,12 +840,11 @@ def _run_missing_inference(
                 )
             # No autocast: deformable attention and all heads stay in fp32.
             predictions = model(features_gpu, run_aux=True)
-            required = {
-                "all_cls_scores",
-                "all_bbox_preds",
-                "all_map_cls_scores",
-                "all_map_pts_preds",
-            }
+            required = set()
+            if "detection" in tasks:
+                required |= {"all_cls_scores", "all_bbox_preds"}
+            if "map" in tasks:
+                required |= {"all_map_cls_scores", "all_map_pts_preds"}
             missing_outputs = required - set(predictions)
             if missing_outputs:
                 raise RuntimeError(
@@ -781,19 +859,34 @@ def _run_missing_inference(
                 raise RuntimeError(
                     f"auxiliary inference did not stay fp32: {non_fp32_outputs}"
                 )
-            decoded_detection = decode_detection_predictions(
-                predictions, max_predictions=int(cfg.det_max_predictions)
+            batch_size = len(ordered_batch_tokens)
+            empty_det = {
+                "boxes": np.zeros((0, 9), dtype=np.float32),
+                "scores": np.zeros((0,), dtype=np.float32),
+                "labels": np.zeros((0,), dtype=np.int64),
+            }
+            empty_map = {
+                "points": np.zeros((0, PROTOCOL_MAP_POINTS, 2), dtype=np.float32),
+                "scores": np.zeros((0,), dtype=np.float32),
+                "labels": np.zeros((0,), dtype=np.int64),
+            }
+            decoded_detection = (
+                decode_detection_predictions(
+                    predictions, max_predictions=int(cfg.det_max_predictions)
+                )
+                if "detection" in tasks
+                else [dict(empty_det) for _ in range(batch_size)]
             )
-            decoded_map = decode_map_predictions(
-                predictions,
-                pc_range=map_pc_range,
-                max_predictions=int(cfg.map_max_predictions),
+            decoded_map = (
+                decode_map_predictions(
+                    predictions,
+                    pc_range=map_pc_range,
+                    max_predictions=int(cfg.map_max_predictions),
+                )
+                if "map" in tasks
+                else [dict(empty_map) for _ in range(batch_size)]
             )
-            if not (
-                len(ordered_batch_tokens)
-                == len(decoded_detection)
-                == len(decoded_map)
-            ):
+            if not (batch_size == len(decoded_detection) == len(decoded_map)):
                 raise RuntimeError("auxiliary decoder batch size mismatch")
             for batch_index, token in enumerate(ordered_batch_tokens):
                 record = _record_from_batch_item(
@@ -803,8 +896,9 @@ def _run_missing_inference(
                     targets[batch_index],
                     map_pc_range,
                     manifest_identity_sha256,
+                    tasks,
                 )
-                _atomic_write_record(records_dir / f"{token}.npz", record)
+                _atomic_write_record(records_dir / f"{token}.npz", record, tasks)
                 progress.update(1)
     progress.close()
 
@@ -813,6 +907,7 @@ def _validate_record_inventory(
     records_dir: Path,
     expected_tokens: Sequence[str],
     manifest_identity_sha256: str,
+    tasks: Sequence[str] = AUX_TASKS,
 ) -> Tuple[List[str], List[str]]:
     expected = set(expected_tokens)
     present_paths = list(records_dir.glob("*.npz")) if records_dir.is_dir() else []
@@ -825,7 +920,7 @@ def _validate_record_inventory(
     valid = []
     for token in sorted(set(present_tokens)):
         _load_record(
-            records_dir / f"{token}.npz", token, manifest_identity_sha256
+            records_dir / f"{token}.npz", token, manifest_identity_sha256, tasks
         )
         valid.append(token)
     missing = sorted(expected - set(valid))
@@ -847,7 +942,8 @@ def _metrics_csv_bytes(metrics: Mapping[str, object]) -> bytes:
     )
     writer = csv.DictWriter(stream, fieldnames=fields)
     writer.writeheader()
-    for task_name in ("detection", "map"):
+    # A head ablation reports only the task it kept.
+    for task_name in metrics.get("tasks", AUX_TASKS):
         task = metrics[task_name]
         for class_name, class_result in task["classes"].items():
             for threshold, threshold_result in class_result["thresholds"].items():
@@ -871,18 +967,19 @@ def _aggregate_records(
     records_dir: Path,
     expected_tokens: Sequence[str],
     manifest_identity_sha256: str,
+    tasks: Sequence[str] = AUX_TASKS,
 ) -> Tuple[Dict[str, object], str]:
     records_digest = hashlib.sha256()
 
     def records() -> Iterator[Mapping[str, np.ndarray]]:
         for token in expected_tokens:
             record, file_sha256 = _load_record(
-                records_dir / f"{token}.npz", token, manifest_identity_sha256
+                records_dir / f"{token}.npz", token, manifest_identity_sha256, tasks
             )
             records_digest.update(f"{token} {file_sha256}\n".encode("utf-8"))
             yield record
 
-    metrics = evaluate_auxiliary_records(records())
+    metrics = evaluate_auxiliary_records(records(), tasks=tasks)
     if int(metrics.get("num_tokens", -1)) != len(expected_tokens):
         raise RuntimeError(
             f"aggregator consumed {metrics.get('num_tokens')} tokens, expected "
@@ -987,11 +1084,22 @@ def _publish_final_results(
         raise RuntimeError("published auxiliary CSV failed its completion hash")
 
 
-def _validate_production_metrics(metrics: Mapping[str, object]) -> None:
+def _validate_production_metrics(
+    metrics: Mapping[str, object], tasks: Sequence[str] = AUX_TASKS
+) -> None:
+    reported = set(metrics.get("tasks", AUX_TASKS))
+    if reported != set(tasks):
+        raise RuntimeError(
+            f"metrics report tasks {sorted(reported)}, expected {sorted(set(tasks))}"
+        )
     for task_name, class_names in (
         ("detection", DET_CLASS_NAMES),
         ("map", MAP_CLASS_NAMES),
     ):
+        if task_name not in tasks:
+            if task_name in metrics:
+                raise RuntimeError(f"{task_name} is absent from this model but was scored")
+            continue
         task = metrics.get(task_name)
         if not isinstance(task, Mapping):
             raise RuntimeError(f"production metrics are missing {task_name}")
@@ -1007,21 +1115,21 @@ def _validate_production_metrics(metrics: Mapping[str, object]) -> None:
                 raise RuntimeError(
                     f"production {task_name}/{class_name} has no ground truth"
                 )
-    actual_det_counts = {
-        class_name: int(metrics["detection"]["classes"][class_name]["num_gt"])
-        for class_name in DET_CLASS_NAMES
-    }
-    if actual_det_counts != PRODUCTION_DET_GT_COUNTS:
-        raise RuntimeError(
-            "production detection GT counts do not match the uncapped navtest "
-            f"reference: actual={actual_det_counts}, expected={PRODUCTION_DET_GT_COUNTS}"
-        )
-    scenes_over_cap = int(metrics["map"].get("scenes_over_training_gt_cap_100", 0))
-    if scenes_over_cap <= 0:
-        raise RuntimeError(
-            "production map GT never exceeded the training cap; uncapped "
-            "evaluation-target path is not proven active"
-        )
+    for task_name, class_names, reference in (
+        ("detection", DET_CLASS_NAMES, PRODUCTION_DET_GT_COUNTS),
+        ("map", MAP_CLASS_NAMES, PRODUCTION_MAP_GT_COUNTS),
+    ):
+        if task_name not in tasks:
+            continue
+        actual = {
+            class_name: int(metrics[task_name]["classes"][class_name]["num_gt"])
+            for class_name in class_names
+        }
+        if actual != reference:
+            raise RuntimeError(
+                f"production {task_name} GT counts do not match the uncapped navtest "
+                f"V3 reference: actual={actual}, expected={reference}"
+            )
 
 
 def _production_guard(
@@ -1068,6 +1176,19 @@ def main(cfg: DictConfig) -> None:
         raise FileNotFoundError(
             f"archived training config does not exist: {training_config_path}"
         )
+
+    # Which heads this checkpoint has decides which tasks are scored.  Read it
+    # from the archived config so the CPU-only aggregate shard agrees with the
+    # GPU extraction shards without instantiating a model.
+    tasks = _agent_tasks(instantiate(_load_training_agent_config(
+        training_config_path, checkpoint_path
+    ).config))
+    if not tasks:
+        raise RuntimeError(
+            "auxiliary evaluation needs at least one of the detection and map heads; "
+            "this checkpoint has neither (plan-only arm)"
+        )
+    logger.info("Auxiliary tasks for this checkpoint: %s", ", ".join(tasks))
 
     scene_filter = instantiate(cfg.scene_filter)
     if scene_filter.tokens is None:
@@ -1120,7 +1241,7 @@ def main(cfg: DictConfig) -> None:
     manifest_identity_sha256 = _write_or_validate_manifest(manifest_path, identity)
 
     valid_tokens, missing_tokens = _validate_record_inventory(
-        records_dir, actual_tokens, manifest_identity_sha256
+        records_dir, actual_tokens, manifest_identity_sha256, tasks
     )
     logger.info(
         "Auxiliary record inventory: valid=%d missing=%d expected=%d",
@@ -1164,7 +1285,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     valid_tokens, missing_tokens = _validate_record_inventory(
-        records_dir, actual_tokens, manifest_identity_sha256
+        records_dir, actual_tokens, manifest_identity_sha256, tasks
     )
     if bool(cfg.extract_only):
         missing_after_set = set(missing_tokens)
@@ -1193,10 +1314,10 @@ def main(cfg: DictConfig) -> None:
             f"first_missing={missing_tokens[:1]}"
         )
     metrics, records_sha256 = _aggregate_records(
-        records_dir, actual_tokens, manifest_identity_sha256
+        records_dir, actual_tokens, manifest_identity_sha256, tasks
     )
     if bool(cfg.production_guard):
-        _validate_production_metrics(metrics)
+        _validate_production_metrics(metrics, tasks)
     _publish_final_results(
         output_dir,
         manifest_identity_sha256,
@@ -1205,9 +1326,8 @@ def main(cfg: DictConfig) -> None:
         records_sha256,
     )
     logger.info(
-        "Auxiliary evaluation complete: det mAP=%.6f map mAP=%.6f output=%s",
-        metrics["detection"]["mAP"],
-        metrics["map"]["mAP"],
+        "Auxiliary evaluation complete: %s output=%s",
+        " ".join(f"{task} mAP={metrics[task]['mAP']:.6f}" for task in tasks),
         output_dir,
     )
 

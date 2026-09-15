@@ -38,7 +38,7 @@ checkpoint:
 # W&B runs ALONGSIDE TensorBoard and is fail-open: an SDK/service failure
 # disables telemetry for the process instead of killing a DDP rank.
 wandb:
-  enable: false
+  enable: true
   project: para-ssr
   name: null          # null -> experiment_name
   group: null

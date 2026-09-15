@@ -9,8 +9,8 @@ embedding, so instance *i* point *j* is query ``i * num_pts + j``.  Classificati
 is per instance (read off the instance-mean of its point features); regression
 is per point.
 
-Nothing produced here reaches the planner or the motion decoder -- PARA-Drive
-Fig. 4 edges (1) and (5), both removed.
+Final point latents can be returned for the planner. The private decoder has
+no dependency on the detection/motion head or the planner.
 """
 from __future__ import annotations
 
@@ -213,7 +213,15 @@ class ParaMapHead(nn.Module):
         for branch in self.cls_branches:
             nn.init.constant_(branch[-1].bias, bias_init)
 
-    def forward(self, bev_embed: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, bev_embed: torch.Tensor, return_hidden: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        """Predict map instances and optionally expose attached point latents.
+
+        ``map_point_hidden`` is ``[B, V, P, C]`` in instance-major,
+        point-minor order. Predicted points are already normalized to ``[0, 1]``
+        over ``pc_range``; scores are foreground-only sigmoid logits.
+        """
         bs = bev_embed.size(0)
         device = bev_embed.device
         num_q = self.map_num_vec * self.map_num_pts_per_vec
@@ -263,10 +271,13 @@ class ParaMapHead(nn.Module):
             all_cls.append(cls)
             all_pts.append(pts)
 
-        return {
+        outputs = {
             "all_map_cls_scores": torch.stack(all_cls),
             "all_map_pts_preds": torch.stack(all_pts),
         }
+        if return_hidden:
+            outputs["map_point_hidden"] = hidden_inst
+        return outputs
 
     # ------------------------------------------------------------------ #
     def loss(
@@ -283,8 +294,14 @@ class ParaMapHead(nn.Module):
             gt_map_labels: ``[bs, max_vec]``
             gt_map_valid: ``[bs, max_vec]`` bool
         """
-        all_cls = preds["all_map_cls_scores"]
-        all_pts = preds["all_map_pts_preds"]
+        # Keep matching, target buffers and loss reductions in at least FP32
+        # even when decoder predictions come from FP16/BF16 autocast. Casting
+        # predictions is differentiable; GT never needs reduced precision.
+        loss_dtype = torch.promote_types(preds["all_map_pts_preds"].dtype, gt_map_pts.dtype)
+        loss_dtype = torch.promote_types(loss_dtype, torch.float32)
+        all_cls = preds["all_map_cls_scores"].to(dtype=loss_dtype)
+        all_pts = preds["all_map_pts_preds"].to(dtype=loss_dtype)
+        gt_map_pts = gt_map_pts.to(dtype=loss_dtype)
         num_layers = all_cls.size(0)
         device = all_cls.device
         losses: Dict[str, torch.Tensor] = {}

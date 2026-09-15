@@ -14,6 +14,9 @@ config:
   bev_w: 100
   embed_dims: 256
   encoder_num_layers: 3
+  # Status conditions planning only; shift + cached yaw warp history BEV.
+  use_shift: true
+  use_ego_motion: false
   use_grid_mask: true
   # Keep ImageNet initialization for fresh training.  Checkpoint-only
   # evaluators set this false because strict loading replaces every weight.
@@ -37,7 +40,7 @@ config:
   # pip install spconv-cu126); "pillar" = spconv-free fallback.
   # sparse voxels must be cell / 8 = 0.08 m; pillars must divide the 0.64 m
   # cell by one power of two on both axes.
-  use_lidar: true
+  use_lidar: false
   lidar_encoder: sparse
   lidar_max_points: 65536
   lidar_z_range: [-3.0, 5.0]
@@ -50,9 +53,11 @@ config:
   lidar_attn_points: 8
 
   # --- planner ------------------------------------------------------------
-  # true: SSR scene-token planner.  false: PARA-Drive planner (plan query +
-  # command embedding -> cross-attention over the full BEV -> MLP).
-  use_stl: true
+  # Interaction on: BEV -> parallel det/motion + map -> sum -> FFN.
+  # Interaction off: BEV -> FFN.
+  # With interaction off, head flags select parallel multi-task or plan-only.
+  use_stl: false
+  use_task_interaction: true
   plan_num_layers: 3
 
   # --- heads --------------------------------------------------------------
@@ -73,12 +78,9 @@ config:
     motion: 1.0
     map: 1.0
   # Closed-loop control of each task's gradient share at the shared BEV.
-  # Same target as the nuScenes 60-epoch arm (PARA_SSR_e2e_60ep.py:114).
-  # Measured unscaled on real navsim batches: plan 0.25% / det 73.5% /
-  # map 26.2% -- the planner barely steers the shared feature without this.
-  # Set to null to train the unscaled reference arm instead.  Head ablations
-  # (use_*_head: false) drop the absent valve automatically; the ablation
-  # wrappers override this to plan : remaining task = 1 : 1.
+  # Retain the existing target; planning now includes both memory paths.
+  # Set to null to train the unscaled reference. Interaction requires both
+  # heads; without it, absent tasks are removed from the balancer.
   grad_balance_target:
     plan: 0.4
     det: 0.3
@@ -93,6 +95,7 @@ config:
   grad_norm_log_interval: 200
 
   # --- optimisation (WoTE/SeerDrive recipe, report #09 4) -----------------
+  training_precision: 32
   max_epochs: 30
   warmup_epochs: 3
   min_lr: 1.0e-6

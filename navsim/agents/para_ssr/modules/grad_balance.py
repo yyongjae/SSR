@@ -53,15 +53,129 @@ Three things this does NOT do, all of which matter:
   unscaled gradients, so head convergence is unaffected -- which is the whole
   point when the heads are meant to become distillation teachers.
 
-Detection and motion share one valve because they share one forward pass
-through ``det_motion_head``: there is a single BEV input, so there can be only
-one scale.  Their losses must therefore be added *before* measuring the valve
-gradient; measuring the two norms separately would miss reinforcement or
-cancellation between them.
+Scales are assigned by the originating loss, not by the decoder traversed on
+the way back to BEV. Planning now reads detection/motion and map latents, so a
+valve at either decoder's BEV input would incorrectly scale planning too.
+``balance_shared_gradients`` adds a loss-local correction directly at BEV;
+the full planning gradient (direct and via either decoder) stays unscaled.
+Detection and motion retain their shared task coefficient. Their losses are
+added before measuring: separate norms miss reinforcement or cancellation.
+
+This correction requires FP32 training (FP64 is also supported for numerical
+tests). In FP16/BF16, combining large auxiliary and small planning gradients
+inside the decoders loses information before the auxiliary VJP is subtracted.
+Casting the final loss or BEV boundary to FP32 cannot recover that information.
+Unbalanced mixed-precision training and mixed-precision inference are separate
+from this controller and do not need the correction.
 """
 import math
 
 import torch
+
+
+def _autocast_enabled(device):
+    # torch 2.0 (still supported by requirements_navsim.txt) has separate
+    # no-argument CUDA and CPU queries; newer torch accepts a device string.
+    try:
+        return torch.is_autocast_enabled(device)
+    except TypeError:
+        if device == "cpu":
+            return torch.is_autocast_cpu_enabled()
+        return device == "cuda" and torch.is_autocast_enabled()
+
+
+def require_full_precision_for_balancing(tensors):
+    """Reject low-precision forward graphs, even outside an autocast context.
+
+    Callers with predictions must pass the original forward outputs: loss
+    routines may already have promoted them, and BEV itself can remain FP32
+    while the private decoders ran in BF16. A scalar AMP loss multiplier is
+    supported by ``_AddSharedGradient``; low-precision decoder arithmetic is
+    not.
+    """
+    tensors = tuple(value for value in tensors if isinstance(value, torch.Tensor))
+    reduced = any(value.dtype in (torch.float16, torch.bfloat16) for value in tensors)
+    devices = {value.device.type for value in tensors}
+    autocast = any(_autocast_enabled(device) for device in devices)
+    if reduced or autocast:
+        raise RuntimeError(
+            "PARA-SSR shared-gradient balancing requires FP32 forward/backward; "
+            "FP16/BF16 cancellation can corrupt the planning gradient. Set "
+            "trainer.params.precision=32, or disable balancing with "
+            "agent.config.grad_balance_target=null (grad_balance_target=None "
+            "in Python) and leave manual aux_grad_scale coefficients at 1.0. "
+            "Casting only losses or BEV to FP32 is insufficient."
+        )
+
+
+class _AddSharedGradient(torch.autograd.Function):
+    """Keep a loss value and private gradients; correct only its BEV gradient.
+
+    The upstream scalar multiplies BOTH outputs in backward. This is essential
+    for Lightning's gradient accumulation and AMP loss scaling. A hook holding
+    a fixed correction would silently skip those multipliers. Every invocation
+    owns its correction, so several outstanding microbatch graphs can coexist.
+    """
+
+    @staticmethod
+    def forward(ctx, loss, shared_feature, correction):
+        ctx.save_for_backward(correction)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (correction,) = ctx.saved_tensors
+        return grad_output, correction * grad_output, None
+
+
+def balance_shared_gradients(
+    total_loss, shared_feature, task_losses, scales, *, measure_norms=False
+):
+    """Scale task-origin gradients at BEV without scaling private parameters.
+
+    ``task_losses`` contains already weighted losses, with detection and motion
+    combined under ``det``. Forward paths must receive the original BEV tensor,
+    without branch-level gradient valves. For each auxiliary loss ``L_k`` add
+    ``(s_k - 1) * dL_k/dBEV`` at BEV on the final backward; all decoder and
+    planner parameters continue to receive their ordinary loss gradients.
+
+    Measurements include every route from a loss to BEV. They report effective
+    norms (raw norm times the current task scale), matching ``GradBalancer``'s
+    update contract. VJPs stop at the activation and do not populate parameter
+    ``.grad`` or invoke DDP parameter reduction. DDP still averages the eventual
+    corrected encoder gradients through its ordinary backward hooks.
+
+    Only tasks requiring a correction or a norm measurement incur an extra
+    reverse traversal. The detached correction supports ordinary first-order
+    training, not higher-order differentiation through gradient balancing.
+    """
+    norms = {}
+    correction = None
+    if not torch.is_grad_enabled() or not shared_feature.requires_grad:
+        return total_loss, norms
+    if any(task != "plan" and float(scales.get(task, 1.0)) != 1.0
+           for task in task_losses):
+        require_full_precision_for_balancing(
+            (shared_feature, total_loss, *task_losses.values())
+        )
+    for task, loss in task_losses.items():
+        # Plan is the numeraire, regardless of the names of branches it uses.
+        scale = 1.0 if task == "plan" else float(scales.get(task, 1.0))
+        if not measure_norms and scale == 1.0:
+            continue
+        if not isinstance(loss, torch.Tensor) or not loss.requires_grad:
+            continue
+        grad = torch.autograd.grad(
+            loss, shared_feature, retain_graph=True, allow_unused=True
+        )[0]
+        if measure_norms:
+            norms[task] = 0.0 if grad is None else float(grad.float().norm()) * scale
+        if grad is not None and scale != 1.0:
+            delta = grad.detach() * (scale - 1.0)
+            correction = delta if correction is None else correction + delta
+    if correction is not None:
+        total_loss = _AddSharedGradient.apply(total_loss, shared_feature, correction)
+    return total_loss, norms
 
 
 class GradBalancer:
@@ -169,7 +283,16 @@ class GradBalancer:
             s = self.scale_for(task)
             if s <= 0:
                 continue          # switched off by a zero target; leave it off
-            raw[task] = measured[task] / s        # undo the valve
+            norm = float(measured[task])
+            # One invalid measurement must not poison checkpointed controller
+            # state forever. Keep the complete previous update and try again
+            # at the next measurement, after the distributed norm reduction.
+            if not math.isfinite(norm) or norm < 0:
+                return self.log_dict()
+            unscaled = norm / s
+            if not math.isfinite(unscaled):
+                return self.log_dict()
+            raw[task] = unscaled        # undo the valve
         base = raw.get(self.NUMERAIRE)
         t_base = self.target[self.NUMERAIRE]
         if not base or base <= 0:

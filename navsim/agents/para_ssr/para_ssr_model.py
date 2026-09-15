@@ -1,17 +1,16 @@
-"""PARA-SSR model: shared BEV encoder with three parallel heads.
-
-Mirrors ``projects/mmdet3d_plugin/SSR/para_ssr.py``:
+"""PARA-SSR: shared BEV, independent perception heads, task-memory planner.
 
 * history frames build ``prev_bev`` under ``no_grad`` (they exist to give the
   temporal self-attention something to attend to, not to be trained through);
 * the current frame's BEV is produced by the planning head, which owns the
   encoder;
-* that one ``bev_embed`` fans out to the detection/motion head and the map head.
-  Neither feeds the other, nor the planner -- the only coupling is the shared
-  feature (PARA-Drive Fig. 5);
-* every auxiliary head sees ``bev_embed`` through ``_ScaleGrad``, so its own
-  parameters train at full strength while its influence on the shared feature
-  is throttled independently;
+* with task interaction, perception latents feed the planner; without it,
+  heads train independently from shared BEV and may be absent for plan-only;
+* shared-BEV gradient balancing happens by loss origin in ``ParaSSRLoss``.
+  Scaling decoder inputs would incorrectly scale planning gradients that
+  travel through those decoders;
+* ego velocity/acceleration condition the planning query only; temporal BEV
+  alignment warps history with the geometric ``bev_shift`` and relative yaw;
 * with ``use_lidar`` (SafeDrive) each frame's point cloud is encoded into a
   LiDAR BEV first, which seeds the BEV queries and feeds the per-layer LiDAR
   cross-attention -- for history frames as well, so ``prev_bev`` is the same
@@ -31,23 +30,6 @@ from .modules.det_motion_head import ParaDetMotionHead
 from .modules.lidar_encoder import build_lidar_encoder
 from .modules.map_head import ParaMapHead
 from .modules.planner_head import ParaSSRPlannerHead
-
-
-class _ScaleGrad(torch.autograd.Function):
-    """Identity forward; scales the gradient flowing backwards.
-
-    Down-weighting an auxiliary *loss* would slow the head itself, which is the
-    opposite of what is wanted when the heads are meant to become teachers.
-    """
-
-    @staticmethod
-    def forward(ctx, x, scale):
-        ctx.scale = scale
-        return x
-
-    @staticmethod
-    def backward(ctx, grad):
-        return grad * ctx.scale, None
 
 
 class GridMask(nn.Module):
@@ -117,6 +99,25 @@ class ParaSSRModel(nn.Module):
         super().__init__()
         self._config = config
         cfg = config
+        if cfg.use_stl or cfg.plan_num_layers != 3:
+            raise ValueError("PARA-SSR requires use_stl=False and plan_num_layers=3")
+        if cfg.use_ego_motion:
+            raise ValueError(
+                "PARA-SSR routes ego status to planning; use_ego_motion must be False "
+                "(geometric BEV translation/rotation alignment uses use_shift)"
+            )
+        self.use_task_interaction = bool(cfg.use_task_interaction)
+        if self.use_task_interaction and (not cfg.use_det_motion_head or not cfg.use_map_head):
+            raise ValueError("the planner requires both det/motion and map heads")
+        if tuple(cfg.map_pc_range) != tuple(cfg.pc_range):
+            raise ValueError("shared BEV/detection/map must use one physical ROI")
+        active_tasks = ["plan"]
+        if cfg.use_det_motion_head:
+            active_tasks.extend(("det", "motion"))
+        if cfg.use_map_head:
+            active_tasks.append("map")
+        if any(cfg.task_loss_weight.get(task, 1.0) <= 0 for task in active_tasks):
+            raise ValueError("active task supervision must all be enabled; remove an unused head instead")
         self._backbone_frozen_stages = int(getattr(cfg, "frozen_stages", -1))
         self._backbone_norm_requires_grad = bool(
             getattr(cfg, "norm_requires_grad", False)
@@ -179,6 +180,7 @@ class ParaSSRModel(nn.Module):
             use_lidar=cfg.use_lidar,
             use_stl=cfg.use_stl,
             plan_num_layers=cfg.plan_num_layers,
+            use_task_interaction=self.use_task_interaction,
         )
         self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
 
@@ -302,37 +304,45 @@ class ParaSSRModel(nn.Module):
             return None
 
         was_training = self.training
-        self.eval()
-        if was_training and self.lidar_encoder is not None:
-            # ``eval()`` exists for the frozen-BN image backbone and the
-            # attention dropout.  The LiDAR encoder trains from scratch with
-            # its own BatchNorm (momentum 0.01, as in SafeDrive): on running
-            # statistics it would produce a history BEV of a different scale
-            # from the batch-normalised current BEV it is aligned with, until
-            # the running estimates catch up.  SafeDrive processes every frame
-            # in the same mode; keep the LiDAR branch in train mode here too.
-            self.lidar_encoder.train()
-        prev_bev = None
-        for t in range(T - 1):
-            feats = self.extract_img_feat(cams[:, t])
-            prev_bev = self.pts_bbox_head(
-                feats,
-                lidar2img=features["lidar2img"],
-                image_hw=features["image_hw"],
-                ego_motion=features["ego_motion"][:, t],
-                bev_shift=features["bev_shift"][:, t],
-                prev_bev=prev_bev,
-                only_bev=True,
-                lidar_bev=self.lidar_bev(features, t),
-            )
-        if was_training:
-            self.train()
-        return prev_bev
+        was_cache_enabled = torch.is_autocast_cache_enabled()
+        try:
+            # History and the trainable current frame share weights and the
+            # caller's autocast context. Caching a weight cast under no_grad
+            # would let the current frame reuse a detached copy and silently
+            # lose encoder gradients. Disable only caching for history;
+            # preserve the caller's autocast enabled state and dtype.
+            torch.set_autocast_cache_enabled(False)
+            self.eval()
+            if was_training and self.lidar_encoder is not None:
+                # The image backbone uses frozen BN, whereas the from-scratch
+                # LiDAR BN must use the same statistics mode for history and
+                # current frames (as in SafeDrive).
+                self.lidar_encoder.train()
+            prev_bev = None
+            for t in range(T - 1):
+                feats = self.extract_img_feat(cams[:, t])
+                prev_bev = self.pts_bbox_head(
+                    feats,
+                    lidar2img=features["lidar2img"],
+                    image_hw=features["image_hw"],
+                    ego_motion=None,
+                    bev_shift=features["bev_shift"][:, t],
+                    bev_yaw=features["ego_motion"][:, t, 2].detach(),
+                    prev_bev=prev_bev,
+                    only_bev=True,
+                    lidar_bev=self.lidar_bev(features, t),
+                )
+            return prev_bev
+        finally:
+            torch.set_autocast_cache_enabled(was_cache_enabled)
+            self.train(was_training)
 
     # ------------------------------------------------------------------ #
     def forward(
         self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None
     ) -> Dict[str, torch.Tensor]:
+        # Interaction requires perception at inference too. In parallel mode,
+        # run_aux only requests optional eval perception; training runs all heads.
         cfg = self._config
         if run_aux is None:
             run_aux = self.training or cfg.test_aux_heads
@@ -341,18 +351,35 @@ class ParaSSRModel(nn.Module):
 
         cams = features["camera_feature"]
         cur_feats = self.extract_img_feat(cams[:, -1])
-        outs = self.pts_bbox_head(
+        bev_embed = self.pts_bbox_head(
             cur_feats,
             lidar2img=features["lidar2img"],
             image_hw=features["image_hw"],
-            ego_motion=features["ego_motion"][:, -1],
+            ego_motion=None,
             bev_shift=features["bev_shift"][:, -1],
+            # Read only relative yaw from the existing cache vector. This is
+            # geometry for history alignment, not learned status conditioning.
+            bev_yaw=features["ego_motion"][:, -1, 2].detach(),
             prev_bev=prev_bev,
-            cmd=features["command"],
+            only_bev=True,
             lidar_bev=self.lidar_bev(features, -1),
         )
 
-        bev_embed = outs["bev_embed"]
+        run_heads = self.use_task_interaction or self.training or run_aux
+        det_out = (
+            self.det_motion_head(bev_embed, return_hidden=self.use_task_interaction)
+            if run_heads and self.det_motion_head is not None else None
+        )
+        map_out = (
+            self.map_head(bev_embed, return_hidden=self.use_task_interaction)
+            if run_heads and self.map_head is not None else None
+        )
+        outs = self.pts_bbox_head.plan_from_bev(
+            bev_embed, features["command"], det_out, map_out,
+            # The cached status is command + (vx, vy, ax, ay) in NAVSIM's
+            # native ego axes and metric units. Command has its own embedding.
+            ego_status=features["status_feature"][:, cfg.num_navi_cmd:],
+        )
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
             "ego_fut_preds": outs["ego_fut_preds"],
@@ -360,17 +387,12 @@ class ParaSSRModel(nn.Module):
                 outs["ego_fut_preds"], features["command"]
             ),
         }
-        # the PARA-Drive planner (use_stl=False) has no scene tokens
-        if outs["token_attn"] is not None:
-            predictions["token_attn"] = outs["token_attn"]
-
-        if run_aux and self.det_motion_head is not None:
-            s = self.aux_grad_scale.get("det", 1.0)
-            bev_det = bev_embed if s == 1.0 else _ScaleGrad.apply(bev_embed, s)
-            predictions.update(self.det_motion_head(bev_det))
-        if run_aux and self.map_head is not None:
-            s = self.aux_grad_scale.get("map", 1.0)
-            bev_map = bev_embed if s == 1.0 else _ScaleGrad.apply(bev_embed, s)
-            predictions.update(self.map_head(bev_map))
+        # Training always exposes predictions needed by every supervised loss,
+        # even when a caller explicitly passes run_aux=False.
+        if self.training or run_aux:
+            if det_out is not None:
+                predictions.update(det_out)
+            if map_out is not None:
+                predictions.update(map_out)
 
         return predictions

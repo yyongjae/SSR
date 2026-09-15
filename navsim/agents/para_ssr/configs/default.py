@@ -100,8 +100,13 @@ class ParaSSRConfig:
     encoder_attn_dropout: float = 0.1
     encoder_ffn_dropout: float = 0.1
 
+    # Historical flag name: now controls full SE(2) history feature alignment
+    # (translation AND rotation) before temporal attention, once per frame.
     use_shift: bool = True
-    use_ego_motion: bool = True
+    # Ego velocity/acceleration condition the planning query directly. Keep
+    # geometric history alignment via bev_shift + yaw, without learned BEV status
+    # conditioning. The legacy feature/config fields remain cache-compatible.
+    use_ego_motion: bool = False
     ego_motion_norm: bool = True
     use_cams_embeds: bool = True
     use_grid_mask: bool = True
@@ -116,7 +121,7 @@ class ParaSSRConfig:
     # in every encoder layer, gated against the camera cross-attention.
     # History frames need it too, or ``prev_bev`` would be a different kind of
     # feature from the current BEV it is aligned with.
-    use_lidar: bool = True
+    use_lidar: bool = False
     # Padded rows per frame.  Measured on trainval: ~50k points fall inside the
     # 32 x 64 m front ROI of a ~91k-point frame (max 53k over the sample);
     # longer clouds are thinned deterministically, never dropped at random.
@@ -149,11 +154,10 @@ class ParaSSRConfig:
     # ------------------------------------------------------------------ #
     # planning head
     # ------------------------------------------------------------------ #
-    # True: SSR's scene-token planner (navi SE -> TokenLearner -> latent
-    # decoder -> waypoint decoder).  False: PARA-Drive's planner, a
-    # command-conditioned plan query cross-attending to the full BEV
-    # (plan_num_layers deep); num_scenes / latent / way layers are then unused.
-    use_stl: bool = True
+    # Three Pre-LN blocks; optionally read private decoder memories after BEV.
+    # Scene-token settings below are retained as inert config compatibility.
+    use_stl: bool = False
+    use_task_interaction: bool = True
     plan_num_layers: int = 3
     num_scenes: int = 16
     num_reg_fcs: int = 2
@@ -219,10 +223,9 @@ class ParaSSRConfig:
         default_factory=lambda: dict(plan=2.0, det=1.0, motion=1.0, map=1.0)
     )
     # Closed-loop control of each task's gradient share at the shared BEV.
-    # Same target as the nuScenes 60-epoch arm (PARA_SSR_e2e_60ep.py:114), so
-    # the two runs stay comparable.  Set to None for the unscaled reference.
-    # Measured unscaled on real navsim batches: plan 0.25% / det 73.5% /
-    # map 26.2% -- the planner barely steers the shared feature without this.
+    # Retain the previous target; re-measure shares for the new planner.
+    # Planning includes direct BEV and both latent-memory paths. Set to None
+    # for the unscaled reference.
     grad_balance_target: Dict[str, float] = field(
         default_factory=lambda: dict(plan=0.4, det=0.3, map=0.3)
     )
@@ -238,12 +241,15 @@ class ParaSSRConfig:
     grad_balance_warmup_iters: int = 10600
     grad_norm_log_interval: int = 200
 
-    # aux heads are train-only by default (PARA-Drive's runtime advantage)
+    # Eval auxiliary predictions. With interaction on, decoders always run;
+    # with it off, evaluation can omit their computation as well.
     test_aux_heads: bool = False
 
     # ------------------------------------------------------------------ #
     # optimisation -- WoTE/SeerDrive recipe, see report #09 §4
     # ------------------------------------------------------------------ #
+    # Also used by the shared Hydra training entrypoint; wrappers already use 32.
+    training_precision: int = 32
     optimizer_type: str = "AdamW"
     weight_decay: float = 1e-4
     max_epochs: int = 30

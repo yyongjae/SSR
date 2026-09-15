@@ -10,6 +10,9 @@ Three multipliers stack, exactly as in the nuScenes config:
 gradient entering ``bev_embed`` and leaves each head's own parameter gradients
 alone, which is why it can hold a task's influence on the shared feature down
 without slowing the head itself.
+
+Shared-gradient balancing requires FP32 forward/backward. Mixed-precision
+training is supported only with balancing disabled and neutral manual scales.
 """
 from __future__ import annotations
 
@@ -18,7 +21,12 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .modules.grad_balance import GradBalancer, all_reduce_mean
+from .modules.grad_balance import (
+    GradBalancer,
+    all_reduce_mean,
+    balance_shared_gradients,
+    require_full_precision_for_balancing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,13 +119,21 @@ class ParaSSRLoss(torch.nn.Module):
                         "grad_balance_target drops %r: that head is disabled", task
                     )
                     del target[task]
-            self.balancer = GradBalancer(
-                target=target,
-                interval=config.grad_balance_interval,
-                momentum=config.grad_balance_momentum,
-                clamp=tuple(config.grad_balance_clamp),
-                warmup_iters=config.grad_balance_warmup_iters,
-            )
+            # Plan-only has no relative task share to control, even if a caller
+            # retains the Hydra multi-task target dictionary.
+            if set(target) == {"plan"} and not (
+                getattr(config, "use_det_motion_head", True)
+                or getattr(config, "use_map_head", True)
+            ):
+                logger.info("GradBalancer disabled: planning is the only active task")
+            else:
+                self.balancer = GradBalancer(
+                    target=target,
+                    interval=config.grad_balance_interval,
+                    momentum=config.grad_balance_momentum,
+                    clamp=tuple(config.grad_balance_clamp),
+                    warmup_iters=config.grad_balance_warmup_iters,
+                )
 
     def get_extra_state(self) -> Dict:
         """Persist controller state through regular Lightning checkpoints."""
@@ -142,7 +158,7 @@ class ParaSSRLoss(torch.nn.Module):
             self.balancer._seen = set(balancer_state.get("seen", ()))
 
     def apply_aux_scales(self, model) -> None:
-        """Synchronize the model valve before every auxiliary forward pass."""
+        """Synchronize task-origin coefficients (never decoder input valves)."""
         if self.balancer is None:
             return
         model.aux_grad_scale = {
@@ -161,6 +177,22 @@ class ParaSSRLoss(torch.nn.Module):
         tw = cfg.task_loss_weight
         logs: Dict[str, torch.Tensor] = {}
         task_losses: Dict[str, torch.Tensor] = {}
+        # Validate the original outputs before individual loss routines promote
+        # predictions to FP32. Also reject AMP during controller warm-up, rather
+        # than letting a long run fail only once its scales become non-neutral.
+        active_scales = (
+            {task: self.balancer.scale_for(task) for task in ("det", "map")}
+            if self.balancer is not None
+            else dict(getattr(model, "aux_grad_scale", {}))
+        )
+        manual_correction = any(
+            prediction_key in predictions and float(active_scales.get(task, 1.0)) != 1.0
+            for task, prediction_key in (
+                ("det", "all_cls_scores"), ("map", "all_map_cls_scores")
+            )
+        )
+        if model.training and (self.balancer is not None or manual_correction):
+            require_full_precision_for_balancing(predictions.values())
 
         # ---- planning -------------------------------------------------
         plan_loss, plan_metrics = compute_plan_loss(
@@ -223,16 +255,22 @@ class ParaSSRLoss(torch.nn.Module):
             and bev_embed.requires_grad
             and self.iteration % cfg.grad_norm_log_interval == 0
         )
+        measurement_losses = dict(task_losses)
+        if "motion" in measurement_losses:
+            # Combine before differentiation to account for cancellation.
+            measurement_losses["det"] = measurement_losses.get("det", 0.0) + (
+                measurement_losses.pop("motion")
+            )
+        # The coefficients captured above belong to this graph. A controller
+        # update below applies to the next microbatch.
+        total_loss, norms = balance_shared_gradients(
+            sum(task_losses.values()),
+            bev_embed,
+            measurement_losses,
+            active_scales if model.training else {},
+            measure_norms=bool(need_balance or need_log),
+        )
         if need_balance or need_log:
-            measurement_losses = dict(task_losses)
-            if "det" in measurement_losses and "motion" in measurement_losses:
-                # Detection and motion share one ScaleGrad valve.  The valve's
-                # actual BEV gradient is grad(L_det + L_motion), not either norm
-                # separately and not the sum of their norms.
-                measurement_losses["det"] = (
-                    measurement_losses["det"] + measurement_losses.pop("motion")
-                )
-            norms = self._measure_bev_grad_norms(bev_embed, measurement_losses)
             norms = all_reduce_mean(norms, bev_embed.device)
             total = sum(norms.values()) or 1.0
             for k, v in norms.items():
@@ -248,7 +286,6 @@ class ParaSSRLoss(torch.nn.Module):
 
         if model.training:
             self.iteration += 1
-        total_loss = sum(task_losses.values())
         logs["loss"] = total_loss.detach()
         # LiDAR/camera blend per encoder layer.  Verification on real scenes
         # (report/12 5-2) showed the LiDAR-seeded BEV dominating early on, so the
@@ -272,9 +309,9 @@ class ParaSSRLoss(torch.nn.Module):
     ) -> Dict[str, float]:
         """``||dL_task / d bev_embed||`` per task.
 
-        ``autograd.grad`` differentiates through ``_ScaleGrad``, so the measured
-        norm already carries whatever valve is currently in effect -- which is
-        exactly what ``GradBalancer.update`` expects and backs out.
+        These are raw task-origin norms, including all direct and indirect
+        routes. Training applies coefficients explicitly in
+        ``balance_shared_gradients``; no decoder boundary scales them.
         """
         norms: Dict[str, float] = {}
         for task, loss in task_losses.items():

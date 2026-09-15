@@ -504,8 +504,16 @@ def _validate_token_list(tokens: Iterable[str], name: str) -> List[str]:
 
 
 def _source_hashes() -> Dict[str, str]:
+    # Model helpers are added independently of this evaluator (e.g. temporal
+    # alignment and LiDAR encoding). Fingerprint the whole local package so
+    # changing an inference dependency cannot silently reuse old token records.
+    source_paths = set(SOURCE_PATHS)
+    package_root = REPO_ROOT / "navsim/agents/para_ssr"
+    source_paths.update(
+        path.relative_to(REPO_ROOT).as_posix() for path in package_root.rglob("*.py")
+    )
     result: Dict[str, str] = {}
-    for relative in SOURCE_PATHS:
+    for relative in sorted(source_paths):
         path = REPO_ROOT / relative
         if not path.is_file():
             raise FileNotFoundError(f"required evaluator source does not exist: {path}")

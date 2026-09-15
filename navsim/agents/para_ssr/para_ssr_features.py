@@ -6,9 +6,9 @@ Produces, per sample:
 ``lidar2img``       ``[N_cam, 4, 4]``         SSR-BEV frame -> image pixels
 ``image_hw``        ``[N_cam, 2]``            (H, W) after resize/crop
 ``bev_shift``       ``[T, 2]``                normalised ego motion per step
-``ego_motion``      ``[T, ego_motion_dims]``  query conditioning vector
+``ego_motion``      ``[T, ego_motion_dims]``  legacy vector; relative yaw at [:,2] aligns BEV
 ``command``         ``[4]``                   driving command one-hot
-``status_feature``  ``[8]``                   command + velocity + acceleration
+``status_feature``  ``[8]``                   command + current planner velocity/acceleration
 ``lidar_points``    ``[T, N_max, 5]``         (use_lidar) front-ROI points in SSR
                                               axes, zero-padded
 ``lidar_num_points`` ``[T]``                  (use_lidar) real rows per frame
@@ -268,11 +268,13 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
     def _get_ego_motion(
         self, agent_input: AgentInput, frame_indices: Sequence[int]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """BEV shift and the query-conditioning vector, per queue step.
+        """BEV shift and the legacy ego vector, per queue step.
 
         ``ego_pose`` is ``(x, y, heading)`` in the *current* frame, x forward,
         y left.  For queue step ``k`` the shift is the ego displacement from
         frame ``k-1`` to frame ``k``, expressed in frame ``k``'s own axes.
+        Temporal feature alignment also reads relative yaw at ``motion[2]``;
+        the remaining vector entries are retained for cache compatibility.
         """
         cfg = self._config
         poses = [

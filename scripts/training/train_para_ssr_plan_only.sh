@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PARA-SSR ablation: PLAN only (no detection/motion head, no vector-map head).
+# PARA-SSR ablation: PLAN only (no interaction or auxiliary heads).
 #
 # The shared BEV is then steered by the planning loss alone -- SSR's original
 # situation, and the control arm the other three are measured against.  Both
@@ -16,11 +16,13 @@
 # Evaluate with the same flags (the checkpoint has no auxiliary tensors and the
 # agent loads strictly):
 #   bash scripts/evaluation/eval_para_ssr.sh /abs/ckpt \
+#     agent.config.use_task_interaction=false \
 #     agent.config.use_det_motion_head=false agent.config.use_map_head=false
 set -euo pipefail
 ABLATION_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-export EXPERIMENT="${EXPERIMENT:-para_ssr_plan_only}"
+export EXPERIMENT="${EXPERIMENT:-para_ssr_plan_only_final}"
 exec bash "${ABLATION_REPO}/scripts/training/train_para_ssr.sh" \
+  agent.config.use_task_interaction=false \
   agent.config.use_det_motion_head=false \
   agent.config.use_map_head=false \
   agent.config.grad_balance_target=null \

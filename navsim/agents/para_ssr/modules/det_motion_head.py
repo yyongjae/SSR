@@ -1,9 +1,8 @@
 """Parallel detection + motion head (``ParaDetMotionHead``), mmdet-free.
 
-One head produces both supervisions from a single forward over the shared BEV,
-which is why detection and motion share a single shared-BEV gradient valve.
-Nothing here feeds the planner or the map head -- the only coupling is through
-``bev_embed`` itself.
+One head produces both supervisions from a single forward over the shared BEV.
+Its final detection and motion latents can also be returned for the planner;
+the private decoder has no dependency on the planner or the map head.
 
 Layout follows the nuScenes config: 300 object queries, a 3-layer deformable
 DETR decoder with iterative reference-point refinement, then a 1-layer
@@ -281,10 +280,16 @@ class ParaDetMotionHead(nn.Module):
         for branch in self.cls_branches:
             nn.init.constant_(branch[-1].bias, bias_init)
 
-    def forward(self, bev_embed: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, bev_embed: torch.Tensor, return_hidden: bool = False
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             bev_embed: ``[bs, bev_h * bev_w, embed_dims]``
+            return_hidden: Include attached final decoder latents as
+                ``det_hidden [B, Q, C]`` and ``motion_hidden [B, Q, M, C]``.
+                Box predictions contain metric XY centres; classification
+                predictions contain foreground-only sigmoid logits.
         """
         bs = bev_embed.size(0)
         device = bev_embed.device
@@ -378,12 +383,16 @@ class ParaDetMotionHead(nn.Module):
         )
         traj_cls = self.traj_cls_branch(motion_hs).squeeze(-1)
 
-        return {
+        outputs = {
             "all_cls_scores": torch.stack(outputs_classes),
             "all_bbox_preds": torch.stack(outputs_coords),
             "traj_preds": traj,
             "traj_cls_preds": traj_cls,
         }
+        if return_hidden:
+            outputs["det_hidden"] = inter_states[-1].permute(1, 0, 2)
+            outputs["motion_hidden"] = motion_hs
+        return outputs
 
     # ------------------------------------------------------------------ #
     # loss
@@ -405,8 +414,17 @@ class ParaDetMotionHead(nn.Module):
             gt_fut_trajs: ``[bs, max_agents, fut_ts, 2]`` future offsets
             gt_fut_masks: ``[bs, max_agents, fut_ts]``
         """
-        all_cls_scores = preds["all_cls_scores"]
-        all_bbox_preds = preds["all_bbox_preds"]
+        # Autocast predictions may be FP16/BF16 while cached GT is FP32.
+        # Match and reduce losses in at least FP32: this both keeps indexed
+        # target assignments type-safe and avoids low-precision focal costs.
+        # The casts stay attached to the original decoder predictions.
+        loss_dtype = torch.promote_types(preds["all_bbox_preds"].dtype, gt_bboxes.dtype)
+        loss_dtype = torch.promote_types(loss_dtype, torch.float32)
+        all_cls_scores = preds["all_cls_scores"].to(dtype=loss_dtype)
+        all_bbox_preds = preds["all_bbox_preds"].to(dtype=loss_dtype)
+        gt_bboxes = gt_bboxes.to(dtype=loss_dtype)
+        if gt_fut_trajs is not None:
+            gt_fut_trajs = gt_fut_trajs.to(dtype=loss_dtype)
         num_layers = all_cls_scores.size(0)
         device = all_cls_scores.device
 
@@ -499,10 +517,10 @@ class ParaDetMotionHead(nn.Module):
         # motion background class, while matched queries without any annotated
         # future are the only entries whose classification weight is zero.
         traj_preds = torch.nan_to_num(
-            preds["traj_preds"], nan=0.0, posinf=0.0, neginf=0.0
+            preds["traj_preds"].to(dtype=loss_dtype), nan=0.0, posinf=0.0, neginf=0.0
         )
         traj_cls_preds = torch.nan_to_num(
-            preds["traj_cls_preds"], nan=0.0, posinf=0.0, neginf=0.0
+            preds["traj_cls_preds"].to(dtype=loss_dtype), nan=0.0, posinf=0.0, neginf=0.0
         )
         loss_traj_sum = traj_preds.sum() * 0.0
         traj_labels = torch.full(

@@ -240,7 +240,7 @@ d     = 1 − cos (쿼리별, 기본)  |  mse
 
 - PARA-SSR validation(val_logs)에서는 `teacher_valid = 0`이 되어 증류 항이 마스킹된다.
 - readout의 open-loop validation은 train_logs 중 log 단위 5%를 hold-out해서 쓴다.
-- **navtest teacher 캐시는 아직 없다.** Stage 1의 PDMS 평가 전에 만들어야 한다(§8). navtest info에는 test log의 frame 71,460개가 있고, teacher의 memory bank를 위해 전부 통과시키되 allow-list token 12,146개만 저장한다(`--only-split-tokens`, 약 31 GB). 모든 navtest token에 위성 타일이 있음을 확인했다.
+- **navtest teacher 캐시는 아직 없다.** Stage 1의 PDMS 평가 전에 만들어야 한다(§8, §9). navtest info에는 test log의 frame 71,460개가 있고, teacher의 memory bank를 위해 전부 통과시키되 allow-list token 12,146개만 저장한다(`--only-split-tokens`, 약 31 GB). 모든 navtest token에 위성 타일이 있음을 확인했다.
 - teacher와 student 모두 train_logs로 학습했다. 따라서 train 캐시는 "본 데이터"의 feature이고, 평가는 navtest feature로 한다. 이 train/test 품질 차이는 양쪽에 대칭으로 존재한다.
 
 ### 6.3 축 정렬
@@ -288,7 +288,66 @@ d     = 1 − cos (쿼리별, 기본)  |  mse
 **기본 설정에서 기존 동작은 바뀌지 않는다.** `kd_mode=none`, `map_label_source=gt`이면 teacher builder도, distiller도 생성되지 않는다.
 KD로 학습한 체크포인트는 KD 설정 없이 평가된다.
 
-## 8. 실행 순서
+## 8. 진행 로드맵 (turing → 5090)
+
+순서를 정하는 기준은 두 가지다. teacher는 5090(sm_120)에서 돌지 않으므로 **teacher가 필요한 작업은 turing에서 먼저 끝낸다.**
+그리고 가장 오래 걸리는 **plan-only student 학습을 가장 먼저 건다.**
+
+### 8.1 turing에서 끝내고 옮길 것
+
+| 작업 | 비용 | 이유 |
+|---|---|---|
+| navtest teacher 캐시 (§9 0-b) | 4 GPU로 약 25분 추정, 약 31 GB | Stage 1 PDMS 평가에 필요. 5090에서는 못 만든다 |
+| plan target 추출, navtrain·navtest (§9 0-c) | CPU | 결과 파일이 작다 |
+| navtest metric cache (`/data/navsim/exp/metric_cache`) | 복사만 | 5090 서버에 없으면 새로 만드는 데 시간이 걸린다 |
+
+위 결과는 rsync로 옮긴다. train teacher 캐시(301 GB)는 5090에서 HF로 받는다(§9 0-a).
+val_logs teacher 캐시가 필요해지면(예: readout open-loop 검증을 공식 val로 하고 싶을 때) 이것도 turing에서 만들어야 한다.
+
+### 8.2 5090 환경 확인 (반나절)
+
+1. `pytest tests/`
+2. `train_readout.py --max-train 256 --epochs 1`, `eval_readout_pdms.py --max-tokens 40`
+3. `scripts/training/smoke_para_ssr.sh`로 PARA-SSR 학습 스모크. 두 가지를 확인한다.
+   - torch 2.7 이상에서 navsim/nuplan-devkit이 도는지
+   - FP32, GPU당 B=4가 32 GB에 들어가는지 (안 들어가면 batch를 줄이고 accumulate를 늘려 global 128 유지)
+
+### 8.3 바로 병렬로 시작할 두 가지
+
+**A. plan-only student 학습** — 가장 오래 걸리므로 먼저 건다.
+
+```bash
+MAP_PROBE=1 ARM=plan_only bash scripts/training/train_para_ssr_kd.sh
+```
+
+이 체크포인트 하나를 세 군데에 쓴다.
+- arm ① 기준선 (probe를 켠 조건. 기존 86.45 런은 probe가 없다)
+- Stage 2의 student BEV 캐시
+- Stage 3 fine-tune의 시작점
+
+**B. Stage 1 관문** — readout만 학습하므로 가볍다. GPU 한 장에 여러 개를 같이 돌려도 된다.
+
+```bash
+PRESETS="h1" SEEDS="0 1 2" bash tools/readout/run_stage1.sh
+```
+
+**통과 기준** (셋 다 만족해야 한다)
+- `S_own − S_ego`가 seed 편차보다 뚜렷하게 크다.
+- `S_shuffled ≤ S_ego`
+- readout 학습 로그에서 `val/l2_4s_bev_shuffled`가 `val/l2_4s`보다 확실히 나쁘다. 비슷하면 h가 BEV를 보지 않는다.
+
+**통과하지 못하면** Stage 2, 3으로 가지 않는다. teacher BEV에 planning 성분이 없는지, readout 버그인지(설계 문서 §08의 "probe가 작동하지 않음": ego 지름길, 미수렴, BEV 불일치)부터 확인한다.
+A는 그대로 모델 작업의 기준선으로 쓸 수 있으므로 버려지지 않는다.
+
+### 8.4 통과한 뒤
+
+1. **용량 곡선:** h0, h2 (`PRESETS="h0 h2"`). A가 학습되는 동안 진행한다.
+2. **Stage 2:** A가 끝나면 student BEV를 캐싱하고(navtrain, navtest) `run_stage2.sh`로 `S_student`, `S_transfer`, `S_transfer+A`를 잰다. §2.3 표로 해석한다.
+3. **Stage 3 fine-tune (feasibility):** `kd_readout`과 대조군 `plan_only`를 같은 `INIT_CKPT`, 같은 LR, 같은 step으로 돌린다.
+4. **Stage 3 본 실험:** ①~④와 대조군 `kd_random`, `kd_feature`를 처음부터, 같은 스케줄로, `MAP_PROBE=1`로 돌린다. PDMS와 map mAP를 함께 보고한다.
+5. **ablation:** `--num-queries`, `--ego-inject`, `--cmd-inject`, λ(`KD_WEIGHT`, `KD_BALANCE`), warmup 길이.
+
+## 9. 실행 명령
 
 경로는 예시다. `PY`는 navsim env의 python이다.
 
@@ -347,7 +406,7 @@ INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 KD_WARMUP=0 KD_RAMP=2000 \
 - `gshare/distill`, `gscale/distill`: GradBalancer를 쓸 때의 distill gradient 몫과 scale
 - readout 쪽 `val/z_cos_spread`: z가 샘플마다 얼마나 다른지. 0에 가까우면 cosine 증류가 당길 것이 없다.
 
-## 9. 5090 서버 메모
+## 10. 5090 서버 메모
 
 - **teacher stack(torch 1.12 / cu116 / mmcv-full 1.6)은 sm_120(RTX 5090)에서 돌지 않는다.** teacher가 필요한 작업(navtest 캐시, 필요하면 val_logs 캐시)은 옮기기 전에 turing에서 끝내야 한다. 그 뒤로는 캐시만 있으면 된다.
 - Stage 1/2 readout 학습은 캐시와 navsim 코드만 필요하다. mmcv가 필요 없다.
@@ -355,7 +414,7 @@ INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 KD_WARMUP=0 KD_RAMP=2000 \
 - GradBalancer와 `KD_BALANCE`는 FP32를 요구한다. 기존 레시피는 GPU당 B=4 FP32이고, 32 GB에 들어가는지는 확인하지 않았다. 안 들어가면 batch를 줄이고 accumulate를 늘려 global 128을 유지한다. KD arm은 GPU당 teacher BEV(fp16 2.56 MB)와 동결 h만 추가된다.
 - 저장공간: teacher BEV 301 GB, student BEV 약 264 GB, navtest 캐시 각 약 31 GB.
 
-## 10. 검증한 것과 하지 않은 것
+## 11. 검증한 것과 하지 않은 것
 
 **검증함** (turing, CPU. GPU는 다른 사용자가 점유 중이었다)
 
@@ -369,12 +428,12 @@ INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 KD_WARMUP=0 KD_RAMP=2000 \
 
 **하지 않음**
 
-- 실제 실험. Stage 1~3 결과는 아직 없다.
+- 실제 실험. Stage 1~3 결과는 아직 없다. 진행 순서는 §8.
 - turing에는 현재 구조의 PARA-SSR 체크포인트가 없다(학습은 다른 서버에서 했다). Stage 2 전에 가져와야 한다.
-- navtest teacher 캐시 전체 생성 (명령은 §8, 스모크만 했다)
+- navtest teacher 캐시 전체 생성 (명령은 §9, 스모크만 했다)
 - turing의 `sensor_blobs/trainval`에는 일부 navtrain frame의 이미지가 없다. `cache_student_bev.py`는 이런 frame을 건너뛰고 `missing_r*.txt`에 기록한다. 실제 학습 서버의 데이터는 확인하지 않았다.
 
-## 11. 미결 사항
+## 12. 미결 사항
 
 - PARA-SSR 구조 자체가 아직 확정되지 않았다. 구조가 바뀌면 Stage 2 캐시와 Stage 3을 다시 돌려야 한다. Stage 1은 teacher에만 의존하므로 재사용된다.
 - teacher 선정 기준을 `S − S_ego`로 수치화하는 것은 보류한다. 단일 점수로 teacher를 고르는 것은 너무 나이브하다.

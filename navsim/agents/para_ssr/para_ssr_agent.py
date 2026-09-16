@@ -50,6 +50,8 @@ from .para_ssr_targets import (
     MAP_CLASS_NAMES,
     ParaSSRTargetBuilder,
 )
+from .readout.distill import KD_DISTANCES, KD_MODES
+from .readout.teacher_targets import ResMapTeacherTargetBuilder
 
 
 class WarmupCosLR(_LRScheduler):
@@ -476,6 +478,23 @@ class ParaSSRAgent(AbstractAgent):
                 "map_dir_interval must satisfy 1 <= interval < points/vector, "
                 f"got {config.map_dir_interval} and {config.map_num_pts_per_vec}"
             )
+        kd_mode = getattr(config, "kd_mode", "none")
+        label_source = getattr(config, "map_label_source", "gt")
+        if kd_mode not in KD_MODES:
+            raise ValueError(f"kd_mode must be one of {KD_MODES}, got {kd_mode!r}")
+        if label_source not in ("gt", "teacher"):
+            raise ValueError(f"map_label_source must be gt|teacher, got {label_source!r}")
+        if (kd_mode != "none" or label_source == "teacher") and not config.kd_teacher_cache:
+            raise ValueError("kd_mode / map_label_source=teacher need kd_teacher_cache")
+        if label_source == "teacher" and not config.use_map_head:
+            raise ValueError("map_label_source=teacher needs use_map_head=true")
+        if kd_mode != "none":
+            if config.kd_distance not in KD_DISTANCES:
+                raise ValueError(f"kd_distance must be one of {KD_DISTANCES}, got {config.kd_distance!r}")
+            if kd_mode == "readout" and not config.kd_readout_ckpt:
+                raise ValueError("kd_mode=readout needs kd_readout_ckpt")
+            if min(int(config.kd_warmup_iters), int(config.kd_ramp_iters)) < 0:
+                raise ValueError("kd_warmup_iters and kd_ramp_iters must be non-negative")
         if trajectory_sampling.num_poses != config.fut_ts:
             raise ValueError(
                 "trajectory_sampling and fut_ts disagree: "
@@ -531,7 +550,23 @@ class ParaSSRAgent(AbstractAgent):
 
         # Fresh training is required after the parity fixes.  Strict loading is
         # intentional so a pre-fix or unrelated checkpoint cannot be scored.
-        self.load_state_dict(state_dict, strict=True)
+        # The one exception is the distillation adapter (readout/distill.py):
+        # it is training-only, so a KD checkpoint must evaluate without it and
+        # a KD fine-tune must start from a checkpoint that never had it.
+        kd_prefix = "_loss.distiller."
+        own = self.state_dict()
+        state_dict = {
+            k: v for k, v in state_dict.items() if not k.startswith(kd_prefix) or k in own
+        }
+        result = self.load_state_dict(state_dict, strict=False)
+        missing = [k for k in result.missing_keys if not k.startswith(kd_prefix)]
+        if missing or result.unexpected_keys:
+            # same wording as torch's strict load, which callers match on
+            raise RuntimeError(
+                "Error(s) in loading PARA-SSR checkpoint: "
+                f"Missing key(s): {missing[:10]}; "
+                f"Unexpected key(s): {list(result.unexpected_keys)[:10]}"
+            )
 
     def get_sensor_config(self) -> SensorConfig:
         """Load only the cameras, LiDAR frames and history this config consumes.
@@ -557,7 +592,13 @@ class ParaSSRAgent(AbstractAgent):
         return [ParaSSRFeatureBuilder(self._config)]
 
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
-        return [ParaSSRTargetBuilder(self._config, self._trajectory_sampling)]
+        builders: List[AbstractTargetBuilder] = [
+            ParaSSRTargetBuilder(self._config, self._trajectory_sampling)
+        ]
+        cfg = self._config
+        if getattr(cfg, "kd_mode", "none") != "none" or getattr(cfg, "map_label_source", "gt") == "teacher":
+            builders.append(ResMapTeacherTargetBuilder(cfg))
+        return builders
 
     # ------------------------------------------------------------------ #
     def forward(
@@ -600,6 +641,9 @@ class ParaSSRAgent(AbstractAgent):
                 backbone_params.append(param)
             else:
                 other_params.append(param)
+
+        # training-only modules owned by the loss (the distillation adapter)
+        other_params += [p for p in self._loss.parameters() if p.requires_grad]
 
         groups = [
             {"params": other_params, "lr": self._lr, "lr_scale": 1.0},

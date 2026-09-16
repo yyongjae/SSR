@@ -94,6 +94,21 @@ config:
   grad_balance_interval: 200
   grad_norm_log_interval: 200
 
+  # --- planning-readout distillation (report/19) ---------------------------
+  # Off by default.  kd_mode: none | readout | random | feature.
+  # map_label_source: gt | teacher (map head supervised by ReSMap predictions).
+  kd_mode: none
+  kd_teacher_cache: null
+  kd_readout_ckpt: null
+  kd_distance: cosine
+  kd_weight: 1.0
+  kd_warmup_iters: 0
+  kd_ramp_iters: 0
+  kd_adapter: false
+  kd_random_seed: 0
+  map_label_source: gt
+  map_pseudo_score_thr: 0.3
+
   # --- optimisation (WoTE/SeerDrive recipe, report #09 4) -----------------
   training_precision: 32
   max_epochs: 30

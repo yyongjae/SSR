@@ -8,7 +8,7 @@ Values fall into three groups:
 * **optimisation** -- the WoTE/SeerDrive-derived recipe (see report #09 §4).
 """
 from dataclasses import dataclass, field
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
@@ -240,6 +240,36 @@ class ParaSSRConfig:
     grad_balance_clamp: Tuple[float, float] = (1e-5, 1.0)
     grad_balance_warmup_iters: int = 10600
     grad_norm_log_interval: int = 200
+
+    # ------------------------------------------------------------------ #
+    # planning-readout distillation from the cached ReSMap teacher
+    # (report/19_planning_readout.md).  All off by default.
+    # ------------------------------------------------------------------ #
+    # none | readout | random | feature   (see readout/distill.py)
+    kd_mode: str = "none"
+    # Root of the sharded ReSMap cache (index.json, bev/, vectors/, ...).
+    kd_teacher_cache: Optional[str] = None
+    # Stage-1 readout trained on the teacher BEV; its h_enc is frozen.
+    kd_readout_ckpt: Optional[str] = None
+    # cosine | mse, on z (readout/random) or on the BEV (feature).
+    kd_distance: str = "cosine"
+    # Fixed lambda.  With "distill" in grad_balance_target the balancer then
+    # rescales the term's BEV gradient on top of this.
+    kd_weight: float = 1.0
+    # Micro-batch counts, the grad_balance_warmup_iters convention: lambda is 0
+    # for kd_warmup_iters, then ramps linearly to kd_weight over kd_ramp_iters.
+    # z_S is meaningless while the student BEV is still random.
+    kd_warmup_iters: int = 0
+    kd_ramp_iters: int = 0
+    # Identity-initialised 1x1 conv on the student BEV before h_enc (design s05).
+    kd_adapter: bool = False
+    # kd_mode=random: seed of the fixed random 256-d projection.
+    kd_random_seed: int = 0
+    # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
+    # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
+    # always uses GT.
+    map_label_source: str = "gt"
+    map_pseudo_score_thr: float = 0.3
 
     # Eval auxiliary predictions. With interaction on, decoders always run;
     # with it off, evaluation can omit their computation as well.

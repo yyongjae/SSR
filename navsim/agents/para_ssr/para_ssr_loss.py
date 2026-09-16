@@ -21,6 +21,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from .readout.distill import ReadoutDistiller
 from .modules.grad_balance import (
     GradBalancer,
     all_reduce_mean,
@@ -95,15 +96,24 @@ class ParaSSRLoss(torch.nn.Module):
         self._config = config
         self.iteration = 0
         self.balancer: Optional[GradBalancer] = None
+        self.distiller: Optional[ReadoutDistiller] = None
+        if getattr(config, "kd_mode", "none") != "none":
+            self.distiller = ReadoutDistiller(config)
         if config.grad_balance_target:
             target = dict(config.grad_balance_target)
-            unsupported = set(target) - {"plan", "det", "map"}
+            unsupported = set(target) - {"plan", "det", "map", "distill"}
             if unsupported:
                 raise ValueError(
                     "unsupported grad_balance_target keys "
                     f"{sorted(unsupported)}; use 'det' for the shared "
-                    "detection+motion valve and only plan/det/map targets"
+                    "detection+motion valve and only plan/det/map/distill targets"
                 )
+            # The distillation term reaches the model only through bev_embed
+            # (its reader is frozen), so the BEV-level correction scales it
+            # exactly.  Without a distillation term there is nothing to steer.
+            if "distill" in target and getattr(config, "kd_mode", "none") == "none":
+                logger.info("grad_balance_target drops 'distill': kd_mode is none")
+                del target["distill"]
             # Head ablations (use_det_motion_head / use_map_head = false) keep
             # the default target dict -- a Hydra override merges keys, it cannot
             # remove one -- so drop the valve of a head that does not exist.
@@ -138,6 +148,8 @@ class ParaSSRLoss(torch.nn.Module):
     def get_extra_state(self) -> Dict:
         """Persist controller state through regular Lightning checkpoints."""
         state = {"iteration": int(self.iteration)}
+        if self.distiller is not None and self.distiller.start_iter is not None:
+            state["kd_start_iter"] = int(self.distiller.start_iter)
         if self.balancer is not None:
             state["balancer"] = {
                 "scale": dict(self.balancer.scale),
@@ -149,6 +161,8 @@ class ParaSSRLoss(torch.nn.Module):
         if not state:
             return
         self.iteration = int(state.get("iteration", 0))
+        if self.distiller is not None and "kd_start_iter" in state:
+            self.distiller.start_iter = int(state["kd_start_iter"])
         balancer_state = state.get("balancer")
         if self.balancer is not None and balancer_state is not None:
             restored_scale = balancer_state.get("scale", {})
@@ -161,6 +175,7 @@ class ParaSSRLoss(torch.nn.Module):
         """Synchronize task-origin coefficients (never decoder input valves)."""
         if self.balancer is None:
             return
+        # distill has no decoder valve; its scale is applied at BEV in forward()
         model.aux_grad_scale = {
             task: self.balancer.scale_for(task) for task in ("det", "map")
         }
@@ -181,7 +196,7 @@ class ParaSSRLoss(torch.nn.Module):
         # predictions to FP32. Also reject AMP during controller warm-up, rather
         # than letting a long run fail only once its scales become non-neutral.
         active_scales = (
-            {task: self.balancer.scale_for(task) for task in ("det", "map")}
+            {task: self.balancer.scale_for(task) for task in ("det", "map", "distill")}
             if self.balancer is not None
             else dict(getattr(model, "aux_grad_scale", {}))
         )
@@ -232,14 +247,19 @@ class ParaSSRLoss(torch.nn.Module):
 
         # ---- vector map -----------------------------------------------
         if model.map_head is not None and "all_map_cls_scores" in predictions:
-            map_losses = model.map_head.loss(
-                predictions,
-                targets["gt_map_pts"],
-                targets["gt_map_labels"],
-                targets["gt_map_valid"],
-            )
+            map_pts, map_labels, map_valid = self._map_labels(targets, logs)
+            map_losses = model.map_head.loss(predictions, map_pts, map_labels, map_valid)
             task_losses["map"] = sum(map_losses.values()) * tw.get("map", 1.0)
             logs.update({k: v.detach() for k, v in map_losses.items()})
+
+        # ---- readout-space distillation (report/19) ---------------------
+        if self.distiller is not None and "teacher_bev" in targets:
+            kd = self.distiller(predictions["bev_embed"], targets, self.iteration)
+            task_losses["distill"] = kd["loss"]
+            logs["loss_distill"] = kd["loss"].detach()
+            logs["kd/raw"] = kd["raw"]
+            logs["kd/coef"] = kd["coef"]
+            logs["kd/valid_frac"] = kd["valid_frac"]
 
         # ---- shared-BEV gradient measurement / balancing ---------------
         bev_embed = predictions["bev_embed"]
@@ -303,6 +323,25 @@ class ParaSSRLoss(torch.nn.Module):
         return total_loss, logs
 
     # ------------------------------------------------------------------ #
+    def _map_labels(self, targets, logs):
+        """GT map labels, or the teacher's where the teacher has the frame."""
+        gt = (targets["gt_map_pts"], targets["gt_map_labels"], targets["gt_map_valid"])
+        if getattr(self._config, "map_label_source", "gt") != "teacher":
+            return gt
+        if "teacher_map_pts" not in targets:
+            raise KeyError(
+                "map_label_source='teacher' but the batch has no teacher_map_pts; "
+                "is ResMapTeacherTargetBuilder registered?"
+            )
+        hit = targets["teacher_valid"].view(-1).bool()
+        logs["kd/pseudo_frac"] = hit.float().mean().detach()
+        pick = lambda t, g: torch.where(hit.view(-1, *([1] * (g.dim() - 1))), t.to(g.dtype), g)
+        return (
+            pick(targets["teacher_map_pts"], gt[0]),
+            pick(targets["teacher_map_labels"], gt[1]),
+            pick(targets["teacher_map_valid"], gt[2]),
+        )
+
     @staticmethod
     def _measure_bev_grad_norms(
         bev_embed: torch.Tensor, task_losses: Dict[str, torch.Tensor]

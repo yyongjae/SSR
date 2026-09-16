@@ -43,7 +43,7 @@ navtest (PDMS evaluation of planning readouts; ~31 GB):
     torchrun --nproc_per_node=4 tools/cache_teacher_kd.py --cfg ... --ckpt ... \
         --split none --only-split-tokens \
         --ann-file /data2/kyungmin/navsim/infos/navsim_map_infos_navtest.pkl \
-        --out /data3/kyungmin/kd_teacher_resmap_navtest
+        --out /data3/kyungmin/kd_teacher_resmap/navtest
 """
 import argparse
 import glob

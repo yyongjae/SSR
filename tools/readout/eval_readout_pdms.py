@@ -6,7 +6,7 @@ same ``pdm_score`` with the same metric cache and scoring parameters.
 
     # S_own      : teacher-trained h on the teacher navtest cache
     python tools/readout/eval_readout_pdms.py --readout runs/teacher_h1_s0/readout.pt \
-        --bev-cache /data3/kyungmin/kd_teacher_resmap_navtest \
+        --bev-cache /data3/kyungmin/kd_teacher_resmap/navtest \
         --targets plan_targets_navtest.npz --out runs/teacher_h1_s0/pdms_teacher.csv
     # S_transfer : the SAME checkpoint on the student navtest cache (no training)
     ...  --bev-cache /data3/kyungmin/student_bev/navtest --out .../pdms_transfer.csv

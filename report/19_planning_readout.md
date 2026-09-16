@@ -240,7 +240,7 @@ d     = 1 − cos (쿼리별, 기본)  |  mse
 
 - PARA-SSR validation(val_logs)에서는 `teacher_valid = 0`이 되어 증류 항이 마스킹된다.
 - readout의 open-loop validation은 train_logs 중 log 단위 5%를 hold-out해서 쓴다.
-- **navtest teacher 캐시는 아직 없다.** Stage 1의 PDMS 평가 전에 만들어야 한다(§8, §9). navtest info에는 test log의 frame 71,460개가 있고, teacher의 memory bank를 위해 전부 통과시키되 allow-list token 12,146개만 저장한다(`--only-split-tokens`, 약 31 GB). 모든 navtest token에 위성 타일이 있음을 확인했다.
+- **navtest teacher 캐시**는 HF repo의 `navtest/`에 있다(§8.1). navtest info에는 test log의 frame 71,460개가 있고, teacher의 memory bank를 위해 전부 통과시키되 allow-list token 12,146개만 저장한다(`--only-split-tokens`, 약 31 GB). 모든 navtest token에 위성 타일이 있음을 확인했다.
 - teacher와 student 모두 train_logs로 학습했다. 따라서 train 캐시는 "본 데이터"의 feature이고, 평가는 navtest feature로 한다. 이 train/test 품질 차이는 양쪽에 대칭으로 존재한다.
 
 ### 6.3 축 정렬
@@ -293,16 +293,21 @@ KD로 학습한 체크포인트는 KD 설정 없이 평가된다.
 순서를 정하는 기준은 두 가지다. teacher는 5090(sm_120)에서 돌지 않으므로 **teacher가 필요한 작업은 turing에서 먼저 끝낸다.**
 그리고 가장 오래 걸리는 **plan-only student 학습을 가장 먼저 건다.**
 
-### 8.1 turing에서 끝내고 옮길 것
+### 8.1 turing에서 끝낸 것과 5090에서 받을 것
 
-| 작업 | 비용 | 이유 |
+teacher가 필요한 작업은 turing에서 끝냈고, 결과는 HF `rudals/resmap-navsim-teacher-kd` 한 곳에 있다.
+
+| 데이터 | 상태 | 5090에서 |
 |---|---|---|
-| navtest teacher 캐시 (§9 0-b) | 4 GPU로 약 25분 추정, 약 31 GB | Stage 1 PDMS 평가에 필요. 5090에서는 못 만든다 |
-| plan target 추출, navtrain·navtest (§9 0-c) | CPU | 결과 파일이 작다 |
-| navtest metric cache (`/data/navsim/exp/metric_cache`) | 복사만 | 5090 서버에 없으면 새로 만드는 데 시간이 걸린다 |
+| train teacher 캐시 (repo 루트, 301 GB) | 완료 | `download_teacher_cache.py --subsets train` |
+| navtest teacher 캐시 (`navtest/`, 약 31 GB) | turing에서 생성·업로드 진행 중 (2026-09-16 시작, 로그 `/data3/kyungmin/logs/navtest_*.log`) | `download_teacher_cache.py --subsets navtest --fields bev` |
+| plan target (navtrain, navtest) | 5090에서 만든다 (CPU, navsim log만 필요) | `build_plan_targets.py` (§9 0-c) |
+| navtest metric cache | 5090 서버에 없으면 만들거나 turing의 `/data/navsim/exp/metric_cache`를 복사 | – |
 
-위 결과는 rsync로 옮긴다. train teacher 캐시(301 GB)는 5090에서 HF로 받는다(§9 0-a).
-val_logs teacher 캐시가 필요해지면(예: readout open-loop 검증을 공식 val로 하고 싶을 때) 이것도 turing에서 만들어야 한다.
+navtest teacher 캐시가 필요한 이유는 **평가**다. 학습(h 학습, Stage 3 증류)에는 train 캐시만 쓴다.
+h는 추론할 때도 teacher BEV를 입력으로 받으므로, navtest 장면을 PDMS로 채점하려면 그 장면들의 teacher BEV가 있어야 한다.
+train_logs 일부를 떼어 평가하면 teacher가 학습한 장면이라 feature가 실제보다 좋게 나와 `S_own`이 부풀려진다.
+val_logs로 평가하려면 teacher val 캐시와 navtrain metric cache가 따로 필요한데, 후자는 turing에서 미완성이다.
 
 ### 8.2 5090 환경 확인 (반나절)
 
@@ -352,18 +357,20 @@ A는 그대로 모델 작업의 기준선으로 쓸 수 있으므로 버려지�
 경로는 예시다. `PY`는 navsim env의 python이다.
 
 ```bash
-# 0-a) teacher 캐시 (5090 서버라면 HF에서 받는다; bev + map arm용 vector)
+# 0-a) teacher 캐시 (5090 서버라면 HF에서 받는다; bev + map arm용 vector, navtest는 bev만)
 python tools/readout/resmap/download_teacher_cache.py --out $DATA/kd_teacher_resmap \
-    --fields bev vectors scores labels
+    --subsets train --fields bev vectors scores labels
+python tools/readout/resmap/download_teacher_cache.py --out $DATA/kd_teacher_resmap \
+    --subsets navtest --fields bev        # -> $DATA/kd_teacher_resmap/navtest
 
-# 0-b) navtest teacher 캐시: turing(A6000)의 resmap env, maptracker repo에서
-#      (teacher stack은 sm_120에서 돌지 않는다). 71,460 frame 통과, 약 25분 추정
+# 0-b) (완료, 재생성할 때만) navtest teacher 캐시: turing(A6000)의 resmap env, maptracker repo에서
+#      (teacher stack은 sm_120에서 돌지 않는다). 71,460 frame 통과
 cd maptracker && torchrun --nproc_per_node=4 tools/cache_teacher_kd.py \
     --cfg work_dirs/resmap_nav_rideflux_stage3/resmap_nav_stage3.py \
     --ckpt work_dirs/resmap_nav_rideflux_stage3/iter_63024.pth \
     --split none --only-split-tokens \
     --ann-file /data2/kyungmin/navsim/infos/navsim_map_infos_navtest.pkl \
-    --out /data3/kyungmin/kd_teacher_resmap_navtest
+    --out /data3/kyungmin/kd_teacher_resmap/navtest
 python tools/readout/verify_teacher_alignment.py --cache /data3/kyungmin/kd_teacher_resmap
 
 # 0-c) plan target (CPU)
@@ -371,7 +378,7 @@ $PY tools/readout/build_plan_targets.py --filter navtrain --split trainval --out
 $PY tools/readout/build_plan_targets.py --filter navtest  --split test     --out $R/plan_targets_navtest.npz
 
 # 1) Stage 1 — 관문
-TEACHER_CACHE=$DATA/kd_teacher_resmap TEACHER_CACHE_TEST=$DATA/kd_teacher_resmap_navtest \
+TEACHER_CACHE=$DATA/kd_teacher_resmap TEACHER_CACHE_TEST=$DATA/kd_teacher_resmap/navtest \
 TARGETS_TRAIN=$R/plan_targets_navtrain.npz TARGETS_TEST=$R/plan_targets_navtest.npz \
 PRESETS="h1" SEEDS="0 1 2" RUNS=$R/runs PYTHON=$PY bash tools/readout/run_stage1.sh
 #   통과하면 PRESETS="h0 h2", --num-queries / --ego-inject / --cmd-inject ablation
@@ -430,7 +437,6 @@ INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 KD_WARMUP=0 KD_RAMP=2000 \
 
 - 실제 실험. Stage 1~3 결과는 아직 없다. 진행 순서는 §8.
 - turing에는 현재 구조의 PARA-SSR 체크포인트가 없다(학습은 다른 서버에서 했다). Stage 2 전에 가져와야 한다.
-- navtest teacher 캐시 전체 생성 (명령은 §9, 스모크만 했다)
 - turing의 `sensor_blobs/trainval`에는 일부 navtrain frame의 이미지가 없다. `cache_student_bev.py`는 이런 frame을 건너뛰고 `missing_r*.txt`에 기록한다. 실제 학습 서버의 데이터는 확인하지 않았다.
 
 ## 12. 미결 사항

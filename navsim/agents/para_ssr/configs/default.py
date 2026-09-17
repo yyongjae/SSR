@@ -125,6 +125,9 @@ class ParaSSRConfig:
     # navsim scores (x, y, heading); nuScenes SSR regressed (x, y) only
     traj_dims: int = 3
     heading_weight: float = 0.5
+    # When False, removes TokenLearner (token selector) and uses dense BEV cross-attention (PARA-Drive style)
+    use_stl: bool = False
+    plan_num_layers: int = 3
 
     # Optional NAVSIM metric-supervised candidate planner. Enabled separately by
     # agent=para_ssr_metric_agent, so the single-trajectory baseline is retained.
@@ -244,7 +247,12 @@ class ParaSSRConfig:
                 "cache_name": "bevfusion",
                 "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
                 "loss_weight": 1.0,
-            }
+            },
+            "resmap": {
+                "cache_name": "resmap",
+                "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
+                "loss_weight": 1.0,
+            },
         }
     )
     # ``{branch: /path/to/stage1_adapter.ckpt}``
@@ -252,6 +260,7 @@ class ParaSSRConfig:
     # Grid the cache was written on; the student BEV is resampled to it.
     distill_cache_size: Tuple[int, int] = (100, 100)
     distill_loss_weight: float = 1.0
+    use_corridor_mask: bool = True
 
     # Stage 1: train one adapter + the unchanged planning decoder from the
     # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.

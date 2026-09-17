@@ -19,4 +19,6 @@ config:
   # distill_branches once that cache exists.
   distill_adapter_checkpoints:
     bevfusion: ${oc.env:BEVFUSION_ADAPTER_CKPT,''}
+    resmap: ${oc.env:RESMAP_ADAPTER_CKPT,''}
   distill_loss_weight: 1.0
+  use_corridor_mask: true

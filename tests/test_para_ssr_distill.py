@@ -15,13 +15,19 @@ import pytest
 import torch
 
 from navsim.agents.para_ssr.configs.default import ParaSSRConfig
+from nuplan.planning.simulation.trajectory.trajectory_sampling import (
+    TrajectorySampling,
+)
+
 from navsim.agents.para_ssr.distill import (
     PlanningBEVAdapter,
+    ParaSSRTeacherAdapterAgent,
     TeacherAdapterPlanner,
     TeacherCacheMismatch,
     TeacherFeatureStore,
     bev_tokens_to_map,
     build_planning_distillation,
+    restrict_dataset_to_stores,
 )
 
 REAL_CACHE = "/home/external-user/datasets/teacher_cache"
@@ -96,6 +102,7 @@ def test_adapter_starts_as_normalised_identity(config):
 def test_store_loads_and_flips(cache, config):
     store = TeacherFeatureStore(cache, "bevfusion")
     store.validate_manifest(config)
+    assert store.spatial_size() == (config.bev_h, config.bev_w)
     batch = store.load_batch(TOKENS, torch.device("cpu"), torch.float32)
     assert batch.shape == (2, config.embed_dims, config.bev_h, config.bev_w)
 
@@ -123,8 +130,31 @@ def test_store_rejects_mismatched_channels(tmp_path, config):
 
 def test_store_reports_missing_samples(cache, config):
     store = TeacherFeatureStore(cache, "bevfusion")
+    assert store.has_token(TOKENS[0])
+    assert not store.has_token("deadbeefdeadbeef")
     with pytest.raises(FileNotFoundError, match="misses"):
         store.load_batch(["deadbeefdeadbeef"], torch.device("cpu"), torch.float32)
+
+
+class _FakeSceneDataset:
+    def __init__(self, tokens):
+        class _Loader:
+            pass
+
+        self._scene_loader = _Loader()
+        self._scene_loader.scene_frames_dicts = {token: {"token": token} for token in tokens}
+
+    def __len__(self):
+        return len(self._scene_loader.scene_frames_dicts)
+
+
+def test_restrict_dataset_drops_uncached_tokens(cache, config):
+    store = TeacherFeatureStore(cache, "bevfusion")
+    dataset = _FakeSceneDataset(list(TOKENS) + ["deadbeefdeadbeef"])
+    dropped = restrict_dataset_to_stores(dataset, [store], name="val")
+    assert dropped == 1
+    assert set(dataset._scene_loader.scene_frames_dicts) == set(TOKENS)
+    assert len(dataset) == len(TOKENS)
 
 
 def test_store_requires_a_manifest(tmp_path, config):
@@ -210,10 +240,6 @@ def test_distillation_is_off_by_default(config):
 # target plumbing
 # --------------------------------------------------------------------- #
 def test_target_cache_name_changes_with_scene_token(config):
-    from nuplan.planning.simulation.trajectory.trajectory_sampling import (
-        TrajectorySampling,
-    )
-
     from navsim.agents.para_ssr.para_ssr_targets import ParaSSRTargetBuilder
 
     ts = TrajectorySampling(time_horizon=4, interval_length=0.5)
@@ -282,3 +308,109 @@ def test_stage1_has_no_unused_parameters(config, cache):
     dead = [n for n, p in model.named_parameters()
             if p.requires_grad and p.grad is None]
     assert dead == [], f"parameters receive no gradient: {dead}"
+
+
+def test_compute_corridor_mask():
+    from navsim.agents.para_ssr.distill import compute_corridor_mask
+
+    trajectories = torch.zeros(2, 8, 3)
+    trajectories[:, :, 1] = torch.linspace(0.0, 20.0, 8)
+    mask = compute_corridor_mask(
+        trajectories=trajectories,
+        pc_range=(-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
+        bev_h=50,
+        bev_w=100,
+        base_weight=0.1,
+    )
+    assert mask.shape == (2, 1, 50, 100)
+    assert mask.min() >= 0.1
+    assert mask.max() <= 1.0
+    # Cells near the forward trajectory (x=0, center column ~50) should have high weight
+    assert mask[0, 0, 0, 50] > 0.8
+    # Distant off-path cells (far right lateral boundary) should have weight close to base_weight
+    assert mask[0, 0, 0, 95] < 0.2
+
+
+def test_stage2_applies_corridor_mask(tmp_path, config, cache):
+    _, _, ckpt = _stage1_checkpoint(tmp_path, config, cache)
+    cfg = replace(
+        config,
+        use_distill=True,
+        distill_feature_root=cache,
+        distill_adapter_checkpoints={"bevfusion": ckpt},
+        use_corridor_mask=True,
+    )
+    distill = build_planning_distillation(cfg)
+
+    student = torch.randn(2, cfg.bev_h * cfg.bev_w, cfg.embed_dims, requires_grad=True)
+    trajectories = torch.zeros(2, 8, 3)
+    trajectories[:, :, 1] = torch.linspace(0.0, 20.0, 8)
+
+    losses, metrics = distill(student, TOKENS, trajectories=trajectories)
+    assert "loss_distill_bevfusion" in losses
+    losses["loss_distill_bevfusion"].backward()
+    assert student.grad is not None
+    assert student.grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(REAL_CACHE, "resmap")),
+    reason="ReSMap teacher cache not present on this machine",
+)
+def test_real_resmap_cache_matches_geometry_and_loads(config):
+    store = TeacherFeatureStore(REAL_CACHE, "resmap")
+    store.validate_manifest(config)
+    assert store.is_sharded()
+    with open(os.path.join(REAL_CACHE, "resmap", "index.json")) as f:
+        tok = next(iter(json.load(f).keys()))
+    batch = store.load_batch([tok], torch.device("cpu"), torch.float32)
+    assert store.spatial_size() == (50, 100)
+    assert store.has_token(tok)
+    assert not store.has_token("f9a027ce6a5453fa")
+    assert batch.shape == (1, config.embed_dims, 50, 100)
+
+
+def test_stage1_planner_follows_teacher_cache_grid(tmp_path, config):
+    """ReSMap-like 50x100 cache must not keep the student's 100x100 positional encoding."""
+    root = _write_cache(str(tmp_path / "c"), config, shape=[50, 100])
+    cfg = replace(
+        config,
+        use_distill=True,
+        input_target=True,
+        distill_feature_root=root,
+        teacher_adapter_branch="bevfusion",
+    )
+    agent = ParaSSRTeacherAdapterAgent(
+        cfg, TrajectorySampling(time_horizon=4, interval_length=0.5)
+    )
+    assert agent.model.planner.bev_h == 50
+    assert agent.model.planner.bev_w == 100
+    bev = agent._store.load_batch(list(TOKENS), torch.device("cpu"), torch.float32)
+    cmd = torch.zeros(len(TOKENS), cfg.num_navi_cmd)
+    cmd[:, 1] = 1.0
+    out = agent.model(bev, cmd)
+    assert out["ego_fut_preds"].shape == (
+        len(TOKENS), cfg.ego_fut_mode, cfg.fut_ts, cfg.traj_dims
+    )
+
+
+def test_stage2_resamples_student_when_teacher_grid_differs(tmp_path, config):
+    root = _write_cache(str(tmp_path / "c"), config, shape=[50, 100])
+    _, _, ckpt = _stage1_checkpoint(tmp_path, config, root)
+    cfg = replace(
+        config,
+        use_distill=True,
+        distill_feature_root=root,
+        distill_adapter_checkpoints={"bevfusion": ckpt},
+        use_corridor_mask=True,
+    )
+    distill = build_planning_distillation(cfg)
+    student = torch.randn(
+        2, cfg.bev_h * cfg.bev_w, cfg.embed_dims, requires_grad=True
+    )
+    trajectories = torch.zeros(2, 8, 3)
+    trajectories[:, :, 1] = torch.linspace(0.0, 20.0, 8)
+    losses, _metrics = distill(student, TOKENS, trajectories=trajectories)
+    losses["loss_distill_bevfusion"].backward()
+    assert student.grad is not None
+    assert student.grad.abs().sum() > 0

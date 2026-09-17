@@ -30,6 +30,8 @@ config:
   # --- heads --------------------------------------------------------------
   use_det_motion_head: true
   use_map_head: true
+  use_stl: false
+  plan_num_layers: 3
   num_query: 300
   # Half-angle about the forward axis; shared by training and auxiliary mAP GT.
   det_fov_half_angle_deg: 80.0

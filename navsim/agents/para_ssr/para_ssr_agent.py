@@ -57,7 +57,10 @@ class WarmupCosLR(_LRScheduler):
         self.lr = lr
         self.epochs = epochs
         self.warmup_epochs = warmup_epochs
-        super().__init__(optimizer, last_epoch, verbose)
+        try:
+            super().__init__(optimizer, last_epoch, verbose)
+        except TypeError:
+            super().__init__(optimizer, last_epoch)
 
     def state_dict(self):
         return {k: v for k, v in self.__dict__.items() if k != "optimizer"}
@@ -419,7 +422,9 @@ class ParaSSRAgent(AbstractAgent):
                     "regenerate the target cache with use_distill=True"
                 )
             distill_losses, distill_metrics = self._distill(
-                predictions["bev_embed"], targets["scene_token"]
+                predictions["bev_embed"],
+                targets["scene_token"],
+                trajectories=targets.get("trajectory"),
             )
             weight = self._config.distill_loss_weight
             for name, value in distill_losses.items():
@@ -438,6 +443,15 @@ class ParaSSRAgent(AbstractAgent):
                 cache_size=self._config.metric_cache_size,
             )
         return self._metric_supervisor
+
+    def filter_datasets_to_teacher_cache(self, train_data, val_data) -> None:
+        if self._distill is None:
+            return
+        from .distill.teacher_store import restrict_dataset_to_stores
+
+        stores = list(self._distill.stores.values())
+        restrict_dataset_to_stores(train_data, stores, name="train")
+        restrict_dataset_to_stores(val_data, stores, name="val")
 
     def validate_metric_cache(self, datasets) -> None:
         """Fail before training if any requested train/val world is missing."""

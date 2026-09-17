@@ -18,7 +18,7 @@ config:
   use_distill: true
   input_target: true
   distill_feature_root: ${oc.env:DISTILL_FEATURE_ROOT,''}
-  teacher_adapter_branch: bevfusion
+  teacher_adapter_branch: ${oc.env:TEACHER_ADAPTER_BRANCH,bevfusion}
 
   # Stage 1 supervises the trajectory only.  Leaving the auxiliary heads on
   # would build agent and map targets that nothing consumes.

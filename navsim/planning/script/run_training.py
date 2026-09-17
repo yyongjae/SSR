@@ -115,14 +115,29 @@ def main(cfg: DictConfig) -> None:
         logger.info("Building SceneLoader")
         train_data, val_data = build_datasets(cfg, agent)
 
+    if hasattr(agent, "filter_datasets_to_teacher_cache"):
+        agent.filter_datasets_to_teacher_cache(train_data, val_data)
+
     if hasattr(agent, "validate_metric_cache"):
         agent.validate_metric_cache((train_data, val_data))
 
     logger.info("Building Datasets")
+    if len(train_data) == 0:
+        raise RuntimeError(
+            "training set is empty after teacher-cache filtering; "
+            "the teacher cache does not cover this split"
+        )
     train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True)
     logger.info("Num training samples: %d", len(train_data))
-    val_dataloader = DataLoader(val_data, **cfg.dataloader.params, shuffle=False)
-    logger.info("Num validation samples: %d", len(val_data))
+    if len(val_data) == 0:
+        val_dataloader = None
+        logger.warning(
+            "Validation set is empty after teacher-cache filtering; "
+            "skipping validation. ReSMap's published cache is train_logs only."
+        )
+    else:
+        val_dataloader = DataLoader(val_data, **cfg.dataloader.params, shuffle=False)
+        logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")
     trainer_params = cfg.trainer.params

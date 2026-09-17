@@ -15,6 +15,7 @@ constructed here -- there is nothing to encode.
 """
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Union
 
 import pytorch_lightning as pl
@@ -38,7 +39,7 @@ from ..para_ssr_agent import WarmupCosLR
 from ..para_ssr_loss import compute_plan_loss
 from ..para_ssr_targets import ParaSSRTargetBuilder
 from .adapter import PlanningBEVAdapter
-from .teacher_store import TeacherFeatureStore
+from .teacher_store import TeacherFeatureStore, restrict_dataset_to_stores
 
 
 class TeacherAdapterFeatureBuilder(AbstractFeatureBuilder):
@@ -66,9 +67,13 @@ class TeacherAdapterFeatureBuilder(AbstractFeatureBuilder):
 class TeacherAdapterPlanner(nn.Module):
     """Trainable adapter feeding the unchanged PARA-SSR planning decoder."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, bev_h: Optional[int] = None, bev_w: Optional[int] = None) -> None:
         super().__init__()
         cfg = config
+        # The planner grid must match the teacher cache, which can differ from
+        # the student's default 100x100 (ReSMap is 50x100).
+        grid_h = int(cfg.bev_h if bev_h is None else bev_h)
+        grid_w = int(cfg.bev_w if bev_w is None else bev_w)
         self.adapter = PlanningBEVAdapter(
             **dict(cfg.distill_branches[cfg.teacher_adapter_branch].get(
                 "adapter", {"channels": cfg.embed_dims}))
@@ -77,8 +82,8 @@ class TeacherAdapterPlanner(nn.Module):
         # one would add parameters that receive no gradient (a DDP error).
         self.planner = ParaSSRPlannerHead(
             transformer=None,
-            bev_h=cfg.bev_h,
-            bev_w=cfg.bev_w,
+            bev_h=grid_h,
+            bev_w=grid_w,
             embed_dims=cfg.embed_dims,
             pc_range=cfg.pc_range,
             num_scenes=cfg.num_scenes,
@@ -94,6 +99,8 @@ class TeacherAdapterPlanner(nn.Module):
             use_metric_planner=False,
             num_plan_candidates=cfg.num_plan_candidates,
             plan_anchor_path="",
+            use_stl=getattr(cfg, "use_stl", False),
+            plan_num_layers=getattr(cfg, "plan_num_layers", 3),
         )
         # ``forward_from_bev`` takes the BEV from the adapter, so the learned BEV
         # queries that ``forward`` would hand to the transformer are unused here.
@@ -102,10 +109,22 @@ class TeacherAdapterPlanner(nn.Module):
         # state_dict, so a stage-1 checkpoint still loads into the full model.
         self.planner.bev_embedding.weight.requires_grad_(False)
 
-    def forward(self, teacher_bev: torch.Tensor, cmd: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        teacher_bev: torch.Tensor,
+        cmd: torch.Tensor,
+        ego_status: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """``teacher_bev`` is ``[B, C, H, W]`` straight from the cache."""
         adapted = self.adapter(teacher_bev)          # [B, H*W, C]
-        outs = self.planner.forward_from_bev(adapted, cmd)
+        expected = self.planner.bev_h * self.planner.bev_w
+        if adapted.size(1) != expected:
+            raise ValueError(
+                f"adapted teacher BEV has {adapted.size(1)} tokens "
+                f"({tuple(teacher_bev.shape[-2:])}), planner grid is "
+                f"{self.planner.bev_h}x{self.planner.bev_w}={expected}"
+            )
+        outs = self.planner.forward_from_bev(adapted, cmd, ego_status=ego_status)
         outs["trajectory"] = self.planner.select_trajectory(
             outs["ego_fut_preds"], cmd
         )
@@ -150,12 +169,24 @@ class ParaSSRTeacherAdapterAgent(AbstractAgent):
         self._branch = branch
 
         spec = dict(config.distill_branches[branch])
+        cache_subdirs = spec.get("cache_subdirs")
+        if cache_subdirs is None:
+            grid_subdirs = (f"cache_train_{config.bev_h}x{config.bev_w}",
+                            f"cache_val_{config.bev_h}x{config.bev_w}")
+            if os.path.isdir(os.path.join(config.distill_feature_root,
+                                          spec.get("cache_name", branch),
+                                          grid_subdirs[0])):
+                cache_subdirs = grid_subdirs
+        extra_kwargs = {k: spec[k] for k in ("feature_key", "flip_w") if k in spec}
+        if cache_subdirs is not None:
+            extra_kwargs["cache_subdirs"] = cache_subdirs
         self._store = TeacherFeatureStore(
-            config.distill_feature_root, spec.get("cache_name", branch)
+            config.distill_feature_root, spec.get("cache_name", branch),
+            **extra_kwargs,
         )
         self._store.validate_manifest(config)
-
-        self.model = TeacherAdapterPlanner(config)
+        cache_h, cache_w = self._store.spatial_size()
+        self.model = TeacherAdapterPlanner(config, bev_h=cache_h, bev_w=cache_w)
         self.latest_logs: Dict[str, torch.Tensor] = {}
 
         if resume_from_checkpoint and checkpoint_path:
@@ -204,7 +235,7 @@ class ParaSSRTeacherAdapterAgent(AbstractAgent):
         teacher_bev = self._store.load_batch(
             targets["scene_token"], command.device, command.dtype
         )
-        return self.model(teacher_bev, command)
+        return self.model(teacher_bev, command, ego_status=features.get("ego_status"))
 
     def compute_loss(
         self,
@@ -222,6 +253,10 @@ class ParaSSRTeacherAdapterAgent(AbstractAgent):
         self.latest_logs = dict(metrics)
         self.latest_logs["loss_plan"] = loss.detach()
         return loss
+
+    def filter_datasets_to_teacher_cache(self, train_data, val_data) -> None:
+        restrict_dataset_to_stores(train_data, [self._store], name="train")
+        restrict_dataset_to_stores(val_data, [self._store], name="val")
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         from ..para_ssr_agent import ParaSSRLoggingCallback

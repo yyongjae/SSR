@@ -172,6 +172,8 @@ class ParaSSRModel(nn.Module):
             use_metric_planner=cfg.use_metric_planner,
             num_plan_candidates=cfg.num_plan_candidates,
             plan_anchor_path=cfg.plan_anchor_path,
+            use_stl=getattr(cfg, "use_stl", False),
+            plan_num_layers=getattr(cfg, "plan_num_layers", 3),
         )
 
         if cfg.use_metric_planner:
@@ -324,13 +326,19 @@ class ParaSSRModel(nn.Module):
             bev_shift=features["bev_shift"][:, -1],
             prev_bev=prev_bev,
             cmd=features["command"],
+            ego_status=(
+                features["status_feature"][:, cfg.num_navi_cmd:]
+                if "status_feature" in features and features["status_feature"].shape[-1] > cfg.num_navi_cmd
+                else features.get("ego_status")
+            ),
         )
 
         bev_embed = outs["bev_embed"]
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
-            "token_attn": outs["token_attn"],
         }
+        if outs.get("token_attn") is not None:
+            predictions["token_attn"] = outs["token_attn"]
         if cfg.use_metric_planner:
             from .modules.candidate_planner import (
                 commanded_candidates, offsets_to_poses, rank_candidates,

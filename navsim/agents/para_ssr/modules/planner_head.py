@@ -77,6 +77,8 @@ class ParaSSRPlannerHead(nn.Module):
         use_metric_planner: bool = False,
         num_plan_candidates: int = 16,
         plan_anchor_path: str = "",
+        use_stl: bool = True,
+        plan_num_layers: int = 3,
     ):
         super().__init__()
         self.bev_h = bev_h
@@ -93,6 +95,7 @@ class ParaSSRPlannerHead(nn.Module):
         self.traj_dims = traj_dims
         self.use_metric_planner = use_metric_planner
         self.num_plan_candidates = num_plan_candidates if use_metric_planner else 1
+        self.use_stl = True if use_metric_planner else use_stl
 
         self.transformer = transformer
         self.positional_encoding = LearnedPositionalEncoding(
@@ -101,43 +104,69 @@ class ParaSSRPlannerHead(nn.Module):
 
         self.bev_embedding = nn.Embedding(bev_h * bev_w, embed_dims)
         self.navi_embedding = nn.Embedding(num_navi_cmd, embed_dims)
-        self.navi_se = SELayer(embed_dims)
 
-        self.tokenlearner = TokenLearnerV11(num_scenes, embed_dims * 2)
-        self.latent_decoder = build_self_attn_decoder(
-            latent_num_layers,
-            embed_dims,
-            num_heads,
-            feedforward_channels,
-            ("self_attn", "norm", "ffn", "norm"),
-            attn_dropout=0.0,
-            ffn_dropout=0.0,
-        )
+        def reg_fcs(out_dims: int) -> nn.Sequential:
+            layers = []
+            for _ in range(num_reg_fcs):
+                layers.append(nn.Linear(embed_dims, embed_dims))
+                layers.append(nn.ReLU())
+            layers.append(nn.Linear(embed_dims, out_dims))
+            return nn.Sequential(*layers)
 
-        self.way_point = nn.Embedding(
-            ego_fut_mode * self.num_plan_candidates * fut_ts, embed_dims * 2
-        )
-        self.way_decoder = build_self_attn_decoder(
-            way_num_layers,
-            embed_dims,
-            num_heads,
-            feedforward_channels,
-            ("cross_attn", "norm", "ffn", "norm"),
-            attn_dropout=0.0,
-            ffn_dropout=0.0,
-        )
+        if self.use_stl:
+            self.navi_se = SELayer(embed_dims)
+            self.tokenlearner = TokenLearnerV11(num_scenes, embed_dims * 2)
+            self.latent_decoder = build_self_attn_decoder(
+                latent_num_layers,
+                embed_dims,
+                num_heads,
+                feedforward_channels,
+                ("self_attn", "norm", "ffn", "norm"),
+                attn_dropout=0.0,
+                ffn_dropout=0.0,
+            )
+            self.way_point = nn.Embedding(
+                ego_fut_mode * self.num_plan_candidates * fut_ts, embed_dims * 2
+            )
+            self.way_decoder = build_self_attn_decoder(
+                way_num_layers,
+                embed_dims,
+                num_heads,
+                feedforward_channels,
+                ("cross_attn", "norm", "ffn", "norm"),
+                attn_dropout=0.0,
+                ffn_dropout=0.0,
+            )
+            self.ego_fut_decoder = reg_fcs(traj_dims)
+            decoders = (self.latent_decoder, self.way_decoder)
+        else:
+            self.plan_query = nn.Embedding(1, embed_dims)
+            self.plan_query_pos = nn.Embedding(1, embed_dims)
+            self.plan_fuser = nn.Sequential(
+                nn.Linear(embed_dims * 2, embed_dims),
+                nn.LayerNorm(embed_dims),
+                nn.ReLU(inplace=True),
+            )
+            # Physical ego dynamics [vx, vy, ax, ay] conditioning
+            self.ego_status_encoder = nn.Sequential(
+                nn.Linear(4, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, embed_dims),
+            )
+            self.plan_decoder = build_self_attn_decoder(
+                plan_num_layers,
+                embed_dims,
+                num_heads,
+                feedforward_channels,
+                ("cross_attn", "norm", "ffn", "norm"),
+                attn_dropout=0.0,
+                ffn_dropout=0.0,
+            )
+            self.ego_fut_decoder = reg_fcs(fut_ts * traj_dims)
+            decoders = (self.plan_decoder,)
 
-        ego_fut_decoder = []
-        for _ in range(num_reg_fcs):
-            ego_fut_decoder.append(nn.Linear(embed_dims, embed_dims))
-            ego_fut_decoder.append(nn.ReLU())
-        ego_fut_decoder.append(nn.Linear(embed_dims, traj_dims))
-        self.ego_fut_decoder = nn.Sequential(*ego_fut_decoder)
-
-        # BaseModule called this in the original implementation.  Keep the
-        # sparse-token decoders on the same Xavier initialization rather than
-        # PyTorch Linear's default Kaiming-uniform initialization.
-        for decoder in (self.latent_decoder, self.way_decoder):
+        # Xavier initialization matching BaseModule convention
+        for decoder in decoders:
             for parameter in decoder.parameters():
                 if parameter.dim() > 1:
                     nn.init.xavier_uniform_(parameter)
@@ -162,11 +191,13 @@ class ParaSSRPlannerHead(nn.Module):
         prev_bev: Optional[torch.Tensor] = None,
         only_bev: bool = False,
         cmd: Optional[torch.Tensor] = None,
+        ego_status: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor] | torch.Tensor:
         """
         Args:
             mlvl_feats: list of ``[bs, num_cam, C, H, W]``
             cmd: one-hot navigation command ``[bs, num_navi_cmd]``
+            ego_status: ``[bs, 4]`` [vx, vy, ax, ay] kinematics
         Returns:
             ``only_bev``: the BEV feature. Otherwise a dict with ``bev_embed``
             ``[bs, bev_h*bev_w, C]``, ``scene_query``, ``token_attn`` and
@@ -195,13 +226,14 @@ class ParaSSRPlannerHead(nn.Module):
         )
         if only_bev:
             return bev_embed
-        return self.forward_from_bev(bev_embed, cmd, bev_pos=bev_pos)
+        return self.forward_from_bev(bev_embed, cmd, bev_pos=bev_pos, ego_status=ego_status)
 
     def forward_from_bev(
         self,
         bev_embed: torch.Tensor,
         cmd: Optional[torch.Tensor],
         bev_pos: Optional[torch.Tensor] = None,
+        ego_status: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Run the planning decoder on an existing BEV feature.
 
@@ -213,6 +245,12 @@ class ParaSSRPlannerHead(nn.Module):
         """
         bs = bev_embed.size(0)
         dtype = bev_embed.dtype
+        expected = self.bev_h * self.bev_w
+        if bev_embed.size(1) != expected:
+            raise ValueError(
+                f"BEV has {bev_embed.size(1)} tokens, planner grid is "
+                f"{self.bev_h}x{self.bev_w}={expected}"
+            )
         if bev_pos is None:
             bev_mask = torch.zeros(
                 (bs, self.bev_h, self.bev_w), device=bev_embed.device, dtype=dtype
@@ -230,6 +268,31 @@ class ParaSSRPlannerHead(nn.Module):
             )
         cmd = cmd.reshape(bs, self.num_navi_cmd)
         cmd_idx = cmd.argmax(dim=-1)
+
+        if not self.use_stl:
+            navi = self.navi_embedding(cmd_idx)  # [B, C]
+            plan_query = self.plan_query.weight.to(dtype).expand(bs, -1)
+            plan_query = self.plan_fuser(torch.cat((plan_query, navi), -1))
+            if hasattr(self, "ego_status_encoder"):
+                status = bev_embed.new_zeros((bs, 4)) if ego_status is None else ego_status.to(dtype=dtype, device=bev_embed.device)
+                plan_query = plan_query + self.ego_status_encoder(status)
+            plan_query_pos = self.plan_query_pos.weight.to(dtype).expand(bs, -1)
+            plan_query = self.plan_decoder(
+                query=plan_query.unsqueeze(0),  # [1, B, C]
+                key=bev_embed.permute(1, 0, 2),  # [HW, B, C]
+                value=bev_embed.permute(1, 0, 2),
+                query_pos=plan_query_pos.unsqueeze(0),
+                key_pos=pos_embd.permute(1, 0, 2),
+            )
+            plan = self.ego_fut_decoder(plan_query[0]).view(
+                bs, 1, self.fut_ts, self.traj_dims
+            )
+            return {
+                "bev_embed": bev_embed,
+                "scene_query": plan_query,
+                "token_attn": None,
+                "ego_fut_preds": plan.expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
+            }
 
         navi_embed = self.navi_embedding(cmd_idx).unsqueeze(1)  # [B, 1, C]
         bev_navi_embed = self.navi_se(bev_embed, navi_embed)

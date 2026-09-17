@@ -227,7 +227,7 @@ d     = 1 − cos (쿼리별, 기본)  |  mse
 
 ### 6.1 ReSMap 캐시
 
-- 위치: HF `rudals/resmap-navsim-teacher-kd` (공개). turing의 로컬 train 사본은 업로드 대조 후 삭제했다(2026-09-16). navtest 캐시는 HF `navtest/`에 있고, turing에도 `/data3/kyungmin/kd_teacher_resmap/navtest`로 남아 있다.
+- 위치: HF `rudals/resmap-navsim-teacher-kd` (공개). turing의 로컬 train 사본은 업로드 대조 후 삭제했다(2026-09-16). navtest 캐시도 HF `navtest/`에만 있다(turing 로컬 사본은 업로드 대조 후 삭제).
 - 형식: `index.json`(token → [shard, row]), `meta.json`, `<field>/<shard>.npy`. fp16이며 BEV는 301 GB다.
 - teacher 입력: 전방 카메라 3대 + 전방 crop 위성 타일. scene 전체 temporal memory를 켠 상태로 scene 순서대로 생성했다.
 - student 입력: 전방 카메라 3대, 2 frame(`frame_indices=(2,3)`).

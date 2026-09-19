@@ -10,12 +10,18 @@
 #   kd_readout   none       d(h_enc(F_S), h_enc(F_T))            (arm 4: readout path)
 #   kd_random    none       d over a fixed random 256-d projection (control: bottleneck only)
 #   kd_feature   none       d(F_S, F_T) over the whole BEV       (control: excess included)
+#   kd_attn      none       sum_u a_T(u) d(F_S(u), F_T(u)): cells weighted by the frozen
+#                           readout's attention on the teacher BEV (spatial method, report/22)
+#   kd_sens      none       sum_u ||J_u (A F_S(u) - F_T(u))||^2 / sum_u ||J_u F_T(u)||^2, J = d traj /
+#                           d F_T of the frozen readout: only the gap that moves the plan (KD_PROBES)
 #
 # Arms 3 vs 4 carry identical teacher knowledge (scene-long temporal memory and
 # satellite prior included); only the injection point differs.
 #
 # Environment:
 #   TEACHER_CACHE   ReSMap cache root                     (required except plan_only/map_gt)
+#   PLAN_MAP        weight of the planning-side map-consistency hinge (plan_map.py), any ARM;
+#                   PLAN_MAP_MARGIN its margin in metres (default 0)
 #   READOUT_CKPT    Stage-1 readout (kd_readout)
 #   KD_WEIGHT       lambda                                 (default 1.0)
 #   KD_DISTANCE     cosine | mse          (default cosine; mse for kd_feature)
@@ -23,6 +29,9 @@
 #                   at 2 GPUs x 4; 0 when fine-tuning)
 #   KD_RAMP         micro-batches of linear ramp           (default 10600)
 #   KD_ADAPTER      1 = 1x1 alignment adapter before h_enc (default 0)
+#   KD_CENTER       none (default) | global | command: subtract the running mean of
+#                   z before the distance, so the scene-independent part (95% of
+#                   the energy of z, per-command) costs nothing (report/19 s3)
 #   KD_BALANCE      e.g. "plan:0.7,distill:0.3" hands lambda to the GradBalancer
 #                   (FP32 only); unset = fixed lambda, balancer off
 #   PSEUDO_THR      teacher score threshold for map_teacher (default 0.3)
@@ -33,6 +42,20 @@
 #   INIT_CKPT       fine-tune from this checkpoint (step 1 of report/19 s4); the
 #                   matching control is ARM=plan_only with the same INIT_CKPT,
 #                   MAX_EPOCHS and LR
+#   HEADS           off (default) | parallel | interaction.  parallel/interaction
+#                   keep det+motion and map heads on (use_task_interaction
+#                   false/true), i.e. distill into the full PARA-SSR model.  Arms:
+#                   control (no teacher), map_teacher, kd_readout, kd_random,
+#                   kd_feature.  MAP_PROBE does not apply (the map head is real).
+#   AUX_BALANCE     full-head GradBalancer target without distill
+#                   (default "plan:0.4,det:0.3,map:0.3", the recipe of the base runs)
+#   KD_SHARE        full heads: distill target added to AUX_BALANCE, in the same
+#                   units.  plan:det:map keep their ratio, so det/map scales match
+#                   the control arm and ||dL_distill/dBEV|| = KD_SHARE/plan x
+#                   ||dL_plan/dBEV||.  Unset = fixed lambda for distill.
+#                   KD_BALANCE, if given, replaces the whole dict verbatim.
+#   WANDB_PROJECT   W&B project when WANDB=0 leaves the config default on
+#                   (default para-ssr-readout)
 #
 # Examples
 #   TEACHER_CACHE=/data/kd_teacher_resmap READOUT_CKPT=runs/teacher_h1_s0/readout.pt \
@@ -46,10 +69,18 @@
 # the KD modules are training-only and are not needed (or loaded) at test time.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ARM="${ARM:?set ARM (plan_only|map_gt|map_teacher|kd_readout|kd_random|kd_feature)}"
+ARM="${ARM:?set ARM (plan_only|map_gt|map_teacher|kd_readout|kd_random|kd_feature|kd_attn|kd_sens|control)}"
+HEADS="${HEADS:-off}"
 PROBE_TAG=""
 [[ "${MAP_PROBE:-0}" == 1 && "${ARM}" != map_* ]] && PROBE_TAG=_probe
-export EXPERIMENT="${EXPERIMENT:-para_ssr_${ARM}${PROBE_TAG}${INIT_CKPT:+_ft}}"
+HEADS_TAG=""
+case "${HEADS}" in
+  off) ;;
+  parallel) HEADS_TAG=par_ ;;
+  interaction) HEADS_TAG=int_ ;;
+  *) echo "unknown HEADS=${HEADS}" >&2; exit 2 ;;
+esac
+export EXPERIMENT="${EXPERIMENT:-para_ssr_${HEADS_TAG}${ARM}${PROBE_TAG}${PLAN_MAP:+_pm${PLAN_MAP}}${INIT_CKPT:+_ft}}"
 
 HEADS_OFF=(agent.config.use_task_interaction=false
            agent.config.use_det_motion_head=false
@@ -67,7 +98,8 @@ KD=(agent.config.kd_teacher_cache="${TEACHER_CACHE:-null}"
     agent.config.kd_distance="${KD_DISTANCE:-${DEFAULT_DISTANCE}}"
     agent.config.kd_warmup_iters="${KD_WARMUP:-10600}"
     agent.config.kd_ramp_iters="${KD_RAMP:-10600}"
-    agent.config.kd_adapter="$([[ "${KD_ADAPTER:-0}" == 1 ]] && echo true || echo false)")
+    agent.config.kd_adapter="$([[ "${KD_ADAPTER:-0}" == 1 ]] && echo true || echo false)"
+    agent.config.kd_center="${KD_CENTER:-none}")
 # One grad_balance_target override per run (Hydra rejects duplicates), so the
 # probe and the distillation budget are composed into a single dict here.
 BALANCE="${KD_BALANCE:-}"
@@ -95,7 +127,42 @@ if [[ "${MAP_PROBE:-0}" == 1 ]]; then
              agent.config.use_map_head=true)
 fi
 
-case "${ARM}" in
+if [[ "${HEADS}" != off ]]; then
+  # Full PARA-SSR: det+motion and map stay on, exactly as in the base run.
+  [[ "${MAP_PROBE:-0}" == 1 ]] && { echo "MAP_PROBE does not apply with HEADS=${HEADS}" >&2; exit 2; }
+  [[ -n "${KD_SHARE:-}" && -n "${KD_BALANCE:-}" ]] && { echo "give KD_SHARE or KD_BALANCE, not both" >&2; exit 2; }
+  [[ -n "${KD_SHARE:-}" && "${ARM}" != kd_* ]] && { echo "KD_SHARE only applies to kd_* arms" >&2; exit 2; }
+  FULL=(agent.config.use_task_interaction="$([[ "${HEADS}" == interaction ]] && echo true || echo false)"
+        agent.config.use_det_motion_head=true
+        agent.config.use_map_head=true)
+  AUX="${AUX_BALANCE:-plan:0.4,det:0.3,map:0.3}"
+  if [[ -n "${KD_BALANCE:-}" ]]; then FULL_BALANCE="${KD_BALANCE}"
+  elif [[ -n "${KD_SHARE:-}" ]]; then FULL_BALANCE="${AUX},distill:${KD_SHARE}"
+  else FULL_BALANCE="${AUX}"; fi
+  FULL+=("agent.config.grad_balance_target={${FULL_BALANCE}}")
+  case "${ARM}" in
+    control)     ARGS=("${FULL[@]}") ;;
+    map_teacher) need_teacher
+                 ARGS=("${FULL[@]}" agent.config.map_label_source=teacher
+                       agent.config.kd_teacher_cache="${TEACHER_CACHE}"
+                       agent.config.map_pseudo_score_thr="${PSEUDO_THR:-0.3}") ;;
+    kd_readout)  need_teacher
+                 ARGS=("${FULL[@]}" "${KD[@]}" agent.config.kd_mode=readout
+                       agent.config.kd_readout_ckpt="${READOUT_CKPT:?READOUT_CKPT is required}") ;;
+    kd_random)   need_teacher
+                 ARGS=("${FULL[@]}" "${KD[@]}" agent.config.kd_mode=random) ;;
+    kd_feature)  need_teacher
+                 ARGS=("${FULL[@]}" "${KD[@]}" agent.config.kd_mode=feature) ;;
+    kd_attn)     need_teacher
+                 ARGS=("${FULL[@]}" "${KD[@]}" agent.config.kd_mode=attn_feature
+                       agent.config.kd_readout_ckpt="${READOUT_CKPT:?READOUT_CKPT is required}") ;;
+    kd_sens)     need_teacher
+                 ARGS=("${FULL[@]}" "${KD[@]}" agent.config.kd_mode=sens_feature
+                       agent.config.kd_sens_probes="${KD_PROBES:-4}"
+                       agent.config.kd_readout_ckpt="${READOUT_CKPT:?READOUT_CKPT is required}") ;;
+    *) echo "ARM=${ARM} is not defined for HEADS=${HEADS}" >&2; exit 2 ;;
+  esac
+else case "${ARM}" in
   plan_only)   ARGS=("${HEADS_OFF[@]}" "$(balance_arg)") ;;
   map_gt)      ARGS=("${MAP_ONLY[@]}") ;;   # MAP_PROBE is moot: the map task is real here
   map_teacher) need_teacher
@@ -109,8 +176,40 @@ case "${ARM}" in
                ARGS=("${HEADS_OFF[@]}" "${KD[@]}" "$(balance_arg)" agent.config.kd_mode=random) ;;
   kd_feature)  need_teacher
                ARGS=("${HEADS_OFF[@]}" "${KD[@]}" "$(balance_arg)" agent.config.kd_mode=feature) ;;
+  kd_attn)     need_teacher
+               ARGS=("${HEADS_OFF[@]}" "${KD[@]}" "$(balance_arg)" agent.config.kd_mode=attn_feature
+                     agent.config.kd_readout_ckpt="${READOUT_CKPT:?READOUT_CKPT is required}") ;;
+  kd_sens)     need_teacher
+               ARGS=("${HEADS_OFF[@]}" "${KD[@]}" "$(balance_arg)" agent.config.kd_mode=sens_feature
+                     agent.config.kd_sens_probes="${KD_PROBES:-4}"
+                     agent.config.kd_readout_ckpt="${READOUT_CKPT:?READOUT_CKPT is required}") ;;
   *) echo "unknown ARM=${ARM}" >&2; exit 2 ;;
-esac
+esac; fi
+
+# grad_balance_target is a dict in para_ssr_agent.yaml.  A plain `key={...}`
+# override MERGES into it: new keys such as `distill` are rejected, and keys
+# left out (e.g. det:0.3) survive.  Delete it and add it back so the dict is
+# exactly what was asked for.
+RESOLVED=()
+for a in "${ARGS[@]}"; do
+  if [[ "${a}" == agent.config.grad_balance_target=* ]]; then
+    RESOLVED+=("~agent.config.grad_balance_target" "+${a}")
+  else
+    RESOLVED+=("${a}")
+  fi
+done
+ARGS=("${RESOLVED[@]}")
+
+if [[ -n "${PLAN_MAP:-}" ]]; then
+  # Planning-side map consistency (plan_map.py), orthogonal to ARM: control +
+  # PLAN_MAP is "constraint only", kd_* + PLAN_MAP is "both" in the 2x2 design.
+  ARGS+=(agent.config.plan_map_weight="${PLAN_MAP}" agent.config.plan_map_margin="${PLAN_MAP_MARGIN:-0.0}")
+fi
+
+if [[ "${WANDB:-0}" == 0 ]]; then
+  # The training config turns W&B on by default; keep these runs in their own project.
+  ARGS+=(wandb.project="${WANDB_PROJECT:-para-ssr-readout}")
+fi
 
 if [[ -n "${INIT_CKPT:-}" ]]; then
   # Weights only: the agent loads them at construction.  Optimiser state and the

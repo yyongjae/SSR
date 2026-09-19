@@ -21,6 +21,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from .plan_map import plan_map_loss
 from .readout.distill import ReadoutDistiller
 from .modules.grad_balance import (
     GradBalancer,
@@ -224,6 +225,22 @@ class ParaSSRLoss(torch.nn.Module):
         logs["loss_plan_reg_weighted"] = task_losses["plan"].detach()
         logs.update(plan_metrics)
 
+        # ---- planning-side map consistency (plan_map.py) ---------------
+        plan_map_weight = float(getattr(cfg, "plan_map_weight", 0.0))
+        if plan_map_weight > 0:
+            if "drivable_sdf" not in targets:
+                if model.training:
+                    raise KeyError("plan_map_weight > 0 needs the drivable_sdf target (DrivableAreaTargetBuilder)")
+            else:
+                pm_loss, pm_metrics = plan_map_loss(
+                    predictions["ego_fut_preds"], targets["command"], targets["trajectory_offsets"],
+                    targets["trajectory_mask"], targets["drivable_sdf"], tuple(cfg.plan_map_extent),
+                    float(cfg.plan_map_margin),
+                )
+                task_losses["plan"] = task_losses["plan"] + plan_map_weight * pm_loss
+                logs["loss_plan_map"] = pm_loss.detach()
+                logs.update(pm_metrics)
+
         # ---- detection + motion ---------------------------------------
         if model.det_motion_head is not None and "all_cls_scores" in predictions:
             det_losses = model.det_motion_head.loss(
@@ -254,12 +271,16 @@ class ParaSSRLoss(torch.nn.Module):
 
         # ---- readout-space distillation (report/19) ---------------------
         if self.distiller is not None and "teacher_bev" in targets:
-            kd = self.distiller(predictions["bev_embed"], targets, self.iteration)
+            ego = features.get("status_feature")
+            ego = ego[:, cfg.num_navi_cmd:] if ego is not None else None
+            kd = self.distiller(predictions["bev_embed"], targets, self.iteration, ego=ego)
             task_losses["distill"] = kd["loss"]
             logs["loss_distill"] = kd["loss"].detach()
             logs["kd/raw"] = kd["raw"]
             logs["kd/coef"] = kd["coef"]
             logs["kd/valid_frac"] = kd["valid_frac"]
+            if "raw_uncentered" in kd:
+                logs["kd/raw_uncentered"] = kd["raw_uncentered"]
 
         # ---- shared-BEV gradient measurement / balancing ---------------
         bev_embed = predictions["bev_embed"]

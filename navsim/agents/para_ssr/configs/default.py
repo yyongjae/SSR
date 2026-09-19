@@ -263,8 +263,36 @@ class ParaSSRConfig:
     kd_ramp_iters: int = 0
     # Identity-initialised 1x1 conv on the student BEV before h_enc (design s05).
     kd_adapter: bool = False
+    # none | global | command.  Remove the scene-independent part of z before the
+    # distance (report/19 s3): 95% of the energy of z is the per-command mean, and
+    # matching it carries no scene information.  Only for kd_mode readout|random.
+    kd_center: str = "none"
+    # EMA momentum of those running means over micro-batches.
+    kd_center_momentum: float = 0.99
     # kd_mode=random: seed of the fixed random 256-d projection.
     kd_random_seed: int = 0
+    # kd_mode=sens_feature: random trajectory-space probes per step (K backward
+    # passes through the frozen reader) estimating the per-cell trajectory change.
+    kd_sens_probes: int = 4
+
+    # Planning-side map consistency (plan_map.py): hinge on the commanded
+    # trajectory's footprint corners against the SDF of the drivable area the
+    # DAC metric uses.  0 = off: no target builder, no term.
+    # Evaluation-only post-processing: heading := direction of travel of the planned
+    # path (para_ssr_model.heading_from_path).  Tests whether DAC failures come from
+    # predicted headings that disagree with the path (the PDM simulator tracks both).
+    heading_from_path: bool = False
+    # Evaluation-only: TOAD's kinematic projection (modules/kinematics.py) of the
+    # planned trajectory, i.e. its test-time step without the CEM search.
+    kinematic_projection: bool = False
+
+    plan_map_weight: float = 0.0
+    plan_map_margin: float = 0.0
+    # (x0, x1, y0, y1) in the current ego frame of NAVSIM trajectories:
+    # x forward, y left, rear axle.  4 s at 18 m/s stays inside x1.
+    plan_map_extent: Tuple[float, float, float, float] = (-8.0, 72.0, -32.0, 32.0)
+    plan_map_res: float = 0.25
+    plan_map_clip: float = 10.0
     # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
     # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
     # always uses GT.

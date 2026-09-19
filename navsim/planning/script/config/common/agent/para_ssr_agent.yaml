@@ -95,7 +95,7 @@ config:
   grad_norm_log_interval: 200
 
   # --- planning-readout distillation (report/19) ---------------------------
-  # Off by default.  kd_mode: none | readout | random | feature.
+  # Off by default.  kd_mode: none | readout | random | feature | attn_feature | sens_feature.
   # map_label_source: gt | teacher (map head supervised by ReSMap predictions).
   kd_mode: none
   kd_teacher_cache: null
@@ -105,7 +105,19 @@ config:
   kd_warmup_iters: 0
   kd_ramp_iters: 0
   kd_adapter: false
+  # none | global | command: z에서 장면과 무관한 성분(command별 평균)을 빼고 거리를 잰다.
+  kd_center: none
+  kd_center_momentum: 0.99
   kd_random_seed: 0
+  kd_sens_probes: 4
+  heading_from_path: false   # evaluation-only: heading := path direction
+  kinematic_projection: false   # evaluation-only: TOAD projection (IK -> clamp -> bicycle rollout)
+  # Planning-side map consistency (plan_map.py); 0 = off.
+  plan_map_weight: 0.0
+  plan_map_margin: 0.0
+  plan_map_extent: [-8.0, 72.0, -32.0, 32.0]
+  plan_map_res: 0.25
+  plan_map_clip: 10.0
   map_label_source: gt
   map_pseudo_score_thr: 0.3
 

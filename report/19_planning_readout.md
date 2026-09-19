@@ -1,8 +1,9 @@
 # Planning readout: ReSMap teacher → PARA-SSR 설계와 실험 프로토콜
 
-2026-09-16. 브랜치 `km/planning-readout`. `planning-readout-design.html`(연구 설계 v3)을
+2026-09-16 작성, 2026-09-17 갱신(현재 구조 run 기준으로 student base를 full PARA-SSR로 변경, 5090 진행 상황 반영).
+브랜치 `km/planning-readout`. `planning-readout-design.html`(연구 설계 v3)을
 현재 PARA-SSR 코드에 맞춰 구체화하고, 논의에서 확정한 결정과 구현된 실험 도구를 정리한다.
-실험 결과는 아직 없다. 이 문서는 **무엇을, 왜, 어떤 순서로 돌리는지**와 그 도구를 설명한다.
+이 문서는 **무엇을, 왜, 어떤 순서로 돌리는지**와 그 도구를 설명한다. 진행 상황은 §11.
 
 ---
 
@@ -14,13 +15,22 @@
 **모듈 성능(map mAP) 향상은 부산물이지 메커니즘이 아니다.** 근거는 다음과 같다.
 
 - 모듈 점수는 라벨 재현을 재므로, planning에 쓰이지 않는 성분(설계 문서 그림 1의 "과잉")까지 포함한다.
-- 현재 데이터에서 "모듈 감독 → planning 향상"이라는 연결은 오히려 역방향이다.
+- 모듈 감독과 planning의 관계는 구조에 따라 부호가 바뀐다. 한 방향으로 가정할 수 없다.
 
-| PARA-SSR arm | PDMS | map mAP |
-|---|---|---|
-| plan only | **86.45** | – |
-| map + plan (GT 라벨) | 85.26 | 39.02 |
-| ReSMap teacher (참고) | – | 77.43 |
+**현재 구조**(전방 카메라 3대, 2 frame, LiDAR 없음, BEV 50×100, `use_stl=false`, 30 epoch, navtest).
+5090 서버(blackwell64)의 `para_ssr_*_final` run이다.
+
+| PARA-SSR run | heads | PDMS | map mAP | det mAP |
+|---|---|---|---|---|
+| `plan_only_final` | plan | 83.98 | – | – |
+| `parallel_final` | det+motion, map, plan (`use_task_interaction=false`) | 84.03 | 27.05 | 27.67 |
+| `interaction_final` | det+motion, map, plan (`use_task_interaction=true`) | **84.87** | 27.23 | 27.07 |
+| ReSMap teacher (참고) | map | – | 77.43 | – |
+
+GradBalancer target은 두 full run 모두 `plan:0.4, det:0.3, map:0.3`이다.
+이전 구조(LiDAR 입력, report/13)에서는 반대로 plan only 86.45 > map + plan 85.26이었다.
+이 문서의 초판은 그 수치를 근거로 plan-only를 student base로 잡았으나, 현재 구조에서는 full 모델이 가장 좋으므로
+**student base를 `interaction_final`로 바꾼다**(§4 Stage 3).
 
 그래서 모든 arm에서 **PDMS와 map mAP를 나란히 보고하고 둘의 상관을 직접 잰다.**
 "mAP는 거의 안 올랐는데 PDMS가 올랐다"는 결과는 그 자체로 설계 문서 그림 1을 뒷받침한다.
@@ -156,6 +166,9 @@ h 자체의 결론은 h0/h1/h2에서 **teacher 순서와 증류 효과의 부호
 - `S_transfer`: Stage 1 체크포인트를 student navtest 캐시에서 평가만 한다. 파인튜닝하면 정렬 측정이 오염된다.
 - `S_transfer+A`: h는 고정하고 1×1 adapter(identity 초기화, 65,792 파라미터)만 학습한다.
 - 체크포인트는 **현재 구조**(BEV 50×100, 전방 ROI, `use_stl=false`)여야 teacher와 칸이 1:1로 맞는다.
+- **Stage 3에서 증류할 바로 그 체크포인트**(`interaction_final`)의 BEV로 잰다. `S_transfer`는 "h_enc가 이 student BEV를 읽을 수 있는가",
+  즉 증류 loss `d(h_enc(F_S), h_enc(F_T))`가 의미 있는 출발점에 있는가를 증류 전에 확인하는 값이다.
+  `cache_student_bev.py`에 full head override(`use_task_interaction=true`, det/map head on)를 주는 경로는 아직 실행해보지 않았다.
 
 ### Stage 3 — 증류
 
@@ -163,39 +176,55 @@ h 자체의 결론은 h0/h1/h2에서 **teacher 순서와 증류 효과의 부호
 h_enc ← Stage 1 가중치 복사 후 동결 (agent의 submodule이 아니다. 저장/로드되지 않는다)
 z_T   = h_enc(F_T, cmd)                 no_grad
 z_S   = h_enc(A(F_S), cmd)              gradient가 student 백본까지 흐른다
-L     = L_plan + λ · ramp(t) · d(z_S, z_T)
+L     = L_plan + L_det + L_motion + L_map + λ · ramp(t) · d(z_S, z_T)     (HEADS=off면 L_plan만)
 d     = 1 − cos (쿼리별, 기본)  |  mse
 ```
 
 - **`h_enc`는 student의 살아있는 planner와 절대 묶지 않는다.** 묶으면 planner가 F_S에 맞춰 적응해서 loss는 줄지만 F_S는 움직이지 않는다.
 - `ker(h_enc)` 방향의 F_S 성분에는 gradient가 0이다. teacher의 과잉을 복제하도록 강요하지 않는다.
-- **λ는 GradBalancer에 맡길 수 있다.** distill의 gradient는 BEV를 통해서만 모델에 닿으므로(h_enc 동결), 기존 BEV 수준 보정이 정확하게 적용된다. 예: `KD_BALANCE="plan:0.7,distill:0.3"`. 이 경우 FP32가 필요하다. 쓰지 않으면 고정 λ를 쓴다. cosine은 [0, 2], plan loss는 O(0.1~1)이므로 λ = 1부터 시작한다.
+- **λ는 GradBalancer에 맡길 수 있다.** distill의 gradient는 BEV를 통해서만 모델에 닿으므로(h_enc 동결), 기존 BEV 수준 보정이 정확하게 적용된다. 이 경우 FP32가 필요하다. 쓰지 않으면 고정 λ를 쓴다. cosine은 [0, 2], plan loss는 O(0.1~1)이므로 λ = 1부터 시작한다.
+  - 고정 λ = 1은 너무 세다. plan-only 체크포인트 fine-tune 스모크(48 step)에서 `gshare/distill` 0.91, `gshare/plan` 0.09였다.
+  - **full head(`HEADS=interaction`)에서는 `KD_SHARE`를 쓴다.** base run의 target `plan:0.4, det:0.3, map:0.3`에 `distill:KD_SHARE`만 더한다.
+    plan은 numeraire라 scale이 항상 1이고 `s_k = (t_k/t_plan)(g_plan/g_k)`이므로, plan:det:map 비율이 그대로면
+    **det/map scale은 대조군과 같고 distill만 추가된다.** distill의 BEV gradient 크기는 `KD_SHARE/0.4 × ‖dL_plan/dBEV‖`로 맞춰진다.
+    GradBalancer의 scale 상한은 1이라 λ보다 키우지는 못한다. raw distill gradient가 목표보다 작으면 몫이 목표에 못 미친다(`gscale/distill`이 1에 붙는다).
+  - HEADS=off에서는 `KD_BALANCE="plan:0.7,distill:0.3"`처럼 dict 전체를 준다.
+  - fine-tune에서는 base checkpoint의 micro-batch 카운터(`interaction_final`: 319,170)가 복원되어 `grad_balance_warmup_iters`(10,600)가 이미 지나 있다.
+    다음 200의 배수(30 micro-batch 뒤)부터 distill scale이 조절된다. det/map scale은 base run의 값(0.055, 0.110)에서 이어간다.
 - **λ warmup:** 학습 초반 F_S는 의미 없는 값이라 z_S 방향을 믿을 수 없다. `kd_warmup_iters` 동안 λ = 0으로 두고 `kd_ramp_iters`에 걸쳐 선형으로 올린다. 카운터는 **증류 첫 step부터** 센다. fine-tune은 base 런의 전역 iteration 카운터를 복원하므로, 전역 카운터로 세면 warmup이 통째로 건너뛰어진다. 시작 지점은 checkpoint의 extra state에 저장한다.
 - missing token(teacher 캐시에 없는 frame)은 `teacher_valid = 0`으로 마스킹한다.
 
-#### arm 구성
+#### arm 구성 (student base: full PARA-SSR, `HEADS=interaction`)
 
-| # | ARM | head | teacher → student BEV 경로 |
+모든 arm이 det+motion, map, plan head와 task interaction을 켠 **같은 구조**다. teacher가 들어가는 경로만 다르다.
+
+| # | ARM | map head 라벨 | teacher → student BEV 경로 |
 |---|---|---|---|
-| ① | `plan_only` | 없음 | 없음 (86.45, 있음) |
-| ② | `map_gt` | map | GT map 라벨 (85.26, 있음) |
-| ③ | `map_teacher` | map | **teacher vector를 map 라벨로** (라벨 경로) |
-| ④ | `kd_readout` | 없음 | **d(h_enc(F_S), h_enc(F_T))** (readout 경로) |
-| 대조 | `kd_random` | 없음 | 고정 무작위 256차원 projection에서의 d |
-| 대조 | `kd_feature` | 없음 | BEV 전체 MSE (과잉 포함) |
+| ① | `control` | GT | 없음 (`interaction_final`과 같은 학습, 84.87) |
+| ② | `map_teacher` | **teacher vector** | 라벨 경로 |
+| ③ | `kd_readout` | GT | **d(h_enc(F_S), h_enc(F_T))** (readout 경로) |
+| 대조 | `kd_random` | GT | 고정 무작위 256차원 projection에서의 d |
+| 대조 | `kd_feature` | GT | BEV 전체 MSE (과잉 포함) |
 
-- **③ vs ④가 논지를 가르는 쌍이다.** 정보원이 같은 teacher이고, 주입 지점만 다르다. ReSMap의 추가 prior(scene 전체 temporal memory, satellite 입력)는 ③과 ④에 똑같이 들어가서 비교에서 상쇄된다. ②와 ④를 직접 비교하면 "teacher가 더 많이 알아서"라는 반론을 막을 수 없다.
-- **② vs ③**은 GT 라벨과 teacher 출력의 차이, 즉 teacher prior의 효과를 따로 분리해서 보여준다.
+초판(plan-only base)과의 차이:
+- ①이 plan-only가 아니라 full 모델이다. 현재 구조에서 가장 좋은 모델을 기준선으로 둔다(§0).
+- 초판의 ② `map_gt`는 ①과 같아져서 없어졌다. ②는 ①의 GT map 라벨을 teacher 출력으로 바꾼 것이고, ③은 ①에 증류 항을 더한 것이다.
+- 모든 arm에 map head가 있으므로 **detached map probe(`MAP_PROBE`)가 필요 없다.** map mAP를 바로 잰다.
+- 질문이 "GT map 감독을 이미 받는 모델에 teacher가 planning 성분을 더 줄 수 있는가"가 된다.
+- plan-only 계열(`HEADS=off`의 `plan_only`, `map_gt`, `kd_*`)은 스크립트에 그대로 남아 있다. §1의 "planner가 BEV를 직접 읽는" 경우에 대한 참고 실험으로 쓸 수 있다.
+- task interaction을 켜면 planner가 BEV뿐 아니라 det/map latent도 읽는다. BEV 증류가 planner에 닿는 경로가 간접적이 된다. `parallel_final`(`HEADS=parallel`)은 fairness check 후보로 남긴다.
+
+- **② vs ③이 논지를 가르는 쌍이다.** 정보원이 같은 teacher이고, 주입 지점만 다르다. ReSMap의 추가 prior(scene 전체 temporal memory, satellite 입력)는 ②와 ③에 똑같이 들어가서 비교에서 상쇄된다. ①과 ③만 비교하면 "teacher가 더 많이 알아서"라는 반론을 막을 수 없다.
+- **① vs ②**는 GT 라벨과 teacher 출력의 차이, 즉 teacher prior를 라벨로 넣었을 때의 효과를 따로 보여준다.
 - **`kd_random`**은 "planning-relevant라서가 아니라 256차원으로 줄여서 좋아진 것"이라는 반론을 막는다.
   - 학습 안 된 attention reader는 대조군으로 쓸 수 없다. 무작위 가중치의 attention pooling은 수천 칸을 평균해서 거의 상수인 벡터를 낸다. 무관한 BEV끼리의 cosine 거리가 약 1e-5다. 그러면 대조군이 차원만 맞춘 게 아니라 그냥 약해진다.
   - 그래서 채널 16 × 공간 16 방향의 분리형 orthonormal projection을 쓴다.
-- **`kd_feature`**는 "과잉을 강요하지 않는 것이 이득"임을 직접 보인다. ④가 이걸 이겨야 한다.
-- 모든 arm에서 **PDMS와 map mAP를 함께** 기록한다. map head가 없는 arm(①, ④, 대조군)은 mAP를 잴 수 없으므로
-  **detached map probe**(`MAP_PROBE=1`)를 붙인다. map head를 켜되 GradBalancer target을 `map: 0`으로 둔다.
-  head는 자기 파라미터로 학습되지만 BEV로 가는 gradient는 제거되므로(스모크에서 `gshare/map = 0.0` 확인),
-  BEV를 바꾸지 않고 BEV에 담긴 map 정보만 잰다. 비교하는 arm에는 전부 붙이거나 전부 떼야 한다.
-  기존 ①(86.45)은 probe가 없는 런이므로 probe를 켠 ①을 다시 돌려야 같은 조건이 된다.
+- **`kd_feature`**는 "과잉을 강요하지 않는 것이 이득"임을 직접 보인다. ③이 이걸 이겨야 한다.
+- 모든 arm에서 **PDMS, map mAP, det mAP를 함께** 기록한다. 모든 arm에 map/det head가 있으므로 probe 없이 잰다.
   평가는 `agent.config.test_aux_heads=true`로 한다.
+- 증류 arm끼리는 **같은 `KD_SHARE`**(distill의 BEV gradient 몫)로 비교한다. `kd_feature`는 거리가 MSE라서 같은 λ는 의미가 없고, 같은 gradient 몫이 공정한 기준이다.
+- (초판, `HEADS=off`) head가 없는 arm의 map mAP는 detached map probe(`MAP_PROBE=1`, GradBalancer target `map: 0`)로 잰다.
+  head는 자기 파라미터로 학습되지만 BEV로 가는 gradient는 제거된다(스모크에서 `gshare/map = 0.0` 확인). 비교하는 arm에는 전부 붙이거나 전부 떼야 한다.
 
 #### 처음부터 학습할까, fine-tuning할까
 
@@ -207,8 +236,10 @@ d     = 1 − cos (쿼리별, 기본)  |  mse
 | 비용 | arm마다 전체 학습 | 짧음 |
 | 혼동 요인 | 적음 | **더 오래 학습한 효과**가 섞인다 |
 
-1. **먼저 fine-tuning으로 feasibility를 본다.** plan-only 체크포인트에서 시작하고(`S_transfer`를 잰 그 체크포인트), `INIT_CKPT`, 낮은 LR, `KD_WARMUP=0`, 짧은 ramp를 쓴다. **대조군(`ARM=plan_only`에 같은 INIT_CKPT, 같은 step, 같은 LR)이 필수다.**
-2. **본 실험은 처음부터 학습한다.** ①~④와 대조군을 같은 스케줄로 돌리고, λ warmup을 켠다. PlanKD 계열 비교 대상도 이 설정이다.
+1. **먼저 fine-tuning으로 feasibility를 본다.** `interaction_final`(30 epoch 완료)에서 시작하고, `INIT_CKPT`, 낮은 LR, `KD_WARMUP=0`, 짧은 ramp를 쓴다.
+   **대조군(`HEADS=interaction ARM=control`에 같은 INIT_CKPT, 같은 epoch, 같은 LR)이 필수다.** 더 오래 학습한 효과를 빼기 위해서다.
+   epoch 수, LR, `KD_SHARE`는 논의 중이다(§8.4).
+2. **본 실험은 처음부터 학습한다.** ①~③과 대조군을 같은 스케줄로 돌리고, λ warmup을 켠다. PlanKD 계열 비교 대상도 이 설정이다.
 
 ## 5. 예상되는 리뷰어 태클
 
@@ -221,7 +252,7 @@ d     = 1 − cos (쿼리별, 기본)  |  mse
 | student BEV는 h_enc에게 처음 보는 입력 아니냐 | `S_transfer`, `S_transfer+A`를 먼저 보고한다. 포기 기준(§2.3)을 미리 정해둔다 |
 | 고용량 h가 없는 정보를 만든다 | `S_shuffled`가 `S_ego` 이하로 떨어져야 한다 |
 | PDMS는 non-reactive라 제한적이다 | 한계로 인정한다. 가능하면 EPDMS(navhard_two_stage)로 한 번 더 확인한다 |
-| teacher가 더 많이 알아서 오른 것이다 | ③ vs ④ 비교 (§4) |
+| teacher가 더 많이 알아서 오른 것이다 | ② vs ③ 비교 (§4) |
 
 ## 6. 데이터와 정렬 (실측)
 
@@ -281,7 +312,7 @@ d     = 1 − cos (쿼리별, 기본)  |  mse
 | `tools/readout/cache_student_bev.py` | Stage 2: 동결된 student BEV 캐싱 (rank 분할, resume, 누락 sensor 건너뛰기, `--merge`) |
 | `tools/readout/verify_teacher_alignment.py` | §6.3 측정 |
 | `tools/readout/run_stage1.sh`, `run_stage2.sh`, `collect_results.py` | 단계 실행과 결과 표 (평균 ± 표준편차, `S − S_ego`) |
-| `scripts/training/train_para_ssr_kd.sh` | Stage 3 arm 런처 (fine-tune 포함) |
+| `scripts/training/train_para_ssr_kd.sh` | Stage 3 arm 런처 (fine-tune 포함). `HEADS=off|parallel|interaction`, full head에서 `KD_SHARE`, W&B 프로젝트 기본 `para-ssr-readout` |
 | `tools/readout/resmap/` | teacher 캐시 생성기 사본(resmap env + maptracker repo에서 실행; navtest용 `--split none --only-split-tokens --ann-file` 추가), HF 업로드/다운로드 |
 | `tests/test_para_ssr_readout.py` | 25개 테스트 |
 
@@ -290,8 +321,8 @@ KD로 학습한 체크포인트는 KD 설정 없이 평가된다.
 
 ## 8. 진행 로드맵 (turing → 5090)
 
-순서를 정하는 기준은 두 가지다. teacher는 5090(sm_120)에서 돌지 않으므로 **teacher가 필요한 작업은 turing에서 먼저 끝낸다.**
-그리고 가장 오래 걸리는 **plan-only student 학습을 가장 먼저 건다.**
+teacher는 5090(sm_120)에서 돌지 않으므로 **teacher가 필요한 작업은 turing에서 끝냈다**(§8.1).
+5090(blackwell64)에는 현재 구조의 full PARA-SSR 체크포인트가 이미 있으므로, 초판의 "plan-only student를 먼저 학습"은 필요 없어졌다.
 
 ### 8.1 turing에서 끝낸 것과 5090에서 받을 것
 
@@ -309,48 +340,37 @@ h는 추론할 때도 teacher BEV를 입력으로 받으므로, navtest 장면�
 train_logs 일부를 떼어 평가하면 teacher가 학습한 장면이라 feature가 실제보다 좋게 나와 `S_own`이 부풀려진다.
 val_logs로 평가하려면 teacher val 캐시와 navtrain metric cache가 따로 필요한데, 후자는 turing에서 미완성이다.
 
-### 8.2 5090 환경 확인 (반나절)
+### 8.2 5090에서 한 것 (2026-09-16~17)
 
-1. `pytest tests/`
-2. `train_readout.py --max-train 256 --epochs 1`, `eval_readout_pdms.py --max-tokens 40`
-3. `scripts/training/smoke_para_ssr.sh`로 PARA-SSR 학습 스모크. 두 가지를 확인한다.
-   - torch 2.7 이상에서 navsim/nuplan-devkit이 도는지
-   - FP32, GPU당 B=4가 32 GB에 들어가는지 (안 들어가면 batch를 줄이고 accumulate를 늘려 global 128 유지)
+| 항목 | 결과 |
+|---|---|
+| 데이터 경로 | `<repo>/data/` 아래 symlink: `dataset/{maps, navsim_logs/{trainval,test}, sensor_blobs/{trainval,test}}`, `exp/metric_cache`(navtest, 12,146), `kd_teacher_resmap`(train + `navtest/`) |
+| 이미지 커버리지 | navtrain 103,288 token 전부, teacher 126,032 token 전부 전방 3 카메라 이미지 있음 (turing과 달리 누락 없음) |
+| plan target | `data/readout/plan_targets_{navtrain,navtest}.npz` (103,288 / 12,146 token) |
+| 환경 | `ssr` env, torch 2.8.0+cu128. `pytest tests/` 123개 통과. full PARA-SSR FP32, GPU당 B=4가 5090에서 30 epoch 학습된 run이 이미 있음 |
+| Stage 1 학습 | h0/h1/h2 × (teacher, ego) × seed 3 + shuffled × 1, 10 epoch 완료. open-loop 결과는 §11. **PDMS 평가는 navtest teacher 캐시를 받은 뒤** |
+| Stage 3 준비 | `train_para_ssr_kd.sh`에 `HEADS`, `KD_SHARE` 추가. Hydra dict override 버그 수정(§11) |
 
-### 8.3 바로 병렬로 시작할 두 가지
-
-**A. plan-only student 학습** — 가장 오래 걸리므로 먼저 건다.
-
-```bash
-MAP_PROBE=1 ARM=plan_only bash scripts/training/train_para_ssr_kd.sh
-```
-
-이 체크포인트 하나를 세 군데에 쓴다.
-- arm ① 기준선 (probe를 켠 조건. 기존 86.45 런은 probe가 없다)
-- Stage 2의 student BEV 캐시
-- Stage 3 fine-tune의 시작점
-
-**B. Stage 1 관문** — readout만 학습하므로 가볍다. GPU 한 장에 여러 개를 같이 돌려도 된다.
+### 8.3 Stage 1 관문
 
 ```bash
-PRESETS="h1" SEEDS="0 1 2" bash tools/readout/run_stage1.sh
+PRESETS="h0 h1 h2" SEEDS="0 1 2" bash tools/readout/run_stage1.sh   # 학습된 run은 건너뛰고 PDMS 평가만
 ```
 
 **통과 기준** (셋 다 만족해야 한다)
 - `S_own − S_ego`가 seed 편차보다 뚜렷하게 크다.
 - `S_shuffled ≤ S_ego`
-- readout 학습 로그에서 `val/l2_4s_bev_shuffled`가 `val/l2_4s`보다 확실히 나쁘다. 비슷하면 h가 BEV를 보지 않는다.
+- readout 학습 로그에서 `val/l2_4s_bev_shuffled`가 `val/l2_4s`보다 확실히 나쁘다. 비슷하면 h가 BEV를 보지 않는다. (open-loop에서는 h0/h1/h2 모두 만족)
 
 **통과하지 못하면** Stage 2, 3으로 가지 않는다. teacher BEV에 planning 성분이 없는지, readout 버그인지(설계 문서 §08의 "probe가 작동하지 않음": ego 지름길, 미수렴, BEV 불일치)부터 확인한다.
-A는 그대로 모델 작업의 기준선으로 쓸 수 있으므로 버려지지 않는다.
 
 ### 8.4 통과한 뒤
 
-1. **용량 곡선:** h0, h2 (`PRESETS="h0 h2"`). A가 학습되는 동안 진행한다.
-2. **Stage 2:** A가 끝나면 student BEV를 캐싱하고(navtrain, navtest) `run_stage2.sh`로 `S_student`, `S_transfer`, `S_transfer+A`를 잰다. §2.3 표로 해석한다.
-3. **Stage 3 fine-tune (feasibility):** `kd_readout`과 대조군 `plan_only`를 같은 `INIT_CKPT`, 같은 LR, 같은 step으로 돌린다.
-4. **Stage 3 본 실험:** ①~④와 대조군 `kd_random`, `kd_feature`를 처음부터, 같은 스케줄로, `MAP_PROBE=1`로 돌린다. PDMS와 map mAP를 함께 보고한다.
-5. **ablation:** `--num-queries`, `--ego-inject`, `--cmd-inject`, λ(`KD_WEIGHT`, `KD_BALANCE`), warmup 길이.
+1. **Stage 2:** `interaction_final`로 student BEV를 캐싱하고(navtrain, navtest) `run_stage2.sh`로 `S_student`, `S_transfer`, `S_transfer+A`를 잰다. §2.3 표로 해석한다.
+2. **Stage 3 fine-tune (feasibility):** `interaction_final`에서 `HEADS=interaction`으로 `kd_readout`과 대조군 `control`을 같은 `INIT_CKPT`, 같은 LR, 같은 epoch로 돌린다.
+   epoch, LR, `KD_SHARE`는 논의 중이다.
+3. **Stage 3 본 실험:** ①~③과 대조군 `kd_random`, `kd_feature`를 처음부터, 같은 스케줄로, 같은 `KD_SHARE`로 돌린다. PDMS, map mAP, det mAP를 함께 보고한다.
+4. **ablation:** `--num-queries`, `--ego-inject`, `--cmd-inject`, `KD_SHARE`, warmup 길이, readout 용량(h0/h2).
 
 ## 9. 실행 명령
 
@@ -384,23 +404,27 @@ PRESETS="h1" SEEDS="0 1 2" RUNS=$R/runs PYTHON=$PY bash tools/readout/run_stage1
 #   통과하면 PRESETS="h0 h2", --num-queries / --ego-inject / --cmd-inject ablation
 #   (READOUT_TRAIN_ARGS로 전달)
 
-# 2) Stage 2 — 현재 구조의 plan-only 체크포인트 필요
+# 2) Stage 2 — Stage 3에서 증류할 체크포인트(interaction_final)의 BEV
+CKPT=.../para_ssr_interaction_final/lightning_logs/version_2/checkpoints/last.ckpt
 for r in 0 1 2 3; do CUDA_VISIBLE_DEVICES=$r $PY tools/readout/cache_student_bev.py \
     --ckpt $CKPT --filter navtrain --split trainval --out $DATA/student_bev/navtrain --rank $r --world 4 \
-    agent.config.use_task_interaction=false agent.config.use_det_motion_head=false \
-    agent.config.use_map_head=false agent.config.grad_balance_target=null & done; wait
+    agent.config.use_task_interaction=true agent.config.use_det_motion_head=true \
+    agent.config.use_map_head=true & done; wait
 $PY tools/readout/cache_student_bev.py --merge --out $DATA/student_bev/navtrain
 #   navtest도 같은 방식 (--filter navtest --split test)
 STUDENT_CACHE=$DATA/student_bev/navtrain STUDENT_CACHE_TEST=$DATA/student_bev/navtest \
 TARGETS_TRAIN=... TARGETS_TEST=... RUNS=$R/runs PYTHON=$PY bash tools/readout/run_stage2.sh
 
-# 3) Stage 3 — fine-tune으로 feasibility, 그 다음 처음부터
-INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 ARM=plan_only bash scripts/training/train_para_ssr_kd.sh   # 대조군
-INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 KD_WARMUP=0 KD_RAMP=2000 \
+# 3) Stage 3 — full PARA-SSR(interaction_final)에서 fine-tune으로 feasibility, 그 다음 처음부터
+#    MAX_EPOCHS / LR / KD_SHARE 값은 예시다(논의 중)
+HEADS=interaction ARM=control INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 \
+  bash scripts/training/train_para_ssr_kd.sh                                    # 대조군
+HEADS=interaction ARM=kd_readout INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 KD_WARMUP=0 KD_RAMP=2000 KD_SHARE=0.1 \
   TEACHER_CACHE=$DATA/kd_teacher_resmap READOUT_CKPT=$R/runs/teacher_h1_s0/readout.pt \
-  ARM=kd_readout bash scripts/training/train_para_ssr_kd.sh
-#   본 실험: ARM ∈ {plan_only, map_gt, map_teacher, kd_readout, kd_random, kd_feature},
-#   INIT_CKPT 없이, 같은 스케줄, MAP_PROBE=1 (map head 없는 arm의 mAP 측정)
+  bash scripts/training/train_para_ssr_kd.sh
+#   본 실험: HEADS=interaction, ARM ∈ {control, map_teacher, kd_readout, kd_random, kd_feature},
+#   INIT_CKPT 없이, 같은 스케줄, 같은 KD_SHARE
+#   W&B 프로젝트는 기본 para-ssr-readout (WANDB_PROJECT로 변경)
 #   DRY_RUN=1 을 붙이면 실행하지 않고 override만 출력한다
 ```
 
@@ -415,15 +439,40 @@ INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 KD_WARMUP=0 KD_RAMP=2000 \
 
 ## 10. 5090 서버 메모
 
-- **teacher stack(torch 1.12 / cu116 / mmcv-full 1.6)은 sm_120(RTX 5090)에서 돌지 않는다.** teacher가 필요한 작업(navtest 캐시, 필요하면 val_logs 캐시)은 옮기기 전에 turing에서 끝내야 한다. 그 뒤로는 캐시만 있으면 된다.
+- **teacher stack(torch 1.12 / cu116 / mmcv-full 1.6)은 sm_120(RTX 5090)에서 돌지 않는다.** 5090 서버에는 ReSMap 체크포인트도 없다. teacher가 필요한 캐시는 turing에서 만들어 HF로 옮긴다.
 - Stage 1/2 readout 학습은 캐시와 navsim 코드만 필요하다. mmcv가 필요 없다.
-- 5090에는 torch ≥ 2.7(cu128)이 필요하다. 이 코드는 torch 2.0.1(e2e env)에서만 검증했다. `WarmupCosLR`는 `verbose` 인자 호환 처리가 되어 있지만, navsim/nuplan-devkit 전체가 새 torch에서 도는지는 **검증하지 않았다.**
-- GradBalancer와 `KD_BALANCE`는 FP32를 요구한다. 기존 레시피는 GPU당 B=4 FP32이고, 32 GB에 들어가는지는 확인하지 않았다. 안 들어가면 batch를 줄이고 accumulate를 늘려 global 128을 유지한다. KD arm은 GPU당 teacher BEV(fp16 2.56 MB)와 동결 h만 추가된다.
+- `ssr` env(torch 2.8.0+cu128)에서 테스트 123개가 통과하고, PARA-SSR 학습·평가가 돈다.
+- FP32, GPU당 B=4: full PARA-SSR(`interaction_final`) + `kd_readout` fine-tune이 GPU당 약 15.6 GB, micro-batch 3.1 it/s(2 GPU). base run의 epoch 시간(약 55분)과 같은 수준이다.
+- scene 로딩(navtrain 978 log + val 214 log)에 학습 시작 전 수 분이 걸린다.
+- readout 학습은 GPU가 아니라 teacher BEV 읽기(디스크)에서 막힌다. BEV를 읽는 run 4~8개를 동시에 돌리면 epoch당 4.5분 안팎이다.
 - 저장공간: teacher BEV 301 GB, student BEV 약 264 GB, navtest 캐시 각 약 31 GB.
 
 ## 11. 검증한 것과 하지 않은 것
 
-**검증함** (turing, CPU. GPU는 다른 사용자가 점유 중이었다)
+**5090에서 검증함** (2026-09-16~17)
+
+- `pytest tests/` 123개 통과 (torch 2.8).
+- Stage 1 readout 학습(open-loop, train_logs 중 log 단위 hold-out 49 log / 4,602 token, 10 epoch, 가장 좋은 val loss 기준, seed 3개 평균 ± 표준편차).
+
+  | preset | 파라미터 | teacher `val/l2_4s` (m) | BEV를 섞은 경우 | ego (BEV 없음) | shuffled 라벨 `l2_4s` / train loss / val loss |
+  |---|---|---|---|---|---|
+  | h0 | 0.47M | 1.538 ± 0.009 | 3.77 | 2.188 ± 0.004 | 9.40 / 0.121 / 0.116 |
+  | h1 | 0.80M | 1.364 ± 0.007 | 4.08 | 2.024 ± 0.009 | 9.45 / 0.120 / 0.117 |
+  | h2 | 1.86M | 1.333 ± 0.006 | 4.35 | 2.024 ± 0.002 | 9.47 / 0.120 / 0.117 |
+
+  - 모든 용량에서 teacher가 ego보다 0.65~0.69 m 낮고, seed 편차(0.01 m 미만)보다 훨씬 크다. h1 → h2에서 개선이 작아진다(포화).
+  - BEV를 샘플끼리 섞으면 오차가 ego보다도 나빠진다. h가 BEV를 읽는다.
+  - shuffled 라벨에서는 h2도 train loss가 val loss 아래로 내려가지 않는다. 용량을 키워도 무작위 라벨을 외우지 않는다.
+  - ego의 h0이 h1/h2보다 나쁜 것은 h0의 head가 linear이기 때문이다(`--no-bev`에서는 head만 학습된다). h1과 h2의 ego head는 같은 구조다.
+  - **PDMS(`S_own`, `S_ego`, `S_shuffled`)는 아직 재지 않았다.** navtest teacher 캐시를 받은 뒤 `run_stage1.sh`로 잰다.
+- plan-only 체크포인트 + `kd_readout` fine-tune 48 step(GPU 2장): 체크포인트 로드, teacher 캐시 읽기, `kd/valid_frac` 1.0(train)/0.0(val), 고정 λ = 1에서 `gshare/distill` 0.91.
+- `interaction_final` + `HEADS=interaction ARM=kd_readout KD_SHARE=0.1` fine-tune 240 micro-batch(GPU 2장): 로드와 학습·검증이 정상.
+  base run의 det/map scale(0.056, 0.110)을 이어받고, 첫 조절에서 `gscale/distill` 0.267이 되었다. 증류 시작 시점의 `kd/raw`(1 − cos)는 0.070이다.
+- **Hydra override 버그 수정.** `grad_balance_target`은 yaml에서 dict라 `agent.config.grad_balance_target={...}`가 **덮어쓰지 않고 병합**된다.
+  새 key(`distill`)는 거부되어 `KD_BALANCE`/`KD_SHARE`를 쓰는 arm이 시작도 못 했고, 빠진 key는 남는다(`map_gt`의 `{plan:0.5,map:0.5}`가 `det:0.3`을 유지. det head가 꺼져 있어 loss 단계에서 버려지므로 결과에는 영향이 없었다).
+  테스트는 Python에서 config를 직접 만들어서 이 경로를 거치지 않았다. 런처가 `~key`로 지운 뒤 `+key=...`로 다시 넣도록 고치고, `run_training.py --cfg job`으로 arm별 최종 config를 확인했다.
+
+**turing에서 검증함** (CPU. GPU는 다른 사용자가 점유 중이었다)
 
 - 기존 테스트 98개와 신규 25개, 총 123개 통과
 - `train_readout.py`: 실제 teacher 캐시로 h0/h1/h2, `--no-bev`, `--shuffle-labels`, `--adapter-only`, `--num-queries 4 --ego-inject early --cmd-inject late` 각각 1 epoch 스모크
@@ -435,12 +484,13 @@ INIT_CKPT=$CKPT MAX_EPOCHS=5 LR=2e-5 KD_WARMUP=0 KD_RAMP=2000 \
 
 **하지 않음**
 
-- 실제 실험. Stage 1~3 결과는 아직 없다. 진행 순서는 §8.
-- turing에는 현재 구조의 PARA-SSR 체크포인트가 없다(학습은 다른 서버에서 했다). Stage 2 전에 가져와야 한다.
-- turing의 `sensor_blobs/trainval`에는 일부 navtrain frame의 이미지가 없다. `cache_student_bev.py`는 이런 frame을 건너뛰고 `missing_r*.txt`에 기록한다. 실제 학습 서버의 데이터는 확인하지 않았다.
+- Stage 1 PDMS, Stage 2, Stage 3 결과는 아직 없다. 진행 순서는 §8.
+- turing의 `sensor_blobs/trainval`에는 일부 navtrain frame의 이미지가 없다. `cache_student_bev.py`는 이런 frame을 건너뛰고 `missing_r*.txt`에 기록한다. 5090 서버에서는 navtrain 전부에 이미지가 있다(§8.2).
 
 ## 12. 미결 사항
 
+- Stage 3 fine-tune의 epoch 수, LR, `KD_SHARE`(distill 몫). 본 실험(처음부터)의 스케줄과 λ warmup 길이.
+- student base를 `interaction_final` 하나로 갈지, `parallel_final`을 fairness check로 같이 돌릴지.
 - PARA-SSR 구조 자체가 아직 확정되지 않았다. 구조가 바뀌면 Stage 2 캐시와 Stage 3을 다시 돌려야 한다. Stage 1은 teacher에만 의존하므로 재사용된다.
 - teacher 선정 기준을 `S − S_ego`로 수치화하는 것은 보류한다. 단일 점수로 teacher를 고르는 것은 너무 나이브하다.
 - h를 자르는 깊이(z를 어느 층 뒤에서 뽑을지)와 여러 h를 동시에 매칭하는 앙상블은 Stage 1 결과를 본 뒤 결정한다.

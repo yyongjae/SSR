@@ -628,6 +628,17 @@ def _load_training_agent_config(
     # Strict checkpoint loading replaces every model tensor.  Avoid an
     # unnecessary timm download/cache dependency during held-out evaluation.
     agent_config.config.backbone_pretrained = False
+    # Readout distillation (report/19) is training-only: evaluate a KD run
+    # without it, as PDM scoring does.  Left on, the agent registers the
+    # teacher-cache target builder next to ParaSSRTargetBuilder and the
+    # single-builder check below rejects the run.  The loader already skips
+    # the distiller's checkpoint keys when no distiller is built.
+    if "kd_mode" in agent_config.config:
+        agent_config.config.kd_mode = "none"
+    if "map_label_source" in agent_config.config:
+        agent_config.config.map_label_source = "gt"
+    if "plan_map_weight" in agent_config.config:
+        agent_config.config.plan_map_weight = 0.0
     return agent_config
 
 

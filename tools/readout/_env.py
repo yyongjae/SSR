@@ -7,8 +7,9 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-# Same defaults as scripts/training/train_para_ssr.sh; override from the shell.
-_DATA = os.environ.get("NAVSIM_DATA", "/data/navsim/dataset")
+# Same defaults as scripts/training/train_para_ssr.sh (<repo>/data/dataset); override from the shell.
+_DEFAULT_DATA = REPO / "data/dataset"
+_DATA = os.environ.get("NAVSIM_DATA", str(_DEFAULT_DATA if _DEFAULT_DATA.is_dir() else "/data/navsim/dataset"))
 os.environ.setdefault("NUPLAN_MAP_VERSION", "nuplan-maps-v1.0")
 os.environ.setdefault("NUPLAN_MAPS_ROOT", f"{_DATA}/maps")
 os.environ.setdefault("OPENSCENE_DATA_ROOT", _DATA)

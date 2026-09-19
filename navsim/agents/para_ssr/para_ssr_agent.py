@@ -52,6 +52,7 @@ from .para_ssr_targets import (
 )
 from .readout.distill import KD_DISTANCES, KD_MODES
 from .readout.teacher_targets import ResMapTeacherTargetBuilder
+from .plan_map import DrivableAreaTargetBuilder
 
 
 class WarmupCosLR(_LRScheduler):
@@ -491,10 +492,19 @@ class ParaSSRAgent(AbstractAgent):
         if kd_mode != "none":
             if config.kd_distance not in KD_DISTANCES:
                 raise ValueError(f"kd_distance must be one of {KD_DISTANCES}, got {config.kd_distance!r}")
-            if kd_mode == "readout" and not config.kd_readout_ckpt:
+            if kd_mode in ("readout", "attn_feature", "sens_feature") and not config.kd_readout_ckpt:
                 raise ValueError("kd_mode=readout needs kd_readout_ckpt")
             if min(int(config.kd_warmup_iters), int(config.kd_ramp_iters)) < 0:
                 raise ValueError("kd_warmup_iters and kd_ramp_iters must be non-negative")
+        plan_map_weight = float(getattr(config, "plan_map_weight", 0.0))
+        if plan_map_weight < 0:
+            raise ValueError(f"plan_map_weight must be >= 0, got {plan_map_weight}")
+        if plan_map_weight > 0:
+            x0, x1, y0, y1 = config.plan_map_extent
+            if not (x1 > x0 and y1 > y0 and float(config.plan_map_res) > 0 and float(config.plan_map_clip) > 0):
+                raise ValueError(
+                    f"plan_map_extent/res/clip invalid: {config.plan_map_extent}, "
+                    f"{config.plan_map_res}, {config.plan_map_clip}")
         if trajectory_sampling.num_poses != config.fut_ts:
             raise ValueError(
                 "trajectory_sampling and fut_ts disagree: "
@@ -598,6 +608,8 @@ class ParaSSRAgent(AbstractAgent):
         cfg = self._config
         if getattr(cfg, "kd_mode", "none") != "none" or getattr(cfg, "map_label_source", "gt") == "teacher":
             builders.append(ResMapTeacherTargetBuilder(cfg))
+        if float(getattr(cfg, "plan_map_weight", 0.0)) > 0:
+            builders.append(DrivableAreaTargetBuilder(cfg))
         return builders
 
     # ------------------------------------------------------------------ #

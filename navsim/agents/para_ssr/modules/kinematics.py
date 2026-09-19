@@ -65,3 +65,31 @@ def clamp_controls(controls: torch.Tensor) -> torch.Tensor:
     a = controls[..., 0].clamp(MIN_LON_ACCEL * CLAMP_MARGIN, MAX_LON_ACCEL * CLAMP_MARGIN)
     omega = controls[..., 1].clamp(-MAX_ABS_YAW_RATE * CLAMP_MARGIN, MAX_ABS_YAW_RATE * CLAMP_MARGIN)
     return torch.stack([a, omega], dim=-1)
+
+
+def bezier_xyyaw(xy: torch.Tensor, fallback_yaw: torch.Tensor, min_speed: float = 1e-3) -> torch.Tensor:
+    """Heading from the path, ported from DiffusionDriveV2 (``diffusiondrivev2_model_sel.bezier_xyyaw``).
+
+    The origin and the T predicted points are the control points of a degree-T
+    Bezier curve; the heading at point k is the direction of its derivative at
+    t = k / T.  The regressed heading is not used, so heading and path agree by
+    construction.
+
+    xy [..., T, 2]; fallback_yaw [..., T] is used where the derivative is ~0 (a car
+    standing still has no direction of travel; DiffusionDriveV2 would return
+    atan2(0, 0) = 0, whose gradient is NaN).  Returns [..., T, 3].
+    """
+    import math
+
+    n = xy.shape[-2]
+    ctrl = torch.cat([torch.zeros_like(xy[..., :1, :]), xy], dim=-2)          # [..., T+1, 2]
+    delta = ctrl[..., 1:, :] - ctrl[..., :-1, :]                              # [..., T, 2]
+    binom = torch.tensor([math.comb(n - 1, i) for i in range(n)], device=xy.device, dtype=xy.dtype)
+    t = torch.arange(1, n + 1, device=xy.device, dtype=xy.dtype) / n
+    powers = torch.arange(0, n, device=xy.device, dtype=xy.dtype)
+    basis = binom * t.view(-1, 1) ** powers * (1 - t).view(-1, 1) ** powers.flip(0)   # [T(t_k), T(i)]
+    deriv = n * torch.einsum("ki,...ic->...kc", basis, delta)                  # [..., T, 2]
+    moving = deriv.norm(dim=-1) > min_speed
+    safe = torch.where(moving.unsqueeze(-1), deriv, torch.ones_like(deriv))   # keep atan2's backward finite
+    yaw = torch.where(moving, torch.atan2(safe[..., 1], safe[..., 0]), fallback_yaw)
+    return torch.cat([xy, yaw.unsqueeze(-1)], dim=-1)

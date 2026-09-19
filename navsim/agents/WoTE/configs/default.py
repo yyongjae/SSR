@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
@@ -13,7 +14,7 @@ class WoTEConfig:
         time_horizon=4, interval_length=0.5
     )
 
-    resnet34_path = '/home/yingyan.li/repo/WoTE/ckpts/resnet34.pth'
+    resnet34_path = os.environ.get("WOTE_RESNET34", '/home/yingyan.li/repo/WoTE/ckpts/resnet34.pth')
     image_architecture: str = "resnet34"
     lidar_architecture: str = "resnet34"
 
@@ -123,8 +124,10 @@ class WoTEConfig:
     num_traj_anchor: int = 256
     
     use_sim_reward: bool = True
-    sim_reward_dict_path: str = f'/home/yingyan.li/repo/WoTE/dataset/extra_data/planning_vb/formatted_pdm_score_{num_traj_anchor}.npy'
-    cluster_file_path = f'/home/yingyan.li/repo/WoTE/dataset/extra_data/planning_vb/trajectory_anchors_{num_traj_anchor}.npy'
+    # WOTE_EXTRA: directory holding WoTE's released planning_vb files (default: the authors' path)
+    _extra = os.environ.get("WOTE_EXTRA", "/home/yingyan.li/repo/WoTE/dataset/extra_data/planning_vb")
+    sim_reward_dict_path: str = f'{_extra}/formatted_pdm_score_{num_traj_anchor}.npy'
+    cluster_file_path = f'{_extra}/trajectory_anchors_{num_traj_anchor}.npy'
     num_plan_queries: int = 32
 
     # map loss

@@ -110,6 +110,21 @@ config:
   kd_center_momentum: 0.99
   kd_random_seed: 0
   kd_sens_probes: 4
+  # Image backbone (timm tag).  v1 = resnet50.tv_in1k; v2 uses resnet34.tv_in1k,
+  # the NAVSIM-standard ResNet-34 (TransFuser / WoTE / DiffusionDrive).
+  image_architecture: resnet50.tv_in1k
+  # v2 planner: WoTE-style anchors + PDM-score rewards (modules/anchor_planner.py).
+  plan_anchor: false
+  plan_anchor_file: null
+  plan_score_file: null
+  plan_reward_weights: [0.1, 0.5, 0.5, 1.0]
+  plan_topk: 6
+  plan_kinematic: false
+  plan_heading_from_xy: false
+  plan_rescore_refined: false   # evaluation-only: WoTE-style rescoring of anchor + offset
+  plan_offset_loss_weight: 1.0
+  plan_im_reward_weight: 1.0
+  plan_sim_reward_weight: 1.0
   heading_from_path: false   # evaluation-only: heading := path direction
   kinematic_projection: false   # evaluation-only: TOAD projection (IK -> clamp -> bicycle rollout)
   # Planning-side map consistency (plan_map.py); 0 = off.

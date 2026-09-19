@@ -21,6 +21,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from .modules.anchor_planner import anchor_plan_losses
 from .plan_map import plan_map_loss
 from .readout.distill import ReadoutDistiller
 from .modules.grad_balance import (
@@ -220,6 +221,19 @@ class ParaSSRLoss(torch.nn.Module):
         )
         task_losses["plan"] = plan_loss * tw.get("plan", 1.0)
         logs["loss_plan_reg"] = plan_loss.detach()
+        if "trajectory_offset" in predictions:
+            # v2 anchor planner: WoTE's three terms replace the L1 regression.  The L1
+            # of the SELECTED trajectory stays in the logs (loss_plan_reg and the
+            # per-command sums) as the v1-comparable planning error; it is not trained.
+            if "sim_reward" not in targets:
+                raise KeyError("plan_anchor needs the sim_reward target: set plan_score_file")
+            al = anchor_plan_losses(predictions, targets["trajectory"], targets["sim_reward"],
+                                    targets["sim_reward_valid"])
+            task_losses["plan"] = tw.get("plan", 1.0) * (
+                float(cfg.plan_offset_loss_weight) * al["traj_offset_loss"]
+                + float(cfg.plan_im_reward_weight) * al["im_reward_loss"]
+                + float(cfg.plan_sim_reward_weight) * al["sim_reward_loss"])
+            logs.update({f"plan_v2/{k}": v.detach() for k, v in al.items()})
         # Keep the historical raw metric, but expose the value that actually
         # enters total_loss so plan=2.0 is not hidden in dashboards.
         logs["loss_plan_reg_weighted"] = task_losses["plan"].detach()

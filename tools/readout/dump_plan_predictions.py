@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--v2-extras", action="store_true",
+                    help="also save the anchor planner's candidates and scores (top-k, all offsets, rewards)")
     args, overrides = ap.parse_known_args()
 
     from navsim.common.dataloader import SceneLoader
@@ -49,6 +51,8 @@ def main():
     dl = DataLoader(FeatureData(tokens, loader, agent.get_feature_builders()), batch_size=args.batch_size,
                     num_workers=args.workers, collate_fn=collate)
     names, traj, preds, cmds, missing = [], [], [], [], []
+    extras = {k: [] for k in ("plan_topk_index", "plan_topk_trajectory", "plan_final_rewards", "sim_rewards",
+                              "im_rewards", "trajectory_offset")} if args.v2_extras else {}
     t0 = time.time()
     with torch.no_grad():
         for toks, feats, failed in dl:
@@ -61,12 +65,16 @@ def main():
             traj.append(out["trajectory"].float().cpu().numpy())
             preds.append(out["ego_fut_preds"].float().cpu().numpy())
             cmds.append(feats["command"].float().cpu().numpy())
+            for k in extras:
+                v = out[k].cpu().numpy()
+                extras[k].append(v if v.dtype.kind in "iu" else v.astype(np.float16))
             if len(names) % 2000 < args.batch_size:
                 print(f"{len(names)}/{len(tokens)}  {(time.time() - t0) / len(names):.3f} s/frame", flush=True)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.out, tokens=np.asarray(names), trajectory=np.concatenate(traj),
                         ego_fut_preds=np.concatenate(preds), command=np.concatenate(cmds),
-                        missing=np.asarray(missing), checkpoint=np.asarray(args.ckpt))
+                        missing=np.asarray(missing), checkpoint=np.asarray(args.ckpt),
+                        **{k: np.concatenate(v) for k, v in extras.items()})
     print(f"saved {len(names)} trajectories ({len(missing)} missing) -> {args.out}", flush=True)
 
 

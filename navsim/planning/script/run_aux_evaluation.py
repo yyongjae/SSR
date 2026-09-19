@@ -639,6 +639,8 @@ def _load_training_agent_config(
         agent_config.config.map_label_source = "gt"
     if "plan_map_weight" in agent_config.config:
         agent_config.config.plan_map_weight = 0.0
+    if agent_config.config.get("plan_anchor", False):
+        agent_config.config.plan_score_file = None  # labels are training-only
     return agent_config
 
 

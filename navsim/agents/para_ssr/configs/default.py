@@ -278,9 +278,31 @@ class ParaSSRConfig:
     # Planning-side map consistency (plan_map.py): hinge on the commanded
     # trajectory's footprint corners against the SDF of the drivable area the
     # DAC metric uses.  0 = off: no target builder, no term.
+    # ---- v2 planner: WoTE-style anchors + PDM-score rewards (modules/anchor_planner.py) ----
+    # Off = the v1 single-query L1 regression.  The two files are WoTE's released
+    # extra data (K-means anchors, and the PDM scores of every anchor per token).
+    plan_anchor: bool = False
+    plan_anchor_file: Optional[str] = None
+    plan_score_file: Optional[str] = None
+    plan_reward_weights: Tuple[float, float, float, float] = (0.1, 0.5, 0.5, 1.0)   # WoTE reward_weights
+    plan_topk: int = 6
+    # Kinematic-bicycle output layer (modules/kinematics.py, from TOAD): the offset
+    # head predicts control corrections and the poses are their rollout.
+    plan_kinematic: bool = False
+    # Heading from the path (modules/kinematics.bezier_xyyaw, from DiffusionDriveV2):
+    # the offset head predicts x, y only.  v2 regressing heading separately left it
+    # ~3 deg off the path direction (median, epoch 1), which the PDM tracker follows.
+    plan_heading_from_xy: bool = False
+    # evaluation-only diagnostic: select among anchor + offset re-encoded and rescored (WoTE test time)
+    plan_rescore_refined: bool = False
+    plan_offset_loss_weight: float = 1.0       # WoTE traj_offset_loss_weight
+    plan_im_reward_weight: float = 1.0         # WoTE im_reward_loss (unweighted)
+    plan_sim_reward_weight: float = 1.0        # WoTE sim_reward_loss (unweighted; x5 inside)
+
     # Evaluation-only post-processing: heading := direction of travel of the planned
-    # path (para_ssr_model.heading_from_path).  Tests whether DAC failures come from
-    # predicted headings that disagree with the path (the PDM simulator tracks both).
+    # path (para_ssr_model.heading_from_path).  On the v1 control it lifts PDMS
+    # 84.74 -> 85.61 (DAC +0.70, EP +0.75): the PDM simulator tracks position AND
+    # heading, and predicted headings that disagree with the path pull it off line.
     heading_from_path: bool = False
     # Evaluation-only: TOAD's kinematic projection (modules/kinematics.py) of the
     # planned trajectory, i.e. its test-time step without the CEM search.

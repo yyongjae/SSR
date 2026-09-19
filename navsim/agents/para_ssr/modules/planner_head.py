@@ -18,6 +18,7 @@ from typing import Dict, Optional, Sequence
 import torch
 import torch.nn as nn
 
+from .anchor_planner import AnchorPlanner
 from .transformer_blocks import LearnedPositionalEncoding
 
 
@@ -127,6 +128,12 @@ class ParaSSRPlannerHead(nn.Module):
         motion_embed_dims: Optional[int] = None,
         map_embed_dims: Optional[int] = None,
         use_task_interaction: bool = True,
+        plan_anchor_file: Optional[str] = None,
+        plan_reward_weights: Sequence[float] = (0.1, 0.5, 0.5, 1.0),
+        plan_topk: int = 6,
+        plan_kinematic: bool = False,
+        plan_heading_from_xy: bool = False,
+        plan_rescore_refined: bool = False,
     ):
         super().__init__()
         if use_stl:
@@ -199,7 +206,19 @@ class ParaSSRPlannerHead(nn.Module):
         for _ in range(num_reg_fcs):
             reg_layers.extend([nn.Linear(embed_dims, embed_dims), nn.ReLU()])
         reg_layers.append(nn.Linear(embed_dims, fut_ts * traj_dims))
-        self.ego_fut_decoder = nn.Sequential(*reg_layers)
+        # v2: WoTE-style anchor vocabulary + PDM-score rewards (anchor_planner.py)
+        # replaces the single-trajectory regressor, which is then not built: an
+        # unused module would fail DDP's unused-parameter check.
+        self.anchor_planner = (
+            AnchorPlanner(plan_anchor_file, embed_dims, fut_ts, traj_dims, plan_reward_weights, plan_topk,
+                          kinematic=plan_kinematic, heading_from_xy=plan_heading_from_xy)
+            if plan_anchor_file else None
+        )
+        self.ego_fut_decoder = nn.Sequential(*reg_layers) if self.anchor_planner is None else None
+        # Evaluation-only diagnostic (never used in training): score the refined
+        # trajectories (anchor + offset) instead of the fixed anchors, as WoTE does at
+        # test time -- a second pass of the planner layers on re-encoded trajectories.
+        self.plan_rescore_refined = bool(plan_rescore_refined)
 
         for layer in self.planner_layers:
             for parameter in layer.parameters():
@@ -345,9 +364,27 @@ class ParaSSRPlannerHead(nn.Module):
         h = h + self.ego_status_encoder(ego_status).unsqueeze(1)
         plan_pos = self.plan_query_pos.weight.to(bev_embed.dtype).unsqueeze(0).expand(bs, -1, -1)
         memories = self.prepare_task_memories(det_out, map_out) if self.use_task_interaction else {}
+        h_ego = h
+        if self.anchor_planner is not None:
+            h = self.anchor_planner.queries(h)                      # [B, K, C]
+            plan_pos = plan_pos.expand(-1, h.shape[1], -1)
         for layer in self.planner_layers:
             h = layer(h, plan_pos, bev_embed, bev_pos, **memories)
         h = self.final_norm(h)
+        if self.anchor_planner is not None:
+            # NAVSIM ego status is (vx, vy, ax, ay) in the ego frame: vx is the speed along heading
+            out = self.anchor_planner(h, init_speed=ego_status[:, 0])
+            if self.plan_rescore_refined and not self.training:
+                out.update(self._rescore_refined(out, h_ego, plan_pos, bev_embed, bev_pos, memories))
+            poses = out["trajectory"]                               # absolute poses [B, T, 3]
+            steps = torch.diff(torch.cat([poses.new_zeros(bs, 1, self.traj_dims), poses], dim=1), dim=1)
+            out.update(
+                bev_embed=bev_embed, scene_query=h.transpose(0, 1), token_attn=None,
+                # per-step offsets of the selected trajectory, so every consumer of the
+                # v1 API (select_trajectory, validation metrics, plan_map) keeps working
+                ego_fut_preds=steps.unsqueeze(1).expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
+            )
+            return out
         plan = self.ego_fut_decoder(h[:, 0]).view(bs, 1, self.fut_ts, self.traj_dims)
         # Keep the existing command-branch loss and evaluation API. The single
         # trajectory has already been conditioned on the command embedding.
@@ -357,6 +394,23 @@ class ParaSSRPlannerHead(nn.Module):
             "token_attn": None,
             "ego_fut_preds": plan.expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
         }
+
+    def _rescore_refined(self, out, h_ego, plan_pos, bev_embed, bev_pos, memories):
+        """WoTE-style test-time selection: re-encode anchor + offset, rescore, pick among the refined."""
+        ap = self.anchor_planner
+        refined = (ap.trajectory_anchors.unsqueeze(0).to(out["trajectory_offset"].dtype)
+                   + out["trajectory_offset"])                                  # [B, K, T, 3]
+        h2 = ap.queries(h_ego, trajectories=refined)
+        for layer in self.planner_layers:
+            h2 = layer(h2, plan_pos, bev_embed, bev_pos, **memories)
+        _, sim2, final2 = ap.score(self.final_norm(h2))
+        k = min(ap.topk, ap.num_anchors)
+        top = final2.topk(k, dim=-1).indices
+        gather = top[:, :, None, None].expand(-1, -1, ap.fut_ts, ap.traj_dims)
+        top_traj = refined.gather(1, gather)
+        return {"trajectory": top_traj[:, 0], "plan_rescore_final_rewards": final2,
+                "plan_rescore_sim_rewards": sim2, "plan_rescore_topk_index": top,
+                "plan_rescore_topk_trajectory": top_traj}
 
     CMD_NAMES = ("left", "straight", "right", "unknown")
 

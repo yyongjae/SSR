@@ -200,6 +200,12 @@ class ParaSSRModel(nn.Module):
             use_stl=cfg.use_stl,
             plan_num_layers=cfg.plan_num_layers,
             use_task_interaction=self.use_task_interaction,
+            plan_anchor_file=getattr(cfg, "plan_anchor_file", None) if getattr(cfg, "plan_anchor", False) else None,
+            plan_reward_weights=getattr(cfg, "plan_reward_weights", (0.1, 0.5, 0.5, 1.0)),
+            plan_topk=getattr(cfg, "plan_topk", 6),
+            plan_kinematic=bool(getattr(cfg, "plan_kinematic", False)),
+            plan_heading_from_xy=bool(getattr(cfg, "plan_heading_from_xy", False)),
+            plan_rescore_refined=bool(getattr(cfg, "plan_rescore_refined", False)),
         )
         self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
 
@@ -406,6 +412,11 @@ class ParaSSRModel(nn.Module):
                 outs["ego_fut_preds"], features["command"]
             ),
         }
+        if "trajectory_offset" in outs:  # v2 anchor planner: selected anchor + offset, and what its losses need
+            predictions.update({k: outs[k] for k in (
+                "trajectory", "plan_topk_trajectory", "plan_topk_reward", "plan_topk_index",
+                "plan_final_rewards", "trajectory_offset", "im_rewards", "sim_rewards", "trajectory_anchors")})
+            predictions.update({k: v for k, v in outs.items() if k.startswith("plan_rescore_")})
         if getattr(cfg, "heading_from_path", False) and not self.training:
             predictions["trajectory"] = heading_from_path(predictions["trajectory"])
         if getattr(cfg, "kinematic_projection", False) and not self.training:

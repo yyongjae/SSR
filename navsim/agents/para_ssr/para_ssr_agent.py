@@ -53,6 +53,7 @@ from .para_ssr_targets import (
 from .readout.distill import KD_DISTANCES, KD_MODES
 from .readout.teacher_targets import ResMapTeacherTargetBuilder
 from .plan_map import DrivableAreaTargetBuilder
+from .plan_score_targets import AnchorScoreTargetBuilder
 
 
 class WarmupCosLR(_LRScheduler):
@@ -496,6 +497,11 @@ class ParaSSRAgent(AbstractAgent):
                 raise ValueError("kd_mode=readout needs kd_readout_ckpt")
             if min(int(config.kd_warmup_iters), int(config.kd_ramp_iters)) < 0:
                 raise ValueError("kd_warmup_iters and kd_ramp_iters must be non-negative")
+        if getattr(config, "plan_anchor", False):
+            if not config.plan_anchor_file:
+                raise ValueError("plan_anchor=true needs plan_anchor_file")
+            if config.traj_dims != 3:
+                raise ValueError("plan_anchor=true needs traj_dims=3 (the anchors are x, y, heading)")
         plan_map_weight = float(getattr(config, "plan_map_weight", 0.0))
         if plan_map_weight < 0:
             raise ValueError(f"plan_map_weight must be >= 0, got {plan_map_weight}")
@@ -568,8 +574,21 @@ class ParaSSRAgent(AbstractAgent):
         state_dict = {
             k: v for k, v in state_dict.items() if not k.startswith(kd_prefix) or k in own
         }
+        # v1 -> v2 init: the anchor planner replaces the single-trajectory regressor.
+        v1_regressor = "para_ssr_model.pts_bbox_head.ego_fut_decoder."
+        if not any(k.startswith(v1_regressor) for k in own):
+            state_dict = {k: v for k, v in state_dict.items() if not k.startswith(v1_regressor)}
         result = self.load_state_dict(state_dict, strict=False)
         missing = [k for k in result.missing_keys if not k.startswith(kd_prefix)]
+        # The v2 anchor planner may be initialised from a v1 checkpoint: its new
+        # modules start fresh, but only when the checkpoint has NONE of them (a
+        # partial match is a different vocabulary/architecture, not an upgrade).
+        anchor_prefix = "para_ssr_model.pts_bbox_head.anchor_planner."
+        if not any(k.startswith(anchor_prefix) for k in state_dict):
+            fresh = [k for k in missing if k.startswith(anchor_prefix)]
+            if fresh:
+                logger.info("v1 checkpoint: %d anchor-planner tensors start fresh", len(fresh))
+            missing = [k for k in missing if not k.startswith(anchor_prefix)]
         if missing or result.unexpected_keys:
             # same wording as torch's strict load, which callers match on
             raise RuntimeError(
@@ -610,6 +629,9 @@ class ParaSSRAgent(AbstractAgent):
             builders.append(ResMapTeacherTargetBuilder(cfg))
         if float(getattr(cfg, "plan_map_weight", 0.0)) > 0:
             builders.append(DrivableAreaTargetBuilder(cfg))
+        # plan_score_file is training-only: evaluation leaves it null and gets no builder
+        if getattr(cfg, "plan_anchor", False) and getattr(cfg, "plan_score_file", None):
+            builders.append(AnchorScoreTargetBuilder(cfg))
         return builders
 
     # ------------------------------------------------------------------ #

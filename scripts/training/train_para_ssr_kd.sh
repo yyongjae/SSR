@@ -20,6 +20,7 @@
 #
 # Environment:
 #   TEACHER_CACHE   ReSMap cache root                     (required except plan_only/map_gt)
+#   PLAN_V2=1       v2 planner: WoTE anchors + PDM-score rewards (data/planning_vb, see tools/plan_v2)
 #   PLAN_MAP        weight of the planning-side map-consistency hinge (plan_map.py), any ARM;
 #                   PLAN_MAP_MARGIN its margin in metres (default 0)
 #   READOUT_CKPT    Stage-1 readout (kd_readout)
@@ -80,7 +81,7 @@ case "${HEADS}" in
   interaction) HEADS_TAG=int_ ;;
   *) echo "unknown HEADS=${HEADS}" >&2; exit 2 ;;
 esac
-export EXPERIMENT="${EXPERIMENT:-para_ssr_${HEADS_TAG}${ARM}${PROBE_TAG}${PLAN_MAP:+_pm${PLAN_MAP}}${INIT_CKPT:+_ft}}"
+export EXPERIMENT="${EXPERIMENT:-para_ssr_${HEADS_TAG}${ARM}${PROBE_TAG}$([[ "${PLAN_V2:-0}" == 1 ]] && echo _v2)${PLAN_MAP:+_pm${PLAN_MAP}}${INIT_CKPT:+_ft}}"
 
 HEADS_OFF=(agent.config.use_task_interaction=false
            agent.config.use_det_motion_head=false
@@ -199,6 +200,14 @@ for a in "${ARGS[@]}"; do
   fi
 done
 ARGS=("${RESOLVED[@]}")
+
+if [[ "${PLAN_V2:-0}" == 1 ]]; then
+  # v2 planner (modules/anchor_planner.py): WoTE's 256 anchors + PDM-score rewards, any ARM.
+  PLAN_VB="${PLAN_VB:-${REPO}/data/planning_vb}"
+  ARGS+=(agent.config.plan_anchor=true
+         agent.config.plan_anchor_file="${PLAN_VB}/trajectory_anchors_256.npy"
+         agent.config.plan_score_file="${PLAN_VB}/pdm_score_256")
+fi
 
 if [[ -n "${PLAN_MAP:-}" ]]; then
   # Planning-side map consistency (plan_map.py), orthogonal to ARM: control +

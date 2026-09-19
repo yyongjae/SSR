@@ -51,7 +51,12 @@ EXP_1A="${EXP_PREFIX}_stage1_bevfusion"
 EXP_1B="${EXP_PREFIX}_stage1_resmap"
 EXP_2="${EXP_PREFIX}_stage2_dual_distill"
 
-# Telemetry / W&B — off. TensorBoard in the experiment dir is enough.
+# Telemetry / W&B — this script only. Loads the personal key from ${REPO}/.env
+# and pins entity to that account so runs do not land on the shared team.
+WANDB_PROJECT="${WANDB_PROJECT:-para-ssr-distill}"
+WANDB_GROUP="${WANDB_GROUP:-full-pipeline}"
+WANDB_MODE_ARG="${WANDB_MODE:-online}"
+WANDB_ENTITY="${WANDB_PERSONAL_ENTITY:-comflife}"
 
 # Python Environment (Auto-detect ssr conda environment)
 if [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
@@ -61,6 +66,34 @@ elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
 else
   PYTHON="${PYTHON:-python}"
 fi
+
+load_personal_wandb() {
+  local env_file="${REPO}/.env"
+  local line key=""
+  if [[ ! -f "${env_file}" ]]; then
+    echo "Error: ${env_file} not found; this script needs WANDB_API_KEY there." >&2
+    exit 1
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    if [[ "${line}" == WANDB_API_KEY=* ]]; then
+      key="${line#WANDB_API_KEY=}"
+      key="${key#\"}"; key="${key%\"}"
+      key="${key#\'}"; key="${key%\'}"
+    fi
+  done < "${env_file}"
+  if [[ -z "${key}" ]]; then
+    echo "Error: WANDB_API_KEY is empty in ${env_file}" >&2
+    exit 1
+  fi
+  export WANDB_API_KEY="${key}"
+  # Force the personal entity even if the parent shell exported the team.
+  export WANDB_ENTITY
+  unset WANDB_DISABLED
+}
+
+load_personal_wandb
 
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPU_IDS[@]}"
@@ -75,7 +108,7 @@ echo " Teacher Cache: ${DISTILL_FEATURE_ROOT}"
 echo " Exp Prefix   : ${EXP_PREFIX}"
 echo " Only stage   : ${ONLY_STAGE:-all}"
 echo " Force retrain: ${FORCE_RETRAIN}"
-echo " W&B          : disabled"
+echo " W&B          : enable=true  entity=${WANDB_ENTITY}  project=${WANDB_PROJECT}  group=${WANDB_GROUP}  (personal .env key)"
 echo "======================================================================"
 
 # Helper to find latest checkpoint in an experiment directory
@@ -137,9 +170,14 @@ stage_selected() {
 }
 
 wandb_args() {
+  local name="$1"
   WANDB_ARGS=(
-    "wandb.enable=false"
-    "wandb.mode=disabled"
+    "wandb.enable=true"
+    "wandb.mode=${WANDB_MODE_ARG}"
+    "wandb.entity=${WANDB_ENTITY}"
+    "wandb.project=${WANDB_PROJECT}"
+    "wandb.group=${WANDB_GROUP}"
+    "wandb.name=${name}"
   )
 }
 
@@ -174,7 +212,7 @@ if stage_selected stage1a; then
     echo " Experiment: ${EXP_1A}"
     echo "======================================================================"
 
-    wandb_args
+    wandb_args "${EXP_1A}"
     "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
       agent=para_ssr_teacher_adapter_agent \
       agent.config.teacher_adapter_branch="bevfusion" \
@@ -222,7 +260,7 @@ if stage_selected stage1b; then
     echo " Experiment: ${EXP_1B}"
     echo "======================================================================"
 
-    wandb_args
+    wandb_args "${EXP_1B}"
     "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
       agent=para_ssr_teacher_adapter_agent \
       agent.config.teacher_adapter_branch="resmap" \
@@ -260,12 +298,13 @@ fi
 # ------------------------------------------------------------------------------
 if [[ -n "${STAGE2_CKPT}" && -f "${STAGE2_CKPT}" ]] && ! stage_forced stage2; then
   echo ">>> [Stage 2] Already done, skipping. Checkpoint: ${STAGE2_CKPT}"
-  echo ""
-  echo "======================================================================"
-  echo " [All-in-One] Pipeline Finished Successfully!"
-  echo " Final Student Model Checkpoints: ${STAGE2_CKPT}"
-  echo " Time: $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "======================================================================"
+  printf '%s\n' \
+    '' \
+    '======================================================================' \
+    ' [All-in-One] Pipeline Finished Successfully!' \
+    " Final Student Model Checkpoints: ${STAGE2_CKPT}" \
+    " Time: $(date '+%Y-%m-%d %H:%M:%S')" \
+    '======================================================================'
   exit 0
 fi
 
@@ -289,7 +328,7 @@ fi
 export BEVFUSION_ADAPTER_CKPT="${BEVFUSION_CKPT}"
 export RESMAP_ADAPTER_CKPT="${RESMAP_CKPT}"
 
-wandb_args
+wandb_args "${EXP_2}"
 "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
   agent=para_ssr_distill_agent \
   agent.lr="1e-4" \
@@ -316,9 +355,11 @@ wandb_args
   "${WANDB_ARGS[@]}" \
   "$@"
 
-echo ""
-echo "======================================================================"
-echo " [All-in-One] Pipeline Finished Successfully!"
-echo " Final Student Model Checkpoints: ${NAVSIM_EXP_ROOT}/${EXP_2}/checkpoints/"
-echo " Time: $(date '+%Y-%m-%d %H:%M:%S')"
-echo "======================================================================"
+STAGE2_FINAL="$(find_checkpoint "${NAVSIM_EXP_ROOT}/${EXP_2}")"
+printf '%s\n' \
+  '' \
+  '======================================================================' \
+  ' [All-in-One] Pipeline Finished Successfully!' \
+  " Final Student Model Checkpoints: ${STAGE2_FINAL:-${NAVSIM_EXP_ROOT}/${EXP_2}}" \
+  " Time: $(date '+%Y-%m-%d %H:%M:%S')" \
+  '======================================================================'

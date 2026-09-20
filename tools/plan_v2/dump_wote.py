@@ -61,6 +61,9 @@ def main():
     dl = DataLoader(FeatureData(tokens, loader, agent.get_feature_builders()), batch_size=args.batch_size,
                     num_workers=args.workers, collate_fn=collate)
     names, traj, road, missing = [], [], [], []
+    # WoTE_model.forward_test computes these inside; recomputed here so the diagnostics can use
+    # the per-candidate sub-scores (sim rewards) and the ranked candidates, not only the winner.
+    extra = {k: [] for k in ("final_rewards", "im_rewards", "sim_rewards", "topk_index", "topk_trajectory")}
     on_road = torch.tensor(ON_ROAD, device=device)
     t0 = time.time()
     with torch.no_grad():
@@ -70,16 +73,34 @@ def main():
                 continue
             feats = {k: v.to(device) for k, v in feats.items()}
             first.clear()
-            out = model.forward_test(feats)
+            model.is_eval = True
+            enc = model.process_trajectory_and_reward(feats)               # forward_test without its selection
+            feat = enc["reward_feature"]
+            im = torch.softmax(model.reward_head(feat).squeeze(-1).float(), dim=-1)
+            sim = torch.cat([h(feat) for h in model.sim_reward_heads], dim=-1).permute(0, 2, 1).float().sigmoid()
+            final = model.weighted_reward_calculation(im, [sim[:, i] for i in range(sim.shape[1])])
+            anch = model.trajectory_anchors.unsqueeze(0).float()            # [1, K, T, 3]
+            off = enc["trajectory_offset"].reshape(anch.shape[0] or 1, *anch.shape[1:]) if enc["trajectory_offset"].dim() != 4 \
+                else enc["trajectory_offset"].float()
+            all_traj = anch + off                                          # [B, K, T, 3]
+            top = final.topk(3, dim=-1).indices
+            gather = top[:, :, None, None].expand(-1, -1, all_traj.shape[2], all_traj.shape[3])
+            top_traj = all_traj.gather(1, gather)
             sem = first["map"].argmax(dim=1)                                   # [B, 128, 256]
             mask = torch.isin(sem, on_road).cpu().numpy()
             names.extend(toks)
-            traj.append(out["trajectory"].float().cpu().numpy().reshape(len(toks), 8, 3))
+            traj.append(top_traj[:, 0].float().cpu().numpy().reshape(len(toks), 8, 3))
             road.append(np.packbits(mask.reshape(len(toks), -1), axis=1))
+            extra["final_rewards"].append(final.float().cpu().numpy().astype(np.float16))
+            extra["im_rewards"].append(im.float().cpu().numpy().astype(np.float16))
+            extra["sim_rewards"].append(sim.float().cpu().numpy().astype(np.float16))
+            extra["topk_index"].append(top.cpu().numpy())
+            extra["topk_trajectory"].append(top_traj.float().cpu().numpy().astype(np.float32))
             if len(names) % 2000 < args.batch_size:
                 print(f"{len(names)}/{len(tokens)}  {(time.time() - t0) / len(names):.3f} s/frame", flush=True)
     np.savez_compressed(args.out, tokens=np.asarray(names), trajectory=np.concatenate(traj),
-                        road=np.concatenate(road), shape=np.asarray(mask.shape[1:]), missing=np.asarray(missing))
+                        road=np.concatenate(road), shape=np.asarray(mask.shape[1:]), missing=np.asarray(missing),
+                        **{k: np.concatenate(v) for k, v in extra.items()})
     print(f"saved {len(names)} ({len(missing)} missing), map {mask.shape[1:]} -> {args.out}", flush=True)
 
 

@@ -425,15 +425,104 @@ class ParaSSRAgent(AbstractAgent):
                 predictions["bev_embed"],
                 targets["scene_token"],
                 trajectories=targets.get("trajectory"),
+                gt_boxes=targets.get("gt_boxes"),
+                gt_valid=targets.get("gt_valid"),
+                gt_fut_trajs=targets.get("gt_fut_trajs"),
+                gt_fut_masks=targets.get("gt_fut_masks"),
+                gt_map_pts=targets.get("gt_map_pts"),
+                gt_map_labels=targets.get("gt_map_labels"),
+                gt_map_valid=targets.get("gt_map_valid"),
             )
             weight = self._config.distill_loss_weight
             for name, value in distill_losses.items():
                 loss = loss + weight * value
                 logs[name] = value.detach()
             logs.update({k: v.detach() for k, v in distill_metrics.items()})
+            head_kd = self._distill_aux_head_kd(predictions)
+            for name, value in head_kd.items():
+                loss = loss + weight * value
+                logs[name] = value.detach()
 
         self.latest_logs = logs
         return loss
+
+    def _distill_aux_head_kd(
+        self, predictions: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Match student aux-head outputs to the same heads on teacher BEV.
+
+        Off by default: Stage-1 adapters are planning projectors, not det/map
+        teachers. Map/det GT instead mark planning-foreground cells in the
+        BEV distill mask and the look prior. Detection KD is opt-in
+        (``distill_head_kd_det``) and cls-only unless ``distill_head_kd_det_geom``.
+        """
+        cfg = self._config
+        weight = float(getattr(cfg, "distill_head_kd_weight", 0.0) or 0.0)
+        if weight <= 0.0 or self._distill is None:
+            return {}
+        teacher_tokens = getattr(self._distill, "teacher_tokens_student_grid", {})
+        student_tokens = getattr(self._distill, "student_tokens_student_grid", {})
+        if not teacher_tokens or not student_tokens:
+            return {}
+        # Skip when this step did not run aux heads (PDM eval / test_aux_heads=false).
+        if "all_map_cls_scores" not in predictions and "all_cls_scores" not in predictions:
+            return {}
+        from .distill.kd_losses import head_response_kd
+
+        tau = float(getattr(cfg, "distill_head_kd_tau", 2.0))
+        losses: Dict[str, torch.Tensor] = {}
+        model = self.para_ssr_model
+
+        def _teacher_head(head, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+            was_training = head.training
+            head.eval()
+            try:
+                with torch.no_grad():
+                    return head(tokens)
+            finally:
+                head.train(was_training)
+
+        if model.map_head is not None and "resmap" in teacher_tokens and "resmap" in student_tokens:
+            teacher_out = _teacher_head(model.map_head, teacher_tokens["resmap"])
+            student_out = model.map_head(student_tokens["resmap"])
+            losses["loss_distill_head_map"] = weight * head_response_kd(
+                {
+                    "cls": student_out["all_map_cls_scores"][-1],
+                    "geom": student_out["all_map_pts_preds"][-1],
+                },
+                {
+                    "cls": teacher_out["all_map_cls_scores"][-1],
+                    "geom": teacher_out["all_map_pts_preds"][-1],
+                },
+                cls_key="cls",
+                geom_key="geom",
+                tau=tau,
+            )
+        include_det = bool(getattr(cfg, "distill_head_kd_det", False))
+        include_det_geom = bool(getattr(cfg, "distill_head_kd_det_geom", False))
+        if (
+            include_det
+            and model.det_motion_head is not None
+            and "bevfusion" in teacher_tokens
+            and "bevfusion" in student_tokens
+        ):
+            teacher_out = _teacher_head(model.det_motion_head, teacher_tokens["bevfusion"])
+            student_out = model.det_motion_head(student_tokens["bevfusion"])
+            student_pred = {"cls": student_out["all_cls_scores"][-1]}
+            teacher_pred = {"cls": teacher_out["all_cls_scores"][-1]}
+            geom_key = None
+            if include_det_geom:
+                student_pred["geom"] = student_out["all_bbox_preds"][-1]
+                teacher_pred["geom"] = teacher_out["all_bbox_preds"][-1]
+                geom_key = "geom"
+            losses["loss_distill_head_det"] = weight * head_response_kd(
+                student_pred,
+                teacher_pred,
+                cls_key="cls",
+                geom_key=geom_key,
+                tau=tau,
+            )
+        return losses
 
     def _get_metric_supervisor(self):
         if self._metric_supervisor is None:

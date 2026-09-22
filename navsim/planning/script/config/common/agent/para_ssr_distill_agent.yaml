@@ -22,3 +22,20 @@ config:
     resmap: ${oc.env:RESMAP_ADAPTER_CKPT,''}
   distill_loss_weight: 1.0
   use_corridor_mask: true
+  distill_trajectory_frame: navsim
+  distill_use_role_masks: true
+  distill_walkway_suppress: 0.0
+  distill_boundary_kernel: 3
+  distill_mse_weight: 1.0
+  distill_cwd_weight: 0.0
+  distill_relation_weight: 0.0
+  distill_attn_weight: 0.0
+  distill_adaptive_branch: false
+  distill_plan_look_weight: 0.5
+  distill_plan_look_tau: 0.5
+  distill_head_kd_weight: 0.0
+  distill_head_kd_det: false
+  distill_head_kd_det_geom: false
+  corridor_sigma_along: 4.0
+  corridor_sigma_cross: 2.5
+  corridor_base_weight: 0.1

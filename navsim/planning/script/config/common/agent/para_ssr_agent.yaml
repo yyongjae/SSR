@@ -16,6 +16,9 @@ config:
   # Keep ImageNet initialization for fresh training.  Checkpoint-only
   # evaluators set this false because strict loading replaces every weight.
   backbone_pretrained: true
+  # timm name. Default matches original SSR torchvision ResNet-50.
+  # Override e.g. agent.config.image_architecture=resnet34.tv_in1k
+  image_architecture: resnet50.tv_in1k
 
   # --- input --------------------------------------------------------------
   # navsim gives history frames 0..3; 3 is the current one and must come last.

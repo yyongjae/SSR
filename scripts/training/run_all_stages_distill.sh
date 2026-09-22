@@ -51,12 +51,45 @@ EXP_1A="${EXP_PREFIX}_stage1_bevfusion"
 EXP_1B="${EXP_PREFIX}_stage1_resmap"
 EXP_2="${EXP_PREFIX}_stage2_dual_distill"
 
-# Telemetry / W&B — this script only. Loads the personal key from ${REPO}/.env
-# and pins entity to that account so runs do not land on the shared team.
+# Telemetry. TensorBoard under lightning_logs/ is always on.
+# W&B stays off unless WANDB=1. The key is read from ${REPO}/.env for this
+# process only. No --team -> personal entity. --team -> the e2ekd team, and
+# that flag is stripped so Hydra never sees it.
+WANDB_WAS_SET=0
+if [[ -n "${WANDB+x}" ]]; then
+  WANDB_WAS_SET=1
+fi
+WANDB="${WANDB:-0}"
 WANDB_PROJECT="${WANDB_PROJECT:-para-ssr-distill}"
 WANDB_GROUP="${WANDB_GROUP:-full-pipeline}"
 WANDB_MODE_ARG="${WANDB_MODE:-online}"
-WANDB_ENTITY="${WANDB_PERSONAL_ENTITY:-comflife}"
+WANDB_PERSONAL_ENTITY="${WANDB_PERSONAL_ENTITY:-comflife}"
+WANDB_TEAM_ENTITY="${WANDB_TEAM_ENTITY:-e2ekd}"
+WANDB_SCOPE="personal"
+USER_ARGS=()
+for _arg in "$@"; do
+  if [[ "${_arg}" == "--team" ]]; then
+    WANDB_SCOPE="team"
+  else
+    USER_ARGS+=("${_arg}")
+  fi
+done
+if ((${#USER_ARGS[@]})); then
+  set -- "${USER_ARGS[@]}"
+else
+  set --
+fi
+unset USER_ARGS _arg
+if [[ "${WANDB_SCOPE}" == "team" ]]; then
+  WANDB_ENTITY="${WANDB_TEAM_ENTITY}"
+  # --team means "upload this run". Do not flip the default for other runs.
+  if [[ "${WANDB_WAS_SET}" == "0" ]]; then
+    WANDB=1
+  fi
+else
+  WANDB_ENTITY="${WANDB_PERSONAL_ENTITY}"
+fi
+unset WANDB_WAS_SET
 
 # Python Environment (Auto-detect ssr conda environment)
 if [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
@@ -66,6 +99,17 @@ elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
 else
   PYTHON="${PYTHON:-python}"
 fi
+
+# Private netrc for this process only. wandb writes API keys to $NETRC
+# (default ~/.netrc). On this shared account that file is the login everyone
+# else inherits, so a WANDB=1 run must not touch it.
+_WANDB_NETRC_FILE=""
+cleanup_personal_wandb() {
+  if [[ -n "${_WANDB_NETRC_FILE}" && -f "${_WANDB_NETRC_FILE}" ]]; then
+    rm -f "${_WANDB_NETRC_FILE}"
+  fi
+  _WANDB_NETRC_FILE=""
+}
 
 load_personal_wandb() {
   local env_file="${REPO}/.env"
@@ -87,13 +131,22 @@ load_personal_wandb() {
     echo "Error: WANDB_API_KEY is empty in ${env_file}" >&2
     exit 1
   fi
+  # Process environment only. Do not call `wandb login`: that writes ~/.netrc.
   export WANDB_API_KEY="${key}"
-  # Force the personal entity even if the parent shell exported the team.
+  # Personal comflife, or e2ekd when this command included --team.
   export WANDB_ENTITY
   unset WANDB_DISABLED
+  _WANDB_NETRC_FILE="$(mktemp "${TMPDIR:-/tmp}/wandb-netrc.XXXXXX")"
+  chmod 600 "${_WANDB_NETRC_FILE}"
+  printf 'machine api.wandb.ai\n  login user\n  password %s\n' "${key}" > "${_WANDB_NETRC_FILE}"
+  export NETRC="${_WANDB_NETRC_FILE}"
+  trap cleanup_personal_wandb EXIT
+  unset key
 }
 
-load_personal_wandb
+if [[ "${WANDB}" != "0" ]]; then
+  load_personal_wandb
+fi
 
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPU_IDS[@]}"
@@ -108,7 +161,13 @@ echo " Teacher Cache: ${DISTILL_FEATURE_ROOT}"
 echo " Exp Prefix   : ${EXP_PREFIX}"
 echo " Only stage   : ${ONLY_STAGE:-all}"
 echo " Force retrain: ${FORCE_RETRAIN}"
-echo " W&B          : enable=true  entity=${WANDB_ENTITY}  project=${WANDB_PROJECT}  group=${WANDB_GROUP}  (personal .env key)"
+if [[ "${WANDB}" != "0" ]]; then
+  echo " W&B          : enable=true  scope=${WANDB_SCOPE}  entity=${WANDB_ENTITY}  project=${WANDB_PROJECT}  group=${WANDB_GROUP}  (one-shot .env key)"
+elif [[ "${WANDB_SCOPE}" == "team" ]]; then
+  echo " W&B          : disabled (WANDB=0). --team did not upload."
+else
+  echo " W&B          : disabled  (TensorBoard: work_dirs/<exp>/lightning_logs)"
+fi
 echo "======================================================================"
 
 # Helper to find latest checkpoint in an experiment directory
@@ -171,14 +230,18 @@ stage_selected() {
 
 wandb_args() {
   local name="$1"
-  WANDB_ARGS=(
-    "wandb.enable=true"
-    "wandb.mode=${WANDB_MODE_ARG}"
-    "wandb.entity=${WANDB_ENTITY}"
-    "wandb.project=${WANDB_PROJECT}"
-    "wandb.group=${WANDB_GROUP}"
-    "wandb.name=${name}"
-  )
+  if [[ "${WANDB}" != "0" ]]; then
+    WANDB_ARGS=(
+      "wandb.enable=true"
+      "wandb.mode=${WANDB_MODE_ARG}"
+      "wandb.entity=${WANDB_ENTITY}"
+      "wandb.project=${WANDB_PROJECT}"
+      "wandb.group=${WANDB_GROUP}"
+      "wandb.name=${name}"
+    )
+  else
+    WANDB_ARGS=("wandb.enable=false")
+  fi
 }
 
 if [[ -z "${BEVFUSION_CKPT}" || ! -f "${BEVFUSION_CKPT}" ]]; then

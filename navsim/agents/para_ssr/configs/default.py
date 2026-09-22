@@ -261,6 +261,41 @@ class ParaSSRConfig:
     distill_cache_size: Tuple[int, int] = (100, 100)
     distill_loss_weight: float = 1.0
     use_corridor_mask: bool = True
+    # NAVSIM GT poses are (x_forward, y_left); BEV cells are SSR (x_right, y_forward).
+    distill_trajectory_frame: str = "navsim"
+    corridor_sigma_base: float = 2.5
+    corridor_sigma_growth: float = 0.1
+    corridor_base_weight: float = 0.1
+    # Heading-aligned corridor: long along-track; cross-track matches v1
+    # isotropic 2.5 m so lane edges stay in the distill mask (DAC).
+    corridor_sigma_along: float = 4.0
+    corridor_sigma_cross: float = 2.5
+    corridor_sigma_along_growth: float = 0.15
+    corridor_sigma_cross_growth: float = 0.1
+    distill_use_role_masks: bool = True
+    distill_agent_inflate: float = 1.5
+    distill_agent_future_sigma: float = 1.5
+    distill_map_sigma: float = 1.25
+    # 0: keep kerb cells. Positive values punch sidewalk-overlapping road edges.
+    distill_walkway_suppress: float = 0.0
+    distill_boundary_kernel: int = 3
+    distill_mse_weight: float = 1.0
+    distill_cwd_weight: float = 0.0
+    distill_cwd_tau: float = 4.0
+    distill_relation_weight: float = 0.0
+    distill_relation_samples: int = 64
+    distill_attn_weight: float = 0.0
+    distill_attn_tau: float = 0.5
+    distill_adaptive_branch: bool = False
+    # Aux GT → planner BEV spatial energy (DistillBEV "where", target = det/map raster).
+    distill_plan_look_weight: float = 0.5
+    distill_plan_look_tau: float = 0.5
+    # Head response KD on adapter tokens is off: the adapter is a planning
+    # projector, not a det/map teacher. Unmatched DETR bbox/traj L1 exploded.
+    distill_head_kd_weight: float = 0.0
+    distill_head_kd_tau: float = 2.0
+    distill_head_kd_det: bool = False
+    distill_head_kd_det_geom: bool = False
 
     # Stage 1: train one adapter + the unchanged planning decoder from the
     # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.

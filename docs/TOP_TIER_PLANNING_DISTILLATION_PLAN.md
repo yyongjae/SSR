@@ -3,10 +3,10 @@
 
 **소속/작업공간**: `/home/external-user/byounggun/SSR`  
 **작성일**: 2026-09-16  
-**개정일**: 2026-09-18  
+**개정일**: 2026-09-20  
 **연구 주제**: 동적 3D 객체(BEVFusion)와 정적 HD-Map(ReSMap) 교사의 지식을, GT 주행 복도(Corridor) 마스크로 걸러 카메라 학생에 전이하는 계획 중심 종단간 자율주행 프레임워크
 
-이 문서는 NAVSIM PARA-SSR 구현(`aux_distill`)과 동일한 학습 계약을 적는다. 그림·수식·실행 기본값은 코드와 일치해야 한다.
+이 문서는 NAVSIM PARA-SSR 구현(`aux_distill`)의 **v1 학습 계약**을 적는다. 플래너/디코더를 바꾸지 않은 채 Stage-2 증류만 PDMS 병목을 겨냥해 바꾼 내용은 [`TOP_TIER_PLANNING_DISTILLATION_PLAN_V2.md`](TOP_TIER_PLANNING_DISTILLATION_PLAN_V2.md)다. v2가 현재 코드 기본값이다.
 
 ---
 
@@ -357,7 +357,7 @@ nohup ./scripts/training/run_all_stages_distill.sh > run_distill.log 2>&1 &
 tail -f run_distill.log
 ```
 
-올인원 스크립트는 `.env`의 `WANDB_API_KEY`로 개인 엔티티 W&B를 켠다. 단계별 단독 스크립트는 `WANDB=0`이면 TensorBoard만 쓴다.
+올인원·단계별 스크립트 모두 기본은 W&B 꺼짐(`WANDB=0`). TensorBoard는 `work_dirs/<exp>/lightning_logs`에 항상 남는다. W&B를 쓰려면 `WANDB=1`이고, 그때만 `.env`의 `WANDB_API_KEY`로 개인 엔티티를 연다.
 
 #### 자동화 흐름
 

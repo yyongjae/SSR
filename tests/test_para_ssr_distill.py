@@ -339,6 +339,8 @@ def test_stage2_applies_corridor_mask(tmp_path, config, cache):
         distill_feature_root=cache,
         distill_adapter_checkpoints={"bevfusion": ckpt},
         use_corridor_mask=True,
+        distill_trajectory_frame="ssr",
+        distill_use_role_masks=False,
     )
     distill = build_planning_distillation(cfg)
 
@@ -403,6 +405,8 @@ def test_stage2_resamples_student_when_teacher_grid_differs(tmp_path, config):
         distill_feature_root=root,
         distill_adapter_checkpoints={"bevfusion": ckpt},
         use_corridor_mask=True,
+        distill_trajectory_frame="ssr",
+        distill_use_role_masks=False,
     )
     distill = build_planning_distillation(cfg)
     student = torch.randn(
@@ -414,3 +418,253 @@ def test_stage2_resamples_student_when_teacher_grid_differs(tmp_path, config):
     losses["loss_distill_bevfusion"].backward()
     assert student.grad is not None
     assert student.grad.abs().sum() > 0
+
+
+def test_navsim_trajectory_lands_on_ssr_forward_axis():
+    from navsim.agents.para_ssr.distill import (
+        compute_corridor_mask,
+        navsim_trajectory_to_ssr,
+    )
+
+    navsim = torch.zeros(1, 8, 3)
+    navsim[0, :, 0] = torch.linspace(0.0, 20.0, 8)  # x_forward
+    ssr = navsim_trajectory_to_ssr(navsim)
+    assert torch.allclose(ssr[0, :, 0], torch.zeros(8), atol=1e-5)
+    assert torch.allclose(ssr[0, :, 1], torch.linspace(0.0, 20.0, 8))
+    mask = compute_corridor_mask(
+        ssr, (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0), 50, 100, base_weight=0.1
+    )
+    assert mask[0, 0, 0, 50] > 0.8
+    assert mask[0, 0, 0, 95] < 0.2
+
+
+def test_anisotropic_corridor_is_tighter_across_track():
+    from navsim.agents.para_ssr.distill import compute_corridor_mask
+
+    traj = torch.zeros(1, 8, 3)
+    traj[0, :, 1] = torch.linspace(0.0, 20.0, 8)
+    traj[0, :, 2] = 0.5 * torch.pi  # SSR heading along +y
+    iso = compute_corridor_mask(
+        traj, (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0), 50, 100, base_weight=0.05
+    )
+    aniso = compute_corridor_mask(
+        traj, (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0), 50, 100,
+        base_weight=0.05, sigma_along=4.0, sigma_cross=1.25,
+    )
+    assert aniso[0, 0, 0, 56] < iso[0, 0, 0, 56]
+    assert aniso[0, 0, 0, 50] > 0.8
+
+
+def test_role_masks_favour_agents_vs_road():
+    from navsim.agents.para_ssr.distill.masks import (
+        combine_role_mask,
+        compute_corridor_mask,
+        rasterize_agent_mask,
+        rasterize_map_class_mask,
+    )
+
+    pc = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
+    traj = torch.zeros(1, 8, 3)
+    traj[0, :, 1] = torch.linspace(0.0, 16.0, 8)
+    corridor = compute_corridor_mask(
+        traj, pc, 40, 80, base_weight=0.05, sigma_along=4.0, sigma_cross=1.25
+    )
+    boxes = torch.zeros(1, 1, 9)
+    boxes[0, 0, 0] = 8.0
+    boxes[0, 0, 1] = 4.0
+    boxes[0, 0, 3] = 2.0
+    boxes[0, 0, 4] = 4.0
+    valid = torch.ones(1, 1, dtype=torch.bool)
+    agents = rasterize_agent_mask(boxes, valid, pc, 40, 80, inflate=1.5)
+    bevfusion = combine_role_mask("bevfusion", corridor, agent=agents, base_weight=0.05)
+    agent_peak = agents[0, 0].argmax()
+    r, c = divmod(int(agent_peak), 80)
+    assert bevfusion[0, 0, r, c] > corridor[0, 0, r, c] + 0.2
+
+    pts = torch.zeros(1, 1, 1, 8, 2)
+    pts[0, 0, 0, :, 0] = 0.5
+    pts[0, 0, 0, :, 1] = torch.linspace(0.1, 0.9, 8)
+    labels = torch.zeros(1, 1, dtype=torch.long)
+    labels[0, 0] = 2
+    map_valid = torch.ones(1, 1, dtype=torch.bool)
+    centerline = rasterize_map_class_mask(pts, labels, map_valid, 2, pc, 40, 80, 1.25)
+    resmap = combine_role_mask(
+        "resmap", corridor, centerline=centerline, base_weight=0.05
+    )
+    assert centerline[0, 0].max() > 0.5
+    assert resmap[0, 0].max() > 0.8
+
+
+def test_stage2_new_kd_terms_reach_student(tmp_path, config, cache):
+    _, _, ckpt = _stage1_checkpoint(tmp_path, config, cache)
+    cfg = replace(
+        config,
+        use_distill=True,
+        distill_feature_root=cache,
+        distill_adapter_checkpoints={"bevfusion": ckpt},
+        distill_trajectory_frame="ssr",
+        distill_use_role_masks=True,
+        distill_cwd_weight=1.0,
+        distill_relation_weight=0.5,
+        distill_attn_weight=0.5,
+    )
+    distill = build_planning_distillation(cfg)
+    student = torch.randn(
+        2, cfg.bev_h * cfg.bev_w, cfg.embed_dims, requires_grad=True
+    )
+    trajectories = torch.zeros(2, 8, 3)
+    trajectories[:, :, 1] = torch.linspace(0.0, 20.0, 8)
+    gt_boxes = torch.zeros(2, 3, 9)
+    gt_boxes[:, 0, 1] = 6.0
+    gt_boxes[:, 0, 3] = 2.0
+    gt_boxes[:, 0, 4] = 4.0
+    gt_valid = torch.zeros(2, 3, dtype=torch.bool)
+    gt_valid[:, 0] = True
+    losses, metrics = distill(
+        student, TOKENS, trajectories=trajectories,
+        gt_boxes=gt_boxes, gt_valid=gt_valid,
+    )
+    assert "loss_distill_bevfusion" in losses
+    assert "distill_cwd/bevfusion" in metrics
+    assert "distill_rel/bevfusion" in metrics
+    assert "distill_attn/bevfusion" in metrics
+    assert distill.teacher_tokens_student_grid["bevfusion"].shape == student.shape
+    losses["loss_distill_bevfusion"].backward()
+    assert student.grad is not None and student.grad.abs().sum() > 0
+
+
+def test_head_response_kd_matches_same_query_outputs():
+    from navsim.agents.para_ssr.distill import head_response_kd
+
+    student = {
+        "cls": torch.randn(2, 4, 5, requires_grad=True),
+        "geom": torch.randn(2, 4, 8, 2, requires_grad=True),
+    }
+    teacher = {
+        "cls": student["cls"].detach() + 0.1,
+        "geom": student["geom"].detach() + 0.1,
+    }
+    loss = head_response_kd(student, teacher, cls_key="cls", geom_key="geom")
+    loss.backward()
+    assert student["cls"].grad.abs().sum() > 0
+    assert student["geom"].grad.abs().sum() > 0
+
+
+def test_head_response_kd_cls_only_skips_unbounded_traj():
+    from navsim.agents.para_ssr.distill import head_response_kd
+
+    student = {
+        "cls": torch.randn(2, 4, 5, requires_grad=True),
+        "geom": torch.randn(2, 4, 9, requires_grad=True),
+        "traj": torch.full((2, 4, 6, 8, 2), 1.0e4, requires_grad=True),
+    }
+    teacher = {
+        "cls": student["cls"].detach(),
+        "geom": student["geom"].detach(),
+        "traj": torch.zeros_like(student["traj"]),
+    }
+    loss = head_response_kd(student, teacher, cls_key="cls")
+    assert loss.detach().item() < 1.0
+    loss.backward()
+    assert student["cls"].grad.abs().sum() > 0
+    assert student["geom"].grad is None
+    assert student["traj"].grad is None
+
+
+def test_distill_head_kd_det_defaults_off():
+    cfg = ParaSSRConfig()
+    assert cfg.distill_head_kd_det is False
+    assert cfg.distill_head_kd_det_geom is False
+    assert cfg.distill_head_kd_weight == 0.0
+
+
+def test_v2_revised_defaults_pull_aux_into_planning():
+    cfg = ParaSSRConfig()
+    assert cfg.corridor_sigma_cross == 2.5
+    assert cfg.corridor_base_weight == 0.1
+    assert cfg.distill_walkway_suppress == 0.0
+    assert cfg.distill_cwd_weight == 0.0
+    assert cfg.distill_relation_weight == 0.0
+    assert cfg.distill_attn_weight == 0.0
+    assert cfg.distill_adaptive_branch is False
+    assert cfg.distill_plan_look_weight == 0.5
+    assert cfg.distill_head_kd_weight == 0.0
+
+
+def test_morphological_boundary_peaks_on_edge():
+    from navsim.agents.para_ssr.distill import morphological_boundary
+
+    road = torch.zeros(1, 1, 16, 16)
+    road[:, :, 4:12, 4:12] = 1.0
+    ring = morphological_boundary(road, kernel=3)
+    assert ring[0, 0, 8, 8] < ring[0, 0, 4, 8]
+    assert ring[0, 0, 4, 8] > 0.5
+    assert ring.shape == road.shape
+
+
+def test_walkway_suppress_punches_overlapping_road_edge():
+    from navsim.agents.para_ssr.distill.masks import combine_role_mask
+
+    corridor = torch.full((1, 1, 8, 8), 0.1)
+    road = torch.zeros(1, 1, 8, 8)
+    walkway = torch.zeros(1, 1, 8, 8)
+    road[0, 0, 3, 3] = 1.0
+    walkway[0, 0, 3, 3] = 1.0
+    kept = combine_role_mask(
+        "resmap", corridor, road=road, walkway=walkway,
+        base_weight=0.1, walkway_suppress=0.0,
+    )
+    punched = combine_role_mask(
+        "resmap", corridor, road=road, walkway=walkway,
+        base_weight=0.1, walkway_suppress=0.8,
+    )
+    assert kept[0, 0, 3, 3] > 0.9
+    assert punched[0, 0, 3, 3] < 0.3
+
+
+def test_planning_look_kd_reaches_student(tmp_path, config, cache):
+    _, _, ckpt = _stage1_checkpoint(tmp_path, config, cache)
+    cfg = replace(
+        config,
+        use_distill=True,
+        distill_feature_root=cache,
+        distill_adapter_checkpoints={"bevfusion": ckpt},
+        distill_trajectory_frame="ssr",
+        distill_use_role_masks=True,
+        distill_plan_look_weight=0.5,
+        distill_cwd_weight=0.0,
+        distill_relation_weight=0.0,
+        distill_attn_weight=0.0,
+    )
+    distill = build_planning_distillation(cfg)
+    student = torch.randn(
+        2, cfg.bev_h * cfg.bev_w, cfg.embed_dims, requires_grad=True
+    )
+    trajectories = torch.zeros(2, 8, 3)
+    trajectories[:, :, 1] = torch.linspace(0.0, 20.0, 8)
+    gt_boxes = torch.zeros(2, 3, 9)
+    gt_boxes[:, 0, 1] = 6.0
+    gt_boxes[:, 0, 3] = 2.0
+    gt_boxes[:, 0, 4] = 4.0
+    gt_valid = torch.zeros(2, 3, dtype=torch.bool)
+    gt_valid[:, 0] = True
+    losses, metrics = distill(
+        student, TOKENS, trajectories=trajectories,
+        gt_boxes=gt_boxes, gt_valid=gt_valid,
+    )
+    assert "loss_distill_plan_look" in losses
+    assert "distill_plan_look" in metrics
+    assert "distill_cwd/bevfusion" not in metrics
+    losses["loss_distill_plan_look"].backward()
+    assert student.grad is not None and student.grad.abs().sum() > 0
+
+
+def test_planning_look_kd_matches_prior_mass():
+    from navsim.agents.para_ssr.distill import planning_look_kd
+
+    student = torch.randn(1, 4, 8, 8, requires_grad=True)
+    prior = torch.zeros(1, 1, 8, 8)
+    prior[:, :, 2, 2] = 1.0
+    loss = planning_look_kd(student, prior, tau=0.5)
+    loss.backward()
+    assert student.grad[0, :, 2, 2].abs().sum() > student.grad[0, :, 7, 7].abs().sum()

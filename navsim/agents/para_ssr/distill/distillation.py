@@ -86,8 +86,8 @@ class PlanningDistillation(nn.Module):
         feature_root: str,
         branches: Mapping[str, Mapping],
         adapter_checkpoint: Mapping[str, str],
-        student_bev_size: Tuple[int, int] = (100, 100),
-        cache_size: Tuple[int, int] = (100, 100),
+        student_bev_size: Tuple[int, int] = (50, 100),
+        cache_size: Tuple[int, int] = (50, 100),
         strict_checkpoints: bool = True,
         use_corridor_mask: bool = True,
         pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
@@ -468,6 +468,9 @@ class PlanningDistillation(nn.Module):
                     f"{student_map.size(0)} student samples"
                 )
             teacher_hw = (int(teacher_map.size(-2)), int(teacher_map.size(-1)))
+            # 50x100 student, BEVFusion cache_train_50x100, and ReSMap after
+            # transpose+flip are the same grid, so this is a no-op. A mismatched
+            # cache is still resized onto the teacher grid before the MSE.
             if tuple(student_map.shape[-2:]) != teacher_hw:
                 aligned_student = F.interpolate(
                     student_map, size=teacher_hw, mode="bilinear",

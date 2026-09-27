@@ -4,6 +4,8 @@ defaults:
 
 config:
   use_metric_planner: true
+  use_task_interaction: false
+  use_ego_motion: true
   num_plan_candidates: 16
   # Environment paths are needed for fresh training only. The anchor buffer is
   # checkpointed; inference can override plan_anchor_path='' after training.

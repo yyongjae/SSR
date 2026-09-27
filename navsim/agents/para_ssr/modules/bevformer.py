@@ -11,8 +11,10 @@ Two things change because navsim is not nuScenes:
    re-derives the BEV shift from ``can_bus[0], can_bus[1], can_bus[-2]``.
    navsim gives history ego poses already expressed in the *current* ego frame,
    so the shift is computed directly in the feature builder and arrives as an
-   explicit ``bev_shift`` tensor.  An ``ego_motion`` vector still feeds the
-   ``can_bus_mlp`` so the query-conditioning path is preserved.
+   explicit ``bev_shift`` tensor. Together with the cached relative yaw, it
+   warps the previous BEV with one SE(2) ``grid_sample`` before temporal
+   attention. The 18-d ego-status vector is not added to BEV queries unless
+   ``use_ego_motion`` is set; the planner consumes it.
 
 2. **No ``img_metas`` dicts.**  ``lidar2img`` and image shapes are ordinary
    batched tensors, built once in the feature builder.
@@ -31,6 +33,7 @@ from typing import List, Optional, Sequence
 import torch
 import torch.nn as nn
 
+from .temporal_alignment import warp_previous_bev
 from .ms_deform_attn import (
     CustomMSDeformableAttention,
     MSDeformableAttention3D,
@@ -472,17 +475,21 @@ class SSRPerceptionTransformer(nn.Module):
 
         self.level_embeds = nn.Parameter(torch.empty(num_feature_levels, embed_dims))
         self.cams_embeds = nn.Parameter(torch.empty(num_cams, embed_dims))
-        ego_motion_layers = [
-            nn.Linear(ego_motion_dims, embed_dims // 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(embed_dims // 2, embed_dims),
-            nn.ReLU(inplace=True),
-        ]
-        if ego_motion_norm:
-            # Original SSR default: can_bus_norm=True.  NAVSIM replaces the
-            # CAN vector, not the conditioning network's output contract.
-            ego_motion_layers.append(nn.LayerNorm(embed_dims))
-        self.ego_motion_mlp = nn.Sequential(*ego_motion_layers)
+        # The 18-d status vector is a planner input. Building the MLP only when
+        # it is actually added keeps an unused parameter out of DDP.
+        self.ego_motion_mlp = None
+        if use_ego_motion:
+            ego_motion_layers = [
+                nn.Linear(ego_motion_dims, embed_dims // 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims // 2, embed_dims),
+                nn.ReLU(inplace=True),
+            ]
+            if ego_motion_norm:
+                # Original SSR default: can_bus_norm=True.  NAVSIM replaces the
+                # CAN vector, not the conditioning network's output contract.
+                ego_motion_layers.append(nn.LayerNorm(embed_dims))
+            self.ego_motion_mlp = nn.Sequential(*ego_motion_layers)
         self.init_weights()
 
     def init_weights(self) -> None:
@@ -515,9 +522,10 @@ class SSRPerceptionTransformer(nn.Module):
         bev_pos: torch.Tensor,
         lidar2img: torch.Tensor,
         image_hw: torch.Tensor,
-        ego_motion: torch.Tensor,
+        ego_motion: Optional[torch.Tensor],
         bev_shift: torch.Tensor,
         prev_bev: Optional[torch.Tensor] = None,
+        bev_yaw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -528,6 +536,7 @@ class SSRPerceptionTransformer(nn.Module):
             image_hw: ``[bs, num_cam, 2]``
             ego_motion: ``[bs, ego_motion_dims]``
             bev_shift: ``[bs, 2]`` normalised (shift_x, shift_y)
+            bev_yaw: ``[bs]`` current heading minus previous heading, radians
         Returns:
             ``[bs, bev_h * bev_w, embed_dims]``
         """
@@ -540,9 +549,27 @@ class SSRPerceptionTransformer(nn.Module):
             shift = torch.zeros_like(shift)
 
         if prev_bev is not None and prev_bev.shape[1] == bev_h * bev_w:
+            if self.use_shift:
+                if bev_yaw is None:
+                    raise ValueError(
+                        "bev_yaw is required to align previous BEV when use_shift=True"
+                    )
+                # Warp the whole history map once. The encoder must not also
+                # shift its temporal reference points, or the translation is
+                # applied twice.
+                previous_grid = prev_bev.permute(0, 2, 1).reshape(
+                    bs, self.embed_dims, bev_h, bev_w
+                )
+                previous_grid = warp_previous_bev(
+                    previous_grid, shift, bev_yaw, self.encoder.pc_range
+                )
+                prev_bev = previous_grid.flatten(2).permute(0, 2, 1)
             prev_bev = prev_bev.permute(1, 0, 2)
+            shift = None
 
         if self.use_ego_motion:
+            if ego_motion is None:
+                raise ValueError("ego_motion is required when use_ego_motion=True")
             motion = self.ego_motion_mlp(ego_motion.to(bev_queries.dtype))[None, :, :]
             bev_queries = bev_queries + motion
 

@@ -6,12 +6,13 @@ Mirrors ``projects/mmdet3d_plugin/SSR/para_ssr.py``:
   temporal self-attention something to attend to, not to be trained through);
 * the current frame's BEV is produced by the planning head, which owns the
   encoder;
-* that one ``bev_embed`` fans out to the detection/motion head and the map head.
-  Neither feeds the other, nor the planner -- the only coupling is the shared
-  feature (PARA-Drive Fig. 5);
-* every auxiliary head sees ``bev_embed`` through ``_ScaleGrad``, so its own
-  parameters train at full strength while its influence on the shared feature
-  is throttled independently.
+* with task interaction, the planner cross-attends the final det/motion and
+  map decoder states in parallel and adds those updates to the BEV update;
+* without it, auxiliary heads still read ``bev_embed`` through ``_ScaleGrad``
+  so their own parameters train at full strength while their BEV gradient is
+  throttled. Interaction mode leaves that valve off and corrects BEV gradients
+  by task origin in the loss, so the planning path through the decoders stays
+  unscaled.
 """
 from __future__ import annotations
 
@@ -112,6 +113,15 @@ class ParaSSRModel(nn.Module):
         super().__init__()
         self._config = config
         cfg = config
+        self.use_task_interaction = bool(getattr(cfg, "use_task_interaction", False))
+        if self.use_task_interaction and (
+            cfg.use_metric_planner or getattr(cfg, "use_stl", False)
+        ):
+            raise ValueError("task interaction requires use_stl=False and use_metric_planner=False")
+        if self.use_task_interaction and (
+            not cfg.use_det_motion_head or not cfg.use_map_head
+        ):
+            raise ValueError("task interaction requires both the det/motion head and the map head")
         self._backbone_frozen_stages = int(getattr(cfg, "frozen_stages", -1))
         self._backbone_norm_requires_grad = bool(
             getattr(cfg, "norm_requires_grad", False)
@@ -174,6 +184,7 @@ class ParaSSRModel(nn.Module):
             plan_anchor_path=cfg.plan_anchor_path,
             use_stl=getattr(cfg, "use_stl", False),
             plan_num_layers=getattr(cfg, "plan_num_layers", 3),
+            use_task_interaction=self.use_task_interaction,
         )
 
         if cfg.use_metric_planner:
@@ -299,6 +310,7 @@ class ParaSSRModel(nn.Module):
                 image_hw=features["image_hw"],
                 ego_motion=features["ego_motion"][:, t],
                 bev_shift=features["bev_shift"][:, t],
+                bev_yaw=features["ego_motion"][:, t, 2].detach(),
                 prev_bev=prev_bev,
                 only_bev=True,
             )
@@ -318,21 +330,54 @@ class ParaSSRModel(nn.Module):
 
         cams = features["camera_feature"]
         cur_feats = self.extract_img_feat(cams[:, -1])
-        outs = self.pts_bbox_head(
-            cur_feats,
+        ego_status = (
+            features["status_feature"][:, cfg.num_navi_cmd:]
+            if "status_feature" in features and features["status_feature"].shape[-1] > cfg.num_navi_cmd
+            else features.get("ego_status")
+        )
+        head_kwargs = dict(
             lidar2img=features["lidar2img"],
             image_hw=features["image_hw"],
             ego_motion=features["ego_motion"][:, -1],
             bev_shift=features["bev_shift"][:, -1],
+            bev_yaw=features["ego_motion"][:, -1, 2].detach(),
             prev_bev=prev_bev,
             cmd=features["command"],
-            ego_status=(
-                features["status_feature"][:, cfg.num_navi_cmd:]
-                if "status_feature" in features and features["status_feature"].shape[-1] > cfg.num_navi_cmd
-                else features.get("ego_status")
-            ),
+            ego_status=ego_status,
         )
+        if not self.use_task_interaction:
+            outs = self.pts_bbox_head(cur_feats, **head_kwargs)
+            return self._predictions_from_plan(features, outs, run_aux)
 
+        bev_embed = self.pts_bbox_head(cur_feats, only_bev=True, **head_kwargs)
+        det_out = self.det_motion_head(bev_embed, return_hidden=True)
+        map_out = self.map_head(bev_embed, return_hidden=True)
+        planned = self.pts_bbox_head.forward_from_bev(
+            bev_embed,
+            features["command"],
+            ego_status=ego_status,
+            det_out=det_out,
+            map_out=map_out,
+        )
+        predictions: Dict[str, torch.Tensor] = {
+            "bev_embed": bev_embed,
+            "ego_fut_preds": planned["ego_fut_preds"],
+            "trajectory": self.pts_bbox_head.select_trajectory(
+                planned["ego_fut_preds"], features["command"]
+            ),
+        }
+        if self.training or run_aux:
+            predictions.update(det_out)
+            predictions.update(map_out)
+        return predictions
+
+    def _predictions_from_plan(
+        self,
+        features: Dict[str, torch.Tensor],
+        outs: Dict[str, torch.Tensor],
+        run_aux: bool,
+    ) -> Dict[str, torch.Tensor]:
+        cfg = self._config
         bev_embed = outs["bev_embed"]
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,

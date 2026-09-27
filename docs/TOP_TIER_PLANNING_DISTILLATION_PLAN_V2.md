@@ -5,7 +5,8 @@
 **소속/작업공간**: `/home/external-user/byounggun/SSR`  
 **작성일**: 2026-09-20  
 **개정일**: 2026-09-21  
-**코드 기본값**: `ParaSSRConfig`, `para_ssr_distill_agent.yaml`, `navsim/agents/para_ssr/distill/`
+**측정일**: 2026-09-23 (`version_2` epoch 29)  
+**코드 기본값**: 이 문서의 7절은 `version_2`를 학습한 값이다. `version_3` 측정은 [`TOP_TIER_PLANNING_DISTILLATION_PLAN_V3.md`](TOP_TIER_PLANNING_DISTILLATION_PLAN_V3.md). 그 다음 기본값은 [`TOP_TIER_PLANNING_DISTILLATION_PLAN_V4.md`](TOP_TIER_PLANNING_DISTILLATION_PLAN_V4.md). `version_4` epoch 29 navtest PDMS는 **0.8563**이고 기록은 그 문서 8절이다.
 
 v1은 frozen-adapter dual-teacher + 등방 복도 MSE + GT plan/det/map + GradBalancer다. v2는 **플래너/디코더를 바꾸지 않고** Stage-2 증류만 바꾼다. 배포 그래프는 v1과 같다: `camera → BEVFormer → planner`.
 
@@ -235,10 +236,34 @@ FORCE_RETRAIN=stage2 ONLY_STAGE=stage2 bash ./scripts/training/run_all_stages_di
 
 ---
 
-## 8. 성능에 대해 지금 말할 수 있는 것
+## 8. 성능에 대해 측정 전에 말할 수 있던 것
 
 맞다: 첫 v2 조합은 navtest에서 PDMS 0.8539 → 0.8433이고, 깎인 항은 주로 DAC다. 그 레시피는 기본값에서 뺐다.
 
-아니다: 그래서 이번 개정이 0.8539를 넘는다는 보장은 없다. look prior와 경계 링은 설계상 DAC/TTC 셀을 플래너 BEV에 남기려는 것이고, 숫자는 30 epoch 뒤 distill 키를 벗긴 navtest PDM으로만 안다.
+측정 전: 이 개정(넓은 복도, 역할 마스크, look prior)이 0.8539를 넘는다는 보장은 없었다. 숫자는 9절.
 
 비교 기준은 `work_dirs/paradrive_distill_stage2_dual_distill/lightning_logs/version_0`의 epoch-29, PDMS 0.8539다.
+
+---
+
+## 9. version_2 측정 (2026-09-23)
+
+ResNet-50, 30 epoch, 같은 12146 navtest 토큰, 실패 0. 체크포인트 `lightning_logs/version_2/checkpoints/epoch=29-step=19950.ckpt`. CSV `work_dirs/eval/paradrive_distill_stage2_version2_epoch29/merged.csv`.
+
+| 항 | v1 `version_0` | 첫 v2 `version_1` | 이번 `version_2` | 이번 − v1 |
+|---|---:|---:|---:|---:|
+| NC | 0.9815 | 0.9799 | 0.9806 | −0.0009 |
+| DAC | 0.9348 | 0.9266 | 0.9354 | +0.0006 |
+| DDC | 1.0000 | 1.0000 | 1.0000 | 0 |
+| EP | 0.8022 | 0.7920 | 0.8003 | −0.0018 |
+| TTC | 0.9395 | 0.9348 | 0.9413 | +0.0018 |
+| comfort | 0.9998 | 1.0000 | 0.9999 | +0.0001 |
+| **score** | **0.8539** | **0.8433** | **0.8534** | **−0.0006** |
+
+DAC 실패는 792 → 785장이다. 새로 실패한 373장과 고친 380장이 점수에서 +0.0284 / −0.0281로 상쇄된다. 둘 다 DAC를 통과한 장면의 EP는 0.8588 → 0.8563이다. 평균이 같은 것이고 장면이 같은 것은 아니다.
+
+학습 신호는 이 손실이 배웠다는 쪽이다. look KL은 epoch 0의 0.284에서 epoch 29의 0.069로 내려가고 후반에 멈춘다. 같은 시점 코사인은 BEVFusion 0.37, ReSMap 0.61로 v1 운전점과 같다. 가중 look 항은 0.035, feature MSE는 1.28 / 0.78, 총 손실은 8.85다.
+
+맞는 말: 첫 v2의 0.8433은 회복됐다. 기준점 0.8539는 넘지 못했다. look prior는 셀 에너지의 위치만 맞추고, 플래너 cross-attn이 읽는 채널 내용은 feature MSE가 맡는데 그 코사인이 v1에서 멈췄다.
+
+다음 계약은 V3다. look prior 기본 가중은 0이고, 궤적의 최악 횡오차와 진행 거리 부족을 계획 손실에 더한다.

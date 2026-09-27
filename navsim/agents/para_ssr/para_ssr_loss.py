@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .modules.grad_balance import GradBalancer, all_reduce_mean
+from .modules.grad_balance import GradBalancer, all_reduce_mean, balance_shared_gradients
 
 
 def compute_plan_loss(
@@ -62,6 +62,144 @@ def compute_plan_loss(
     # configured loss whenever a weight (notably heading_weight) changes.
     loss = err.mean()
 
+    return loss, _plan_command_metrics(err, weight, mode)
+
+
+def compute_plan_tail_loss(
+    ego_fut_preds: torch.Tensor,
+    gt_offsets: torch.Tensor,
+    gt_mask: torch.Tensor,
+    command: torch.Tensor,
+    gt_poses: Optional[torch.Tensor] = None,
+    progress_cap: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Worst lateral miss and one-sided progress shortfall of the commanded mode.
+
+    Both are zero when that mode matches GT. Lateral backprops through the
+    worst valid waypoint. Progress is polyline length from the origin.
+    ``progress_cap`` stops the shortfall once the prediction reaches that
+    fraction of the GT length, so the last part of the human path is not
+    pulled in. Only a path shorter than ``cap * len(GT)`` is penalized.
+    """
+    cap = float(progress_cap)
+    if not 0.0 < cap <= 1.0:
+        raise ValueError(f"progress_cap must be in (0, 1], got {progress_cap}")
+    batch, _, steps, _ = ego_fut_preds.shape
+    cmd_idx = command.reshape(batch, -1).argmax(dim=-1)
+    pred_xy = ego_fut_preds[
+        torch.arange(batch, device=ego_fut_preds.device), cmd_idx
+    ][..., :2].cumsum(dim=-2)
+    gt_xy = gt_offsets[..., :2].cumsum(dim=-2) if gt_poses is None else gt_poses[..., :2]
+    mask = gt_mask.reshape(batch, steps).to(dtype=pred_xy.dtype)
+
+    lateral = (pred_xy[..., 1] - gt_xy[..., 1]).abs() * mask
+    lat_tail = lateral.amax(dim=-1).mean()
+
+    def _length(xy: torch.Tensor) -> torch.Tensor:
+        prev = torch.cat((xy.new_zeros(batch, 1, 2), xy[:, :-1]), dim=1)
+        return ((xy - prev).norm(dim=-1) * mask).sum(dim=-1)
+
+    shortfall = (cap * _length(gt_xy) - _length(pred_xy)).clamp_min(0).mean()
+    return lat_tail, shortfall
+
+
+# Pacifica front bumper, rear axle to bumper. Matches
+# ``nuplan...get_pacifica_parameters().front_length``, which the PDM scorer uses.
+_PACIFICA_FRONT_LENGTH_M = 4.049
+_TTC_STEP_S = 0.5
+_TTC_PROJECTION_S = (0.5, 1.0)
+_TTC_STOP_SPEED_MPS = 5e-3
+_TTC_PENETRATION_CLAMP_M = 1.0
+
+
+def compute_plan_ttc_proxy(
+    ego_fut_preds: torch.Tensor,
+    gt_mask: torch.Tensor,
+    command: torch.Tensor,
+    gt_boxes: torch.Tensor,
+    gt_valid: torch.Tensor,
+    gt_fut_trajs: torch.Tensor,
+    gt_fut_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Penetration of the commanded bumper's 0.5s and 1.0s probes into GT boxes.
+
+    The polyline is open-loop and 2 Hz. NAVSIM waypoints are converted to SSR
+    with :func:`navsim_trajectory_to_ssr`. Agent boxes stay in the SSR code
+    ``(x_right, y_forward, z, width, length, height, yaw, ...)``, and the yaw
+    axes match the occupancy splat in ``distill/masks.py``. A step slower than
+    the scorer's stopped threshold contributes 0. The hinge is the depth inside
+    the box, clamped at 1 m, and is 0 for agents behind the rear axle.
+    """
+    from .distill.masks import navsim_trajectory_to_ssr
+
+    batch, _, steps, _ = ego_fut_preds.shape
+    agents = int(gt_boxes.size(1))
+    if agents == 0 or steps == 0:
+        return ego_fut_preds.new_zeros(())
+    if gt_fut_trajs.size(2) != steps:
+        raise ValueError(
+            "gt_fut_trajs steps must match the plan horizon, "
+            f"got {gt_fut_trajs.size(2)} and {steps}"
+        )
+
+    cmd_idx = command.reshape(batch, -1).argmax(dim=-1)
+    offsets = ego_fut_preds[torch.arange(batch, device=ego_fut_preds.device), cmd_idx]
+    poses_xy = offsets[..., :2].cumsum(dim=-2)
+    heading = offsets[..., 2].cumsum(dim=-1)
+    poses = torch.cat(
+        (
+            poses_xy,
+            torch.atan2(heading.sin(), heading.cos()).unsqueeze(-1),
+        ),
+        dim=-1,
+    )
+    ssr = navsim_trajectory_to_ssr(poses)
+    origin = poses.new_zeros(batch, 1, 2)
+    segment = torch.cat((origin, poses_xy[:, :-1]), dim=1)
+    speed = (poses_xy - segment).norm(dim=-1) / _TTC_STEP_S
+    forward = torch.stack((ssr[..., 2].cos(), ssr[..., 2].sin()), dim=-1)
+    bumper = ssr[..., :2] + _PACIFICA_FRONT_LENGTH_M * forward
+    probes = []
+    for delta_t in _TTC_PROJECTION_S:
+        probes.append(bumper + (speed * delta_t).unsqueeze(-1) * forward)
+    points = torch.stack(probes, dim=2)
+
+    centers = gt_boxes[:, :, None, :2] + gt_fut_trajs.cumsum(dim=2)
+    centers = centers.permute(0, 2, 1, 3)
+    yaw = gt_boxes[:, :, 6]
+    half_l = gt_boxes[:, :, 4] * 0.5
+    half_w = gt_boxes[:, :, 3] * 0.5
+    delta = points[:, :, :, None, :] - centers[:, :, None, :, :]
+    cos_y = yaw.cos()[:, None, None, :]
+    sin_y = yaw.sin()[:, None, None, :]
+    dx = delta[..., 0]
+    dy = delta[..., 1]
+    along = cos_y * dx + sin_y * dy
+    across = -sin_y * dx + cos_y * dy
+    outside_l = along.abs() - half_l[:, None, None, :]
+    outside_w = across.abs() - half_w[:, None, None, :]
+    outside = torch.hypot(outside_l.clamp_min(0), outside_w.clamp_min(0))
+    inside = torch.minimum(torch.maximum(outside_l, outside_w), outside.new_zeros(()))
+    penetration = (-(outside + inside)).clamp(0, _TTC_PENETRATION_CLAMP_M)
+
+    ahead = ((centers - ssr[:, :, None, :2]) * forward[:, :, None, :]).sum(dim=-1) > 0
+    agent_ok = gt_valid.bool()[:, None, :] & (gt_fut_masks > 0.5).permute(0, 2, 1)
+    moving = speed > _TTC_STOP_SPEED_MPS
+    keep = ahead & agent_ok
+    keep = keep[:, :, None, :] & moving[:, :, None, None]
+    penetration = penetration.masked_fill(~keep, 0)
+    step = penetration.amax(dim=(2, 3))
+
+    mask = gt_mask.reshape(batch, steps).to(dtype=step.dtype)
+    counted = mask.sum(dim=-1)
+    scene = (step * mask).sum(dim=-1) / counted.clamp_min(1)
+    scene = torch.where(counted > 0, scene, torch.zeros_like(scene))
+    return scene.mean()
+
+
+def _plan_command_metrics(
+    err: torch.Tensor, weight: torch.Tensor, mode: int
+) -> Dict[str, torch.Tensor]:
     # Diagnostics per command. Reported as SUMS and COUNTS, not ratios: turn
     # commands are absent from most batches, and a per-iteration ratio would
     # either read 0.0 (a lie) or NaN (which propagates through all-reduce).
@@ -73,7 +211,7 @@ def compute_plan_loss(
         for i in range(min(mode, len(names))):
             metrics[f"plan_err_sum/{names[i]}"] = num[i]
             metrics[f"plan_n/{names[i]}"] = den[i]
-    return loss, metrics
+    return metrics
 
 
 class ParaSSRLoss(torch.nn.Module):
@@ -166,6 +304,7 @@ class ParaSSRLoss(torch.nn.Module):
             # shared-BEV diagnostics so balancing measures the actual gradient.
             plan_total = (plan_loss + cfg.candidate_cls_loss_weight * cls_loss
                           + cfg.metric_loss_weight * metric_loss)
+            balance_plan = plan_total
             logs["loss_plan_cls"] = cls_loss.detach()
             logs["loss_plan_metric"] = metric_loss.detach()
             logs["loss_plan_cls_weighted"] = (cls_loss * cfg.candidate_cls_loss_weight * tw.get("plan", 1.0)).detach()
@@ -179,8 +318,43 @@ class ParaSSRLoss(torch.nn.Module):
                 targets["command"],
                 heading_weight=cfg.heading_weight,
             )
-            plan_total = plan_loss
-        task_losses["plan"] = plan_total * tw.get("plan", 1.0)
+            lat_w = float(getattr(cfg, "plan_tail_lat_weight", 0.0) or 0.0)
+            prog_w = float(getattr(cfg, "plan_tail_progress_weight", 0.0) or 0.0)
+            if lat_w != 0.0 or prog_w != 0.0:
+                lat_tail, prog_tail = compute_plan_tail_loss(
+                    predictions["ego_fut_preds"],
+                    targets["trajectory_offsets"],
+                    targets["trajectory_mask"],
+                    targets["command"],
+                    gt_poses=targets.get("trajectory"),
+                    progress_cap=float(getattr(cfg, "plan_tail_progress_cap", 1.0)),
+                )
+            else:
+                lat_tail = plan_loss.detach().new_zeros(())
+                prog_tail = lat_tail
+            # Valve measures imitation L1. The progress shortfall and the TTC
+            # proxy stay in the total loss and do not set the det/map scales.
+            balance_plan = plan_loss
+            ttc_w = float(getattr(cfg, "plan_ttc_proxy_weight", 0.0) or 0.0)
+            if ttc_w != 0.0:
+                ttc_proxy = compute_plan_ttc_proxy(
+                    predictions["ego_fut_preds"],
+                    targets["trajectory_mask"],
+                    targets["command"],
+                    targets["gt_boxes"],
+                    targets["gt_valid"],
+                    targets["gt_fut_trajs"],
+                    targets["gt_fut_masks"],
+                )
+            else:
+                ttc_proxy = plan_loss.detach().new_zeros(())
+            plan_total = plan_loss + lat_w * lat_tail + prog_w * prog_tail + ttc_w * ttc_proxy
+            logs["loss_plan_tail_lat"] = lat_tail.detach()
+            logs["loss_plan_tail_progress"] = prog_tail.detach()
+            logs["loss_plan_ttc_proxy"] = ttc_proxy.detach()
+        plan_w = tw.get("plan", 1.0)
+        task_losses["plan"] = plan_total * plan_w
+        plan_for_balance = balance_plan * plan_w
         logs["loss_plan_reg"] = plan_loss.detach()
         # Keep the historical raw metric, but expose the value that actually
         # enters total_loss so plan=2.0 is not hidden in dashboards.
@@ -222,6 +396,14 @@ class ParaSSRLoss(torch.nn.Module):
 
         # ---- shared-BEV gradient measurement / balancing ---------------
         bev_embed = predictions["bev_embed"]
+        measurement_losses = dict(task_losses)
+        measurement_losses["plan"] = plan_for_balance
+        if "det" in measurement_losses and "motion" in measurement_losses:
+            # Detection and motion share one valve. Measure their sum so
+            # reinforcement and cancellation both show up in the norm.
+            measurement_losses["det"] = (
+                measurement_losses["det"] + measurement_losses.pop("motion")
+            )
         need_balance = (
             self.balancer is not None
             and model.training
@@ -234,16 +416,24 @@ class ParaSSRLoss(torch.nn.Module):
             and bev_embed.requires_grad
             and self.iteration % cfg.grad_norm_log_interval == 0
         )
+        use_interaction = bool(getattr(model, "use_task_interaction", False))
+        if use_interaction:
+            # Heads were run on the unscaled BEV. Correct only the auxiliary
+            # task's BEV gradient; planning through those decoders stays at 1.
+            total_loss, norms = balance_shared_gradients(
+                sum(task_losses.values()),
+                bev_embed,
+                measurement_losses,
+                dict(getattr(model, "aux_grad_scale", {})),
+                measure_norms=bool(need_balance or need_log),
+            )
+        else:
+            total_loss = sum(task_losses.values())
+            norms = (
+                self._measure_bev_grad_norms(bev_embed, measurement_losses)
+                if need_balance or need_log else {}
+            )
         if need_balance or need_log:
-            measurement_losses = dict(task_losses)
-            if "det" in measurement_losses and "motion" in measurement_losses:
-                # Detection and motion share one ScaleGrad valve.  The valve's
-                # actual BEV gradient is grad(L_det + L_motion), not either norm
-                # separately and not the sum of their norms.
-                measurement_losses["det"] = (
-                    measurement_losses["det"] + measurement_losses.pop("motion")
-                )
-            norms = self._measure_bev_grad_norms(bev_embed, measurement_losses)
             norms = all_reduce_mean(norms, bev_embed.device)
             total = sum(norms.values()) or 1.0
             for k, v in norms.items():
@@ -259,7 +449,6 @@ class ParaSSRLoss(torch.nn.Module):
 
         if model.training:
             self.iteration += 1
-        total_loss = sum(task_losses.values())
         logs["loss"] = total_loss.detach()
         return total_loss, logs
 

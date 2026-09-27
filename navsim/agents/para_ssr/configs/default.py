@@ -68,12 +68,12 @@ class ParaSSRConfig:
     # distance at 0.5 / 1.0 / 1.5 m.  A one-metre cell would leave the feature
     # coarser than the strictest threshold it is graded on.
     #
-    # Keep 100 x 100 for the first controlled experiment: it preserves the
-    # original 10,000-query architecture while changing only the physical ROI.
-    # This makes cells 0.64 m lateral x 0.32 m longitudinal; see the report for
-    # the square-cell 50 x 100 ablation that should follow.
+    # 50 x 100 square cells, 0.64 m on both axes. This is the interaction-branch
+    # grid and the native grid of the BEVFusion 50x100 cache and the ReSMap
+    # cache. The older 100 x 100 student (0.32 m forward) is the measured v4
+    # run; it is not this default.
     pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
-    bev_h: int = 100
+    bev_h: int = 50
     bev_w: int = 100
 
     # Deliberately identical to pc_range.  A different map range would make the
@@ -106,7 +106,9 @@ class ParaSSRConfig:
     encoder_ffn_dropout: float = 0.1
 
     use_shift: bool = True
-    use_ego_motion: bool = True
+    # 18-d ego status stays out of the BEV queries. Command and [vx, vy, ax, ay]
+    # condition the planner. History alignment still uses bev_shift.
+    use_ego_motion: bool = False
     ego_motion_norm: bool = True
     use_cams_embeds: bool = True
     use_grid_mask: bool = True
@@ -125,9 +127,21 @@ class ParaSSRConfig:
     # navsim scores (x, y, heading); nuScenes SSR regressed (x, y) only
     traj_dims: int = 3
     heading_weight: float = 0.5
+    # Dense planner only. Lateral tail is off: version_3's amax dominated the
+    # plan gradient and raised DAC failures. Progress is a shortfall up to
+    # ``plan_tail_progress_cap`` of the GT polyline. See plan v4.
+    # The bumper probe stays in the code with weight 0. The training contract
+    # is v4: lat off, progress 0.003, cap 0.9.
+    plan_tail_lat_weight: float = 0.0
+    plan_tail_progress_weight: float = 0.003
+    plan_tail_progress_cap: float = 0.9
+    plan_ttc_proxy_weight: float = 0.0
     # When False, removes TokenLearner (token selector) and uses dense BEV cross-attention (PARA-Drive style)
     use_stl: bool = False
     plan_num_layers: int = 3
+    # Plan query cross-attends final det/motion and map decoder states in
+    # parallel and adds the two updates. Requires both auxiliary heads.
+    use_task_interaction: bool = True
 
     # Optional NAVSIM metric-supervised candidate planner. Enabled separately by
     # agent=para_ssr_metric_agent, so the single-trajectory baseline is retained.
@@ -236,7 +250,7 @@ class ParaSSRConfig:
     # Stage 2: frozen stage-1 adapters pull the student BEV towards a frozen
     # teacher's cached BEV.  Off by default; nothing below is read when off.
     use_distill: bool = False
-    # Root holding ``<teacher>/cache_{train,val}_100x100/samples/...``.
+    # Root holding BEVFusion ``cache_{train,val}_50x100`` and the ReSMap shards.
     distill_feature_root: str = ""
     # ``{branch: {cache_name, adapter: {...}, loss_weight}}``.  A single teacher
     # is supported deliberately: the MapTRv2 cache does not exist yet, and
@@ -257,8 +271,10 @@ class ParaSSRConfig:
     )
     # ``{branch: /path/to/stage1_adapter.ckpt}``
     distill_adapter_checkpoints: Dict[str, str] = field(default_factory=dict)
-    # Grid the cache was written on; the student BEV is resampled to it.
-    distill_cache_size: Tuple[int, int] = (100, 100)
+    # BEVFusion directory ``cache_train_50x100``. ReSMap is sharded and already
+    # 50x100 after the lateral/forward transpose. Same shape as the student,
+    # so stage 2 does not resample either teacher.
+    distill_cache_size: Tuple[int, int] = (50, 100)
     distill_loss_weight: float = 1.0
     use_corridor_mask: bool = True
     # NAVSIM GT poses are (x_forward, y_left); BEV cells are SSR (x_right, y_forward).
@@ -287,8 +303,9 @@ class ParaSSRConfig:
     distill_attn_weight: float = 0.0
     distill_attn_tau: float = 0.5
     distill_adaptive_branch: bool = False
-    # Aux GT → planner BEV spatial energy (DistillBEV "where", target = det/map raster).
-    distill_plan_look_weight: float = 0.5
+    # Look-prior KL was learned on version_2 (0.284 → 0.069) and did not move
+    # navtest PDMS. The code path stays; the default is off.
+    distill_plan_look_weight: float = 0.0
     distill_plan_look_tau: float = 0.5
     # Head response KD on adapter tokens is off: the adapter is a planning
     # projector, not a det/map teacher. Unmatched DETR bbox/traj L1 exploded.

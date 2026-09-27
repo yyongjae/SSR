@@ -281,10 +281,14 @@ class ParaDetMotionHead(nn.Module):
         for branch in self.cls_branches:
             nn.init.constant_(branch[-1].bias, bias_init)
 
-    def forward(self, bev_embed: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, bev_embed: torch.Tensor, return_hidden: bool = False
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             bev_embed: ``[bs, bev_h * bev_w, embed_dims]``
+            return_hidden: also return ``det_hidden [B,Q,C]`` and
+                ``motion_hidden [B,Q,M,C]`` from the final decoder states.
         """
         bs = bev_embed.size(0)
         device = bev_embed.device
@@ -378,12 +382,16 @@ class ParaDetMotionHead(nn.Module):
         )
         traj_cls = self.traj_cls_branch(motion_hs).squeeze(-1)
 
-        return {
+        outputs = {
             "all_cls_scores": torch.stack(outputs_classes),
             "all_bbox_preds": torch.stack(outputs_coords),
             "traj_preds": traj,
             "traj_cls_preds": traj_cls,
         }
+        if return_hidden:
+            outputs["det_hidden"] = inter_states[-1].permute(1, 0, 2)
+            outputs["motion_hidden"] = motion_hs
+        return outputs
 
     # ------------------------------------------------------------------ #
     # loss

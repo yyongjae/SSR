@@ -104,8 +104,10 @@ class TeacherFeatureStore:
         """``(H, W)`` of tensors returned by :meth:`load_batch`.
 
         Stage-1's planner positional encoding must match this grid.  The student
-        default is 100x100; ReSMap's sharded cache is 50x100 after the
-        ``(C, lateral, forward) -> (C, forward, lateral)`` transpose.
+        default is 50x100. ReSMap's sharded cache is 50x100 after the
+        ``(C, lateral, forward) -> (C, forward, lateral)`` transpose. The
+        BEVFusion 50x100 cache is already ``(C, forward, lateral)`` and only
+        needs the width flip.
         """
         if self.is_sharded():
             meta = self.meta()

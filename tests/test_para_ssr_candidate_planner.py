@@ -179,7 +179,8 @@ def _tiny_config(anchor_path="", **overrides):
         det_num_decoder_layers=1, map_num_vec=2, map_max_vec=2,
         map_num_pts_per_vec=4, map_num_orders=1, map_num_decoder_layers=1,
         use_grid_mask=False, grad_balance_target=None, grad_norm_log_interval=1,
-        use_metric_planner=True, num_plan_candidates=3, plan_anchor_path=anchor_path,
+        use_metric_planner=True, use_task_interaction=False, use_ego_motion=True,
+        num_plan_candidates=3, plan_anchor_path=anchor_path,
         metric_cache_path="/nonexistent/cache/that/inference/must/not/read",
     )
     values.update(overrides)

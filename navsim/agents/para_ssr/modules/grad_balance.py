@@ -196,6 +196,54 @@ class GradBalancer:
         return {f'gscale/{k}': v for k, v in self.scale.items()}
 
 
+class _AddSharedGradient(torch.autograd.Function):
+    """Keep the loss value. Add a detached correction only to the BEV gradient."""
+
+    @staticmethod
+    def forward(ctx, loss, shared_feature, correction):
+        ctx.save_for_backward(correction)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (correction,) = ctx.saved_tensors
+        return grad_output, correction * grad_output, None
+
+
+def balance_shared_gradients(
+    total_loss, shared_feature, task_losses, scales, *, measure_norms=False
+):
+    """Scale auxiliary BEV gradients without scaling the planning path.
+
+    Planning reads det/map decoder states, so a valve on those decoder inputs
+    would also scale the plan gradient. This adds ``(s_k - 1) * dL_k/dBEV`` at
+    the BEV activation. Head parameters keep the ordinary loss gradient.
+    Reported norms are the raw norm times the current scale, which is what
+    ``GradBalancer.update`` divides back out.
+    """
+    norms = {}
+    correction = None
+    if not torch.is_grad_enabled() or not shared_feature.requires_grad:
+        return total_loss, norms
+    for task, loss in task_losses.items():
+        scale = 1.0 if task == "plan" else float(scales.get(task, 1.0))
+        if not measure_norms and scale == 1.0:
+            continue
+        if not isinstance(loss, torch.Tensor) or not loss.requires_grad:
+            continue
+        grad = torch.autograd.grad(
+            loss, shared_feature, retain_graph=True, allow_unused=True
+        )[0]
+        if measure_norms:
+            norms[task] = 0.0 if grad is None else float(grad.detach().float().norm()) * scale
+        if grad is not None and scale != 1.0:
+            delta = grad.detach() * (scale - 1.0)
+            correction = delta if correction is None else correction + delta
+    if correction is not None:
+        total_loss = _AddSharedGradient.apply(total_loss, shared_feature, correction)
+    return total_loss, norms
+
+
 def all_reduce_mean(values, device):
     """Average a {name: float} across ranks so every rank solves identically.
 

@@ -64,22 +64,30 @@ PROTOCOL_TOP_K = 100
 PROTOCOL_MAP_POINTS = 20
 PROTOCOL_MAP_ORDERS = 20
 PROTOCOL_MAP_MIN_LENGTH = 1.0
-# Detection and the BEV encoder use the full extent; the map is scored on the
-# front half only.  Both mirror NAVSIM TransFuser -- see ParaSSRConfig.
-PROTOCOL_PC_RANGE = (-32.0, -32.0, -2.0, 32.0, 32.0, 2.0)
+# One front-only ROI for the BEV, the detector and the map head. Detection GT
+# also passes the +-80 degree camera FOV, matching ParaSSRConfig. The older
+# rear-inclusive detection counts do not apply to this student.
+PROTOCOL_PC_RANGE = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
 PROTOCOL_MAP_PC_RANGE = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
+PROTOCOL_DET_FOV_HALF_ANGLE_DEG = 80.0
 PRODUCTION_TOKEN_COUNT = 12_146
 PRODUCTION_TOKEN_SHA256 = (
     "19cf783cbae935fce54cc459f05be508cfb546b0d92e7a5a122d0fc0d8bd4419"
 )
 PRODUCTION_DET_GT_COUNTS = {
-    "vehicle": 69_142,
-    "pedestrian": 34_653,
-    "bicycle": 931,
-    "traffic_cone": 20_942,
-    "barrier": 8_073,
-    "czone_sign": 753,
-    "generic_object": 61_214,
+    "vehicle": 49_705,
+    "pedestrian": 24_918,
+    "bicycle": 545,
+    "traffic_cone": 16_974,
+    "barrier": 5_646,
+    "czone_sign": 503,
+    "generic_object": 43_282,
+}
+PRODUCTION_MAP_GT_COUNTS = {
+    "road": 46_007,
+    "walkway": 47_115,
+    "centerline": 187_039,
+    "crosswalk": 17_904,
 }
 RECORD_KEYS = {
     "token",
@@ -604,8 +612,13 @@ def _build_agent(
         )
     if tuple(float(value) for value in agent.config.pc_range) != PROTOCOL_PC_RANGE:
         raise RuntimeError(
-            f"metric protocol V2 fixes pc_range={PROTOCOL_PC_RANGE}, "
+            f"metric protocol V3 fixes pc_range={PROTOCOL_PC_RANGE}, "
             f"got {tuple(agent.config.pc_range)}"
+        )
+    if float(agent.config.det_fov_half_angle_deg) != PROTOCOL_DET_FOV_HALF_ANGLE_DEG:
+        raise RuntimeError(
+            "metric protocol V3 fixes det_fov_half_angle_deg="
+            f"{PROTOCOL_DET_FOV_HALF_ANGLE_DEG}, got {agent.config.det_fov_half_angle_deg}"
         )
     if tuple(float(value) for value in agent.config.map_pc_range) != PROTOCOL_MAP_PC_RANGE:
         raise RuntimeError(
@@ -1007,21 +1020,19 @@ def _validate_production_metrics(metrics: Mapping[str, object]) -> None:
                 raise RuntimeError(
                     f"production {task_name}/{class_name} has no ground truth"
                 )
-    actual_det_counts = {
-        class_name: int(metrics["detection"]["classes"][class_name]["num_gt"])
-        for class_name in DET_CLASS_NAMES
-    }
-    if actual_det_counts != PRODUCTION_DET_GT_COUNTS:
-        raise RuntimeError(
-            "production detection GT counts do not match the uncapped navtest "
-            f"reference: actual={actual_det_counts}, expected={PRODUCTION_DET_GT_COUNTS}"
-        )
-    scenes_over_cap = int(metrics["map"].get("scenes_over_training_gt_cap_100", 0))
-    if scenes_over_cap <= 0:
-        raise RuntimeError(
-            "production map GT never exceeded the training cap; uncapped "
-            "evaluation-target path is not proven active"
-        )
+    for task_name, class_names, reference in (
+        ("detection", DET_CLASS_NAMES, PRODUCTION_DET_GT_COUNTS),
+        ("map", MAP_CLASS_NAMES, PRODUCTION_MAP_GT_COUNTS),
+    ):
+        actual = {
+            class_name: int(metrics[task_name]["classes"][class_name]["num_gt"])
+            for class_name in class_names
+        }
+        if actual != reference:
+            raise RuntimeError(
+                f"production {task_name} GT counts do not match the front-only "
+                f"navtest reference: actual={actual}, expected={reference}"
+            )
 
 
 def _production_guard(

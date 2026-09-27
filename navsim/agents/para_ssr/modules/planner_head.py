@@ -32,6 +32,82 @@ from .transformer_blocks import (
 from .candidate_planner import load_plan_anchors, poses_to_offsets, commanded_candidates
 
 
+class PlanTaskMemoryLayer(nn.Module):
+    """One planner layer: BEV, then parallel det and map attention, then FFN.
+
+    Both task attentions read the residual left by the BEV attention. Neither
+    consumes the other branch's update. The two updates are added together.
+    """
+
+    def __init__(
+        self,
+        embed_dims: int,
+        num_heads: int,
+        feedforward_channels: int,
+        use_task_interaction: bool = True,
+    ):
+        super().__init__()
+        self.use_task_interaction = use_task_interaction
+        self.bev_query_norm = nn.LayerNorm(embed_dims)
+        self.bev_memory_norm = nn.LayerNorm(embed_dims)
+        self.bev_cross_attn = nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
+        if use_task_interaction:
+            self.det_query_norm = nn.LayerNorm(embed_dims)
+            self.map_query_norm = nn.LayerNorm(embed_dims)
+            self.det_memory_norm = nn.LayerNorm(embed_dims)
+            self.map_memory_norm = nn.LayerNorm(embed_dims)
+            self.plan_det_cross_attn = nn.MultiheadAttention(
+                embed_dims, num_heads, batch_first=True
+            )
+            self.plan_map_cross_attn = nn.MultiheadAttention(
+                embed_dims, num_heads, batch_first=True
+            )
+        self.ffn_norm = nn.LayerNorm(embed_dims)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dims, feedforward_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(feedforward_channels, embed_dims),
+        )
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        plan_query_pos: torch.Tensor,
+        bev: torch.Tensor,
+        bev_pos: torch.Tensor,
+        det_memory: Optional[torch.Tensor] = None,
+        det_position: Optional[torch.Tensor] = None,
+        det_confidence: Optional[torch.Tensor] = None,
+        map_memory: Optional[torch.Tensor] = None,
+        map_position: Optional[torch.Tensor] = None,
+        map_confidence: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        value = self.bev_memory_norm(bev)
+        h = h + self.bev_cross_attn(
+            self.bev_query_norm(h) + plan_query_pos,
+            value + bev_pos,
+            value,
+            need_weights=False,
+        )[0]
+        if self.use_task_interaction:
+            value = self.det_memory_norm(det_memory)
+            det_update = self.plan_det_cross_attn(
+                self.det_query_norm(h) + plan_query_pos,
+                value + det_position + det_confidence,
+                value,
+                need_weights=False,
+            )[0]
+            value = self.map_memory_norm(map_memory)
+            map_update = self.plan_map_cross_attn(
+                self.map_query_norm(h) + plan_query_pos,
+                value + map_position + map_confidence,
+                value,
+                need_weights=False,
+            )[0]
+            h = h + det_update + map_update
+        return h + self.ffn(self.ffn_norm(h))
+
+
 class SELayer(nn.Module):
     """Channel gating of the BEV feature by the navigation-command embedding."""
 
@@ -79,8 +155,11 @@ class ParaSSRPlannerHead(nn.Module):
         plan_anchor_path: str = "",
         use_stl: bool = True,
         plan_num_layers: int = 3,
+        use_task_interaction: bool = False,
     ):
         super().__init__()
+        if use_task_interaction and (use_metric_planner or use_stl):
+            raise ValueError("task interaction requires the dense planner (use_stl=False)")
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.embed_dims = embed_dims
@@ -96,6 +175,7 @@ class ParaSSRPlannerHead(nn.Module):
         self.use_metric_planner = use_metric_planner
         self.num_plan_candidates = num_plan_candidates if use_metric_planner else 1
         self.use_stl = True if use_metric_planner else use_stl
+        self.use_task_interaction = bool(use_task_interaction) and not self.use_stl
 
         self.transformer = transformer
         self.positional_encoding = LearnedPositionalEncoding(
@@ -153,17 +233,44 @@ class ParaSSRPlannerHead(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(embed_dims, embed_dims),
             )
-            self.plan_decoder = build_self_attn_decoder(
-                plan_num_layers,
-                embed_dims,
-                num_heads,
-                feedforward_channels,
-                ("cross_attn", "norm", "ffn", "norm"),
-                attn_dropout=0.0,
-                ffn_dropout=0.0,
-            )
+            if self.use_task_interaction:
+                self.det_projection = nn.Linear(embed_dims, embed_dims)
+                self.motion_projection = nn.Linear(embed_dims, embed_dims)
+                self.map_projection = nn.Linear(embed_dims, embed_dims)
+                self.det_memory_norm = nn.LayerNorm(embed_dims)
+                self.map_memory_norm = nn.LayerNorm(embed_dims)
+
+                def metadata_encoder(input_dims: int) -> nn.Sequential:
+                    return nn.Sequential(
+                        nn.Linear(input_dims, embed_dims),
+                        nn.ReLU(inplace=True),
+                        nn.Linear(embed_dims, embed_dims),
+                    )
+
+                self.det_position_encoder = metadata_encoder(2)
+                self.map_position_encoder = metadata_encoder(2)
+                self.det_confidence_encoder = metadata_encoder(1)
+                self.map_confidence_encoder = metadata_encoder(1)
+                self.planner_layers = nn.ModuleList(
+                    PlanTaskMemoryLayer(
+                        embed_dims, num_heads, feedforward_channels, True
+                    )
+                    for _ in range(plan_num_layers)
+                )
+                self.final_norm = nn.LayerNorm(embed_dims)
+                decoders = tuple(self.planner_layers)
+            else:
+                self.plan_decoder = build_self_attn_decoder(
+                    plan_num_layers,
+                    embed_dims,
+                    num_heads,
+                    feedforward_channels,
+                    ("cross_attn", "norm", "ffn", "norm"),
+                    attn_dropout=0.0,
+                    ffn_dropout=0.0,
+                )
+                decoders = (self.plan_decoder,)
             self.ego_fut_decoder = reg_fcs(fut_ts * traj_dims)
-            decoders = (self.plan_decoder,)
 
         # Xavier initialization matching BaseModule convention
         for decoder in decoders:
@@ -189,6 +296,7 @@ class ParaSSRPlannerHead(nn.Module):
         ego_motion: torch.Tensor,
         bev_shift: torch.Tensor,
         prev_bev: Optional[torch.Tensor] = None,
+        bev_yaw: Optional[torch.Tensor] = None,
         only_bev: bool = False,
         cmd: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
@@ -223,10 +331,46 @@ class ParaSSRPlannerHead(nn.Module):
             ego_motion=ego_motion,
             bev_shift=bev_shift,
             prev_bev=prev_bev,
+            bev_yaw=bev_yaw,
         )
         if only_bev:
             return bev_embed
         return self.forward_from_bev(bev_embed, cmd, bev_pos=bev_pos, ego_status=ego_status)
+
+    def prepare_task_memories(
+        self,
+        det_out: Dict[str, torch.Tensor],
+        map_out: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Pool decoder latents once. Box and score metadata are detached.
+
+        Detection XY is metric and is normalised by the BEV range. Map points
+        are already in ``[0, 1]``. Confidence is the max sigmoid class score.
+        """
+        det_hidden = det_out["det_hidden"]
+        motion_hidden = det_out["motion_hidden"]
+        map_point_hidden = map_out["map_point_hidden"]
+        if det_hidden.ndim != 3 or motion_hidden.ndim != 4 or map_point_hidden.ndim != 4:
+            raise ValueError("expected det [B,Q,C], motion [B,Q,M,C], map [B,V,P,C] latents")
+        det_memory = self.det_memory_norm(
+            self.det_projection(det_hidden) + self.motion_projection(motion_hidden.mean(dim=2))
+        )
+        map_memory = self.map_memory_norm(self.map_projection(map_point_hidden.mean(dim=2)))
+        det_xy = det_out["all_bbox_preds"][-1, ..., :2].detach()
+        xy_origin = det_xy.new_tensor(self.pc_range[:2])
+        xy_extent = det_xy.new_tensor((self.real_w, self.real_h))
+        det_xy = (det_xy - xy_origin) / xy_extent
+        map_xy = map_out["all_map_pts_preds"][-1].detach()
+        det_score = det_out["all_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
+        map_score = map_out["all_map_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
+        return {
+            "det_memory": det_memory,
+            "det_position": self.det_position_encoder(det_xy),
+            "det_confidence": self.det_confidence_encoder(det_score),
+            "map_memory": map_memory,
+            "map_position": self.map_position_encoder(map_xy).mean(dim=2),
+            "map_confidence": self.map_confidence_encoder(map_score),
+        }
 
     def forward_from_bev(
         self,
@@ -234,6 +378,8 @@ class ParaSSRPlannerHead(nn.Module):
         cmd: Optional[torch.Tensor],
         bev_pos: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
+        det_out: Optional[Dict[str, torch.Tensor]] = None,
+        map_out: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Run the planning decoder on an existing BEV feature.
 
@@ -270,26 +416,43 @@ class ParaSSRPlannerHead(nn.Module):
         cmd_idx = cmd.argmax(dim=-1)
 
         if not self.use_stl:
-            navi = self.navi_embedding(cmd_idx)  # [B, C]
-            plan_query = self.plan_query.weight.to(dtype).expand(bs, -1)
-            plan_query = self.plan_fuser(torch.cat((plan_query, navi), -1))
-            if hasattr(self, "ego_status_encoder"):
-                status = bev_embed.new_zeros((bs, 4)) if ego_status is None else ego_status.to(dtype=dtype, device=bev_embed.device)
-                plan_query = plan_query + self.ego_status_encoder(status)
-            plan_query_pos = self.plan_query_pos.weight.to(dtype).expand(bs, -1)
-            plan_query = self.plan_decoder(
-                query=plan_query.unsqueeze(0),  # [1, B, C]
-                key=bev_embed.permute(1, 0, 2),  # [HW, B, C]
-                value=bev_embed.permute(1, 0, 2),
-                query_pos=plan_query_pos.unsqueeze(0),
-                key_pos=pos_embd.permute(1, 0, 2),
-            )
-            plan = self.ego_fut_decoder(plan_query[0]).view(
+            navi = self.navi_embedding(cmd_idx).unsqueeze(1)  # [B, 1, C]
+            query = self.plan_query.weight.to(dtype).unsqueeze(0).expand(bs, -1, -1)
+            h = self.plan_fuser(torch.cat((query, navi), dim=-1))
+            if ego_status is None:
+                status = bev_embed.new_zeros((bs, 4))
+            else:
+                status = ego_status.to(dtype=dtype, device=bev_embed.device)
+                if status.shape != (bs, 4):
+                    raise ValueError(
+                        f"expected ego_status [B, 4] (vx, vy, ax, ay), got {tuple(status.shape)}"
+                    )
+            h = h + self.ego_status_encoder(status).unsqueeze(1)
+            plan_pos = self.plan_query_pos.weight.to(dtype).unsqueeze(0).expand(bs, -1, -1)
+            if self.use_task_interaction:
+                if det_out is None or map_out is None:
+                    raise ValueError("task interaction planning requires det/motion and map outputs")
+                memories = self.prepare_task_memories(det_out, map_out)
+                for layer in self.planner_layers:
+                    h = layer(h, plan_pos, bev_embed, pos_embd, **memories)
+                h = self.final_norm(h)
+                scene_query = h.transpose(0, 1)
+            else:
+                plan_query = self.plan_decoder(
+                    query=h.transpose(0, 1),  # [1, B, C]
+                    key=bev_embed.permute(1, 0, 2),  # [HW, B, C]
+                    value=bev_embed.permute(1, 0, 2),
+                    query_pos=plan_pos.transpose(0, 1),
+                    key_pos=pos_embd.permute(1, 0, 2),
+                )
+                h = plan_query.transpose(0, 1)
+                scene_query = plan_query
+            plan = self.ego_fut_decoder(h[:, 0]).view(
                 bs, 1, self.fut_ts, self.traj_dims
             )
             return {
                 "bev_embed": bev_embed,
-                "scene_query": plan_query,
+                "scene_query": scene_query,
                 "token_attn": None,
                 "ego_fut_preds": plan.expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
             }

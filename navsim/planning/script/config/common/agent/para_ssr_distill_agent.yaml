@@ -31,7 +31,7 @@ config:
   distill_relation_weight: 0.0
   distill_attn_weight: 0.0
   distill_adaptive_branch: false
-  distill_plan_look_weight: 0.5
+  distill_plan_look_weight: 0.0
   distill_plan_look_tau: 0.5
   distill_head_kd_weight: 0.0
   distill_head_kd_det: false

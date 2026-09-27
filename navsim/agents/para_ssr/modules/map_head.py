@@ -213,7 +213,9 @@ class ParaMapHead(nn.Module):
         for branch in self.cls_branches:
             nn.init.constant_(branch[-1].bias, bias_init)
 
-    def forward(self, bev_embed: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, bev_embed: torch.Tensor, return_hidden: bool = False
+    ) -> Dict[str, torch.Tensor]:
         bs = bev_embed.size(0)
         device = bev_embed.device
         num_q = self.map_num_vec * self.map_num_pts_per_vec
@@ -263,10 +265,14 @@ class ParaMapHead(nn.Module):
             all_cls.append(cls)
             all_pts.append(pts)
 
-        return {
+        outputs = {
             "all_map_cls_scores": torch.stack(all_cls),
             "all_map_pts_preds": torch.stack(all_pts),
         }
+        if return_hidden:
+            # ``hidden_inst`` is the last decoder layer: [B, V, P, C].
+            outputs["map_point_hidden"] = hidden_inst
+        return outputs
 
     # ------------------------------------------------------------------ #
     def loss(

@@ -24,5 +24,6 @@ config:
   # would build agent and map targets that nothing consumes.
   use_det_motion_head: false
   use_map_head: false
+  use_task_interaction: false
   # There is no image backbone on this path.
   backbone_pretrained: false

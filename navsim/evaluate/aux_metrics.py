@@ -30,7 +30,7 @@ from navsim.agents.para_ssr.para_ssr_targets import (
 
 # V2: BEV geometry moved onto NAVSIM TransFuser's -- pc_range +-32 m in both
 # axes and a front-only map extent -- so V1 numbers are not comparable.
-AUX_METRIC_PROTOCOL_VERSION = 2
+AUX_METRIC_PROTOCOL_VERSION = 3
 DEFAULT_DET_THRESHOLDS = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_MAP_THRESHOLDS = (0.5, 1.0, 1.5)
 

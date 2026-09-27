@@ -71,7 +71,7 @@ class TeacherAdapterPlanner(nn.Module):
         super().__init__()
         cfg = config
         # The planner grid must match the teacher cache, which can differ from
-        # the student's default 100x100 (ReSMap is 50x100).
+        # the student's 50x100 grid. A cache with another shape still wins.
         grid_h = int(cfg.bev_h if bev_h is None else bev_h)
         grid_w = int(cfg.bev_w if bev_w is None else bev_w)
         self.adapter = PlanningBEVAdapter(
@@ -101,6 +101,7 @@ class TeacherAdapterPlanner(nn.Module):
             plan_anchor_path="",
             use_stl=getattr(cfg, "use_stl", False),
             plan_num_layers=getattr(cfg, "plan_num_layers", 3),
+            use_task_interaction=False,
         )
         # ``forward_from_bev`` takes the BEV from the adapter, so the learned BEV
         # queries that ``forward`` would hand to the transformer are unused here.

@@ -36,7 +36,10 @@ export DISTILL_FEATURE_ROOT="${DISTILL_FEATURE_ROOT:-/home/external-user/dataset
 EXP_PREFIX="${EXP_PREFIX:-paradrive_distill}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-20}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-30}"
-SAVE_TOP_K="${SAVE_TOP_K:-1}"  # Prune checkpoints: keep only latest 1 (+ last.ckpt) instead of all epochs
+# Keep a weight file every 5 epochs (epoch=4,9,14,... in Lightning's
+# 0-based names) plus last.ckpt. save_top_k=-1 does not prune those files.
+SAVE_TOP_K="${SAVE_TOP_K:--1}"
+EVERY_N_EPOCHS="${EVERY_N_EPOCHS:-5}"
 
 # Optional checkpoints override (if skipping or reusing existing stage 1 runs)
 BEVFUSION_CKPT="${BEVFUSION_ADAPTER_CKPT:-}"
@@ -292,7 +295,9 @@ if stage_selected stage1a; then
       trainer.params.check_val_every_n_epoch=2 \
       trainer.params.precision=32 \
       +trainer.params.devices="${NUM_GPUS}" \
+      checkpoint.every_n_epochs="${EVERY_N_EPOCHS}" \
       checkpoint.save_top_k="${SAVE_TOP_K}" \
+      checkpoint.save_last=true \
       trainer.params.gradient_clip_val=35.0 \
       trainer.params.gradient_clip_algorithm=norm \
       "${WANDB_ARGS[@]}" \
@@ -340,7 +345,9 @@ if stage_selected stage1b; then
       trainer.params.check_val_every_n_epoch=2 \
       trainer.params.precision=32 \
       +trainer.params.devices="${NUM_GPUS}" \
+      checkpoint.every_n_epochs="${EVERY_N_EPOCHS}" \
       checkpoint.save_top_k="${SAVE_TOP_K}" \
+      checkpoint.save_last=true \
       trainer.params.gradient_clip_val=35.0 \
       trainer.params.gradient_clip_algorithm=norm \
       "${WANDB_ARGS[@]}" \
@@ -412,7 +419,9 @@ wandb_args "${EXP_2}"
   trainer.params.check_val_every_n_epoch=5 \
   trainer.params.precision=32 \
   +trainer.params.devices="${NUM_GPUS}" \
+  checkpoint.every_n_epochs="${EVERY_N_EPOCHS}" \
   checkpoint.save_top_k="${SAVE_TOP_K}" \
+  checkpoint.save_last=true \
   trainer.params.gradient_clip_val=35.0 \
   trainer.params.gradient_clip_algorithm=norm \
   "${WANDB_ARGS[@]}" \

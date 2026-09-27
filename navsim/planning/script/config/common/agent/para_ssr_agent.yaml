@@ -8,7 +8,8 @@ config:
   # --- shared BEV encoder -------------------------------------------------
   # SSR axes: x is right, y is forward.  All heads share this front-only ROI:
   # x in [-32, 32] m, y in [0, 32] m.  The dataclass owns both range values.
-  bev_h: 100
+  # 50 rows x 100 columns: 0.64 m cells. Same front box as the 100x100 run.
+  bev_h: 50
   bev_w: 100
   embed_dims: 256
   encoder_num_layers: 3
@@ -35,6 +36,17 @@ config:
   use_map_head: true
   use_stl: false
   plan_num_layers: 3
+  # 18-d ego motion is not added to BEV queries. Command and [vx, vy, ax, ay]
+  # enter the planner. bev_shift still aligns history.
+  use_ego_motion: false
+  # BEV cross-attn, then parallel det/motion and map cross-attn, then sum.
+  use_task_interaction: true
+  # v4: lateral tail off. Progress shortfall stops at 90% of GT length.
+  # The bumper probe stays in code at weight 0.
+  plan_tail_lat_weight: 0.0
+  plan_tail_progress_weight: 0.003
+  plan_tail_progress_cap: 0.9
+  plan_ttc_proxy_weight: 0.0
   num_query: 300
   # Half-angle about the forward axis; shared by training and auxiliary mAP GT.
   det_fov_half_angle_deg: 80.0

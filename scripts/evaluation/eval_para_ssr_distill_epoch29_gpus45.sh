@@ -157,3 +157,55 @@ avg_row["valid"] = bool(n_valid == n)
 out.parent.mkdir(parents=True, exist_ok=True)
 pd.concat([merged, pd.DataFrame([avg_row])], ignore_index=True).to_csv(out, index=False)
 PY
+
+# Detection and map mAP on the same navtest split and the same two GPUs.
+AUX_EXPERIMENT="${EXPERIMENT_NAME}_aux"
+AUX_CONFIG="${SNAPSHOT_DIR}/aux_training_config.yaml"
+"${PYTHON}" - "${REPO}" "${AUX_CONFIG}" <<'PY'
+import sys
+from pathlib import Path
+
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
+
+repo = Path(sys.argv[1])
+out = Path(sys.argv[2])
+config_dir = repo / "navsim/planning/script/config"
+with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+    cfg = compose(
+        config_name="default_training",
+        overrides=[
+            "agent=para_ssr_agent",
+            "agent.config.backbone_pretrained=false",
+            "agent.config.test_aux_heads=true",
+        ],
+    )
+out.parent.mkdir(parents=True, exist_ok=True)
+OmegaConf.save(cfg, out)
+print(f"wrote aux training config: {out}")
+PY
+
+echo "starting det/map mAP on GPU ${GPU0},${GPU1}"
+SSR_NAVSIM_PYTHON="${PYTHON}" \
+  GPU_IDS="${GPU0},${GPU1}" \
+  AUX_CHECKPOINT="${STUDENT_CKPT}" \
+  AUX_TRAINING_CONFIG="${AUX_CONFIG}" \
+  AUX_EXPERIMENT="${AUX_EXPERIMENT}" \
+  AUX_BATCH_SIZE="${AUX_BATCH_SIZE:-4}" \
+  bash "${REPO}/scripts/evaluation/eval_para_ssr_aux.sh"
+
+"${PYTHON}" - "${REPO}/work_dirs/${AUX_EXPERIMENT}/aux_metrics.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+metrics = json.loads(path.read_text())["metrics"]
+print("")
+print("======================================================================")
+print(" NAVSIM aux mAP")
+print(f" det mAP: {float(metrics['detection']['mAP']):.4f}")
+print(f" map mAP: {float(metrics['map']['mAP']):.4f}")
+print(f" json: {path}")
+print("======================================================================")
+PY

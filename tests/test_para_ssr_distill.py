@@ -257,10 +257,14 @@ def test_target_cache_name_changes_with_scene_token(config):
     reason="NAVSIM teacher cache not present on this machine",
 )
 def test_real_cache_matches_the_student_geometry(config):
-    store = TeacherFeatureStore(REAL_CACHE, "bevfusion")
+    store = TeacherFeatureStore(
+        REAL_CACHE, "bevfusion",
+        cache_subdirs=("cache_train_50x100", "cache_val_50x100"),
+    )
     store.validate_manifest(config)
-    manifest = store.manifests()["cache_train_100x100"]
+    manifest = store.manifests()["cache_train_50x100"]
     assert manifest["bev_channels"] == config.embed_dims
+    assert tuple(manifest["target_bev_shape"]) == (50, 100)
     assert tuple(manifest["target_bev_shape"]) == (config.bev_h, config.bev_w)
 
 
@@ -373,7 +377,7 @@ def test_real_resmap_cache_matches_geometry_and_loads(config):
 
 
 def test_stage1_planner_follows_teacher_cache_grid(tmp_path, config):
-    """ReSMap-like 50x100 cache must not keep the student's 100x100 positional encoding."""
+    """The stage-1 planner grid is the teacher cache, including a 50x100 cache."""
     root = _write_cache(str(tmp_path / "c"), config, shape=[50, 100])
     cfg = replace(
         config,
@@ -401,6 +405,8 @@ def test_stage2_resamples_student_when_teacher_grid_differs(tmp_path, config):
     _, _, ckpt = _stage1_checkpoint(tmp_path, config, root)
     cfg = replace(
         config,
+        bev_h=100,
+        bev_w=100,
         use_distill=True,
         distill_feature_root=root,
         distill_adapter_checkpoints={"bevfusion": ckpt},
@@ -578,7 +584,7 @@ def test_distill_head_kd_det_defaults_off():
     assert cfg.distill_head_kd_weight == 0.0
 
 
-def test_v2_revised_defaults_pull_aux_into_planning():
+def test_v4_defaults_cap_progress_and_drop_the_lateral_tail():
     cfg = ParaSSRConfig()
     assert cfg.corridor_sigma_cross == 2.5
     assert cfg.corridor_base_weight == 0.1
@@ -587,8 +593,128 @@ def test_v2_revised_defaults_pull_aux_into_planning():
     assert cfg.distill_relation_weight == 0.0
     assert cfg.distill_attn_weight == 0.0
     assert cfg.distill_adaptive_branch is False
-    assert cfg.distill_plan_look_weight == 0.5
+    assert cfg.distill_plan_look_weight == 0.0
     assert cfg.distill_head_kd_weight == 0.0
+    assert cfg.plan_tail_lat_weight == 0.0
+    assert cfg.plan_tail_progress_weight == 0.003
+    assert cfg.plan_tail_progress_cap == 0.9
+
+
+def test_plan_tail_is_zero_on_gt_and_penalizes_the_worst_step():
+    from navsim.agents.para_ssr.para_ssr_loss import compute_plan_tail_loss
+
+    gt = torch.zeros(1, 4, 3)
+    gt[0, :, 0] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    offsets = torch.zeros(1, 4, 3)
+    offsets[0, :, 0] = 1.0
+    command = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+    mask = torch.ones(1, 4)
+    preds = offsets.unsqueeze(1).expand(1, 4, 4, 3).clone().requires_grad_(True)
+    lat, prog = compute_plan_tail_loss(preds, offsets, mask, command, gt_poses=gt)
+    assert lat.item() == 0.0
+    assert prog.item() == 0.0
+
+    bad = offsets.unsqueeze(1).expand(1, 4, 4, 3).clone()
+    bad = bad.contiguous().requires_grad_(True)
+    bad.data[0, 1, 2, 1] = 2.0
+    lat, prog = compute_plan_tail_loss(bad, offsets, mask, command, gt_poses=gt)
+    assert abs(lat.item() - 2.0) < 1e-5
+    assert prog.item() == 0.0
+    lat.backward()
+    assert bad.grad[0, 1, 2, 1].abs() > 0
+    assert bad.grad[0, 0].abs().sum() == 0
+
+    short = offsets.unsqueeze(1).expand(1, 4, 4, 3).clone()
+    short = short.contiguous().requires_grad_(True)
+    short.data[..., 0] = 0.5
+    lat, prog = compute_plan_tail_loss(short, offsets, mask, command, gt_poses=gt)
+    assert lat.item() == 0.0
+    assert prog.item() > 1.0
+    longer = offsets.unsqueeze(1).expand(1, 4, 4, 3).clone()
+    longer = longer.contiguous()
+    longer[..., 0] = 2.0
+    _, prog_long = compute_plan_tail_loss(longer, offsets, mask, command, gt_poses=gt)
+    assert prog_long.item() == 0.0
+
+    near = offsets.unsqueeze(1).expand(1, 4, 4, 3).clone()
+    near = near.contiguous()
+    near[..., 0] = 0.95
+    _, prog_near = compute_plan_tail_loss(
+        near, offsets, mask, command, gt_poses=gt, progress_cap=0.9
+    )
+    assert prog_near.item() == 0.0
+    _, prog_capped_short = compute_plan_tail_loss(
+        short, offsets, mask, command, gt_poses=gt, progress_cap=0.9
+    )
+    assert prog_capped_short.item() > 0.0
+    assert prog_capped_short.item() < prog.item()
+
+
+def test_v4_grid_is_square_50x100_and_the_ttc_proxy_stays_off():
+    cfg = ParaSSRConfig()
+    assert (cfg.bev_h, cfg.bev_w) == (50, 100)
+    assert tuple(cfg.distill_cache_size) == (50, 100)
+    assert cfg.plan_ttc_proxy_weight == 0.0
+    assert cfg.plan_tail_lat_weight == 0.0
+    assert cfg.plan_tail_progress_weight == 0.003
+    assert cfg.plan_tail_progress_cap == 0.9
+
+
+def _ttc_batch(offsets, box_xy, *, yaw=1.5707963267948966, size=2.0):
+    """One commanded forward path and one stationary SSR box."""
+    preds = offsets.unsqueeze(1).expand(1, 4, offsets.size(1), 3).clone()
+    preds = preds.contiguous().requires_grad_(True)
+    command = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+    mask = torch.ones(1, offsets.size(1))
+    box = torch.zeros(1, 1, 9)
+    box[0, 0, 0] = box_xy[0]
+    box[0, 0, 1] = box_xy[1]
+    box[0, 0, 3] = size
+    box[0, 0, 4] = size
+    box[0, 0, 6] = yaw
+    valid = torch.ones(1, 1, dtype=torch.bool)
+    fut = torch.zeros(1, 1, offsets.size(1), 2)
+    fut_mask = torch.ones(1, 1, offsets.size(1))
+    return preds, mask, command, box, valid, fut, fut_mask
+
+
+def test_plan_ttc_proxy_hits_only_the_forward_ssr_box():
+    from navsim.agents.para_ssr.para_ssr_loss import (
+        _PACIFICA_FRONT_LENGTH_M,
+        compute_plan_ttc_proxy,
+    )
+
+    steps = 8
+    offsets = torch.zeros(1, steps, 3)
+    offsets[0, :, 0] = 2.0
+    # Step 0 pose is 2 m forward. The 0.5 s probe is bumper + speed*0.5.
+    probe_y = 2.0 + _PACIFICA_FRONT_LENGTH_M + 4.0 * 0.5
+    preds, mask, command, box, valid, fut, fut_mask = _ttc_batch(
+        offsets, (0.0, probe_y)
+    )
+    loss = compute_plan_ttc_proxy(preds, mask, command, box, valid, fut, fut_mask)
+    assert abs(loss.item() - 1.0 / steps) < 1e-4
+    loss.backward()
+    assert preds.grad[0, 1].abs().sum() > 0
+    assert preds.grad[0, 0].abs().sum() == 0
+
+    far, mask, command, box, valid, fut, fut_mask = _ttc_batch(offsets, (0.0, 40.0))
+    assert compute_plan_ttc_proxy(far, mask, command, box, valid, fut, fut_mask).item() == 0.0
+
+    behind, mask, command, box, valid, fut, fut_mask = _ttc_batch(offsets, (0.0, -8.0))
+    assert compute_plan_ttc_proxy(behind, mask, command, box, valid, fut, fut_mask).item() == 0.0
+
+    # Same numbers read as SSR x instead of SSR y: the converted path is on +y.
+    swapped, mask, command, box, valid, fut, fut_mask = _ttc_batch(
+        offsets, (probe_y, 0.0)
+    )
+    assert compute_plan_ttc_proxy(swapped, mask, command, box, valid, fut, fut_mask).item() == 0.0
+
+    stopped = torch.zeros(1, steps, 3)
+    parked, mask, command, box, valid, fut, fut_mask = _ttc_batch(
+        stopped, (0.0, _PACIFICA_FRONT_LENGTH_M)
+    )
+    assert compute_plan_ttc_proxy(parked, mask, command, box, valid, fut, fut_mask).item() == 0.0
 
 
 def test_morphological_boundary_peaks_on_edge():

@@ -358,6 +358,7 @@ class ParaSSRModel(nn.Module):
             ego_status=ego_status,
             det_out=det_out,
             map_out=map_out,
+            return_bev_attn=bool(getattr(cfg, "distill_selector", False)),
         )
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
@@ -366,6 +367,8 @@ class ParaSSRModel(nn.Module):
                 planned["ego_fut_preds"], features["command"]
             ),
         }
+        if "plan_bev_attn" in planned:
+            predictions["plan_bev_attn"] = planned["plan_bev_attn"]
         if self.training or run_aux:
             predictions.update(det_out)
             predictions.update(map_out)

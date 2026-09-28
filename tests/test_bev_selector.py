@@ -1,0 +1,158 @@
+"""BEV selector distillation stays off the v4 adapter path."""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import replace
+
+import numpy as np
+import pytest
+import torch
+
+from navsim.agents.para_ssr.configs.default import ParaSSRConfig
+from navsim.agents.para_ssr.distill.distillation import build_planning_distillation
+from navsim.agents.para_ssr.distill.selector import (
+    BEVRegisterSelector,
+    diversity_loss,
+)
+from navsim.agents.para_ssr.modules.planner_head import PlanTaskMemoryLayer
+
+
+def _write_teacher(root, config, teacher):
+    shape = [config.bev_h, config.bev_w]
+    sx0, sy0, _, sx1, sy1, _ = config.pc_range
+    pc_range = [sy0, -sx1, -3.0, sy1, -sx0, 5.0]
+    base = os.path.join(root, teacher, "cache_train_50x100")
+    os.makedirs(base, exist_ok=True)
+    with open(os.path.join(base, "manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "split": "train",
+                "target_bev_shape": shape,
+                "bev_channels": config.embed_dims,
+                "point_cloud_range": pc_range,
+                "to_student_transform": "student_bev = teacher_bev[:, :, ::-1]",
+            },
+            handle,
+        )
+    token = "00aabbccddeeff01"
+    shard = os.path.join(base, "samples", token[:2])
+    os.makedirs(shard, exist_ok=True)
+    rng = np.random.default_rng(1)
+    np.savez(
+        os.path.join(shard, token + ".npz"),
+        bev_feature=rng.standard_normal((config.embed_dims, *shape)).astype(np.float16),
+    )
+
+
+def test_v4_config_does_not_enable_the_selector():
+    config = ParaSSRConfig()
+    assert config.distill_selector is False
+    assert config.grad_balance_target == {"plan": 0.4, "det": 0.3, "map": 0.3}
+    assert config.use_corridor_mask is True
+
+
+def test_selector_build_skips_stage1_adapters(tmp_path):
+    config = replace(
+        ParaSSRConfig(),
+        use_distill=True,
+        distill_selector=True,
+        distill_feature_root=str(tmp_path),
+        distill_adapter_checkpoints={},
+        embed_dims=8,
+        bev_h=4,
+        bev_w=4,
+        distill_selector_registers=2,
+    )
+    # Manifest channels follow embed_dims. Rewrite after the small config.
+    for teacher in ("bevfusion", "resmap"):
+        _write_teacher(str(tmp_path), config, teacher)
+    module = build_planning_distillation(config)
+    assert module.selector_mode
+    assert len(module.adapters) == 0
+    assert module.selector is not None
+    assert tuple(module.selector.registers.shape) == (2, 2, 8)
+
+
+def test_token_match_does_not_train_the_registers():
+    torch.manual_seed(0)
+    selector = BEVRegisterSelector(
+        channels=8, num_registers=2, bev_h=4, bev_w=4, tok_warmup_steps=1,
+    )
+    selector.steps.fill_(1)
+    bev = torch.randn(2, 16, 8, requires_grad=True)
+    teacher = torch.randn(2, 16, 8)
+    command = torch.zeros(2, 4)
+    command[:, 1] = 1.0
+    plan_attn = torch.rand(2, 16)
+    losses, _ = selector(
+        bev, (teacher, teacher), plan_attn, command, torch.zeros(2, 4),
+    )
+    losses["loss_distill_tok"].backward(retain_graph=True)
+    assert bev.grad is not None and bev.grad.abs().sum() > 0
+    assert selector.registers.grad is None or selector.registers.grad.abs().sum() == 0
+    assert selector.query_proj.weight.grad is None or selector.query_proj.weight.grad.abs().sum() == 0
+
+    selector.zero_grad(set_to_none=True)
+    bev.grad = None
+    (losses["loss_distill_cover"] + losses["loss_distill_div"]).backward()
+    assert selector.registers.grad is not None and selector.registers.grad.abs().sum() > 0
+    assert bev.grad is None
+
+
+def test_diversity_is_lower_when_peaks_are_apart():
+    xy = torch.stack((
+        torch.linspace(-8, 8, 16),
+        torch.zeros(16),
+    ), dim=-1)
+    same = torch.zeros(1, 4, 16)
+    same[..., 0] = 1.0
+    apart = torch.zeros(1, 4, 16)
+    apart[0, 0, 0] = 1.0
+    apart[0, 1, 5] = 1.0
+    apart[0, 2, 10] = 1.0
+    apart[0, 3, 15] = 1.0
+    assert diversity_loss(apart, xy, 4.0) < diversity_loss(same, xy, 4.0)
+
+
+def test_default_planner_layer_still_returns_a_tensor():
+    layer = PlanTaskMemoryLayer(8, 2, 16, True)
+    h = torch.randn(2, 1, 8)
+    pos = torch.randn(2, 1, 8)
+    bev = torch.randn(2, 4, 8)
+    bev_pos = torch.randn(2, 4, 8)
+    memory = torch.randn(2, 3, 8)
+    meta = torch.zeros(2, 3, 8)
+    out = layer(h, pos, bev, bev_pos, memory, meta, meta, memory, meta, meta)
+    assert out.shape == h.shape
+    hidden, attn = layer(
+        h, pos, bev, bev_pos, memory, meta, meta, memory, meta, meta,
+        return_bev_attn=True,
+    )
+    assert hidden.shape == h.shape
+    assert attn.shape == (2, 4)
+    assert torch.allclose(attn.sum(dim=-1), torch.ones(2), atol=1e-5)
+
+
+def test_selector_yaml_turns_grad_balance_off():
+    pytest.importorskip("hydra")
+    from hydra import compose, initialize_config_dir
+
+    cfg_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "navsim", "planning", "script", "config", "common", "agent",
+    )
+    from hydra.utils import instantiate
+
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        selector = compose(config_name="para_ssr_selector_agent")
+        v4 = compose(config_name="para_ssr_distill_agent")
+    selector_cfg = instantiate(selector.config)
+    v4_cfg = instantiate(v4.config)
+    assert selector_cfg.distill_selector is True
+    assert selector_cfg.image_architecture == "resnet34.tv_in1k"
+    assert selector_cfg.grad_balance_target is None
+    assert v4_cfg.distill_selector is False
+    assert v4_cfg.image_architecture == "resnet50.tv_in1k"
+    assert v4_cfg.grad_balance_target == {"plan": 0.4, "det": 0.3, "map": 0.3}
+    assert v4_cfg.use_corridor_mask is True

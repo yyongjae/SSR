@@ -313,6 +313,13 @@ class ParaSSRConfig:
     distill_head_kd_tau: float = 2.0
     distill_head_kd_det: bool = False
     distill_head_kd_det_geom: bool = False
+    # Train-only BEV registers. Off so the v4 adapter + corridor launcher is
+    # unchanged. See docs/bev_selector.md.
+    distill_selector: bool = False
+    distill_selector_registers: int = 16
+    distill_selector_div_sigma: float = 4.0
+    # Five epochs at ~10639 microbatches/rank (2 GPU x batch 4, navtrain).
+    distill_selector_tok_warmup_steps: int = 53195
 
     # Stage 1: train one adapter + the unchanged planning decoder from the
     # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.

@@ -421,6 +421,21 @@ class ParaSSRAgent(AbstractAgent):
                     "planning distillation needs targets['scene_token']; "
                     "regenerate the target cache with use_distill=True"
                 )
+            distill_kwargs = {}
+            if getattr(self._distill, "selector_mode", False):
+                status = features.get("ego_status")
+                status_feature = features.get("status_feature")
+                if (
+                    status is None
+                    and status_feature is not None
+                    and status_feature.shape[-1] > self._config.num_navi_cmd
+                ):
+                    status = status_feature[:, self._config.num_navi_cmd:]
+                distill_kwargs = {
+                    "plan_attn": predictions.get("plan_bev_attn"),
+                    "command": features.get("command"),
+                    "ego_status": status,
+                }
             distill_losses, distill_metrics = self._distill(
                 predictions["bev_embed"],
                 targets["scene_token"],
@@ -432,6 +447,7 @@ class ParaSSRAgent(AbstractAgent):
                 gt_map_pts=targets.get("gt_map_pts"),
                 gt_map_labels=targets.get("gt_map_labels"),
                 gt_map_valid=targets.get("gt_map_valid"),
+                **distill_kwargs,
             )
             weight = self._config.distill_loss_weight
             for name, value in distill_losses.items():

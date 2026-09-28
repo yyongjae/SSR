@@ -1,0 +1,23 @@
+# BEV-register distillation. Adds selector losses on the current student.
+# Stage-1 adapters and GradBalancer stay on the v4 launcher
+# (scripts/training/run_all_stages_distill.sh, agent=para_ssr_distill_agent).
+#
+#   bash ./scripts/training/run_bev_selector_distill.sh
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Interaction-branch student is resnet50.tv_in1k. This run uses ResNet-34.
+  image_architecture: resnet34.tv_in1k
+  distill_selector: true
+  distill_selector_registers: 16
+  distill_selector_div_sigma: 4.0
+  distill_selector_tok_warmup_steps: 53195
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0
+  # Unscaled task gradients. The 0.4/0.3/0.3 valve stays the v4 default.
+  grad_balance_target: null

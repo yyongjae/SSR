@@ -38,6 +38,7 @@ from .masks import (
     rasterize_map_class_mask,
     tokens_from_mask,
 )
+from .selector import BEVRegisterSelector
 from .teacher_store import TeacherFeatureStore
 
 # Stage-1 checkpoints are Lightning files whose keys carry an ``agent.`` prefix.
@@ -117,6 +118,12 @@ class PlanningDistillation(nn.Module):
         adaptive_clamp: Tuple[float, float] = (0.25, 4.0),
         plan_look_weight: float = 0.5,
         plan_look_tau: float = 0.5,
+        selector_mode: bool = False,
+        selector_registers: int = 16,
+        selector_div_sigma: float = 4.0,
+        selector_tok_warmup_steps: int = 53195,
+        selector_channels: int = 256,
+        selector_commands: int = 4,
     ) -> None:
         super().__init__()
         if not branches:
@@ -156,6 +163,12 @@ class PlanningDistillation(nn.Module):
         self.adaptive_clamp = (float(adaptive_clamp[0]), float(adaptive_clamp[1]))
         self.plan_look_weight = float(plan_look_weight)
         self.plan_look_tau = float(plan_look_tau)
+        self.selector_mode = bool(selector_mode)
+        self.selector_registers = int(selector_registers)
+        self.selector_div_sigma = float(selector_div_sigma)
+        self.selector_tok_warmup_steps = int(selector_tok_warmup_steps)
+        self.selector_channels = int(selector_channels)
+        self.selector_commands = int(selector_commands)
 
         self.adapters = nn.ModuleDict()
         self.stores: Dict[str, TeacherFeatureStore] = {}
@@ -164,33 +177,48 @@ class PlanningDistillation(nn.Module):
         self.teacher_tokens_student_grid: Dict[str, torch.Tensor] = {}
         self.student_tokens_student_grid: Dict[str, torch.Tensor] = {}
 
-        active_branch_names = [
-            name for name in branches
-            if name in adapter_checkpoint and adapter_checkpoint[name]
-        ]
-        if strict_checkpoints and not active_branch_names:
-            raise KeyError(
-                f"no stage-1 adapter checkpoint for any branch in {list(branches.keys())}. Train "
-                "them first; stage 2 is defined only against frozen adapters."
-            )
+        if self.selector_mode:
+            # Registers replace the frozen adapter. Stage-1 checkpoints are not
+            # read, so the v4 launcher is the only path that requires them.
+            active_branch_names = [
+                name for name in ("bevfusion", "resmap") if name in branches
+            ]
+            if active_branch_names != ["bevfusion", "resmap"]:
+                raise KeyError(
+                    "BEV selector distillation needs both bevfusion and resmap "
+                    f"branches, got {list(branches.keys())}"
+                )
+        else:
+            active_branch_names = [
+                name for name in branches
+                if name in adapter_checkpoint and adapter_checkpoint[name]
+            ]
+            if strict_checkpoints and not active_branch_names:
+                raise KeyError(
+                    f"no stage-1 adapter checkpoint for any branch in {list(branches.keys())}. Train "
+                    "them first; stage 2 is defined only against frozen adapters."
+                )
 
         states: Dict[str, Mapping[str, torch.Tensor]] = {}
         for name in active_branch_names:
             raw = branches[name]
             cfg = dict(raw)
-            adapter = PlanningBEVAdapter(**dict(cfg.pop("adapter", {})))
-            path = adapter_checkpoint.get(name)
-            if path:
-                path = os.path.abspath(os.path.expanduser(os.fspath(path)))
-                if path not in states:
-                    states[path] = _checkpoint_state(path)
-                load_prefixed_module(adapter, states[path])
-                self.loaded_adapter_checkpoints[name] = path
-            elif strict_checkpoints:
-                raise KeyError(f"empty adapter checkpoint path for {name}")
-            adapter.requires_grad_(False)
-            adapter.eval()
-            self.adapters[name] = adapter
+            if self.selector_mode:
+                cfg.pop("adapter", None)
+            else:
+                adapter = PlanningBEVAdapter(**dict(cfg.pop("adapter", {})))
+                path = adapter_checkpoint.get(name)
+                if path:
+                    path = os.path.abspath(os.path.expanduser(os.fspath(path)))
+                    if path not in states:
+                        states[path] = _checkpoint_state(path)
+                    load_prefixed_module(adapter, states[path])
+                    self.loaded_adapter_checkpoints[name] = path
+                elif strict_checkpoints:
+                    raise KeyError(f"empty adapter checkpoint path for {name}")
+                adapter.requires_grad_(False)
+                adapter.eval()
+                self.adapters[name] = adapter
 
             cache_name = cfg.pop("cache_name", name)
             store_kwargs = {k: cfg.pop(k) for k in ("cache_subdirs", "feature_key",
@@ -207,6 +235,19 @@ class PlanningDistillation(nn.Module):
                 raise TypeError(f"unused distillation options for {name}: {cfg}")
             self.register_buffer(
                 f"ema_loss_{name}", torch.tensor(1.0), persistent=False
+            )
+
+        self.selector: Optional[BEVRegisterSelector] = None
+        if self.selector_mode:
+            self.selector = BEVRegisterSelector(
+                channels=self.selector_channels,
+                num_registers=self.selector_registers,
+                num_commands=self.selector_commands,
+                bev_h=self.student_bev_size[0],
+                bev_w=self.student_bev_size[1],
+                pc_range=self.pc_range,
+                div_sigma_m=self.selector_div_sigma,
+                tok_warmup_steps=self.selector_tok_warmup_steps,
             )
 
     # ------------------------------------------------------------------ #
@@ -442,8 +483,15 @@ class PlanningDistillation(nn.Module):
         gt_map_pts: Optional[torch.Tensor] = None,
         gt_map_labels: Optional[torch.Tensor] = None,
         gt_map_valid: Optional[torch.Tensor] = None,
+        plan_attn: Optional[torch.Tensor] = None,
+        command: Optional[torch.Tensor] = None,
+        ego_status: Optional[torch.Tensor] = None,
     ):
         """``student_bev`` is ``[B, bev_h*bev_w, C]``; returns (losses, metrics)."""
+        if self.selector_mode:
+            return self._selector_forward(
+                student_bev, tokens, plan_attn, command, ego_status,
+            )
         student_map = bev_tokens_to_map(student_bev, self.student_bev_size)
         traj = None
         if self.use_corridor_mask and trajectories is not None and trajectories.numel() > 0:
@@ -536,6 +584,35 @@ class PlanningDistillation(nn.Module):
                 metrics["distill_plan_look"] = look.detach()
         return losses, metrics
 
+    def _selector_forward(
+        self,
+        student_bev: torch.Tensor,
+        tokens: Sequence[str],
+        plan_attn: Optional[torch.Tensor],
+        command: Optional[torch.Tensor],
+        ego_status: Optional[torch.Tensor],
+    ):
+        if self.selector is None:
+            raise RuntimeError("selector distillation was not constructed")
+        if plan_attn is None or command is None:
+            raise ValueError(
+                "BEV selector distillation needs plan_bev_attn and command from "
+                "the student forward"
+            )
+        teachers = []
+        for name in ("bevfusion", "resmap"):
+            teacher_map = self.stores[name].load_batch(
+                tokens, student_bev.device, student_bev.dtype)
+            student_hw = self.student_bev_size
+            if tuple(teacher_map.shape[-2:]) != student_hw:
+                teacher_map = F.interpolate(
+                    teacher_map, size=student_hw, mode="bilinear", align_corners=False,
+                )
+            teachers.append(bev_map_to_tokens(teacher_map))
+        return self.selector(
+            student_bev, teachers, plan_attn, command, ego_status,
+        )
+
 
 def build_planning_distillation(config):
     """Construct the stage-2 module from a :class:`ParaSSRConfig`, or ``None``."""
@@ -580,6 +657,14 @@ def build_planning_distillation(config):
         adaptive_branch=bool(getattr(config, "distill_adaptive_branch", False)),
         plan_look_weight=float(getattr(config, "distill_plan_look_weight", 0.5)),
         plan_look_tau=float(getattr(config, "distill_plan_look_tau", 0.5)),
+        selector_mode=bool(getattr(config, "distill_selector", False)),
+        selector_registers=int(getattr(config, "distill_selector_registers", 16)),
+        selector_div_sigma=float(getattr(config, "distill_selector_div_sigma", 4.0)),
+        selector_tok_warmup_steps=int(
+            getattr(config, "distill_selector_tok_warmup_steps", 53195)
+        ),
+        selector_channels=int(getattr(config, "embed_dims", 256)),
+        selector_commands=int(getattr(config, "num_navi_cmd", 4)),
     )
     module.validate_manifests(config)
     return module

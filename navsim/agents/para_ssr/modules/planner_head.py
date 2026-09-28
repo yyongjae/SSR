@@ -81,14 +81,30 @@ class PlanTaskMemoryLayer(nn.Module):
         map_memory: Optional[torch.Tensor] = None,
         map_position: Optional[torch.Tensor] = None,
         map_confidence: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_bev_attn: bool = False,
+    ):
         value = self.bev_memory_norm(bev)
-        h = h + self.bev_cross_attn(
-            self.bev_query_norm(h) + plan_query_pos,
-            value + bev_pos,
-            value,
-            need_weights=False,
-        )[0]
+        # The default path keeps need_weights=False so the fused kernel, and
+        # therefore the v4 training graph, stays as it was. Attention is read
+        # only for the train-only BEV selector.
+        if return_bev_attn:
+            attended, bev_attn = self.bev_cross_attn(
+                self.bev_query_norm(h) + plan_query_pos,
+                value + bev_pos,
+                value,
+                need_weights=True,
+                average_attn_weights=True,
+            )
+            h = h + attended
+            bev_attn = bev_attn.squeeze(1)
+        else:
+            h = h + self.bev_cross_attn(
+                self.bev_query_norm(h) + plan_query_pos,
+                value + bev_pos,
+                value,
+                need_weights=False,
+            )[0]
+            bev_attn = None
         if self.use_task_interaction:
             value = self.det_memory_norm(det_memory)
             det_update = self.plan_det_cross_attn(
@@ -105,7 +121,10 @@ class PlanTaskMemoryLayer(nn.Module):
                 need_weights=False,
             )[0]
             h = h + det_update + map_update
-        return h + self.ffn(self.ffn_norm(h))
+        h = h + self.ffn(self.ffn_norm(h))
+        if return_bev_attn:
+            return h, bev_attn
+        return h
 
 
 class SELayer(nn.Module):
@@ -380,6 +399,7 @@ class ParaSSRPlannerHead(nn.Module):
         ego_status: Optional[torch.Tensor] = None,
         det_out: Optional[Dict[str, torch.Tensor]] = None,
         map_out: Optional[Dict[str, torch.Tensor]] = None,
+        return_bev_attn: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Run the planning decoder on an existing BEV feature.
 
@@ -429,12 +449,20 @@ class ParaSSRPlannerHead(nn.Module):
                     )
             h = h + self.ego_status_encoder(status).unsqueeze(1)
             plan_pos = self.plan_query_pos.weight.to(dtype).unsqueeze(0).expand(bs, -1, -1)
+            plan_attn = None
             if self.use_task_interaction:
                 if det_out is None or map_out is None:
                     raise ValueError("task interaction planning requires det/motion and map outputs")
                 memories = self.prepare_task_memories(det_out, map_out)
-                for layer in self.planner_layers:
-                    h = layer(h, plan_pos, bev_embed, pos_embd, **memories)
+                last = len(self.planner_layers) - 1
+                for index, layer in enumerate(self.planner_layers):
+                    if return_bev_attn and index == last:
+                        h, plan_attn = layer(
+                            h, plan_pos, bev_embed, pos_embd,
+                            return_bev_attn=True, **memories,
+                        )
+                    else:
+                        h = layer(h, plan_pos, bev_embed, pos_embd, **memories)
                 h = self.final_norm(h)
                 scene_query = h.transpose(0, 1)
             else:
@@ -450,12 +478,15 @@ class ParaSSRPlannerHead(nn.Module):
             plan = self.ego_fut_decoder(h[:, 0]).view(
                 bs, 1, self.fut_ts, self.traj_dims
             )
-            return {
+            planned = {
                 "bev_embed": bev_embed,
                 "scene_query": scene_query,
                 "token_attn": None,
                 "ego_fut_preds": plan.expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
             }
+            if plan_attn is not None:
+                planned["plan_bev_attn"] = plan_attn
+            return planned
 
         navi_embed = self.navi_embedding(cmd_idx).unsqueeze(1)  # [B, 1, C]
         bev_navi_embed = self.navi_se(bev_embed, navi_embed)

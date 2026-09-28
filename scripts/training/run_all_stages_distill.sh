@@ -55,24 +55,19 @@ EXP_1B="${EXP_PREFIX}_stage1_resmap"
 EXP_2="${EXP_PREFIX}_stage2_dual_distill"
 
 # Telemetry. TensorBoard under lightning_logs/ is always on.
-# W&B stays off unless WANDB=1. The key is read from ${REPO}/.env for this
-# process only. No --team -> personal entity. --team -> the e2ekd team, and
-# that flag is stripped so Hydra never sees it.
-WANDB_WAS_SET=0
-if [[ -n "${WANDB+x}" ]]; then
-  WANDB_WAS_SET=1
-fi
-WANDB="${WANDB:-0}"
-WANDB_PROJECT="${WANDB_PROJECT:-para-ssr-distill}"
+# W&B uploads to the e2ekd team by default. WANDB=0 turns that off.
+# The key is read from ${REPO}/.env for this process only. --team is accepted
+# and stripped so Hydra never sees it; the entity is already e2ekd.
+WANDB="${WANDB:-1}"
+WANDB_PROJECT="${WANDB_PROJECT:-v1_distill}"
 WANDB_GROUP="${WANDB_GROUP:-full-pipeline}"
 WANDB_MODE_ARG="${WANDB_MODE:-online}"
-WANDB_PERSONAL_ENTITY="${WANDB_PERSONAL_ENTITY:-comflife}"
-WANDB_TEAM_ENTITY="${WANDB_TEAM_ENTITY:-e2ekd}"
-WANDB_SCOPE="personal"
+WANDB_ENTITY="${WANDB_ENTITY:-e2ekd}"
+WANDB_RUN_PREFIX="${WANDB_RUN_PREFIX:-r50_dtd_trial}"
 USER_ARGS=()
 for _arg in "$@"; do
   if [[ "${_arg}" == "--team" ]]; then
-    WANDB_SCOPE="team"
+    WANDB_ENTITY="e2ekd"
   else
     USER_ARGS+=("${_arg}")
   fi
@@ -83,16 +78,6 @@ else
   set --
 fi
 unset USER_ARGS _arg
-if [[ "${WANDB_SCOPE}" == "team" ]]; then
-  WANDB_ENTITY="${WANDB_TEAM_ENTITY}"
-  # --team means "upload this run". Do not flip the default for other runs.
-  if [[ "${WANDB_WAS_SET}" == "0" ]]; then
-    WANDB=1
-  fi
-else
-  WANDB_ENTITY="${WANDB_PERSONAL_ENTITY}"
-fi
-unset WANDB_WAS_SET
 
 # Python Environment (Auto-detect ssr conda environment)
 if [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
@@ -136,7 +121,7 @@ load_personal_wandb() {
   fi
   # Process environment only. Do not call `wandb login`: that writes ~/.netrc.
   export WANDB_API_KEY="${key}"
-  # Personal comflife, or e2ekd when this command included --team.
+  # Team entity e2ekd. The key stays in this process and in the temp netrc.
   export WANDB_ENTITY
   unset WANDB_DISABLED
   _WANDB_NETRC_FILE="$(mktemp "${TMPDIR:-/tmp}/wandb-netrc.XXXXXX")"
@@ -150,6 +135,56 @@ load_personal_wandb() {
 if [[ "${WANDB}" != "0" ]]; then
   load_personal_wandb
 fi
+
+# One number per stage that actually starts. Display name is
+# r50_dtd_trial_<n>. The next n is one past the highest name already in
+# e2ekd/v1_distill and the local counter, so a second launch does not reuse it.
+alloc_wandb_trial() {
+  if [[ -n "${WANDB_TRIAL:-}" ]]; then
+    echo "${WANDB_TRIAL}"
+    return
+  fi
+  WANDB_SILENT=true "${PYTHON}" -c "$(cat <<'PY'
+import re
+import sys
+from pathlib import Path
+
+entity, project, prefix, root = sys.argv[1:5]
+counter = Path(root) / f".{prefix}_counter"
+counter.parent.mkdir(parents=True, exist_ok=True)
+lock_path = counter.with_suffix(".lock")
+
+import fcntl
+with open(lock_path, "a") as lockf:
+    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+    local = 0
+    if counter.exists():
+        text = counter.read_text().strip()
+        if text.isdigit():
+            local = int(text)
+    remote = 0
+    try:
+        import wandb
+        api = wandb.Api(timeout=30)
+        pat = re.compile(rf"^{re.escape(prefix)}_(\d+)$")
+        for run in api.runs(f"{entity}/{project}"):
+            match = pat.fullmatch(run.name or "")
+            if match:
+                remote = max(remote, int(match.group(1)))
+    except Exception as exc:
+        # A new project is created on the first upload, so a missing project
+        # is the normal first-run case. Other failures still fall back locally.
+        if "could not find project" not in str(exc).lower():
+            print(
+                f"W&B name scan failed ({type(exc).__name__}: {exc}); using the local counter.",
+                file=sys.stderr,
+            )
+    nxt = max(local, remote) + 1
+    counter.write_text(f"{nxt}\n")
+    print(nxt)
+PY
+)" "${WANDB_ENTITY}" "${WANDB_PROJECT}" "${WANDB_RUN_PREFIX}" "${NAVSIM_EXP_ROOT}"
+}
 
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPU_IDS[@]}"
@@ -165,9 +200,7 @@ echo " Exp Prefix   : ${EXP_PREFIX}"
 echo " Only stage   : ${ONLY_STAGE:-all}"
 echo " Force retrain: ${FORCE_RETRAIN}"
 if [[ "${WANDB}" != "0" ]]; then
-  echo " W&B          : enable=true  scope=${WANDB_SCOPE}  entity=${WANDB_ENTITY}  project=${WANDB_PROJECT}  group=${WANDB_GROUP}  (one-shot .env key)"
-elif [[ "${WANDB_SCOPE}" == "team" ]]; then
-  echo " W&B          : disabled (WANDB=0). --team did not upload."
+  echo " W&B          : enable=true  entity=${WANDB_ENTITY}  project=${WANDB_PROJECT}  group=${WANDB_GROUP}  name=${WANDB_RUN_PREFIX}_<n>  (one-shot .env key)"
 else
   echo " W&B          : disabled  (TensorBoard: work_dirs/<exp>/lightning_logs)"
 fi
@@ -232,8 +265,15 @@ stage_selected() {
 }
 
 wandb_args() {
-  local name="$1"
+  local stage="$1"
   if [[ "${WANDB}" != "0" ]]; then
+    local name
+    name="${WANDB_RUN_PREFIX}_$(alloc_wandb_trial)"
+    if [[ ! "${name}" =~ ^${WANDB_RUN_PREFIX}_[0-9]+$ ]]; then
+      echo "Error: W&B run name must look like ${WANDB_RUN_PREFIX}_<number>, got '${name}'." >&2
+      exit 1
+    fi
+    echo " W&B run      : ${WANDB_ENTITY}/${WANDB_PROJECT}  ${name}  (${stage})"
     WANDB_ARGS=(
       "wandb.enable=true"
       "wandb.mode=${WANDB_MODE_ARG}"
@@ -241,6 +281,7 @@ wandb_args() {
       "wandb.project=${WANDB_PROJECT}"
       "wandb.group=${WANDB_GROUP}"
       "wandb.name=${name}"
+      "wandb.tags=[${stage},r50,dtd]"
     )
   else
     WANDB_ARGS=("wandb.enable=false")
@@ -278,7 +319,7 @@ if stage_selected stage1a; then
     echo " Experiment: ${EXP_1A}"
     echo "======================================================================"
 
-    wandb_args "${EXP_1A}"
+    wandb_args stage1a
     "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
       agent=para_ssr_teacher_adapter_agent \
       agent.config.teacher_adapter_branch="bevfusion" \
@@ -328,7 +369,7 @@ if stage_selected stage1b; then
     echo " Experiment: ${EXP_1B}"
     echo "======================================================================"
 
-    wandb_args "${EXP_1B}"
+    wandb_args stage1b
     "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
       agent=para_ssr_teacher_adapter_agent \
       agent.config.teacher_adapter_branch="resmap" \
@@ -398,7 +439,7 @@ fi
 export BEVFUSION_ADAPTER_CKPT="${BEVFUSION_CKPT}"
 export RESMAP_ADAPTER_CKPT="${RESMAP_CKPT}"
 
-wandb_args "${EXP_2}"
+wandb_args stage2
 "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
   agent=para_ssr_distill_agent \
   agent.lr="1e-4" \

@@ -100,6 +100,28 @@ def test_token_match_does_not_train_the_registers():
     assert bev.grad is None
 
 
+def test_front_grid_anchors_split_the_registers_at_step_zero():
+    selector = BEVRegisterSelector(
+        channels=8, num_registers=16, bev_h=50, bev_w=100, tok_warmup_steps=10,
+    )
+    bev = torch.zeros(1, 5000, 8)
+    command = torch.zeros(1, 4)
+    command[:, 1] = 1.0
+    attention = selector.attend(bev, command, torch.zeros(1, 4))
+    means = torch.matmul(attention[0], selector.cell_xy)
+    nearest = _nearest_metres(means.reshape(-1, 2).detach())
+    # Collapsed init sits at ~1e-6 m and diversity loss 2. A few metres is split.
+    assert float(nearest.min()) > 2.0
+    assert float(diversity_loss(attention.reshape(1, -1, 5000), selector.cell_xy, 4.0)) < 1.5
+
+
+def _nearest_metres(means: torch.Tensor) -> torch.Tensor:
+    delta = means.unsqueeze(0) - means.unsqueeze(1)
+    dist = delta.pow(2).sum(dim=-1).clamp_min(0).sqrt()
+    eye = torch.eye(dist.size(0), dtype=torch.bool)
+    return dist.masked_fill(eye, 1e6).amin(dim=-1)
+
+
 def test_diversity_is_lower_when_peaks_are_apart():
     xy = torch.stack((
         torch.linspace(-8, 8, 16),

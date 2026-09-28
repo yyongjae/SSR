@@ -10,6 +10,7 @@ the registers cannot lower the match loss by sliding onto easy cells.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Sequence, Tuple
 
 import torch
@@ -36,6 +37,8 @@ class BEVRegisterSelector(nn.Module):
         pc_range: Sequence[float] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
         div_sigma_m: float = 4.0,
         tok_warmup_steps: int = 53195,
+        anchor_sigma_m: float = 6.0,
+        anchor_floor: float = 0.3,
     ) -> None:
         super().__init__()
         if num_registers < 2:
@@ -48,6 +51,8 @@ class BEVRegisterSelector(nn.Module):
         self.pc_range = tuple(float(v) for v in pc_range)
         self.div_sigma_m = float(div_sigma_m)
         self.tok_warmup_steps = max(int(tok_warmup_steps), 1)
+        self.anchor_sigma_m = float(anchor_sigma_m)
+        self.anchor_floor = float(anchor_floor)
 
         registers = torch.randn(2, self.num_registers, self.channels) * 1e-6
         self.registers = nn.Parameter(registers)
@@ -61,6 +66,13 @@ class BEVRegisterSelector(nn.Module):
         )
         coords = torch.stack((grid_x.reshape(-1), grid_y.reshape(-1)), dim=-1)
         self.register_buffer("cell_xy", coords, persistent=False)
+        # Fixed front-grid places. Identical N(0, 1e-6) queries make every
+        # attention the same map, and diversity then has zero gradient.
+        self.register_buffer(
+            "anchor_logits",
+            anchor_logit_bias(coords, self.num_registers, self.pc_range, self.anchor_sigma_m),
+            persistent=False,
+        )
 
     def ramp(self) -> torch.Tensor:
         """0 at step 0, 1 once ``tok_warmup_steps`` forwards have run."""
@@ -115,6 +127,10 @@ class BEVRegisterSelector(nn.Module):
         key = self.key_proj(bev.detach())
         scale = self.channels ** -0.5
         logits = torch.einsum("bark,bnk->barn", query, key) * scale
+        # 1 at step 0, then the same warmup as token match, down to a floor.
+        # The floor stays so the slots cannot fall back onto one point.
+        alpha = self.anchor_floor + (1.0 - self.anchor_floor) * (1.0 - self.ramp())
+        logits = logits + alpha * self.anchor_logits.to(device=logits.device, dtype=logits.dtype)
         return logits.softmax(dim=-1)
 
     def forward(
@@ -170,6 +186,44 @@ class BEVRegisterSelector(nn.Module):
             metrics.update(_selection_metrics(stacked, self.cell_xy))
         self.steps += 1
         return losses, metrics
+
+
+def anchor_logit_bias(
+    cell_xy: torch.Tensor,
+    num_registers: int,
+    pc_range: Sequence[float],
+    sigma_m: float,
+) -> torch.Tensor:
+    """``[2, R, HW]`` log-blobs on a front lattice. Bank 1 is shifted half a step.
+
+    Places are the grid, not the GT trajectory or GT boxes.
+    """
+    banks = []
+    for shift in (0.0, 1.0):
+        anchors = _lattice_xy(num_registers, pc_range, shift)
+        delta = cell_xy.unsqueeze(0) - anchors.unsqueeze(1)
+        dist2 = delta.pow(2).sum(dim=-1)
+        banks.append(-dist2 / (2.0 * float(sigma_m) ** 2))
+    return torch.stack(banks, dim=0)
+
+
+def _lattice_xy(num: int, pc_range: Sequence[float], shift: float) -> torch.Tensor:
+    """``[R, 2]`` as ``(x_right, y_forward)`` inside ``pc_range``."""
+    cols = int(math.ceil(math.sqrt(num)))
+    rows = int(math.ceil(num / cols))
+    x_min, y_min, _, x_max, y_max, _ = (float(v) for v in pc_range)
+    x_pad = (x_max - x_min) / 8.0
+    y_pad = (y_max - y_min) / 8.0
+    xs = torch.linspace(x_min + x_pad, x_max - x_pad, cols)
+    ys = torch.linspace(y_min + y_pad, y_max - y_pad, rows)
+    if cols > 1:
+        xs = xs + shift * 0.5 * (xs[1] - xs[0])
+    if rows > 1:
+        ys = ys + shift * 0.5 * (ys[1] - ys[0])
+    xs = xs.clamp(x_min + x_pad * 0.5, x_max - x_pad * 0.5)
+    ys = ys.clamp(y_min + y_pad * 0.5, y_max - y_pad * 0.5)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    return torch.stack((grid_x.reshape(-1), grid_y.reshape(-1)), dim=-1)[:num]
 
 
 def _layernorm(tokens: torch.Tensor) -> torch.Tensor:

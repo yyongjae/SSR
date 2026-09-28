@@ -114,7 +114,7 @@ Train-only `BEVRegisterSelector`. 입력은 planner가 이미 받는 것과 같�
 
 Teacher BEV는 고르는 데 쓰지 않는다. Teacher는 모을 때의 값으로만 들어온다.
 
-Register는 bank당 16개, 합 32개다. Object bank 16개는 BEVFusion 캐시를 읽고, map bank 16개는 ReSMap 캐시를 읽는다. 각 register는 256차원 학습 임베딩이고 초기 분포는 \(N(0, 10^{-6})\)이다.
+Register는 bank당 16개, 합 32개다. Object bank 16개는 BEVFusion 캐시를 읽고, map bank 16개는 ReSMap 캐시를 읽는다. 학습 임베딩의 초기 분포는 \(N(0, 10^{-6})\)이다. 그것만 두면 32개 attention이 같은 맵이 되고 diversity 기울기가 0이다. 그래서 각 슬롯 로짓에 전방 격자 좌표를 더한다. 4×4, 좌우 \([-24, 24]\) m, 전방 \([4, 28]\) m, 폭 6 m. 지도 bank는 물체 bank보다 격자 간격의 절반만큼 어긋난다. GT 궤적이나 GT 박스는 시작 위치가 아니다. 이 좌표 항의 세기는 step 0에서 1이고, token ramp와 같이 줄어 0.3에서 멈춘다. 0까지 내리지 않아서 슬롯이 다시 한 점에 붙지 않는다.
 
 16은 칸 수가 아니다. Register 하나가 5000칸 위의 attention이다. SSR과 DrivoR의 16은 planner가 읽는 장면 토큰 전체였다. 우리 planner는 5000칸을 그대로 보고, register는 distill을 담는 통이다. 통이 너무 적으면 앞 32 m × 좌우 64 m 안의 차가 한 토큰에 섞인다. Bank당 8개는 그 쪽에 걸친다. DrivoR은 카메라당 16과 32 사이에서 점수가 멈췄다. 32를 넘기면 diversity가 빈 구석으로 슬롯을 밀고, \(w_k\)가 그 슬롯을 꺼서 손실만 늘어난다. 그래서 기본은 bank당 16이고, ablation은 bank당 8, 16, 32이다. 추론 비용은 어느 쪽이든 0이다.
 

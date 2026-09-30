@@ -124,6 +124,11 @@ class PlanningDistillation(nn.Module):
         selector_tok_warmup_steps: int = 53195,
         selector_channels: int = 256,
         selector_commands: int = 4,
+        selector_anchor_sigma: float = 6.0,
+        selector_anchor_sigma_end: float = 2.0,
+        selector_anchor_floor: float = 0.05,
+        selector_plan_tau: float = 0.3,
+        selector_struct_mix: float = 0.5,
     ) -> None:
         super().__init__()
         if not branches:
@@ -169,6 +174,11 @@ class PlanningDistillation(nn.Module):
         self.selector_tok_warmup_steps = int(selector_tok_warmup_steps)
         self.selector_channels = int(selector_channels)
         self.selector_commands = int(selector_commands)
+        self.selector_anchor_sigma = float(selector_anchor_sigma)
+        self.selector_anchor_sigma_end = float(selector_anchor_sigma_end)
+        self.selector_anchor_floor = float(selector_anchor_floor)
+        self.selector_plan_tau = float(selector_plan_tau)
+        self.selector_struct_mix = float(selector_struct_mix)
 
         self.adapters = nn.ModuleDict()
         self.stores: Dict[str, TeacherFeatureStore] = {}
@@ -248,6 +258,11 @@ class PlanningDistillation(nn.Module):
                 pc_range=self.pc_range,
                 div_sigma_m=self.selector_div_sigma,
                 tok_warmup_steps=self.selector_tok_warmup_steps,
+                anchor_sigma_m=self.selector_anchor_sigma,
+                anchor_sigma_end_m=self.selector_anchor_sigma_end,
+                anchor_floor=self.selector_anchor_floor,
+                plan_tau=self.selector_plan_tau,
+                struct_mix=self.selector_struct_mix,
             )
 
     # ------------------------------------------------------------------ #
@@ -491,6 +506,7 @@ class PlanningDistillation(nn.Module):
         if self.selector_mode:
             return self._selector_forward(
                 student_bev, tokens, plan_attn, command, ego_status,
+                gt_boxes, gt_valid, gt_map_pts, gt_map_labels, gt_map_valid,
             )
         student_map = bev_tokens_to_map(student_bev, self.student_bev_size)
         traj = None
@@ -584,6 +600,39 @@ class PlanningDistillation(nn.Module):
                 metrics["distill_plan_look"] = look.detach()
         return losses, metrics
 
+    def _selector_structure(
+        self,
+        student_bev: torch.Tensor,
+        gt_boxes: Optional[torch.Tensor],
+        gt_valid: Optional[torch.Tensor],
+        gt_map_pts: Optional[torch.Tensor],
+        gt_map_labels: Optional[torch.Tensor],
+        gt_map_valid: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Agent occupancy and the road-boundary ring, flattened to ``[B, HW]``.
+
+        Current boxes only. The ring is the morphological boundary of the road
+        splat. Neither one is the GT trajectory corridor.
+        """
+        height, width = self.student_bev_size
+        extras = self._aux_rasters(
+            height, width, gt_boxes, gt_valid, None, None,
+            gt_map_pts, gt_map_labels, gt_map_valid, {},
+            want_agent=True, want_map=True,
+        )
+
+        def _flat(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if mask is None:
+                return None
+            flat = mask.detach().flatten(2).squeeze(1)
+            if flat.shape[-1] != height * width:
+                raise ValueError(
+                    f"structure length {flat.shape[-1]} != {height * width}"
+                )
+            return flat.to(device=student_bev.device, dtype=student_bev.dtype)
+
+        return _flat(extras.get("agent")), _flat(extras.get("boundary"))
+
     def _selector_forward(
         self,
         student_bev: torch.Tensor,
@@ -591,6 +640,11 @@ class PlanningDistillation(nn.Module):
         plan_attn: Optional[torch.Tensor],
         command: Optional[torch.Tensor],
         ego_status: Optional[torch.Tensor],
+        gt_boxes: Optional[torch.Tensor] = None,
+        gt_valid: Optional[torch.Tensor] = None,
+        gt_map_pts: Optional[torch.Tensor] = None,
+        gt_map_labels: Optional[torch.Tensor] = None,
+        gt_map_valid: Optional[torch.Tensor] = None,
     ):
         if self.selector is None:
             raise RuntimeError("selector distillation was not constructed")
@@ -609,8 +663,11 @@ class PlanningDistillation(nn.Module):
                     teacher_map, size=student_hw, mode="bilinear", align_corners=False,
                 )
             teachers.append(bev_map_to_tokens(teacher_map))
+        structure = self._selector_structure(
+            student_bev, gt_boxes, gt_valid, gt_map_pts, gt_map_labels, gt_map_valid,
+        )
         return self.selector(
-            student_bev, teachers, plan_attn, command, ego_status,
+            student_bev, teachers, plan_attn, command, ego_status, structure,
         )
 
 
@@ -665,6 +722,13 @@ def build_planning_distillation(config):
         ),
         selector_channels=int(getattr(config, "embed_dims", 256)),
         selector_commands=int(getattr(config, "num_navi_cmd", 4)),
+        selector_anchor_sigma=float(getattr(config, "distill_selector_anchor_sigma", 6.0)),
+        selector_anchor_sigma_end=float(
+            getattr(config, "distill_selector_anchor_sigma_end", 2.0)
+        ),
+        selector_anchor_floor=float(getattr(config, "distill_selector_anchor_floor", 0.05)),
+        selector_plan_tau=float(getattr(config, "distill_selector_plan_tau", 0.3)),
+        selector_struct_mix=float(getattr(config, "distill_selector_struct_mix", 0.5)),
     )
     module.validate_manifests(config)
     return module

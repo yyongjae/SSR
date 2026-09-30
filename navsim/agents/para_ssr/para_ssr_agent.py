@@ -450,9 +450,13 @@ class ParaSSRAgent(AbstractAgent):
                 **distill_kwargs,
             )
             weight = self._config.distill_loss_weight
+            distill_sum = None
             for name, value in distill_losses.items():
                 loss = loss + weight * value
                 logs[name] = value.detach()
+                distill_sum = value if distill_sum is None else distill_sum + value
+            if distill_sum is not None:
+                self._log_distill_bev_grad(predictions, weight * distill_sum, logs)
             logs.update({k: v.detach() for k, v in distill_metrics.items()})
             head_kd = self._distill_aux_head_kd(predictions)
             for name, value in head_kd.items():
@@ -461,6 +465,40 @@ class ParaSSRAgent(AbstractAgent):
 
         self.latest_logs = logs
         return loss
+
+    def _log_distill_bev_grad(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        distill_loss: torch.Tensor,
+        logs: Dict[str, torch.Tensor],
+    ) -> None:
+        """``||d L_distill / d bev_embed||`` on the same cadence as ``gnorm/plan``.
+
+        Kept out of ``gshare``. Cover and diversity do not reach ``bev_embed``,
+        so this is the per-cell match. Shares stay plan / det / map.
+        """
+        bev = predictions.get("bev_embed")
+        interval = int(getattr(self._config, "grad_norm_log_interval", 0) or 0)
+        if (
+            bev is None
+            or interval <= 0
+            or not self.training
+            or not isinstance(distill_loss, torch.Tensor)
+            or not distill_loss.requires_grad
+            or not bev.requires_grad
+        ):
+            return
+        step = int(getattr(self._loss, "iteration", 1)) - 1
+        if step % interval != 0:
+            return
+        grad = torch.autograd.grad(
+            distill_loss, bev, retain_graph=True, allow_unused=True
+        )[0]
+        norm = 0.0 if grad is None else float(grad.detach().norm())
+        from .modules.grad_balance import all_reduce_mean
+
+        reduced = all_reduce_mean({"distill": norm}, bev.device)
+        logs["gnorm/distill"] = bev.new_tensor(float(reduced["distill"]))
 
     def _distill_aux_head_kd(
         self, predictions: Dict[str, torch.Tensor]

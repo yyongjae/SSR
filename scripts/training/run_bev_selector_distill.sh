@@ -88,7 +88,7 @@ if [[ "${WANDB}" != "0" ]]; then
     "wandb.project=${WANDB_PROJECT}"
     "wandb.group=${WANDB_GROUP}"
     "wandb.name=${run_name}"
-    "wandb.tags=[bev-selector,r50,stage-one]"
+    "wandb.tags=[bev-selector,r34,v2]"
   )
 fi
 

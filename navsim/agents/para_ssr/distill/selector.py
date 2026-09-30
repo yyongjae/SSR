@@ -4,9 +4,10 @@ The deployed student is unchanged. These registers are not a planner and are
 not read at inference. They choose where a frozen teacher supervises
 ``bev_embed``, on top of the student's own plan / det / motion / map losses.
 
-The attention that picks cells is trained by planner-attention coverage and a
-spatial diversity penalty. The feature match uses that attention detached, so
-the registers cannot lower the match loss by sliding onto easy cells.
+v2 matches teacher features per cell. Attention is detached, so the registers
+cannot lower the match by sliding onto easy cells. Coverage chases a sharpened
+planner map mixed with a bank structure prior, not a pooled token and not the
+GT trajectory. See ``docs/bev_selector_v2.md``.
 """
 from __future__ import annotations
 
@@ -38,7 +39,10 @@ class BEVRegisterSelector(nn.Module):
         div_sigma_m: float = 4.0,
         tok_warmup_steps: int = 53195,
         anchor_sigma_m: float = 6.0,
-        anchor_floor: float = 0.3,
+        anchor_sigma_end_m: float = 2.0,
+        anchor_floor: float = 0.05,
+        plan_tau: float = 0.3,
+        struct_mix: float = 0.5,
     ) -> None:
         super().__init__()
         if num_registers < 2:
@@ -52,7 +56,16 @@ class BEVRegisterSelector(nn.Module):
         self.div_sigma_m = float(div_sigma_m)
         self.tok_warmup_steps = max(int(tok_warmup_steps), 1)
         self.anchor_sigma_m = float(anchor_sigma_m)
+        self.anchor_sigma_end_m = float(anchor_sigma_end_m)
         self.anchor_floor = float(anchor_floor)
+        self.plan_tau = float(plan_tau)
+        self.struct_mix = float(struct_mix)
+        if not 0.0 <= self.struct_mix <= 1.0:
+            raise ValueError(f"struct_mix must be in [0, 1], got {struct_mix}")
+        if self.plan_tau <= 0.0:
+            raise ValueError(f"plan_tau must be positive, got {plan_tau}")
+        if self.anchor_sigma_end_m <= 0.0 or self.anchor_sigma_m <= 0.0:
+            raise ValueError("anchor sigma must be positive")
 
         registers = torch.randn(2, self.num_registers, self.channels) * 1e-6
         self.registers = nn.Parameter(registers)
@@ -68,15 +81,30 @@ class BEVRegisterSelector(nn.Module):
         self.register_buffer("cell_xy", coords, persistent=False)
         # Fixed front-grid places. Identical N(0, 1e-6) queries make every
         # attention the same map, and diversity then has zero gradient.
+        # Distances stay here; the gaussian width is applied in ``attend``.
         self.register_buffer(
-            "anchor_logits",
-            anchor_logit_bias(coords, self.num_registers, self.pc_range, self.anchor_sigma_m),
+            "anchor_dist2",
+            anchor_dist2(coords, self.num_registers, self.pc_range),
             persistent=False,
         )
 
     def ramp(self) -> torch.Tensor:
         """0 at step 0, 1 once ``tok_warmup_steps`` forwards have run."""
         return (self.steps.float() / float(self.tok_warmup_steps)).clamp(0.0, 1.0)
+
+    def anchor_sigma(self) -> torch.Tensor:
+        """6 m at step 0, 2 m once the token ramp finishes."""
+        ramp = self.ramp()
+        return self.anchor_sigma_m + (self.anchor_sigma_end_m - self.anchor_sigma_m) * ramp
+
+    def anchor_mix(self) -> torch.Tensor:
+        """1 at step 0, then down to ``anchor_floor`` on the same ramp.
+
+        This is a probability mixture weight, not a logit scale. Scaling the
+        logits by a small floor would widen the softmax.
+        """
+        ramp = self.ramp()
+        return self.anchor_floor + (1.0 - self.anchor_floor) * (1.0 - ramp)
 
     def command_prior(self, command: torch.Tensor) -> torch.Tensor:
         """Wide forward wedge in SSR metres. Not the GT trajectory.
@@ -127,11 +155,14 @@ class BEVRegisterSelector(nn.Module):
         key = self.key_proj(bev.detach())
         scale = self.channels ** -0.5
         logits = torch.einsum("bark,bnk->barn", query, key) * scale
-        # 1 at step 0, then the same warmup as token match, down to a floor.
-        # The floor stays so the slots cannot fall back onto one point.
-        alpha = self.anchor_floor + (1.0 - self.anchor_floor) * (1.0 - self.ramp())
-        logits = logits + alpha * self.anchor_logits.to(device=logits.device, dtype=logits.dtype)
-        return logits.softmax(dim=-1)
+        learned = logits.softmax(dim=-1)
+        sigma = self.anchor_sigma().to(device=logits.device, dtype=logits.dtype).clamp_min(1e-3)
+        dist2 = self.anchor_dist2.to(device=logits.device, dtype=logits.dtype)
+        anchor = (-dist2 / (2.0 * sigma * sigma)).softmax(dim=-1)
+        mix = self.anchor_mix().to(device=logits.device, dtype=logits.dtype)
+        # ``mix`` is 1 at step 0, so the lattice splits identical queries
+        # before diversity has a gradient. It stays at ``anchor_floor``.
+        return mix * anchor + (1.0 - mix) * learned
 
     def forward(
         self,
@@ -140,41 +171,58 @@ class BEVRegisterSelector(nn.Module):
         plan_attn: torch.Tensor,
         command: torch.Tensor,
         ego_status: Optional[torch.Tensor] = None,
+        structure_by_bank: Optional[Sequence[Optional[torch.Tensor]]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """Match pooled tokens and train the registers on coverage.
+        """Match cells and train the registers on coverage.
 
         ``teacher_by_bank`` is ``(bevfusion, resmap)``, each ``[B, HW, C]``
-        already on the student grid and without gradient.
+        already on the student grid and without gradient. ``structure_by_bank``
+        is ``(agent, boundary)``, each ``[B, HW]`` or ``None``.
         """
         if len(teacher_by_bank) != 2:
             raise ValueError("selector expects BEVFusion then ReSMap")
+        if structure_by_bank is None:
+            structure_by_bank = (None, None)
+        if len(structure_by_bank) != 2:
+            raise ValueError("structure_by_bank is (agent, boundary)")
         attention = self.attend(student_bev, command, ego_status)
         ramp = self.ramp()
         prior = self.command_prior(command)
-        target_p = _normalize_rows(plan_attn.detach().to(dtype=student_bev.dtype))
-        cover_target = (1.0 - ramp) * prior + ramp * target_p
-        cover_target = _normalize_rows(cover_target)
+        plan = _normalize_rows(plan_attn.detach().to(dtype=student_bev.dtype))
 
         names = ("bevfusion", "resmap")
         losses: Dict[str, torch.Tensor] = {}
-        metrics: Dict[str, torch.Tensor] = {"distill_selector_ramp": ramp.detach()}
+        metrics: Dict[str, torch.Tensor] = {
+            "distill_selector_ramp": ramp.detach(),
+            "distill_sel_anchor_sigma": self.anchor_sigma().detach(),
+            "distill_sel_anchor_mix": self.anchor_mix().detach(),
+        }
         cover_terms = []
         token_terms = []
         attentions = []
         for bank, name in enumerate(names):
             weights = attention[:, bank]
             attentions.append(weights)
+            late = late_cover_target(
+                plan, structure_by_bank[bank], tau=self.plan_tau, mix=self.struct_mix,
+            )
+            cover_target = _normalize_rows((1.0 - ramp) * prior + ramp * late)
             cover_terms.append(coverage_loss(weights, cover_target))
             teacher = teacher_by_bank[bank]
             if teacher.shape != student_bev.shape:
                 raise ValueError(
                     f"{name} tokens {tuple(teacher.shape)} != student {tuple(student_bev.shape)}"
                 )
-            token_terms.append(token_match_loss(student_bev, teacher.detach(), weights, target_p))
+            token_terms.append(token_match_loss(student_bev, teacher.detach(), weights))
             with torch.no_grad():
+                cell_w = _normalize_rows(weights.detach().sum(dim=1))
+                cos = F.cosine_similarity(
+                    _layernorm(student_bev), _layernorm(teacher), dim=-1
+                )
+                metrics[f"distill_sel_cos/{name}"] = (cell_w * cos).sum(dim=-1).mean()
                 gathered_s = torch.matmul(weights, student_bev)
                 gathered_t = torch.matmul(weights, teacher)
-                metrics[f"distill_sel_cos/{name}"] = F.cosine_similarity(
+                metrics[f"distill_sel_cos_pooled/{name}"] = F.cosine_similarity(
                     _layernorm(gathered_s), _layernorm(gathered_t), dim=-1
                 ).mean()
 
@@ -188,13 +236,12 @@ class BEVRegisterSelector(nn.Module):
         return losses, metrics
 
 
-def anchor_logit_bias(
+def anchor_dist2(
     cell_xy: torch.Tensor,
     num_registers: int,
     pc_range: Sequence[float],
-    sigma_m: float,
 ) -> torch.Tensor:
-    """``[2, R, HW]`` log-blobs on a front lattice. Bank 1 is shifted half a step.
+    """``[2, R, HW]`` squared metres to a front lattice. Bank 1 is shifted half a step.
 
     Places are the grid, not the GT trajectory or GT boxes.
     """
@@ -202,8 +249,7 @@ def anchor_logit_bias(
     for shift in (0.0, 1.0):
         anchors = _lattice_xy(num_registers, pc_range, shift)
         delta = cell_xy.unsqueeze(0) - anchors.unsqueeze(1)
-        dist2 = delta.pow(2).sum(dim=-1)
-        banks.append(-dist2 / (2.0 * float(sigma_m) ** 2))
+        banks.append(delta.pow(2).sum(dim=-1))
     return torch.stack(banks, dim=0)
 
 
@@ -242,24 +288,52 @@ def coverage_loss(attention: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     return (1.0 - F.cosine_similarity(mass, goal, dim=-1)).mean()
 
 
+def sharpen_rows(mass: torch.Tensor, tau: float) -> torch.Tensor:
+    """Sharpen a non-negative ``[..., HW]`` map. ``tau`` < 1 peaks it."""
+    powered = mass.clamp_min(0).clamp_min(1e-8).pow(1.0 / float(tau))
+    return _normalize_rows(powered)
+
+
+def late_cover_target(
+    plan: torch.Tensor,
+    structure: Optional[torch.Tensor],
+    tau: float,
+    mix: float,
+) -> torch.Tensor:
+    """Sharpened planner mass, mixed with one bank's structure prior.
+
+    ``plan`` and ``structure`` are ``[B, HW]``. An empty structure row keeps
+    the sharpened planner map. This is not the GT trajectory.
+    """
+    sharp = sharpen_rows(plan, tau)
+    if structure is None or float(mix) <= 0.0:
+        return sharp
+    struct = structure.detach().to(dtype=sharp.dtype)
+    if struct.shape != sharp.shape:
+        raise ValueError(
+            f"structure {tuple(struct.shape)} != plan {tuple(sharp.shape)}"
+        )
+    mass = struct.clamp_min(0).sum(dim=-1, keepdim=True)
+    struct_n = _normalize_rows(struct.clamp_min(0))
+    mixed = (1.0 - float(mix)) * sharp + float(mix) * struct_n
+    mixed = torch.where(mass <= 1e-6, sharp, mixed)
+    return _normalize_rows(mixed)
+
+
 def token_match_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
     attention: torch.Tensor,
-    plan_attn: torch.Tensor,
 ) -> torch.Tensor:
-    """Pooled LN match. Attention is detached, so this loss does not move it.
+    """Per-cell LN MSE. Attention is detached, so this loss does not move it.
 
-    ``student`` and ``teacher`` are ``[B, HW, C]``. Registers the planner does
-    not read contribute nothing, via ``w_k = <A_k, P>``.
+    ``student`` and ``teacher`` are ``[B, HW, C]``. ``attention`` is ``[B, R, HW]``.
+    The cell weight is the normalised sum of the bank's registers. The square
+    is averaged over channels so the scale does not grow with ``C``.
     """
-    weights = attention.detach()
-    student_tok = _layernorm(torch.matmul(weights, student))
-    teacher_tok = _layernorm(torch.matmul(weights, teacher))
-    per_register = (student_tok - teacher_tok).pow(2).mean(dim=-1)
-    importance = (weights * plan_attn.detach().unsqueeze(1)).sum(dim=-1)
-    importance = importance / importance.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-    return (importance * per_register).sum(dim=-1).mean()
+    cell_w = _normalize_rows(attention.detach().sum(dim=1))
+    per_cell = (_layernorm(student) - _layernorm(teacher)).pow(2).mean(dim=-1)
+    return (cell_w * per_cell).sum(dim=-1).mean()
 
 
 def diversity_loss(

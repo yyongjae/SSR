@@ -6,6 +6,12 @@
 
 갱신 2026-10-03 (§9 추가): "받고 → 캐싱 → 원본 지우기"가 가능한지 보려고 OpenScene archive 구조를 쟀다. HF에서 archive 0쌍 전체와 400개 archive의 앞 2 MB를 스트리밍으로 읽었다(네트워크 약 10.3 GB, 디스크에 저장한 archive 바이트 없음). 이 측정으로 바뀐 §0·§3·§7-2의 수치에는 "(§9에서 갱신)"을 붙였다. GPU와 잡은 쓰지 않았다.
 
+갱신 2026-10-03 (§10 추가): 사용자 결정(아래 상자)에 맞춰 운영안을 §10으로 확정했다. §9-8에서 [새 코드]였던 목록 생성기와 스트리밍 추출기를 구현하고 시험했다(합성 서버 시험 28/28, HF 실제 archive 쌍 #146 시험 통과). 시험은 scratch 폴더에만 풀었고 `/home/external-user/{navsim,datasets,ssd}`의 기존 데이터에는 쓰지 않았다. GPU는 쓰지 않았다. 바뀐 §0·§3·§4 단계 2·§7-2·§9-0·§9-8에는 "(§10에서 확정)"을 붙였고, 이전 분석은 지우지 않았다.
+
+검토 2026-10-03 (§10): §10의 명령을 스크립트 인자·동작과 대조하고(`--help`, 목록 생성기 재실행, TEST A 재실행 28/28) 수치를 `summary.json`과 시험 로그에 다시 맞췄다. 고친 것: §10-3에 `TOK`/`HS`/`NGPU` 변수(7번이 navtrain 5 s 입력으로 고정돼 있던 문제), 4번의 "8개 스트림" 표현, 6번 `kept_files` 식, §4 단계 0 이관 목록에 `xfer/` 추가, `stream_extract.sh`의 반영 실패 시 상태 JSON 처리(§10-5 5번), §7-1·§8의 해소된 항목 표시.
+
+갱신 2026-10-03 (§10-7 ReSMap): 사용자 요청("ReSMap도 적용 가능하게 데이터 구성")에 맞춰 ReSMap 미래 추론에 필요한 데이터를 §10-7로 정리했다. `make_needed_files.py`에 B 방식(log 전 프레임 3캠) 옵션 `--resmap-full-logs`를 더했고, 옵션 없이 돌린 목록은 이전과 바이트 단위로 같음을 확인했다(E2E 4 s, navtrain 5 s). §10-0, §10-1 3번, §10-3 1번을 함께 고쳤다.
+
 **표기**
 - [실측]: 파일이나 로그에서 직접 확인한 값, 또는 기존 파일을 CPU로 전수 계산한 값
 - [재구성]: 2026-09-27 세션 기록에서 되살린 명령이나 값
@@ -13,17 +19,31 @@
 - [추론]: 근거는 있지만 검증하지 않은 판단
 - [제안]: 아직 실행하지 않은 절차
 - [새 코드]: 지금 저장소에 없어서 새로 써야 하는 코드
+- [구현·시험됨]: 이전에 [새 코드]였고 지금은 구현해 시험까지 한 코드. 시험 범위는 §10-5에 적었다
 
 **읽는 순서**
 - 처음 보는 세션: §0 → §1 → §3 → §7
 - 세팅을 할 때: §2 → §4 → §6
-- 센서를 받아 캐싱한 뒤 원본을 지울 계획일 때: §9 (§4 단계 2보다 우선)
+- **센서를 받아 캐싱할 때: §10** (확정 운영안. §4 단계 2와 §9-8보다 우선)
+- 전송량·archive 구조의 근거와 "원본 삭제" 분석: §9
+
+> **결정 (2026-10-03, 사용자)**
+> - OpenScene v1.1 trainval 센서 원본(400개 archive, 2,124 GB)은 **저장하지 않는다.**
+> - archive는 스트리밍으로 받는다. 받는 동안 **캐싱에 필요한 파일만 풀어 보관**하고, 나머지는 스트림에서 바로 버린다. archive 바이트는 디스크에 쓰지 않는다.
+> - 풀어 둔 파일은 캐싱 뒤에도 남기는 것이 기본값이다. 그래서 teacher·config·BEV 저장 여부는 다시 받지 않고 바꿀 수 있다. 되돌릴 수 없는 것은 버린 부분(나머지 5캠, 고른 범위 밖 프레임)뿐이다.
+> - **ReSMap도 적용할 수 있게 구성한다**(사용자 요청). ReSMap 입력은 BEVFusion과 같은 앞카메라 3장(+위성)이라, 같은 추출본으로 충분하다(A 방식, 추가 0 GB). 자세한 것은 §10-7.
+> - 운영안·명령·검증 기준·시험 결과·남은 결정은 **§10**에 있다. 구현된 도구(`SSR/tools/future_teacher_cache/xfer/`): `make_needed_files.py`, `stream_extract.sh`, `rstream.py`.
 
 **전제:** 새 서버에는 NAVSIM 다운로드, 현재 프레임 teacher 캐시(`cache_{train,val}_50x100`, ReSMap root + navtest)가 있다. 나머지 캐시는 `report/39_new_server_setup_runbook.md`(이하 39)대로 다시 만든다. 경로는 옛 서버와 같은 절대경로라고 가정한다(39 §3.2).
 
 ---
 
 ## 0. 요약
+
+**확정된 것 (2026-10-03, §10)**
+- 다운로드 방식: 선택지 B(전부 스트리밍하되 필요한 파일만 추출)로 한다. 원본 archive는 저장하지 않고, 풀어 낸 필요 파일은 보관한다.
+- 전송량은 어느 범위든 2,124 GB다. 보관하는 센서는 E2E 4 s 약 159 GB, navtrain 5 s 약 227 GB다(S1, F0/L0/R0 + lidar + sweep) [추정, 목록 생성기 실측 파일 수 × archive 0 평균 크기].
+- 도구는 구현·시험했다(§10-5). 남은 결정은 범위(E2E 4 s / navtrain 5 s), 카메라(3 / 8캠), ReSMap 연속 구간 필요 여부다(§10-1).
 
 **무엇인가**
 - 학습 때만 **미래 정보**(t+0.5 … t+4 s)를 써서 target을 만든다. 추론 때 학생은 지금처럼 현재·과거 카메라만 본다(LUPI).
@@ -55,7 +75,9 @@
    - **전송량은 2,124 GB(camera 1,242 + lidar 882, tgz 기준)다 [실측, HF API] (§9에서 갱신, 이전 값 "약 1.6–2.25 TB [추정]").** 35 §0-2의 1.6 TB는 틀렸다. 2.25 TB는 전부 풀었을 때의 크기로 맞다(실측 프레임당 크기로 약 2.25 TB).
    - archive와 log의 공식 대응표가 있고(`openscene_sensor_trainval_0-199.json`), archive는 log 단위로 정렬돼 있다. **그러나 stage-T·E2E·navtrain 어느 집합이든 400개 archive가 모두 필요하다.** 필요한 log만 골라 받아도 줄지 않는다 [실측] (§9에서 갱신).
    - 시간은 10 MB/s면 약 59 h, 50 MB/s면 약 11.8 h, 100 MB/s면 약 5.9 h다 [추정] (§9에서 갱신). 이 서버에서 HF로 잰 값은 스트림당 1.2–2.75 MB/s, 합산 약 4–5.6 MB/s였다(약 148 h). 새 서버 값은 모른다.
+   - (§10-5에서 추가) 구현한 도구로 archive 쌍 #146을 받았을 때는 camera 1.35, lidar 0.67 MB/s, 2스트림 합산 1.64 MB/s였다. 이 속도면 전체가 약 15일이다. 그래서 새 서버에서 대역폭과 병렬 수를 먼저 잰다(§10-3 3–4번).
 2. **디스크:** 스트리밍 추출로 필요한 파일만 남기면 센서는 106–190 GB다 [추정]. teacher npz는 `--drop-bev`면 약 10 GB, BEV까지 저장하면 약 300 GB다 [추정]. **원본은 캐싱이 끝나면 지울 수 있다.** archive 쌍 단위로 받기 → 추론 → 지우기를 돌리면 원본이 동시에 디스크에 있는 양은 수–수십 GB다 (§9에서 갱신).
+   - (§10에서 확정) 원본 archive는 디스크에 쓰지 않는다. 풀어 낸 필요 파일(106–227 GB)은 캐싱 뒤에도 남긴다. 그래서 `--drop-bev`가 안전한 기본값이 된다(bev가 필요해지면 남긴 파일로 다시 추론). 새 서버 합계는 `--drop-bev` 기준 E2E 4 s 약 1.67 TB, navtrain 5 s 약 1.75 TB다(§10-2).
 3. **GPU 시간은 작다:** navtrain 4 s 전체가 전용 GPU 1장으로 약 2.7 h다 [추정, 11.6 frame/s]. 11.6은 전용 GPU 실측이 아니다. 공유 GPU 두 프로세스의 실측 5.7–5.8 task/s(`logs/cache_gpu{0,1}.log`)를 합한 값과 같다. 다만 GPU를 공유하면 18.5 GB 메모리 문제가 다시 생긴다.
 4. **ReSMap 미래**(F5 계열에만 필요): 공동연구자 환경에 의존한다. torch 1.12 env, checkpoint, 위성 타일, infos가 kyungmin 서버에 있고, sm_120에서는 돌지 않는다.
 
@@ -205,7 +227,7 @@
 | | 내용 | 전송량 | 새로 쓰는 디스크 | 시간 | GPU | 주요 위험 | 과학적 의미 |
 |---|---|---|---|---|---|---|---|
 | **A. OpenScene 전체 다운로드 + 전체 추출** | `download_trainval.sh` 그대로 | **2,124 GB** [실측] (§9에서 갱신) | 약 2.25 TB(센서) + npz 10–300 GB | 10 MB/s 기준 약 59 h. 50 MB/s면 약 11.8 h (§9에서 갱신) | navtrain 4 s 2.7 GPU-h (전용) | 디스크 부족. 기존 `trainval_sensor_blobs`와 섞여 덮어쓸 위험 | 무엇이든 할 수 있다(F1–F5, 모든 split) |
-| **B. 전부 받되 필요한 파일만 스트리밍 추출** | Range 재개 스트리머 `\| tar -xz -T needed.txt` (§9-8에서 갱신, 이전: `wget -O- … \| tar`) | A와 같음(400개 archive 전부, 2,124 GB [실측]) | E2E 4 s 159 GB, stage-T만 106 GB (+ npz). archive 쌍 단위로 처리하고 지우면 동시 최대 수–수십 GB (§9에서 갱신) | A와 같음 | A와 같음 | 파일 목록 생성기가 필요함 [새 코드]. tar가 "Not found in archive"로 exit 2를 내므로 무시 처리가 필요함(archive별 목록이면 exit 2는 진짜 누락이다, §9-8). 이어받기 없는 `curl | tar`는 끊겼다(HTTP/2 exit 92 실측, §9-1). wget은 기본으로 Range 재시도를 한다(로컬 확인, HF 미시험) | A와 같음. 다만 원본을 지우면 범위를 넓힐 때 다시 받아야 함(§9-5) |
+| **B. 전부 받되 필요한 파일만 스트리밍 추출 [선택됨, §10에서 확정]** | Range 재개 스트리머 `\| tar -xz -T needed.txt` (§9-8에서 갱신, 이전: `wget -O- … \| tar`) | A와 같음(400개 archive 전부, 2,124 GB [실측]) | E2E 4 s 159 GB, stage-T만 106 GB (+ npz). archive 쌍 단위로 처리하고 지우면 동시 최대 수–수십 GB (§9에서 갱신) | A와 같음 | A와 같음 | 파일 목록 생성기가 필요함 [새 코드]. tar가 "Not found in archive"로 exit 2를 내므로 무시 처리가 필요함(archive별 목록이면 exit 2는 진짜 누락이다, §9-8). 이어받기 없는 `curl | tar`는 끊겼다(HTTP/2 exit 92 실측, §9-1). wget은 기본으로 Range 재시도를 한다(로컬 확인, HF 미시험) | A와 같음. 다만 원본을 지우면 범위를 넓힐 때 다시 받아야 함(§9-5) |
 | **B'. 필요한 log가 든 archive만 받기** | archive와 log의 대응을 먼저 확인 | **절약 0: 어느 집합이든 400개 전부 필요** [실측] (§9에서 갱신) | B와 같음 | B와 같음 | 같음 | archive는 log 단위가 맞지만, 필요한 log가 200쌍 전부에 퍼져 있다(§9-1). B'는 B와 같아진다 | B와 같음 |
 | **C1. navtest만 (34 단계 A식 진단)** | 다운로드 없음 | 0 | npz 1.1 GB(`--drop-bev`) / 34 GB | 준비 반나절 [추정] | 12,900프레임, 전용 약 19분, 공유 약 37분 | 학습이 없다. 학습된 E2E 궤적(E0 navtest 궤적)을 전제로 하므로 사용자 요구 4와 충돌 [35 §0-1] | H1: "미래 프레임 teacher 출력이 교정 정보로 쓸 만한가"만 답한다. teacher-미래 vs GT-미래 vs 등속 비교 |
 | **C2. navtrain 중 이미 디스크에 있는 것만** | sweep까지 있는 약 10,407프레임 | 0 | 약 1 GB / 28 GB | – | 약 15분 | 4 s 전부가 있는 token은 BEV∪디스크 기준 30.1%가 상한이고, sweep 누락으로 더 줄어든다 [미계산]. 위치 편향 가능성(history가 겹치는 위치에 몰림) [추론] | 파일럿 정도만 된다. KD를 그 token에만 걸 수는 있다(§5-4). 그러나 편향된 부분집합이다 |
@@ -213,6 +235,7 @@
 | **E. 장면 샘플링 + B** | 34 §1-1: navtrain 2–3만 장면 | B와 같음(센서가 archive에 섞여 있으므로) | stage-T 집합이면 106 GB(§2-4). 2–3만 장면을 stage-T처럼 흩어 뽑으면 약 80–120 GB [추정: 프레임 × DL 비율 0.84 × 2.023 MB] | B와 같음 | stage-T 집합이면 62,629프레임, 전용 약 1.5 GPU-h. 2–3만 장면이면 약 4.8–7.1만 프레임 [추정] | 전송량은 줄지 않는다. 34 §1-1의 "2.5–3.5만 프레임"은 navtrain 전체 값(11.6만)을 장면 수에 비례해 줄인 것이라 과소다. 표본에서는 이웃 token끼리 미래 프레임을 덜 공유한다(stage-T: token당 2.38 프레임, navtrain 전체: 1.09). stage-T 집합(26,366 token)을 그대로 쓰면 자연스러운 표본이 된다 | stage-T 교정기 학습에는 충분하다. E2 KD는 85,109 중 일부에만 걸린다 |
 
 **정리 [추론]**
+- **(§10에서 확정)** 사용자가 B를 골랐다. 원본은 저장하지 않고, 풀어 낸 필요 파일은 보관한다. 파일 목록 생성기와 스트리밍 추출기는 구현·시험됐다(§10-5). "tar exit 2 무시 처리"는 필요 없어졌다: 목록이 archive별이라 exit 2와 "Not found"는 실패로 처리한다. 범위(E2E 4 s / navtrain 5 s)는 §10-1에서 정한다. 아래 문장들은 결정 전 분석이다.
 - 다운로드가 필요한 선택지(A/B/B'/E)는 전송량이 **같다(2,124 GB, §9에서 갱신)**. 다른 것은 디스크 사용량뿐이다. 원본을 계속 보관할 필요는 없다. 받기 → 캐싱 → 지우기 운영안은 §9에 있다. 다운로드를 하기로 하면 **B를 E2E 4 s 집합 기준으로 한 번에 하는 것**이 범위를 나중에 넓힐 필요가 적다.
 - 다운로드 없이 할 수 있는 것은 C1(진단), C2(편향된 파일럿), D(GT 특권)뿐이다.
 - C1과 D는 서로 독립이라 병행할 수 있다.
@@ -225,6 +248,7 @@
 **실행 순서 (검증 단계에서 고침):** 0 → 1 → 3 → 4 → (2, 다운로드할 때만) → 5 → 6 → 7 → 8 → (9) → 10.
 - 단계 2-2의 파일 목록 생성기는 단계 3이 만드는 `future_*.yaml`(또는 걸러 낸 yaml)이 필요하다. 그래서 단계 3이 단계 2보다 먼저다.
 - 단계 4(재현 검증)는 bevfusion `data/navsim` symlink와 `infos/validate_test.pkl`이 필요하다. 둘 다 단계 4 안에서 만든다.
+- (§10에서 확정) 다운로드하는 경우 단계 2는 §10-3을 따른다. 전송이 수일 걸릴 수 있으므로 단계 0 → 3 다음에 바로 전송을 시작하고, 단계 1·4는 전송하는 동안 병행한다. 단계 5–7은 전송과 전역 완결성 검사(§10-3 7번)가 끝난 뒤에 한다.
 - 다운로드하지 않는 길(C1 navtest, P1)은 단계 2를 건너뛴다. P1만 할 때는 단계 1–7도 필요 없다(단계 8의 GT source와 단계 10만). 대신 stage T 학습 데이터(39 §6.3 경로 B: drafts, labels, pack, train/dev objects)가 있어야 한다.
 
 변수는 39 §0.5를 따른다. 추가 변수는 아래와 같다.
@@ -244,6 +268,7 @@ BPY=/home/external-user/miniconda3/envs/bevfusion/bin/python
 | `$BF` working tree 전체(`runs`, `data` 제외, `.git`·`build/` 포함 약 918 MB) 또는 `git diff` + untracked 2개(`tools/cache_teacher_bev.py`, `chain_stage2.sh`) | 캐시를 만든 코드는 커밋 `cf3e02a`가 아니라 그 위의 **dirty tree**(수정 10개 파일: config 4개, `navsim_dataset.py`, `transforms_3d.py`, `fov_utils.py`, `hungarian_assigner.py`, `setup_fix.md`, `docs/NAVSIM.md`)다. clone만 하면 config가 100×100(`voxel_size [0.04,0.08,0.2]`)이 된다. working tree를 통째로 옮겨도 `build/`와 `.so`는 단계 1에서 다시 빌드한다. `.git`이 없으면 manifest의 `git_commit`이 null이 된다 |
 | `$BF/data/infos/navsim_infos_val_navtest.pkl` (156,409,747 B) | 단계 4 infos 재현의 비교 기준. 위 "data 제외"에 걸리므로 따로 옮긴다 |
 | `$BF/runs/navsim-fusion-50x100/epoch_20.pth` (481,739,184 B) + `configs.yaml` | teacher 가중치와 학습 당시의 resolved config |
+| `$REPO/tools/future_teacher_cache/xfer/` 전체 (약 6 MB; `run_*/`가 생긴 뒤면 그 폴더도) | (§10에서 추가) 다운로드 도구와 출처 고정 파일. `hf/tree_*.json`(크기·`lfs.oid`), `hf/map_trainval.json`, `results/stream_test_146/extra_*_146.txt`(§10-3 3번 provenance 대조)가 여기에만 있다 |
 | (선택) `$TC/bevfusion/cache_val_50x100_future/` (1,422 npz, 3.6 GB) | navtest 실행을 11,478개로 줄인다. manifest가 없으므로 다시 돌려도 손해는 작다 |
 
 ```bash
@@ -272,32 +297,22 @@ head -c 1048576 $BF/runs/navsim-fusion-50x100/epoch_20.pth | sha256sum | cut -c1
 - config 확인 [제안]: 캐시에 쓸 config를 resolve한 결과가 `runs/navsim-fusion-50x100/configs.yaml`과 같은지, `voxel_size [0.08,0.08,0.2]`인지 본다.
 
 ### 단계 2. 센서 다운로드 (선택지 A/B/B'/E일 때만)
-1. **archive 대응 확인 [제안]:** archive 하나의 내용과 크기를 본다.
-   ```bash
-   U=https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/openscene-v1.1
-   wget -qO- $U/openscene_sensor_trainval_lidar/openscene_sensor_trainval_lidar_0.tgz | tar -tz | cut -d/ -f1-4 | sort -u | head
-   # 크기: HF API (예: https://huggingface.co/api/datasets/OpenDriveLab/OpenScene/tree/main/openscene-v1.1/openscene_sensor_trainval_lidar)
-   ```
-   - archive가 log 단위로 묶여 있으면 B'(필요한 log가 든 archive만)가 가능하다. 아니면 400개를 모두 받는다.
-2. **필요 파일 목록 [새 코드, 작음]:** `make_needed_files.py`를 만든다.
+
+**(§10에서 확정) 이 단계는 §10-3의 절차로 실행한다.** 아래 1–3은 결정 전 기록이다. 1은 §9-1에서 해소됐고, 2는 `make_needed_files.py`로 구현됐고, 3의 명령 스케치는 `stream_extract.sh`로 대체됐다. 4는 그대로 유효하다.
+
+1. **archive 대응 확인 [제안 → §9-1에서 해소]:** archive 하나의 내용과 크기를 본다. 결과: log 단위로 정렬돼 있지만 어느 집합이든 400개가 모두 필요하다. 명령 원문은 생략한다(`main` 대신 revision sha로 고정한 URL은 §9-8, §10-3).
+2. **필요 파일 목록 [새 코드 → 구현·시험됨: `$W/xfer/make_needed_files.py`, §10-3 1번]:** 아래는 원래 요구 사항이다. 구현은 이를 모두 만족한다(입력은 parquet·yaml·json·txt token 목록, sweep 포함, 디스크에 있는 파일 제외, archive별 목록).
    - 입력: `future_train.yaml`의 token과 log pkl의 `cams[*].data_path` / `lidar_path`
    - 출력: archive 안 경로(`openscene-v1.1/sensor_blobs/trainval/<log>/CAM_F0/<tok>.jpg` 형식, 실제 prefix는 위 1에서 확인)의 목록
    - 대상 범위: F0/L0/R0 + `MergedPointCloud` `.pcd`. ReSMap까지 할 계획이면 이것으로 충분하다(ReSMap은 3캠만 쓴다). 8캠이 모두 필요하면 범위를 넓힌다.
    - 집합(E2E / stage-T / navtrain)은 §7의 결정을 따른다. 입력 yaml은 단계 3에서 만든다(단계 3을 먼저 실행).
    - 각 프레임의 sweep(f−1, f−2) lidar도 목록에 넣는다. §2-1 집합에서는 추가분이 0이지만, 생성기가 직접 포함하면 집합을 바꿔도 안전하다.
-3. **스트리밍 추출 [제안]:**
-   ```bash
-   cd $DL; mkdir -p logs
-   for i in $(seq 0 199); do for m in camera lidar; do
-     wget -qO- $U/openscene_sensor_trainval_${m}/openscene_sensor_trainval_${m}_${i}.tgz \
-       | tar -xz --skip-old-files --strip-components=2 -C $DL/trainval_sensor_blobs -T needed_${m}.txt 2> logs/x_${m}_${i}.err
-     echo "$m $i ${PIPESTATUS[*]}" >> logs/dl_status.txt     # tar exit 2 ("Not found in archive")는 정상일 수 있다
-   done; done
-   ```
-   - `--strip-components=2` 뒤의 경로가 기존 구조 `trainval_sensor_blobs/trainval/<log>/...`와 맞는지 archive 1개로 먼저 확인한다.
-   - 이미 있는 파일을 덮어쓰지 않도록 `--skip-old-files`를 쓴다(위 명령에 넣었다).
+3. **스트리밍 추출 [제안 → 구현·시험됨: `$W/xfer/stream_extract.sh`, §10-3 3–6번]:** 이전의 `wget -qO- … | tar -xz --skip-old-files … -T needed_${m}.txt` 루프 스케치는 지웠다. 바뀐 점은 다음과 같다.
+   - 목록이 archive별이라 tar exit 2 / "Not found in archive"는 정상이 아니라 실패다.
+   - `--skip-old-files`로 최종 폴더에 바로 풀지 않는다. 끊긴 스트림이 잘린 파일을 남기고 재시도 때 `--skip-old-files`가 그것을 지키기 때문이다. archive별 staging 폴더에 풀고, 검사를 통과한 뒤 hard link로 옮긴다(덮어쓰기 없음, §10-5).
+   - `--strip-components=2` 뒤의 경로가 기존 구조와 맞는 것은 §9-1(archive 0)과 §10-5(#146)에서 확인했다.
    - `download_trainval.sh`를 그대로 쓰면 마지막에 `mv openscene-v1.1/meta_datas trainval_navsim_logs`, `mv openscene-v1.1/sensor_blobs trainval_sensor_blobs`를 한다. 대상 디렉터리가 이미 있으면 그 안에 `meta_datas/`, `sensor_blobs/`로 중첩돼 들어가 구조가 어긋난다. 기존 `$DL`에서 그대로 실행하지 않는다(선택지 A의 위험).
-   - 병렬로 받으려면 archive 번호로 나눠 여러 개를 띄운다.
+   - 병렬은 `stream_extract.sh -P N`으로 한다(§10-3 4번).
 4. **lidar `.bin` 변환은 하지 않는다.** 기존 캐시와 infos는 `.pcd`를 직접 읽었다. 형식을 바꾸면 §6-2 재현 검증을 다시 통과해야 한다.
 
 ### 단계 3. 미래 token 목록 (ssr env, CPU, 수 분)
@@ -347,6 +362,7 @@ CUDA_VISIBLE_DEVICES="" nice -n 10 $BPY tools/data_converter/navsim_converter.py
 - **`--check-files`는 카메라만 검사한다.** lidar와 sweep `.pcd`는 검사하지 않는다(`navsim_converter.py:259-290`).
   - 옛 서버의 `future_train.pkl` 18,482개 중 8,075개가 sweep 누락이었다. 이대로 돌리면 `loading.py:140`에서 FileNotFoundError로 죽는다.
   - 사전 검사가 필요하다 [새 코드, 작음]. infos의 `lidar_path`와 `sweeps[*].data_path`가 모두 있는지 확인하고, 없는 프레임은 빼거나 데이터를 받는다. **sweep 수를 바꿔 우회하지 않는다**(teacher 입력이 달라진다).
+  - (§10에서 확정) 다운로드 경로에서는 `make_needed_files.py` 재실행이 이 사전 검사를 대신한다(§10-3 7번). 이 스크립트는 sweep을 `navsim_converter.build_sweeps`와 같은 규칙으로 세고, 실행 프레임 중 sweep이 빠진 수(`run_frames_on_disk_missing_some_sweep`)를 낸다 [제안, 추출 후 재실행은 미시험].
 - 기대값: test 12,900 frame, 715,399 box, drop 0 [실측, 옛 서버]. train은 받은 범위에 따라 다르다.
 - **part 분할은 하지 않는다.** 아래 단계 6처럼 split당 한 번의 `-np N` 실행으로 돌린다.
 
@@ -525,8 +541,8 @@ torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
 
 | 리스크 | 근거 | 대응 |
 |---|---|---|
-| 다운로드 크기와 시간을 모름 (1.6 vs 2.25 TB, 10 MB/s) | 35 §0-2(1.6 TB, 압축 기준, 출처 미기재)와 frame 수 × 프레임당 크기 계산(2.25 TB)이 다름. 브리프의 2.1 TB는 navtrain 1,192 log 분량(669,588 frame × 3.116 MB ≈ 2.09 TB)과 맞는다. archive 크기 실측 없음 | 단계 2-1에서 archive 1개와 HF 크기 API로 먼저 잰다 |
-| 필요한 log만 받을 수 있는지 모름 | archive와 log의 대응표 없음 | 단계 2-1 |
+| 다운로드 크기와 시간을 모름 (1.6 vs 2.25 TB, 10 MB/s) | 35 §0-2(1.6 TB, 압축 기준, 출처 미기재)와 frame 수 × 프레임당 크기 계산(2.25 TB)이 다름. 브리프의 2.1 TB는 navtrain 1,192 log 분량(669,588 frame × 3.116 MB ≈ 2.09 TB)과 맞는다. archive 크기 실측 없음 | 단계 2-1에서 archive 1개와 HF 크기 API로 먼저 잰다. **(§9-1에서 해소: 2,124 GB. 시간은 새 서버 대역폭에 달림, §10-3 3–4번에서 잰다)** |
+| 필요한 log만 받을 수 있는지 모름 | archive와 log의 대응표 없음 | 단계 2-1. **(§9-1에서 해소: 대응표는 있으나 어느 집합이든 400개 전부 필요)** |
 | 공유 GPU에서 프로세스당 18.5 GB | 9/27 실측. 원인 미상 | 전용 GPU에서 돌리거나 진단 먼저 |
 | sweep 누락으로 실행 중 사망 | `--check-files`가 lidar를 검사하지 않음. 8,075/18,482 | 단계 5 사전 검사 |
 | manifest 덮어쓰기 | `run_cache.sh` part 구조 | split당 `-np N` 한 번 |
@@ -536,25 +552,28 @@ torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
 | 부분 커버리지 편향 | 4 s 전부가 있는 token이 history 겹침 위치에 몰릴 수 있음 | 편향 분석 후 사용 |
 | ReSMap 공동연구자 의존 | env, checkpoint, 타일이 kyungmin 서버에 있음 | ReSMap 미래는 필요할 때만 |
 | GT 벌점과 R_G의 정보원 중복 | 37 §12-4 | E2−E1 해석 범위를 미리 한정 |
-| 디스크 | 새 서버 여유 공간 모름 | `--drop-bev` + 3캠·lidar만 추출이면 약 170 GB(E2E) [추정] |
+| 디스크 | 새 서버 여유 공간 모름 | `--drop-bev` + 3캠·lidar만 추출이면 약 170 GB(E2E) [추정]. (§10-2에서 갱신) 보관 센서 + npz는 E2E 4 s 약 167 GB, navtrain 5 s 약 239 GB, 새 서버 합계 1.67 / 1.75 TB, 권장 약 2 TB |
 
 ### 7-2. 사용자가 정할 것
 1. **미래 정보원:** GT 미래만(P1/P3/P5-GT, 다운로드 없음) / teacher 미래(P2/P4, 다운로드) / 둘 다(P1 대 P2 비교).
-2. **다운로드 여부와 범위:** 안 함(C1/C2/D) / stage-T 집합만(약 106 GB 디스크) / E2E 4 s(약 159 GB) / navtrain 전체. 8캠을 모두 받을지(F3·ReSMap 확장 대비) 3캠만 받을지. **전송량은 어느 범위든 2,124 GB로 같다.** 그래서 범위를 넓히는 비용은 일시 디스크와 GPU 시간뿐이다(navtrain 5 s, trainval 전 프레임까지 §9-3) (§9에서 갱신).
+2. **(방식은 §10에서 확정, 범위는 §10-1에 남음)** 방식: B, 원본 저장 안 함, 풀어 낸 필요 파일 보관. 범위 기본값은 navtrain 5 s(보관 227 GB) [제안], 다른 후보는 E2E 4 s(159 GB). 카메라 기본값은 3캠 [제안]. 아래는 결정 전 문장이다.
+   **다운로드 여부와 범위:** 안 함(C1/C2/D) / stage-T 집합만(약 106 GB 디스크) / E2E 4 s(약 159 GB) / navtrain 전체. 8캠을 모두 받을지(F3·ReSMap 확장 대비) 3캠만 받을지. **전송량은 어느 범위든 2,124 GB로 같다.** 그래서 범위를 넓히는 비용은 일시 디스크와 GPU 시간뿐이다(navtrain 5 s, trainval 전 프레임까지 §9-3) (§9에서 갱신).
 3. **`--drop-bev`:** 박스만 쓸지(약 10 GB), BEV까지 저장할지(약 300 GB). P4나 H5를 할 계획이 있는지에 달려 있다.
+   - (§10에서 확정) 기본값은 `--drop-bev`다. 풀어 낸 입력을 보관하므로 이 선택은 되돌릴 수 있다. bev가 필요해지면 보관 파일로 다시 추론한다(전용 GPU 1장 약 2.2–3.2 h).
 4. **teacher 필요성 논거를 어디서 세울지:** out-of-sample 미래 품질 / 라벨 없는 장애물 / dense 미래 feature(P4) / 포기(R_G는 oracle 참고값으로만).
 5. **E2 결합 방식:** 추가(KD 3-teacher) / 교체(R_T⊕G) / KD가 아닌 aux loss(P5).
 6. **부분 커버리지 KD 허용 여부**와, 허용한다면 `kd_loss` 분모 규칙(§5-4).
 7. **34 단계 A식 navtest 진단(C1)을 E2E와 무관한 진단으로 허용할지.** 사용자 요구 3·4와의 관계를 정해야 한다.
 8. score 임계(0.3), 사각지대 처리(모름 vs 비어 있음), raster 해상도(S grid 50×100 대 경로 좌표 O(t,s)).
 9. 현재 주 라인(E1 필요, 38 §8)과의 우선순위. 미래 작업은 E1/E2 결과 뒤인지, 병행인지.
-10. **원본 센서를 캐싱 후 지울지, 지운다면 무엇을 남길지** (§9에서 추가). 원본을 지운 뒤 다시 필요해지면(§9-5: teacher·config 변경, bev 미저장 상태의 F3/P4, ReSMap 미래, 8캠) 2,124 GB를 다시 받아야 한다. 그래서 삭제 전에 확정한다(§9-4).
+10. **(§10에서 확정)** 원본 archive는 저장하지 않는다. 풀어 낸 필요 파일은 캐싱 뒤에도 남긴다(기본값. 지우려면 §10-1 4번). 그래서 아래의 "재DL" 경우 중 teacher·config 변경과 bev 미저장은 재DL 없이 처리된다. 8캠, 범위 밖 프레임, ReSMap 연속 구간만 남는다. 아래는 결정 전 문장이다.
+    **원본 센서를 캐싱 후 지울지, 지운다면 무엇을 남길지** (§9에서 추가). 원본을 지운 뒤 다시 필요해지면(§9-5: teacher·config 변경, bev 미저장 상태의 F3/P4, ReSMap 미래, 8캠) 2,124 GB를 다시 받아야 한다. 그래서 삭제 전에 확정한다(§9-4).
     - 남길 것: bev feature(E2E 4 s 248 GB), 전방 3캠(ReSMap 미래·학생 미래용 49 GB–), golden 샘플(약 3 GB)
     - 파이프라인: P-stream-all 또는 P-chunked(§9-2)
 
 **의존성상 가능한 순서 하나 [추론, 결정 아님]**
 1. 다운로드 없이: 단계 1·3·4(재현) → 단계 5–7을 test split만(navtest 미래 추론 C1, 약 20–40분) → §6-4 품질 측정 → GT raster 빌더와 R_G(P1). P1은 bevfusion 쪽(단계 1–7)과 독립이라 먼저 해도 된다.
-2. 그 결과를 보고 다운로드(B, E2E 4 s)를 할지 정한다 → R_F(P2) → E2 결합
+2. 그 결과를 보고 다운로드(B, E2E 4 s)를 할지 정한다 → R_F(P2) → E2 결합. (§10에서 갱신) 방식은 B로 확정, 범위 기본값은 navtrain 5 s(§10-1)
 
 ---
 
@@ -579,6 +598,7 @@ torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
 - `logs/{infos_test,infos_train,validate,validate50,memtest,cache_gpu0,cache_gpu1}.log`
 - `validate_out/`, `memtest_out/manifest.json`
 - 부분 캐시: `/home/external-user/datasets/teacher_cache/bevfusion/cache_val_50x100_future` (1,422 npz, manifest 없음)
+- 다운로드 도구 `xfer/` (§9, §10): `make_needed_files.py`, `stream_extract.sh`, `rstream.py`, `hf/`(tree·대응표), `tests/{flaky_server.py,test_a.sh,test_b_verify.py}`, `results/{needed_summaries/,stream_test_146/,stream_test_A.out}`
 
 **bevfusion**
 - `tools/cache_teacher_bev.py` (untracked)
@@ -605,14 +625,14 @@ torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
 - `/home/external-user/navsim/download/{download_trainval.sh,download_navtrain_hf.sh,download_test.sh}`
 
 **확인하지 못한 것** (이 문서의 수치에 영향을 줄 수 있음)
-- OpenScene archive 크기와 log 대응
-- 새 서버의 대역폭, 디스크, GPU arch
+- ~~OpenScene archive 크기와 log 대응~~ (§9-1에서 해소)
+- 새 서버의 대역폭, 디스크, GPU arch (대역폭·병렬 수는 §10-3 3–4번에서 잰다)
 - 미래 프레임에서의 teacher 정확도
 - "4 s 전부 확보 가능" 부분집합에서 sweep 누락을 뺀 실제 비율과 그 편향
 - ReSMap 처리량, ReSMap memory 리셋 구간의 정확한 정의(§2-2의 구간 수)
 - 전용 GPU에서의 BEVFusion 처리량(11.6 frame/s는 가정)과 CPU 디코딩 상한 69 frame/s의 근거
 - 18.5 GB GPU 메모리의 원인
-- `--drop-bev` npz 실제 크기 (멤버 크기에서 계산함)
+- `--drop-bev` npz 실제 크기 (멤버 크기에서 계산함. §9-8 메모: 기존 npz를 bev 없이 다시 써 보면 87,760 B, 차이 0.1%)
 
 ---
 
@@ -639,6 +659,7 @@ torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
 - S2: 새 서버에 trainval 센서가 하나도 없다.
 
 ### 9-0. 결론
+- **(§10에서 확정)** 사용자는 "원본 2 TB는 저장하지 않고, 받으면서 캐싱에 필요한 파일만 풀어 보관하고 나머지는 버린다"로 정했다. 이 절의 P-stream-all에서 "삭제" 단계를 뺀 형태다. 그래서 아래의 "지운 뒤 재DL" 위험은 보관하지 않은 부분(5캠, 범위 밖 프레임, ReSMap 연속 구간)에만 해당한다. 보관 파일까지 지우기로 할 때만 §9-4 전체가 다시 삭제 조건이 된다. 아래 분석은 근거로 남긴다.
 - **받고 → 필요한 파일만 풀고 → 캐싱 → 원본 삭제는 가능하다** [실측 근거 + 추론].
   - archive 400개가 log 단위로 정렬돼 있다. camera_i와 lidar_i에는 같은 log 6–7개가 들어 있고, log는 archive 경계를 넘지 않는다.
   - BEVFusion의 sweep(f−1, f−2)도 같은 log 안에 있다. 그래서 archive 쌍 하나만 있으면 그 log들의 추론이 끝난다.
@@ -921,6 +942,14 @@ torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
   - 근거: archive 0에서 겹치는 파일의 크기가 모두 같았다. 내용 일치는 9-4 3번으로 확인한다.
 
 ### 9-8. 명령 스케치 [제안; `make_needed_files.py`, `check_group.py`, `validate_group.py`는 새 코드]
+
+**(§10에서 확정) 실제 실행은 §10-3을 따른다.** 이 스케치는 기록용으로 남긴다. 상태는 다음과 같다.
+- (1) `make_needed_files.py`: 구현·시험됨. 인자는 아래 스케치(`--set`)와 다르다(`--tokens … --horizon-s …`, §10-3).
+- (2) `fetch()`: `stream_extract.sh`로 대체됐다. 바뀐 점: staging에 풀고 검사 뒤 hard link로 옮김(`--skip-old-files` 대신), sha256은 `rstream.py`가 직접 계산(`tee >(sha256sum)` 대신), archive별 상태 JSON과 재실행 시 완료분 건너뛰기.
+- tar 함정 하나를 구현 중에 확인했다: `-C`가 `-T`보다 뒤에 오면 tar가 오류 없이 현재 폴더에 푼다. 아래 스케치와 구현은 모두 `-C`를 앞에 둔다.
+- (3a)의 `check_group.py --all`: archive별 검사는 `stream_extract.sh`에 들어갔고, 전역 검사는 `make_needed_files.py` 재실행으로 한다(§10-3 7번).
+- (3b)·(5) P-chunked, (4) `delete_group`, `validate_group.py`: 원본을 지우지 않기로 했으므로 구현하지 않았다. 보관 파일을 나중에 지우기로 하면 그때 쓴다 [새 코드].
+
 `rstream.py`는 `$W/xfer/rstream.py`에 있다. 변수는 §4를 따른다.
 
 ```bash
@@ -1010,3 +1039,424 @@ done; run_group $PREV
 - §7-1의 "다운로드 크기와 시간을 모름"과 "필요한 log만 받을 수 있는지 모름" 두 행은 9-1로 해소됐다. 2,124 GB이고, log만 골라 받아도 절약이 0이다.
 - §8 "확인하지 못한 것"의 "OpenScene archive 크기와 log 대응"과 "`--drop-bev` npz 실제 크기"는 해소됐다. 87,886 B는 2,648,014 B에서 bev 멤버를 뺀 계산값이다. 검증 단계에서 기존 npz 3개를 bev 없이 `np.savez`로 다시 쓰면 87,760 B였다(차이 0.1%).
 - 9-1의 "log가 archive 경계를 넘지 않는다"는 archive 0과 대응표에 근거한 추론이다. P-chunked의 첫 묶음 검사(누락 0)가 이를 실제로 확인한다.
+
+---
+
+## 10. 확정 운영안: 스트리밍하며 필요한 파일만 풀어 보관
+
+작성 2026-10-03. 사용자 결정: "모든 원본 2TB 저장은 안 할 거고 캐싱에 필요한 건 저장하는 식으로 할게. 데이터 전송받으면서 필요한 데이터만 풀고 안 쓰는 건 다 버리는 식으로."
+
+- 이 절이 다운로드·추출의 실행 기준이다. §4 단계 2와 §9-8의 스케치보다 우선한다. §9-1–§9-3의 측정값은 근거로 그대로 쓴다.
+- §9-8에서 [새 코드]였던 두 도구를 구현해 이 서버에서 시험했다(§10-5). 시험은 scratch 폴더에만 풀었다. `/home/external-user/{navsim,datasets,ssd}`의 기존 데이터에는 쓰지 않았다.
+- 수치는 이 서버에서 `make_needed_files.py`로 다시 센 값이다. 새 서버도 같은 navtrain 센서 패키지와 같은 현재 프레임 캐시를 가진다(S1)고 가정한다. 새 서버에서 목록을 다시 만들면 같은 값이 나와야 한다(§10-3 1번).
+
+도구 위치: `$W/xfer/` (= `$REPO/tools/future_teacher_cache/xfer/`, untracked. 새 서버로 `$W` 전체를 옮긴다, §4 단계 0)
+
+| 파일 | 하는 일 | 상태 |
+|---|---|---|
+| `make_needed_files.py` | token 목록과 horizon을 받아, 실행할 미래 프레임과 archive별 필요 파일 목록(`needed_{camera,lidar}_<i>.txt`, 200개씩)을 만든다. sweep(f−1, f−2) 포함. 디스크에 이미 있는 파일은 뺀다. `run_frames.txt`, `run_frames.yaml`(converter `--scene-filter` 형식), `summary.json`도 쓴다 | [구현·시험됨] 전체 집합 약 4–8 s |
+| `stream_extract.sh` | archive마다 `rstream.py` → `tar -xzvv -C <staging> --strip-components=2 -T <목록>` 파이프. 검사를 통과한 archive만 hard link로 센서 폴더에 옮긴다. archive별 상태 JSON, 재실행 시 완료분 건너뛰기, `-P` 병렬 | [구현·시험됨] TEST A 28/28, TEST B 통과 |
+| `rstream.py` | HTTP/1.1 스트림을 stdout으로. 끊기면 `Range: bytes=<offset>-`로 다시 붙는다. 스트림의 sha256을 직접 계산하고, TOTAL보다 많이 쓰지 않고, Content-Range를 확인한다. 옛 사용법(`rstream.py URL TOTAL > out`)도 된다 | [구현·시험됨] 종료 코드 0 정상, 3 재시도 소진(기본 200회), 4 읽는 쪽이 닫힘, 5 서버가 너무 많이 보냄 |
+| `tests/flaky_server.py`, `tests/test_a.sh`, `tests/test_b_verify.py` | 합성 서버 시험, 실제 archive 시험 검증 | §10-5 |
+
+### 10-0. 한 줄 결론과 남기는 것·버리는 것
+
+**400개 archive(2,124 GB)를 한 번 스트리밍하면서, 실행할 미래 프레임의 F0/L0/R0 `.jpg`·`MergedPointCloud` `.pcd`와 그 sweep `.pcd` 중 디스크에 없는 것만 기존 센서 폴더에 풀어 보관한다. 나머지는 스트림에서 바로 버리고, archive 바이트는 디스크에 쓰지 않는다.**
+
+| 구분 | 무엇 | 양 (S1) |
+|---|---|---|
+| **보관** | 실행 프레임의 3캠 `.jpg` + `.pcd`, 그 프레임의 sweep `.pcd`. 모두 디스크에 없던 것만. `$DL/trainval_sensor_blobs/trainval/<log>/<CAM_xx\|MergedPointCloud>/`에 기존 파일과 같은 구조로 들어간다 | E2E 4 s: camera 235,629 + lidar 78,543 파일, 약 159 GB / navtrain 5 s: 336,021 + 112,007 파일, 약 227 GB [추정: 실측 파일 수 × archive 0 평균 크기, ±2%] |
+| **보관 (기록)** | archive별 상태 JSON(sha256, 바이트, 재시도, tar 종료 코드, 푼 파일 수·크기), `members/`(tar가 푼 파일 목록 = 나중에 지울 때의 목록), 목록·summary | 수십 MB |
+| **보관 (결과)** | teacher npz (`--drop-bev`) | E2E 4 s 8.2 GB / navtrain 5 s 11.7 GB [추정] |
+| **버림** | 같은 archive 안의 나머지 member: 다른 5개 카메라(CAM_L1, L2, R1, R2, B0) 전부, 범위 밖 프레임의 3캠·lidar, 이미 디스크에 있는 파일(덮어쓰지 않음) | 압축 기준 받은 바이트의 약 93%(E2E 4 s) / 89%(navtrain 5 s) |
+| **저장 안 함** | archive(tgz) 바이트 자체. `rstream.py` → `tar` 파이프로만 흐른다. 디스크에 생기는 것은 archive별 staging 폴더에 풀린 "목록에 있는 파일"뿐이고, 검사 뒤 hard link로 옮기고 staging은 지운다 | 0 (staging은 동시에 최대 P × archive당 필요분, 대부분 1 GB 미만, 최대 2.7 GB) |
+
+**보관하기 때문에 생기는 결과 [추론]**
+- **되돌릴 수 있는 것** (다시 받지 않고 보관 파일로 다시 추론하면 된다. 전용 GPU 1장 E2E 4 s 약 2.2 h, navtrain 5 s 약 3.2 h):
+  - BEV feature 저장 여부. 그래서 **`--drop-bev`를 안전한 기본값**으로 둔다. bev를 넣은 npz(E2E 4 s 248 GB, navtrain 5 s 352 GB)는 보관 센서(159 / 227 GB)보다 크다. F3/P4가 필요해지면 그때 bev를 다시 추론한다(§9-5의 권고와 같은 결론).
+  - teacher checkpoint 교체(재학습 teacher), config 변경(100×100 격자, lidar-only, ROI, score 임계, query 수), infos 재생성. 단 F0/L0/R0와 sweep ≤ 2 안에서만이다.
+  - §6-2 재현이나 §6-4 품질 검사에서 늦게 버그가 나와도 재전송이 필요 없다. §9-4의 삭제 전 관문 대부분이 "재DL 방지" 조건에서 "다시 추론하면 되는" 조건으로 바뀐다.
+- **되돌릴 수 없는 것** (바꾸려면 2,124 GB를 다시 받는다. camera만이면 1,242 GB, lidar만이면 882 GB):
+  - 나머지 5개 카메라: 8캠·360° teacher, 학생 쪽 다른 카메라
+  - 고른 범위·horizon 밖의 프레임: 예를 들어 E2E 4 s로 정한 뒤의 dev(val_logs) token, 5 s, 다른 token 집합, trainval 전 프레임(§9-3)
+  - ReSMap 미래를 log 안에서 빈틈없이(2 Hz 연속) 돌려야 할 경우의 연속 구간 프레임(B 방식). 기존 ReSMap 캐시처럼 "센서가 있는 프레임만 장면 순서대로" 돌리면(A 방식) 보관한 3캠으로 충분하다. B 방식의 추가분은 `--resmap-full-logs`로 미리 풀 수 있다(§10-7, +231 GB E2E 4 s / +254 GB navtrain 5 s)
+  - sweep을 3개 이상 쓰는 teacher(f−3 `.pcd`가 없음)
+- 그래서 **스트리밍을 시작하기 전에** 범위, 카메라, ReSMap 연속 구간 필요 여부를 정한다(§10-1). 시작한 뒤에 범위를 넓히면 그만큼 다시 받아야 한다. 범위가 어디든 400개 archive가 모두 필요하므로 사실상 전체 재전송이다.
+
+### 10-1. 남은 결정과 기본값
+
+기본값은 [제안]이다. 사용자가 정한다. 디스크는 S1, decimal GB, 보관 센서 기준이다.
+
+| # | 결정 | 선택지와 디스크 | 기본값 [제안] | 근거와 되돌릴 수 있는지 |
+|---|---|---|---|---|
+| 1 | **범위·horizon** | E2E 4 s: 실행 93,606 프레임, 보관 159 GB, npz 8.2 GB, GPU 2.24 h / navtrain 5 s: 133,113, 227 GB, 11.7 GB, 3.19 h. 참고: stage-T 4 s 107 GB, navtrain 4 s 190 GB, E2E 5 s 191 GB | **navtrain 5 s** | 전송량은 같다(2,124 GB). E2E 4 s의 실행 프레임은 navtrain 5 s에 모두 들어 있다(run_frames 비교, 차집합 0) [실측]. 차이 +68 GB, npz +3.5 GB, GPU +1.0 h(전용 1장)로 dev token 평가와 GT 벌점과 같은 0–5 s 범위를 얻는다(§9-3). 범위 밖은 되돌릴 수 없다. 5 s를 쓰려면 `future_index_train.json`(지금 k=1..8)을 k=1..10으로 다시 만든다(`make_token_lists.py:30`의 `range(1, 9)` → `range(1, 11)`, 그리고 `:35-36, :46`의 출력 파일 이름을 바꿔 4 s 파일을 덮어쓰지 않게 한다) [새 코드, 몇 줄]. 이 index는 §4 단계 8 로더에만 필요하고 스트리밍·추론(§10-3 1–11번)에는 필요 없다 |
+| 2 | **카메라** | 3캠(F0/L0/R0) / 8캠: E2E 4 s +83 GB(합 242), navtrain 5 s +119 GB(합 346) [추정: DL 프레임 × 다른 5캠 평균 1.062 MB] | **3캠** | BEVFusion과 ReSMap 모두 3캠만 쓴다. 8캠은 360° teacher나 학생 쪽 다른 카메라를 쓸 때만 필요하다. 되돌릴 수 없다. 8캠으로 하려면 `make_needed_files.py --cams CAM_F0 CAM_L0 CAM_R0 CAM_L1 CAM_L2 CAM_R1 CAM_R2 CAM_B0`만 바꾼다(단계 5의 `--cameras`는 빼도 된다) |
+| 3 | **ReSMap 미래 구간 방식** (§10-7) | A. 센서가 있는 프레임만 장면 순서대로(기존 ReSMap 캐시 방식): **추가 0 GB** / B. log를 2 Hz로 빈틈없이: 3캠 추가 E2E 4 s 368,453 프레임 약 231 GB(합 약 390 GB), navtrain 5 s 405,086 프레임 약 254 GB(합 약 481 GB) [실측 파일 수 × 평균 크기] | **A** | 사용자 요청으로 ReSMap 적용 가능성을 남긴다. A는 기존 ReSMap 캐시와 R_M teacher가 만들어진 조건과 같아 비교가 깨지지 않는다. B를 나중에 원하면 camera archive 1,242 GB를 다시 받아야 하므로, B가 필요하면 시작 전에 `--resmap-full-logs`를 켠다 [구현·시험됨]. §9-5의 "324 GB"는 디스크 밖 모든 프레임의 3캠(A에서 이미 푸는 실행 프레임 포함)이었다 |
+| 4 | **캐싱 뒤 보관 파일 삭제** | 보관: 위 표 그대로 / 삭제: −159 GB(E2E 4 s) 또는 −227 GB(navtrain 5 s) | **보관** | 사용자 결정의 "캐싱에 필요한 건 저장"과 같다. 지우면 §10-0의 "되돌릴 수 있는 것"이 모두 되돌릴 수 없게 된다. 지우기로 하면 §9-4 관문을 모두 통과한 뒤 `state/members/*.txt`와 `preexisting.txt`(§10-3 2번)로 지운다. 삭제 도구는 아직 없다 [새 코드] |
+| 5 | `--drop-bev` | 켬: npz 8.2 / 11.7 GB / 끔: 248 / 352 GB | **켬** | 보관 파일로 다시 추론할 수 있어 되돌릴 수 있다(§10-0) |
+
+- **시나리오 확인:** 위 수치는 새 서버에 navtrain current+history 센서 패키지가 있다는 전제(S1)다. 없다면(S2) E2E 4 s 보관량은 230 GB가 된다(실행 93,606 프레임 전부 + sweep용 lidar 28,623 프레임) [추정]. 다만 S2에서는 학생 학습에 쓰는 navtrain 현재·과거 센서도 없으므로, 그것을 같은 스트림에서 함께 풀지(§9-7) 따로 받을지를 먼저 정해야 한다. 지금 `make_needed_files.py`는 실행 프레임과 sweep만 목록에 넣는다. navtrain 현재·과거까지 넣으려면 목록 확장이 필요하다 [새 코드, 작음].
+
+### 10-2. 용량·시간 예산
+
+**전송** [실측, HF API]: 어느 범위든 400개 archive, 2,124 GB(camera 1,242 + lidar 882). archive 쌍 평균 10.6 GB, 최소 3.0 GB(#146), 최대 33.8 GB(#124).
+
+**보관하는 센서** [추정: `make_needed_files.py` 파일 수 × archive 0 평균 크기]
+
+| 범위 | 실행 프레임 | DL 프레임 | 보관 (S1) | 보관 (S2) | 버리는 비율 (S1, 압축 기준) | npz `--drop-bev` / bev 포함 |
+|---|---:|---:|---:|---:|---:|---:|
+| stage-T 4 s | 62,629 | 52,528 | 106.6 GB | 159.3 GB | 95% | 5.5 / 166 GB |
+| E2E 4 s | 93,606 | 78,543 | 159.3 GB | 230.1 GB | 93% | 8.2 / 248 GB |
+| navtrain 4 s | 112,152 | 93,670 | 190.0 GB | 275.9 GB | 91% | 9.9 / 297 GB |
+| E2E 5 s | 111,236 | 93,994 | 190.7 GB | – | 91% | 9.8 / 295 GB |
+| **navtrain 5 s** | 133,113 | 112,007 | **227.2 GB** | – | 89% | 11.7 / 352 GB |
+
+- S2 값은 §9-2와 E2E 4 s 재계산(`e2e_4s_S2`)에서 가져왔다. "–"는 세지 않았다.
+
+**새 서버 디스크 합계** (기준선 약 1,507 GB, §9-7) [추정]
+
+| 운영 | 합계 | 비고 |
+|---|---:|---|
+| E2E 4 s, 3캠, `--drop-bev` | 약 1.67 TB | 1,507 + 159 + 8 |
+| E2E 4 s, 3캠, bev 포함 | 약 1.91 TB | + 248 |
+| **navtrain 5 s, 3캠, `--drop-bev` (기본값)** | **약 1.75 TB** | 1,507 + 227 + 12 |
+| navtrain 5 s, 3캠, bev 포함 | 약 2.09 TB | + 352 |
+| 8캠으로 할 때 | 각 행 + 83 GB(E2E 4 s) / + 119 GB(navtrain 5 s) | |
+
+- 일시 공간: staging은 동시에 P × archive당 필요분이다. 가장 큰 것은 navtrain 5 s의 lidar_124 약 2.7 GB이고, P=4면 많아야 약 11 GB다. `bevfusion.tar.zst`(156 GB)로 teacher cache를 옮긴다면 그동안 +156 GB가 더 든다.
+- ReSMap 캐시(377 GB)를 새 서버에 두지 않으면 그만큼 준다.
+- 권장 디스크는 **약 2 TB**다(기본값 1.75 TB + 일시 공간). bev까지 저장하면 2.5 TB [추론].
+
+**다운로드 시간** [추정: 2,124 GB ÷ 대역폭]
+
+| 합산 대역폭 | 시간 | 근거 |
+|---:|---:|---|
+| 1.64 MB/s | 약 360 h (15일) | 이 서버, 쌍 #146, 2스트림(§10-5) |
+| 4 MB/s | 약 148 h (6.2일) | 이 서버, 쌍 0, 2스트림(§9-1) |
+| 10 MB/s | 약 59 h | 가정 |
+| 50 MB/s | 약 11.8 h | 가정 |
+| 100 MB/s | 약 5.9 h | 가정 |
+
+- 스트림당 실측은 camera 1.35–2.75 MB/s, lidar 0.67–1.23 MB/s다. 병렬 3개 이상은 HF에서 재지 않았다. 새 서버 대역폭과 HF의 스트림당·IP당 제한은 모른다.
+- 가장 큰 archive 하나가 걸리는 시간: lidar_124(14.46 GB)는 0.67 MB/s면 약 6.0 h, camera 최대(19.30 GB)는 1.35 MB/s면 약 4.0 h다. 큰 archive부터 받으면 마지막에 긴 꼬리가 남지 않는다(§10-3 5번).
+- 풀기 CPU는 병목이 아니다(전체 약 2.7 core-h, §9-2).
+
+**GPU 시간** [추정, 전용 11.6 frame/s는 가정이고 공유 5.8만 실측]
+
+| 범위 | 전용 1장 | 공유 1장 | 전용 4장 |
+|---|---:|---:|---:|
+| E2E 4 s (93,606) | 2.24 h | 4.48 h | 0.56 h |
+| navtrain 5 s (133,113) | 3.19 h | 6.38 h | 0.80 h |
+
+- 추론은 전송이 끝난 뒤 한 번에 돌린다(§9-2의 P-stream-all). 전송이 GPU보다 수십 배 길어서, 묶음 단위 겹침(P-chunked)으로 아낄 수 있는 시간은 GPU 시간 정도(수 h)뿐이다 [추론]. 그래서 P-chunked는 구현하지 않았다.
+
+### 10-3. 실행 절차 (새 서버)
+
+변수는 §4와 같다. 아래를 더한다.
+```bash
+REPO=/home/external-user/yongjae/SSR; D=/home/external-user/ssd/yongjae_refiner
+PY=/home/external-user/miniconda3/envs/ssr/bin/python; BPY=/home/external-user/miniconda3/envs/bevfusion/bin/python
+DL=/home/external-user/navsim/download; TC=/home/external-user/datasets/teacher_cache
+BF=/home/external-user/yongjae/bevfusion; W=$REPO/tools/future_teacher_cache; X=$W/xfer
+SB=$DL/trainval_sensor_blobs; NGPU=1   # NGPU: 추론에 쓸 전용 GPU 수
+SET=navtrain_5s; TOK=$W/future_index_train.json; HS=5          # 기본값 navtrain 5 s
+# E2E 4 s로 정했다면 대신: SET=e2e_4s; TOK=$D/splits/e2e_train_trainlogs.parquet; HS=4   (39 S5 §5.2가 만든 parquet)
+R=$X/run_$SET       # 이 폴더에 lists/, state/, 로그가 쌓인다(수십 MB)
+```
+
+**0. 준비 (§4 단계 0, 3)** — 단계 0의 항목과 `$W/xfer/` 전체(특히 `hf/`, `results/stream_test_146/`)와 bevfusion을 옮기고, 단계 3(`make_token_lists.py`)으로 `future_index_train.json`을 만든다. E2E 4 s면 39 S5(§5.2)의 `$D/splits/e2e_train_trainlogs.parquet`가 먼저 있어야 한다.
+- 5 s의 k=1..10 index(§10-1 1번)는 이 절의 1–11번에는 필요 없다. `make_needed_files.py`가 `--horizon-s`로 log pkl에서 미래 프레임을 직접 센다. k=1..10 index는 §4 단계 8 로더용이므로 그 전에 만들면 된다.
+```bash
+ls $X/{make_needed_files.py,stream_extract.sh,rstream.py} $X/hf/{map_trainval.json,tree_openscene_sensor_trainval_camera.json,tree_openscene_sensor_trainval_lidar.json}
+jq --version; flock -V | head -1; tar --version | head -1    # jq, flock, GNU tar 필요 (이 서버: GNU tar 1.35)
+ls $SB/trainval | wc -l     # S1 확인. 이 서버 값 1192 (navtrain log 폴더)
+df -h $SB                   # §10-2 예산과 비교
+```
+
+**1. 필요 파일 목록** (CPU, 수 초–수 분)
+```bash
+$PY $X/make_needed_files.py --tokens $TOK --horizon-s $HS --out $R/lists      # 약 5–20 s
+jq '{run_frames, run_frames_on_disk, dl_frames, run_frames_on_disk_missing_some_sweep, sweep_only_lidar_frames_outside_run,
+     camera_files:.totals.camera_files, lidar_files:.totals.lidar_files, est_extracted_GB, archives_with_nonempty_list}' $R/lists/summary.json
+```
+- 기본값 `--logs-dir`, `--sensor-root`, `--cache-dir`(`cache_train_50x100`), `--map xfer/hf/map_trainval.json`, `--cams CAM_F0 CAM_L0 CAM_R0`은 옛 서버와 같은 절대경로를 가정한다.
+- ReSMap B 방식(§10-1 3번, §10-7)으로 정했다면 위 명령에 `--resmap-full-logs`를 더한다. A 방식(기본)이면 그대로 둔다. 어느 쪽이든 `jq .resmap $R/lists/summary.json`으로 ReSMap 프레임 수를 본다(아래 §10-7 표와 같아야 한다).
+- 기대값(이 서버, S1):
+
+| 키 | navtrain 5 s | E2E 4 s |
+|---|---:|---:|
+| `run_frames` | 133,113 | 93,606 |
+| `run_frames_on_disk` | 21,106 | 15,063 |
+| `dl_frames` | 112,007 | 78,543 |
+| `run_frames_on_disk_missing_some_sweep` | 9,727 | 6,610 |
+| `sweep_only_lidar_frames_outside_run` | 0 | 0 |
+| `camera_files` / `lidar_files` | 336,021 / 112,007 | 235,629 / 78,543 |
+| `est_extracted_GB` | 227.2 | 159.3 |
+| `archives_with_nonempty_list` | camera 200, lidar 200 | 같음 |
+
+- 값이 다르면 새 서버의 navtrain 센서 패키지나 현재 프레임 캐시가 옛 서버와 다르다는 뜻이다. 스트리밍 전에 원인을 본다.
+
+**2. 기록 남기기** (출처 고정, §9-6)
+```bash
+mkdir -p $R/prov
+find $SB/trainval -type f | sort > $R/prov/preexisting.txt          # 스트리밍 전 파일 스냅샷 (나중에 지울 때의 가드)
+sha256sum $X/hf/*.json > $R/prov/hf.sha256
+sha256sum $DL/trainval_navsim_logs/trainval/*.pkl > $R/prov/logs.sha256
+cp $R/lists/summary.json $R/prov/summary_before.json
+```
+- URL은 `stream_extract.sh` 안에서 revision `a76f840b65e972bc45e56c2adced897498e9a026`로 고정돼 있다. archive별 sha256 대조는 도구가 한다.
+
+**3. 대역폭 시험 + 출처 대조** (가장 작은 쌍 #146, 3.00 GB, scratch 폴더에 푼다. 본 실행 전에 한다)
+```bash
+T=$R/probe146
+bash $X/stream_extract.sh -l $R/lists -r $T/root -s $T/state -P 2 --extra-lists $X/results/stream_test_146 146
+$PY $X/tests/test_b_verify.py $R/lists $X/results/stream_test_146 $T/state $T/root $SB 146
+rm -rf $T/root                  # 시험 추출물. 본 실행에서 #146을 다시 받는다(3.0 GB)
+```
+- `--extra-lists`는 이미 디스크에 있는 파일 50개(camera 30, 8캠 전부 포함 / lidar 20)를 같은 스트림에서 함께 풀어, `test_b_verify.py`가 디스크의 원본과 `cmp`한다(§9-4 3번). 이 50개는 navtrain 패키지 파일이므로 S1이면 새 서버에도 있다 [추론].
+- 기대 출력(이 서버 값): `summary {'done': 2} … aggregate`, 마지막 줄 `TEST B: PASS`. 필요 파일은 navtrain 5 s 목록이면 camera 459 + lidar 153개, E2E 4 s 목록이면 261 + 87개다. 여기에 provenance 50개가 더해진다. `provenance_cmp_identical`이 30/20, `needed_present_on_real_disk`가 0이어야 한다.
+- 이 서버에서는 1,835 s, 합산 1.64 MB/s였다. 이 값으로 전체 시간을 다시 어림한다(§10-2).
+- 이 시험은 2번(스냅샷) 뒤, 본 실행(4·5번) 전에 한다. 본 실행이 #146을 이미 받은 뒤에는 `needed_present_on_real_disk`가 0이 아니라 FAIL이 된다. provenance 파일이 새 서버 디스크에 없으면 `test_b_verify.py`가 FileNotFoundError로 멈추는데, 이는 S1 전제가 다르다는 뜻이다.
+
+**4. 병렬 수 정하기** (본 실행의 일부. 받은 것은 그대로 쓴다)
+```bash
+bash $X/stream_extract.sh -l $R/lists -r $SB -s $R/state -P 4 144 143 126 58      # 다음으로 작은 4쌍 = archive 8개, 동시 스트림 4개
+# 마지막 요약 줄의 "aggregate MB/s"를 3번(-P 2)과 비교한다. 거의 2배면 -P 8로 다음 몇 쌍(128 …)을 더 재 본다
+```
+- `-P`는 동시 스트림 수다. camera_i와 lidar_i는 따로 센다.
+- 합산 속도가 더 오르지 않는 지점의 P를 쓴다. HF가 429나 연결 거부를 내기 시작하면 줄인다 [제안. 3개 이상은 미측정].
+
+**5. 본 실행** (tmux 또는 screen 안에서. 멈췄다가 다시 시작해도 같은 명령)
+```bash
+$PY -c "
+import json,re;s={}
+for m in ('camera','lidar'):
+  for f in json.load(open('$X/hf/tree_openscene_sensor_trainval_'+m+'.json')):
+    g=re.search(r'_(\d+)\.tgz$',f['path'])
+    if g: s[int(g[1])]=s.get(int(g[1]),0)+f['size']
+print(*sorted(s,key=lambda i:-s[i]))" > $R/order_desc.txt       # 큰 쌍부터: 124 116 191 153 51 …
+P=4      # 4번에서 정한 값
+bash $X/stream_extract.sh -l $R/lists -r $SB -s $R/state -P $P -f $R/order_desc.txt 2>&1 | tee -a $R/main.out
+# 멈추기: 그 창에서 Ctrl-C (프로세스 그룹 전체가 멈춘다). 다시 시작: 같은 명령. done인 archive는 건너뛴다
+```
+- 결과 위치: `$SB/trainval/<log>/{CAM_F0,CAM_L0,CAM_R0,MergedPointCloud}/<token>.{jpg,pcd}`. 기존 navtrain 파일과 같은 폴더에 hard link로 들어가고, 기존 파일은 덮어쓰지 않는다.
+- staging은 `$SB/.xfer_staging/<mod>_<i>/`(같은 파일시스템이어야 한다. 다르면 시작할 때 거부한다).
+- archive마다 기대 로그: `<mod>_<i> done in …s (<bytes> B, sha ok, {"committed_new":N,"already_present_same_size":0,"conflict_different_size":0,…,"missing_after_commit":0})`
+- 끝났을 때 기대 요약: `summary {'done': 400}`. 3·4번에서 받은 것은 건너뛰므로 `streamed_this_run`은 그만큼 적다. 하나라도 done이 아니면 `NOT DONE: …`을 찍고 exit 1이다.
+
+**6. 상태 확인** (실행 중 아무 때나)
+```bash
+jq -r .state $R/state/status/*.json | sort | uniq -c                    # 끝나면 400 done
+jq -r 'select(.state!="done" and .state!="skipped_empty") | "\(.key) \(.why // .error)"' $R/state/status/*.json
+jq -s 'map(select(.state=="done")) | {n:length, tgz_GB:(map(.bytes)|add/1e9), retries:(map(.rstream_retries)|add),
+        kept_files:(map(.commit.committed_new + .commit.already_present_same_size)|add), kept_GB:(map(.verify.extracted_bytes)|add/1e9),
+        not_found:(map(.not_found)|add), sha_bad:(map(select(.sha_ok|not))|length)}' $R/state/status/*.json
+tail -n 5 $R/state/status.log; du -sh $SB/.xfer_staging
+```
+- 이 서버의 #146 시험에서 같은 명령의 결과는 `n 2, tgz_GB 3.00, retries 2, kept_files 398, not_found 0, sha_bad 0`이었다(398 = 필요 348 + provenance 50).
+- `kept_files`에 `already_present_same_size`를 더하는 이유: 반영(hard link) 도중에 실행이 죽으면 다음 실행에서 그 파일들은 "이미 있음, 같은 크기"로 세진다.
+- 끝났을 때 `kept_files`는 `camera_files + lidar_files`(navtrain 5 s 448,028 / E2E 4 s 314,172)와 같아야 하고, `kept_GB`는 `est_extracted_GB`와 약 ±2% 안이어야 한다. `.xfer_staging`은 비어 있어야 한다(끝나면 `rmdir`).
+
+**7. 전역 완결성** (전송이 끝난 뒤)
+```bash
+$PY $X/make_needed_files.py --tokens $TOK --horizon-s $HS --out $R/lists_after    # 1번과 같은 입력
+jq '{run_frames, run_frames_on_disk, dl_frames, run_frames_on_disk_missing_some_sweep,
+     camera_files:.totals.camera_files, lidar_files:.totals.lidar_files, archives_with_nonempty_list}' $R/lists_after/summary.json
+```
+- 기대: `run_frames`는 1번과 같고, `run_frames_on_disk` = `run_frames`, `dl_frames` 0, `run_frames_on_disk_missing_some_sweep` 0, 파일 0, `archives_with_nonempty_list` camera 0 / lidar 0 [제안, 추출 후 재실행은 미시험. 정의상 성립].
+- 이것이 §4 단계 5의 lidar·sweep 사전 검사를 대신한다.
+
+**8. 전송 중에 병행할 것:** §4 단계 1(bevfusion env)과 단계 4(§6-2 재현, navtest 24 token)는 센서 다운로드와 무관하다. 전송하는 며칠 동안 끝내 둔다.
+
+**9. infos** (§4 단계 5, bevfusion env, CPU)
+```bash
+cd $BF
+CUDA_VISIBLE_DEVICES="" nice -n 10 $BPY tools/data_converter/navsim_converter.py \
+  --navsim-logs $DL/trainval_navsim_logs/trainval --sensor-root $SB --split trainval \
+  --scene-filter $R/lists/run_frames.yaml --keyframes-only --check-files --cameras CAM_F0 CAM_L0 CAM_R0 \
+  --workers 8 --lidar-prefix lidar --lidar-ext .pcd --max-sweeps 2 --out $W/infos/future_train_$SET.pkl
+sha256sum $W/infos/future_train_$SET.pkl > $R/prov/infos.sha256
+```
+- `run_frames.yaml`은 `{log_names, tokens}` 형식이라 converter의 `--scene-filter`에 그대로 들어간다(`load_scene_filter`가 두 키를 읽음) [실측, 코드].
+- 기대: 프레임 수 = `run_frames`(133,113 / 93,606), drop 0. 3캠만 풀었으므로 `--cameras`는 반드시 준다.
+
+**10. BEVFusion 추론** (§4 단계 6, GPU)
+```bash
+cd $BF; export PATH=/home/external-user/miniconda3/envs/bevfusion/bin:$PATH NCCL_SOCKET_IFNAME=lo OMP_NUM_THREADS=2
+torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
+  configs/navsim/det/transfusion/secfpn/camera+lidar/swint_convfuser.yaml runs/navsim-fusion-50x100/epoch_20.pth \
+  --cache-dir $TC/bevfusion/cache_train_50x100_future --split train --ann-file $W/infos/future_train_$SET.pkl \
+  --skip-existing --drop-bev
+```
+- split당 `-np N` 한 번으로 돌린다(manifest 덮어쓰기 방지, §4 단계 6).
+
+**11. 사후 검사** (§4 단계 7, §6-3)
+```bash
+C=$TC/bevfusion/cache_train_50x100_future
+jq '{checkpoint_sha256_head, bev_feature_stored, num_samples_expected, num_samples_written}' $C/manifest.json
+# 기대: "cddf943ffec8d6a8", false, 둘 다 run_frames
+$PY - $R/lists/run_frames.txt $C <<'EOF'
+import sys, os, glob, numpy as np
+run = [l.split('\t')[0] for l in open(sys.argv[1]) if l.strip()]
+S = sys.argv[2] + '/samples'
+miss = [t for t in run if not os.path.isfile(f'{S}/{t[:2]}/{t}.npz')]
+bad = 0
+for t in run:
+    try: np.load(f'{S}/{t[:2]}/{t}.npz')['pred_boxes_3d']
+    except Exception: bad += 1
+print(len(run), 'missing', len(miss), 'tmp', len(glob.glob(f'{S}/*/*.tmp.npz')), 'unreadable', bad)
+EOF
+# 기대: <run_frames> missing 0 tmp 0 unreadable 0
+cp $C/manifest.json $R/prov/manifest_$SET.json
+```
+
+**12. 품질 검사와 그 뒤:** §6-4(좌표 in-sample cm 수준, out-of-sample 재현율), 박스 영상 투영 QA를 한다. 그다음 §4 단계 8(로더·raster 빌더)로 간다. 보관 파일이 남아 있으므로 여기서 버그가 나와도 다시 추론하면 된다.
+
+### 10-4. 검증 기준
+
+| 수준 | 항목 | 합격 기준 | 어디서 확인 | 상태 |
+|---|---|---|---|---|
+| archive | 받은 바이트 | `bytes == size`(HF tree) | `stream_extract.sh` 상태 JSON | [구현·시험됨] |
+| archive | 출처 | 스트림 sha256 == `lfs.oid` | 같음(`sha_ok`) | [구현·시험됨] TEST A의 잘못된 oid는 실패로 잡힘 |
+| archive | 종료 코드 | rstream rc 0, tar rc 0 | 같음 | [구현·시험됨] |
+| archive | 누락 | "Not found in archive" 0 | `logs/<key>.tar.err` | [구현·시험됨] TEST A의 없는 이름은 실패로 잡힘 |
+| archive | 목록 일치 | 목록의 파일이 모두 있고 크기 > 0, tar가 보고한 크기와 같음, 목록 밖 파일 0 | 같음(`verify`) | [구현·시험됨] |
+| archive | 반영 | 덮어쓰기 0(`conflict_different_size` 0), 반영 뒤 누락 0(`missing_after_commit` 0) | 같음(`commit`) | [구현·시험됨] 크기가 다른 기존 파일은 건드리지 않고 실패 처리 |
+| 출처 | 기존 파일과 내용 일치 | provenance 50개 `cmp` 100% | §10-3 3번 `test_b_verify.py` | 이 서버에서 통과. 새 서버에서 다시 |
+| 전체 | 실행 프레임 완결 | `make_needed_files.py` 재실행에서 DL 0, sweep 누락 0, 필요 파일 0 | §10-3 7번 | [제안, 미시험] |
+| 전체 | 크기 | 보관 바이트가 `est_extracted_GB`와 ±2% 안 | §10-3 6번 | #146에서 175.4 vs 174.6 MB(+0.5%) |
+| infos | 프레임 수 | `run_frames`와 같음, drop 0 | §10-3 9번 | [제안] |
+| teacher | 재현 | §6-2 기준(24/24, 매칭 100%) | §4 단계 4 | [제안] |
+| npz | 완결 | npz 수 = `run_frames`, 차집합 ∅, `.tmp.npz` 0, 전수 `np.load`, sha head `cddf943ffec8d6a8`, `bev_feature_stored` false | §10-3 11번 | [제안] |
+| npz | 품질 | §6-4 좌표 오차 cm 수준(in-sample) | §6-4 | [제안] |
+
+### 10-5. 시험 결과 (이 서버, 2026-10-03)
+
+**목록 생성기 수치** (`results/needed_summaries/*.json`, 각 약 4–8 s)
+
+| 집합 | 실행 | 디스크에 있음 | DL | 있지만 sweep 누락 | 실행 밖 sweep 파일 | 보관 GB (archive 비율 보정) | 버리는 비율 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| E2E 4 s | 93,606 | 15,063 | 78,543 | 6,610 | 0 | 159.3 (158.9) | 93% |
+| stage-T 4 s | 62,629 | 10,101 | 52,528 | 4,164 | 0 | 106.6 | 95% |
+| navtrain 4 s | 112,152 | 18,482 | 93,670 | 8,075 | 0 | 190.0 | 91% |
+| navtrain 5 s | 133,113 | 21,106 | 112,007 | 9,727 | 0 | 227.2 | 89% |
+| E2E 5 s | 111,236 | 17,242 | 93,994 | 7,997 | 0 | 190.7 | 91% |
+| E2E 2 s | 52,647 | 9,431 | 43,216 | 3,024 | 0 | 87.7 | 96% |
+| E2E 4 s, S2(디스크에 센서 없음) | 93,606 | 0 | 93,606 | 0 | 28,623 | 230.1 | 89% |
+
+- 모든 집합에서 camera 200개, lidar 200개 archive의 목록이 비어 있지 않다. E2E 4 s는 camera 235,629개, lidar 78,543개 파일이다.
+- §2-1, §9-1, §9-2의 값과 모두 같다. 차이는 버리는 비율의 반올림뿐이다: navtrain 4 s 91%(§9-0은 92%), navtrain 5 s 89%(90%). 보관 바이트를 압축 크기로 되돌릴 때 archive 0의 확장 비율(camera 1.003, lidar 1.134)을 써서 생긴 차이다.
+- E2E 4 s의 실행 프레임은 navtrain 5 s에 모두 들어 있다(차집합 0). E2E 5 s도 마찬가지다 [실측].
+
+**TEST A: 합성 서버, 네트워크 없음** (`tests/test_a.sh`, 결과 `results/stream_test_A.out`): **28/28 통과**
+- 가짜 archive 4쌍(총 33 MB). 서버는 Range, 302 한 번, 연결 끊김을 흉내 낸다. 각 파일의 처음 두 요청은 150 kB 뒤에 끊었다.
+- 재개: rstream이 Range로 이어받았고(archive마다 재시도 2회 이상), 완료된 archive의 sha256이 모두 맞았다.
+- 실패 처리:
+  - 목록이 빈 archive는 받지 않고 `skipped_empty`
+  - archive에 없는 이름: tar exit 2, "Not found" 1개, 센서 폴더에 아무것도 쓰지 않음
+  - 틀린 `lfs.oid`: sha 검사 실패, 아무것도 쓰지 않음
+  - 크기가 다른 기존 파일: 그 파일은 그대로 두고 실패 처리. 검사를 통과한 다른 파일은 반영
+- 추출: 센서 폴더에는 목록의 파일만 있고(71개, 목록 밖 0, 누락 0), 원본과 바이트 단위로 같다.
+- 재실행: 완료된 archive는 다시 요청하지 않는다. 실패한 것은 다시 시도한다. 입력을 고친 뒤 재실행하면 모두 완료된다.
+- 강제 종료 후 재개: `-P 2` 실행을 받는 도중 프로세스 그룹째 SIGKILL하고 `-P 3`으로 다시 돌렸다. 끝까지 갔고, 결과가 중단 없는 실행과 같았고, staging이 남지 않았다.
+
+**TEST B: 실제 HF, archive 쌍 #146(3.00 GB, 가장 작은 쌍), E2E 4 s 목록** (결과 `results/stream_test_146/`): **통과**
+- 무결성: sha256 == `lfs.oid`(camera `86a20b3e…99a9`, lidar `c796de6d…8b28`), tar exit 0, "Not found" 0.
+- 필요 파일 camera 261 + lidar 87개가 모두 크기 > 0으로 풀렸다. 목록 밖 0, 누락 0(provenance 포함 398개). 필요 파일 중 실제 디스크에 이미 있던 것은 0개였다.
+- 출처: 이미 디스크에 있던 camera 30개(8캠 전부 포함)와 lidar 20개를 같은 스트림에서 풀어 `cmp`했다. 50/50 같다.
+- 크기: 필요 파일 175.4 MB, 추정 174.6 MB(+0.5%).
+- **처음으로 HF에서 재개 경로가 쓰였다.** 두 archive 모두 한 번씩 끊겼다(camera는 1,087,930,077 B에서 "premature end of body"). Range로 이어받았고 sha256이 맞았다.
+- 속도: camera 1.35 MB/s(1,317 s), lidar 0.67 MB/s(1,834 s), 합산 약 1.64 MB/s. §9-1의 약 4 MB/s보다 느리다. 이 속도면 전체가 약 15일이다.
+- 재실행하면 두 archive 모두 네트워크 없이 건너뛴다.
+- 시험 추출물은 지웠다. 로그와 상태는 `results/stream_test_146/state/`에 있다.
+
+**구현 중 고친 문제**
+1. rstream: 서버가 오류 없이 연결을 일찍 닫으면 빈 read가 나와 조용히 다시 붙고 재시도 수가 0으로 남았다. 지금은 재시도로 세고 로그를 남긴다.
+2. tar: `-C`가 `-T`보다 뒤에 오면 오류 없이 현재 폴더에 푼다. 도구는 `-C`를 앞에 둔다(§9-8 스케치도 순서가 맞다).
+3. 요약이 이전 실행에서 끝난 archive까지 바이트에 셌다. 지금은 run ID로 이번 실행분만 센다.
+4. TEST A의 강제 종료 단계가 처음에는 worker를 남겼다. 고친 것은 시험(프로세스 그룹 전체를 죽임)이고 도구는 아니다.
+5. (검토 단계) `stream_extract.sh`: 반영(hard link) 파이썬이 예외로 죽으면 상태 JSON이 깨진 채(`"commit":` 뒤가 빈 값) 남았다. 지금은 `failed`/`commit script failed`로 기록한다. 경로를 파일로 막은 합성 시험으로 확인했고, 수정 뒤 TEST A를 다시 돌려 28/28이다. `--help`가 코드 줄까지 찍던 것도 고쳤다.
+
+**남은 한계**
+- rstream이 포기하면(한 실행에서 재시도 200회 초과) 그 archive는 다음 실행에서 처음부터 다시 받는다. 실행 사이의 바이트 단위 재개는 없다.
+- 요약의 바이트는 archive별 마지막 시도만 센다.
+- 같은 이름·같은 크기의 기존 파일은 내용 비교 없이 받아들인다(출처 대조는 3번의 50개 표본으로 한다).
+- 크기 추정은 archive 0 평균 파일 크기다. 실제 크기는 상태 JSON(`verify.extracted_bytes`)에 남는다.
+- 병렬 3개 이상은 HF에서 재지 않았다.
+- 보관 파일 삭제 도구(`members/` 기반)는 없다. 지우지 않는 것이 기본값이라 만들지 않았다.
+
+### 10-6. 실패·재시작 대응
+
+| 상황 | 도구의 동작 | 할 일 |
+|---|---|---|
+| 받는 도중 연결이 끊김 | rstream이 `Range`로 같은 위치부터 다시 붙는다(한 실행에서 최대 200회, `--max-retries`) | 없음. 상태 JSON의 `rstream_retries`로 본다. #146에서는 archive당 1회였다 |
+| rstream 재시도 소진(rc 3), sha 불일치, tar 오류, 바이트 부족 | 그 시도의 staging을 지우고 같은 실행 안에서 다시 시도한다(`-R`, 기본 3회, 대기 10 s × 시도 번호). 센서 폴더는 바뀌지 않는다 | 같은 명령을 다시 실행한다. 같은 archive가 계속 sha 불일치면 HF tree·revision이 바뀌었는지 본다(`$R/prov/hf.sha256`) |
+| "Not found in archive" > 0 | 실패. 센서 폴더는 바뀌지 않는다 | 목록과 실제 archive가 다르다는 뜻이다(대응표 불일치나 log가 archive 경계를 넘음, §9-1의 [추론]). `logs/<key>.tar.err`의 이름을 보고, 그 log가 어느 archive에 있는지 확인한다 |
+| 반영 충돌(같은 이름, 다른 크기) | 그 파일은 건드리지 않고 archive를 실패로 둔다. 다른 파일은 반영된다. 같은 실행에서 다시 시도하지 않는다 | 사람이 본다. 기존 파일이 잘린 파일인지(옛 다운로드의 흔적), archive 쪽이 다른지 확인한다. 정리한 뒤 다시 실행한다 |
+| Ctrl-C, 강제 종료, 재부팅 | 끝난 archive는 done으로 남는다. 진행 중이던 archive는 상태가 done이 아니다 | 같은 명령을 다시 실행한다. done은 건너뛰고, 진행 중이던 것은 처음부터 받는다. 남은 staging은 다음 시도가 지운다(TEST A 4번) |
+| 반영 단계 자체가 실패(hard link 거부, 권한, 경로가 파일로 막힘 등) | 상태 JSON이 `failed`, `why: commit`, `commit.error: "commit script failed"`가 된다. 다시 시도하지 않는다(검토 단계에서 추가, 합성 시험으로 확인) | `logs/<key>.log`와 센서 폴더 권한·파일시스템을 본다. 고친 뒤 같은 명령. 이미 들어간 파일은 다음 실행에서 `already_present_same_size`로 세진다 |
+| 디스크 부족 | tar가 실패해 그 archive가 실패한다. 센서 폴더는 바뀌지 않는다 | 공간을 확보하고 다시 실행한다. §10-2 예산 + staging(P × 최대 2.7 GB)을 미리 확보한다 |
+| 같은 state로 두 번 동시에 실행 | archive별 `flock`이 잡혀 있으면 그 archive를 건너뛴다 | 피한다. 한 번에 한 실행만 둔다 |
+| HF 속도 제한, 429, 연결 거부 [추론, 미관측] | rstream이 재시도한다. 계속되면 rc 3으로 실패한다 | `-P`를 줄이고 다시 실행한다 |
+| 전송 뒤 7번 완결성 검사에서 남은 파일이 있음 | – | `lists_after/needed_*_<i>.txt`가 비어 있지 않은 archive만 다시 받는다: 그 목록으로 `bash $X/stream_extract.sh -l $R/lists_after -r $SB -s $R/state_fix -P $P <i …>`. `$R/state`에는 그 archive가 done으로 남아 있으므로 새 state 폴더를 쓴다 |
+| infos·추론·QA 단계의 버그 | – | 보관 파일로 다시 돌린다. 재전송은 필요 없다(§10-0) |
+
+### 10-7. ReSMap 적용 (같은 추출본으로)
+
+작성 2026-10-03. 사용자 요청: "ReSMap도 적용 가능하게끔 데이터 구성". 이 절은 데이터 구성만 다룬다. ReSMap을 미래 프레임에 실제로 돌리는 것은 공동연구자(kyungmin) 자원이 있어야 한다.
+
+**ReSMap 입력과 캐시 방식** [실측, `$TC/resmap/README.md`, `meta.json`, `navtest/meta.json`]
+- 입력은 **앞카메라 3장(CAM_L0/F0/R0) + 앞쪽으로 자른 위성 타일**이다. LiDAR와 뒤쪽 관측은 쓰지 않는다. ROI는 전방 0..32 m, 좌우 ±32 m다.
+- temporal memory 모델이다. 기존 캐시는 메모리를 켠 채 **장면 순서대로** 만들었다.
+  - root: navtrain `train_logs`에서 센서가 있는 126,032프레임
+  - navtest: 센서가 있는 71,460프레임을 모두 장면 순서대로 돌리고 allow-list token 12,146개만 저장했다(`only_split_tokens: true`)
+- 그래서 **BEVFusion용 추출본(3캠 + LiDAR)에 ReSMap 카메라 입력이 이미 들어 있다.** 위성 타일은 OpenScene에 없으므로 따로 필요하다.
+
+**A/B 방식** [실측: 이 서버에서 `make_needed_files.py` 재실행, `summary.json`의 `resmap`. 크기는 파일 수 × archive 0 평균 크기, 괄호는 archive별 보정]
+
+| | E2E 4 s (978 log) | navtrain 5 s (1,192 log) |
+|---|---:|---:|
+| 실행 log의 전체 프레임 | 573,028 | 669,588 |
+| **A**: 추출 뒤 3캠이 모두 있는 프레임 (ReSMap이 장면 순서대로 돌 프레임) | 204,575 | 264,502 |
+| **A**: 추가로 풀 파일 | 0 | 0 |
+| **B**: 추가로 풀 프레임 / 카메라 파일 | 368,453 / 1,105,359 | 405,086 / 1,215,258 |
+| **B**: 추가 디스크 | 약 231 GB (235) | 약 254 GB (259) |
+| B를 포함한 보관 합계 | 약 390–394 GB | 약 481–485 GB |
+
+- 전송량은 A든 B든 같다(2,124 GB). B는 디스크만 더 쓴다.
+- B를 나중에 원하게 되면 camera archive(1,242 GB)를 다시 받아야 한다. 그래서 **스트리밍 전에 A/B를 정한다**(§10-1 3번). 기본값은 A다. 기존 ReSMap 캐시와 R_M teacher가 만들어진 조건과 같아 비교가 깨지지 않는다.
+- A가 맞는지는 ReSMap의 memory 리셋 기준에 달려 있다. 기준은 kyungmin map infos의 `local_idx == 0`이고, 센서가 없는 프레임으로 생긴 간격에서 리셋하는지는 확인하지 않았다(아래 질문 1).
+- B 목록: `make_needed_files.py ... --resmap-full-logs`. 옵션 없이 만든 목록은 이전 결과와 바이트 단위로 같다(E2E 4 s, navtrain 5 s에서 `diff -rq` 확인) [구현·시험됨].
+
+**ReSMap 미래 캐시는 새 폴더에 따로 만든다** [추론, 모델 구조]
+- 기존 ReSMap 캐시에 미래 프레임을 덧붙이면 안 된다. 미래 프레임이 끼면 메모리가 바뀌어, 같은 log에서 이미 캐시된 프레임의 feature도 달라진다(§2-2). 실행 log 전체를 장면 순서대로 다시 돌린다(A: 위 표 204,575 / 264,502프레임).
+- navtrain 5 s를 고르면 `val_logs` token의 현재 프레임도 새 실행에 들어간다. ReSMap root에는 `train_logs`만 있기 때문이다. 이 프레임 수는 위 표의 A에 이미 포함돼 있다.
+- 저장은 navtest처럼 필요한 프레임만 한다. 시간 이동 teacher target이 되는 미래 프레임 합집합은 E2E 4 s 169,248, navtrain 5 s 226,176프레임이다.
+
+| 저장 필드 | 프레임당 | E2E 4 s | navtrain 5 s |
+|---|---:|---:|---:|
+| 전 필드 (`bev` 256×100×50 f16 = 2.56 MB 포함) | 약 2.73 MB | 약 462 GB | 약 617 GB |
+| `bev` 제외 (`seg` 4×200×100 + `vectors` + `scores` + `labels` + `props`) | 약 0.17 MB | 약 28.5 GB | 약 38.1 GB |
+
+- 지도 KD를 query·logit 수준(벡터, 점수, seg logit)으로 한다면 `bev` 없이도 된다 [추론]. BEVFusion의 `--drop-bev`와 같은 판단이다. 보관한 3캠이 있으므로 나중에 `bev`가 필요해지면 다시 돌리면 된다(재전송 불필요).
+
+**kyungmin 쪽에서 받아야 하는 것** (이 서버에 없음을 확인했다. 경로는 `meta.json` 기준)
+
+| 항목 | 위치 |
+|---|---|
+| 설정 | `/home/kyungmin/min_ws/rideflux/maptracker/work_dirs/resmap_nav_rideflux_stage3/resmap_nav_stage3.py` |
+| checkpoint | 같은 폴더 `iter_63024.pth` (sha256 `0eaeda793402a804…`) |
+| 지도 infos | `/data2/kyungmin/navsim/infos/navsim_map_infos_*.pkl`. 미래 프레임을 포함한 infos를 새로 만들어야 한다. converter도 kyungmin 쪽에 있다 |
+| 위성 타일 | 출처가 문서화되어 있지 않다. 미래 프레임 위치까지 덮는지 확인한다 |
+| 생성 코드 | maptracker repo의 `tools/cache_teacher_kd.py` |
+| 실행 환경 | torch 1.12 env. RTX 5090(sm_120)에서는 돌지 않는다(§2-2). 새 서버 GPU에서 돌 수 있는지 확인한다 |
+
+**kyungmin에게 물어볼 것**
+1. memory 리셋 기준(`local_idx == 0`): 센서가 없는 프레임으로 간격이 생기면 리셋하는가? → A로 충분한지 판단한다. 이 답은 **스트리밍 전에** 필요하다.
+2. 미래 프레임을 포함한 map infos를 만들 수 있는가?
+3. 위성 타일이 navtrain 전 구간을 덮는가?
+4. 실행 위치: 새 서버에서 env를 돌릴 수 있는가, 아니면 kyungmin 서버에서 돌리고 결과만 받는가? 후자라면 새로 푼 프레임의 3캠만 넘기면 된다. E2E 4 s 78,543프레임 약 49 GB, navtrain 5 s 112,007프레임 약 70 GB다. navtrain 현재·과거 센서는 kyungmin 쪽에도 있다고 가정한다(기존 캐시를 만들었으므로).
+
+**순서**
+- 스트리밍 전에는 A/B(§10-1 3번)만 정하면 된다. 질문 1의 답이 그 근거다.
+- ReSMap 실행은 추출이 끝난 뒤 언제든 할 수 있다. BEVFusion 추론(§10-3)과 독립이다.

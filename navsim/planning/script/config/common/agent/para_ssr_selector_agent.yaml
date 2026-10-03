@@ -14,11 +14,10 @@ config:
   distill_selector_registers: 16
   distill_selector_div_sigma: 4.0
   distill_selector_tok_warmup_steps: 53195
-  # v2: per-cell match, sharpened planner cover, annealing anchor.
-  # See docs/bev_selector_v2.md. Student graph is unchanged.
+  # v3: per-cell match, sharpened planner cover, log-gaussian anchor.
+  # See docs/bev_selector_v3.md. Student graph is unchanged.
   distill_selector_anchor_sigma: 6.0
   distill_selector_anchor_sigma_end: 2.0
-  distill_selector_anchor_floor: 0.05
   distill_selector_plan_tau: 0.3
   distill_selector_struct_mix: 0.5
   use_corridor_mask: false

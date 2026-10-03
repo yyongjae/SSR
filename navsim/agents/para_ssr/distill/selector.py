@@ -4,10 +4,12 @@ The deployed student is unchanged. These registers are not a planner and are
 not read at inference. They choose where a frozen teacher supervises
 ``bev_embed``, on top of the student's own plan / det / motion / map losses.
 
-v2 matches teacher features per cell. Attention is detached, so the registers
+v3 matches teacher features per cell. Attention is detached, so the registers
 cannot lower the match by sliding onto easy cells. Coverage chases a sharpened
 planner map mixed with a bank structure prior, not a pooled token and not the
-GT trajectory. See ``docs/bev_selector_v2.md``.
+GT trajectory. The anchor is a log-gaussian inside the same softmax. A
+probability mixture with a uniform map collapsed in v2. See
+``docs/bev_selector_v3.md``.
 """
 from __future__ import annotations
 
@@ -40,7 +42,6 @@ class BEVRegisterSelector(nn.Module):
         tok_warmup_steps: int = 53195,
         anchor_sigma_m: float = 6.0,
         anchor_sigma_end_m: float = 2.0,
-        anchor_floor: float = 0.05,
         plan_tau: float = 0.3,
         struct_mix: float = 0.5,
     ) -> None:
@@ -57,7 +58,6 @@ class BEVRegisterSelector(nn.Module):
         self.tok_warmup_steps = max(int(tok_warmup_steps), 1)
         self.anchor_sigma_m = float(anchor_sigma_m)
         self.anchor_sigma_end_m = float(anchor_sigma_end_m)
-        self.anchor_floor = float(anchor_floor)
         self.plan_tau = float(plan_tau)
         self.struct_mix = float(struct_mix)
         if not 0.0 <= self.struct_mix <= 1.0:
@@ -96,15 +96,6 @@ class BEVRegisterSelector(nn.Module):
         """6 m at step 0, 2 m once the token ramp finishes."""
         ramp = self.ramp()
         return self.anchor_sigma_m + (self.anchor_sigma_end_m - self.anchor_sigma_m) * ramp
-
-    def anchor_mix(self) -> torch.Tensor:
-        """1 at step 0, then down to ``anchor_floor`` on the same ramp.
-
-        This is a probability mixture weight, not a logit scale. Scaling the
-        logits by a small floor would widen the softmax.
-        """
-        ramp = self.ramp()
-        return self.anchor_floor + (1.0 - self.anchor_floor) * (1.0 - ramp)
 
     def command_prior(self, command: torch.Tensor) -> torch.Tensor:
         """Wide forward wedge in SSR metres. Not the GT trajectory.
@@ -155,14 +146,12 @@ class BEVRegisterSelector(nn.Module):
         key = self.key_proj(bev.detach())
         scale = self.channels ** -0.5
         logits = torch.einsum("bark,bnk->barn", query, key) * scale
-        learned = logits.softmax(dim=-1)
-        sigma = self.anchor_sigma().to(device=logits.device, dtype=logits.dtype).clamp_min(1e-3)
+        sigma = self.anchor_sigma().to(device=logits.device, dtype=logits.dtype)
         dist2 = self.anchor_dist2.to(device=logits.device, dtype=logits.dtype)
-        anchor = (-dist2 / (2.0 * sigma * sigma)).softmax(dim=-1)
-        mix = self.anchor_mix().to(device=logits.device, dtype=logits.dtype)
-        # ``mix`` is 1 at step 0, so the lattice splits identical queries
-        # before diversity has a gradient. It stays at ``anchor_floor``.
-        return mix * anchor + (1.0 - mix) * learned
+        ramp = self.ramp().to(device=logits.device, dtype=logits.dtype)
+        # ``ramp`` is 0 at step 0, so random projections cannot erase the
+        # lattice. Later the gaussian stays inside the same softmax.
+        return anchor_log_attention(logits, dist2, sigma, ramp)
 
     def forward(
         self,
@@ -195,7 +184,6 @@ class BEVRegisterSelector(nn.Module):
         metrics: Dict[str, torch.Tensor] = {
             "distill_selector_ramp": ramp.detach(),
             "distill_sel_anchor_sigma": self.anchor_sigma().detach(),
-            "distill_sel_anchor_mix": self.anchor_mix().detach(),
         }
         cover_terms = []
         token_terms = []
@@ -234,6 +222,25 @@ class BEVRegisterSelector(nn.Module):
             metrics.update(_selection_metrics(stacked, self.cell_xy))
         self.steps += 1
         return losses, metrics
+
+
+def anchor_log_attention(
+    logits: torch.Tensor,
+    dist2: torch.Tensor,
+    sigma: torch.Tensor,
+    ramp: torch.Tensor,
+) -> torch.Tensor:
+    """Softmax of ``ramp * logits + log gaussian``.
+
+    ``ramp`` is 0 at step 0, so the map is the anchor gaussian before the
+    projections have a scale. A constant logit does not flatten that gaussian,
+    and identical logits across slots stay on the lattice. This is not a
+    probability mixture with a separate uniform map.
+    """
+    sigma = sigma.to(device=logits.device, dtype=logits.dtype).clamp_min(1e-3)
+    log_anchor = -dist2.to(device=logits.device, dtype=logits.dtype) / (2.0 * sigma * sigma)
+    scale = ramp.to(device=logits.device, dtype=logits.dtype)
+    return (scale * logits + log_anchor).softmax(dim=-1)
 
 
 def anchor_dist2(

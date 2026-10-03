@@ -13,6 +13,7 @@ from navsim.agents.para_ssr.configs.default import ParaSSRConfig
 from navsim.agents.para_ssr.distill.distillation import build_planning_distillation
 from navsim.agents.para_ssr.distill.selector import (
     BEVRegisterSelector,
+    anchor_log_attention,
     diversity_loss,
     late_cover_target,
     sharpen_rows,
@@ -180,14 +181,14 @@ def test_step_zero_attention_is_the_six_metre_anchor():
     sigma = torch.tensor(6.0)
     anchor = (-selector.anchor_dist2 / (2.0 * sigma ** 2)).softmax(dim=-1)
     assert torch.allclose(attention, anchor.unsqueeze(0), atol=1e-5)
-    assert float(selector.anchor_mix()) == pytest.approx(1.0)
     assert float(selector.anchor_sigma()) == pytest.approx(6.0)
+    assert float(selector.ramp()) == pytest.approx(0.0)
 
 
-def test_warmup_end_keeps_a_narrow_anchor_residue():
+def test_warmup_end_is_the_two_metre_gaussian():
     selector = BEVRegisterSelector(
-        channels=4, num_registers=4, bev_h=8, bev_w=8, tok_warmup_steps=10,
-        anchor_sigma_m=6.0, anchor_sigma_end_m=2.0, anchor_floor=0.05,
+        channels=4, num_registers=16, bev_h=50, bev_w=100, tok_warmup_steps=10,
+        anchor_sigma_m=6.0, anchor_sigma_end_m=2.0,
     )
     with torch.no_grad():
         for module in (
@@ -198,20 +199,58 @@ def test_warmup_end_keeps_a_narrow_anchor_residue():
             module.bias.zero_()
         selector.registers.zero_()
     selector.steps.fill_(selector.tok_warmup_steps)
-    bev = torch.randn(1, 64, 4)
+    bev = torch.randn(1, 5000, 4)
     command = torch.zeros(1, 4)
     command[0, 1] = 1.0
     attention = selector.attend(bev, command, torch.zeros(1, 4))
     sigma = torch.tensor(2.0)
     anchor = (-selector.anchor_dist2 / (2.0 * sigma ** 2)).softmax(dim=-1)
-    uniform = torch.full_like(anchor, 1.0 / anchor.shape[-1])
-    expected = 0.05 * anchor + 0.95 * uniform
-    assert float(selector.anchor_mix()) == pytest.approx(0.05)
     assert float(selector.anchor_sigma()) == pytest.approx(2.0)
-    assert torch.allclose(attention, expected.unsqueeze(0), atol=1e-5)
+    assert torch.allclose(attention, anchor.unsqueeze(0), atol=1e-5)
+    means = torch.matmul(attention[0].reshape(-1, 5000), selector.cell_xy)
+    nearest = _nearest_metres(means)
+    # The v2 residue of a shared uniform map sat at 0.34 m and entropy 8.44.
+    assert float(nearest.min()) > 4.0
+    assert 4.5 < float(_entropy(attention)) < 5.5
     wide = (-selector.anchor_dist2 / (2.0 * 6.0 ** 2)).softmax(dim=-1)
-    narrow = anchor
-    assert float(_entropy(narrow)) < float(_entropy(wide))
+    assert float(_entropy(anchor)) < float(_entropy(wide))
+
+
+def test_uniform_mixture_has_no_diversity_gradient():
+    """The v2 basin: 5% of a 2 m gaussian plus a shared uniform map."""
+    selector = BEVRegisterSelector(
+        channels=4, num_registers=16, bev_h=50, bev_w=100, tok_warmup_steps=10,
+    )
+    sigma = torch.tensor(2.0)
+    anchor = (-selector.anchor_dist2 / (2.0 * sigma ** 2)).softmax(dim=-1)
+    anchor = anchor.reshape(1, -1, 5000)
+    logits = torch.zeros(1, 32, 5000, requires_grad=True)
+    learned = logits.softmax(dim=-1)
+    residue = 0.05 * anchor + 0.95 * learned
+    loss = diversity_loss(residue, selector.cell_xy, 4.0)
+    grad = torch.autograd.grad(loss, logits)[0]
+    assert float(loss) == pytest.approx(1.757, abs=1e-2)
+    assert float(grad.abs().mean()) < 1e-4
+
+
+def test_a_logit_peak_can_leave_the_anchor():
+    selector = BEVRegisterSelector(
+        channels=4, num_registers=4, bev_h=50, bev_w=100, tok_warmup_steps=10,
+    )
+    sigma = torch.tensor(2.0)
+    dist2 = selector.anchor_dist2
+    anchor = (-dist2 / (2.0 * sigma ** 2)).softmax(dim=-1)
+    mode = int(anchor[0, 0].argmax())
+    distance = (selector.cell_xy - selector.cell_xy[mode]).pow(2).sum(-1).sqrt()
+    far = int((distance - 8.0).abs().argmin())
+    logits = torch.zeros(1, 2, 4, 5000)
+    logits[0, 0, 0, far] = 40.0
+    moved = anchor_log_attention(logits, dist2, sigma, torch.tensor(1.0))
+    origin = torch.matmul(anchor[0, 0], selector.cell_xy)
+    shifted = torch.matmul(moved[0, 0, 0], selector.cell_xy)
+    assert float((shifted - origin).norm()) > 4.0
+    flat = anchor_log_attention(torch.full_like(logits, 40.0), dist2, sigma, torch.tensor(1.0))
+    assert torch.allclose(flat, anchor.unsqueeze(0), atol=1e-5)
 
 
 def _entropy(prob: torch.Tensor) -> torch.Tensor:
@@ -300,7 +339,7 @@ def test_selector_yaml_turns_grad_balance_off():
     assert selector_cfg.distill_selector_plan_tau == 0.3
     assert selector_cfg.distill_selector_anchor_sigma == 6.0
     assert selector_cfg.distill_selector_anchor_sigma_end == 2.0
-    assert selector_cfg.distill_selector_anchor_floor == 0.05
+    assert not hasattr(selector_cfg, "distill_selector_anchor_floor")
     assert selector_cfg.distill_selector_struct_mix == 0.5
     assert v4_cfg.distill_selector is False
     assert v4_cfg.image_architecture == "resnet50.tv_in1k"

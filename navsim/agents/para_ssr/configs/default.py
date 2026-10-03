@@ -314,16 +314,15 @@ class ParaSSRConfig:
     distill_head_kd_det: bool = False
     distill_head_kd_det_geom: bool = False
     # Train-only BEV registers. Off so the v4 adapter + corridor launcher is
-    # unchanged. The selector recipe is docs/bev_selector_v2.md.
+    # unchanged. The selector recipe is docs/bev_selector_v3.md.
     distill_selector: bool = False
     distill_selector_registers: int = 16
     distill_selector_div_sigma: float = 4.0
     # Five epochs at ~10639 microbatches/rank (2 GPU x batch 4, navtrain).
     distill_selector_tok_warmup_steps: int = 53195
-    # Anchor width and mixture. Probability mix, so the end sigma stays 2 m.
+    # Log-gaussian width. Sigma anneals 6 m to 2 m inside the same softmax.
     distill_selector_anchor_sigma: float = 6.0
     distill_selector_anchor_sigma_end: float = 2.0
-    distill_selector_anchor_floor: float = 0.05
     # Late cover target: sharpen planner attention, then mix the bank prior.
     distill_selector_plan_tau: float = 0.3
     distill_selector_struct_mix: float = 0.5

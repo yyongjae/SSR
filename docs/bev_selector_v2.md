@@ -4,7 +4,8 @@
 **기준 문서**: [`bev_selector.md`](bev_selector.md) (v1. 그 파일의 측정만 여기로 가져오고, 레시피는 바꾸지 않는다)  
 **소속**: `/home/external-user/byounggun/SSR`  
 **작성일**: 2026-09-30  
-**상태**: 코드가 이 문서다. 학습 점수는 아직 없다.  
+**상태**: 측정된 v2 기록. 코드 기본값은 [`bev_selector_v3.md`](bev_selector_v3.md)다.  
+**측정**: Lightning `version_2`의 `last.ckpt`, navtest PDMS **0.8457**. 장면 분해와 수정은 v3 문서.  
 **비교**: 같은 navtest 12146 토큰, distill 키를 벗긴 epoch 29.
 
 Student는 바꾸지 않는다. 카메라, ResNet-34, BEV 50×100, dense planner, task interaction, plan / det / motion / map 손실, 진행 꼬리 0.003, GradBalancer 꺼짐은 v1과 같다. 배포 그래프도 같다. Register는 학습 중에만 있고 `agent._distill.*`로 빠진다.

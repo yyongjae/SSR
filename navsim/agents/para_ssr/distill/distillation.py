@@ -126,7 +126,6 @@ class PlanningDistillation(nn.Module):
         selector_commands: int = 4,
         selector_anchor_sigma: float = 6.0,
         selector_anchor_sigma_end: float = 2.0,
-        selector_anchor_floor: float = 0.05,
         selector_plan_tau: float = 0.3,
         selector_struct_mix: float = 0.5,
     ) -> None:
@@ -176,7 +175,6 @@ class PlanningDistillation(nn.Module):
         self.selector_commands = int(selector_commands)
         self.selector_anchor_sigma = float(selector_anchor_sigma)
         self.selector_anchor_sigma_end = float(selector_anchor_sigma_end)
-        self.selector_anchor_floor = float(selector_anchor_floor)
         self.selector_plan_tau = float(selector_plan_tau)
         self.selector_struct_mix = float(selector_struct_mix)
 
@@ -260,7 +258,6 @@ class PlanningDistillation(nn.Module):
                 tok_warmup_steps=self.selector_tok_warmup_steps,
                 anchor_sigma_m=self.selector_anchor_sigma,
                 anchor_sigma_end_m=self.selector_anchor_sigma_end,
-                anchor_floor=self.selector_anchor_floor,
                 plan_tau=self.selector_plan_tau,
                 struct_mix=self.selector_struct_mix,
             )
@@ -726,7 +723,6 @@ def build_planning_distillation(config):
         selector_anchor_sigma_end=float(
             getattr(config, "distill_selector_anchor_sigma_end", 2.0)
         ),
-        selector_anchor_floor=float(getattr(config, "distill_selector_anchor_floor", 0.05)),
         selector_plan_tau=float(getattr(config, "distill_selector_plan_tau", 0.3)),
         selector_struct_mix=float(getattr(config, "distill_selector_struct_mix", 0.5)),
     )

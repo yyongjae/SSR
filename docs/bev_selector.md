@@ -4,7 +4,7 @@
 
 **소속**: `/home/external-user/byounggun/SSR`  
 **작성일**: 2026-09-28  
-**상태**: v1 기록. 코드 기본값은 [`bev_selector_v2.md`](bev_selector_v2.md)다.  
+**상태**: v1 기록. 코드 기본값은 [`bev_selector_v3.md`](bev_selector_v3.md)다.  
 **측정**: `r34_sel_trial_2` epoch 29, navtest PDMS **0.8343** (DAC fail 1030). v4는 0.8563.  
 **기준 점수**: 같은 navtest 12146 토큰, distill 키를 벗긴 epoch 29. version_0 PDMS 0.8539, version_4 PDMS 0.8563 (DAC fail 764, TTC fail 681).
 

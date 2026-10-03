@@ -1,0 +1,36 @@
+{
+ "T": {
+  "tau0": 0.0,
+  "tau1": 0.0,
+  "p_g": 0.0,
+  "z_lon": 0.0,
+  "w_lat": 0.0,
+  "n_tokens": 96,
+  "draft_valid_eq": true,
+  "ckpt_keys": [
+   "model",
+   "epoch",
+   "step",
+   "val"
+  ],
+  "ckpt_epoch": 31.0,
+  "ckpt_step": 68736.0
+ },
+ "none": {
+  "tau0": 0.0,
+  "tau1": 0.0,
+  "p_g": 0.0,
+  "z_lon": 0.0,
+  "w_lat": 0.0,
+  "n_tokens": 96,
+  "draft_valid_eq": true,
+  "ckpt_keys": [
+   "model",
+   "epoch",
+   "step",
+   "val"
+  ],
+  "ckpt_epoch": 29.0,
+  "ckpt_step": 64440.0
+ }
+}

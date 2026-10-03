@@ -1,0 +1,23 @@
+{
+ "drafts_dev": {
+  "n": 150,
+  "mismatch": 0,
+  "examples": [],
+  "cfg_hash": "3b7db8d7e630"
+ },
+ "sdf_dev": {
+  "n": 50,
+  "mismatch": 0,
+  "examples": []
+ },
+ "sdf_navtest_preexisting550": {
+  "n": 50,
+  "mismatch": 0,
+  "examples": []
+ },
+ "centerline_dev_pack": {
+  "n": 150,
+  "mismatch": 0,
+  "examples": []
+ }
+}

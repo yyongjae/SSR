@@ -8,7 +8,7 @@ Values fall into three groups:
 * **optimisation** -- the WoTE/SeerDrive-derived recipe (see report #09 §4).
 """
 from dataclasses import dataclass, field
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
@@ -258,6 +258,46 @@ class ParaSSRConfig:
     # backbone learns at 0.1x, as in WoTE and in the original SSR config
     backbone_lr_mult: float = 0.1
     grad_clip_norm: float = 35.0
+
+    # ------------------------------------------------------------------ #
+    # Stage E: student refiner (+ correction KD).  'off' = E0, nothing is
+    # built, loaded or computed (bit-identical, tools/refiner/stageE_parity.py).
+    # See navsim/agents/para_ssr/refiner/e2e.py and
+    # report/refiner_T/stageE_impl_plan.md.
+    # ------------------------------------------------------------------ #
+    refiner_mode: str = "off"            # off | E1 (surrogate) | E2 (surrogate + KD)
+    ref_bev_grad_scale: float = 0.1      # gradient scale student BEV <- refiner
+    ref_w: float = 1.0                   # weight of the surrogate loss
+    ref_term_weights: Dict[str, float] = field(
+        default_factory=lambda: dict(col=1.0, ttc=1.0, dac=1.0, prog=2.0, cmf=0.1, mod=0.1)
+    )
+    ref_m_col: float = 0.15
+    ref_m_dac: float = 0.05
+    ref_m_ttc: float = 0.15
+    ref_lon_st_slope: float = 0.1        # mode-A straight-through slope (training only)
+    ref_perturb_frac: float = 0.5        # share of samples fed a perturbed sg(tau0)
+    ref_seed: int = 0                    # refiner init + perturbation rng
+    ref_lr_mult: float = 3.0             # refiner lr = lr * 3 (stage-T 3e-4 peak)
+    ref_weight_decay: float = 0.01
+    ref_clip: float = 1.0                # refiner-only grad-norm clip (before the global 35)
+    ref_data_root: str = "/home/external-user/ssd/yongjae_refiner"
+    kd_teacher_runs: Tuple[str, ...] = ()
+    kd_lambda: float = 0.0               # lambda_KD constant (from the pilot rule)
+    kd_space: str = ""                   # KD control space raw | tanh | decoded; E2 training refuses "" (user choice)
+    kd_ramp: Tuple[float, float] = (5.0, 10.0)   # 0 before epoch a, linear to 1 at epoch b (REVISION 1: 5-9)
+    ref_eval_traj: str = "final"         # eval output: final (tau_final) | tau0
+    # KD balance / draft options (defaults = the behaviour before these options existed; refiner/e2e.py docstring)
+    kd_balance: str = "fixed"            # fixed: kd_lambda x ramp | ema: w = kd_ratio * EMA(L_sur_w) / EMA(L_KD)
+    kd_ratio: float = 1.0                # ema: target weighted-KD / weighted-surrogate magnitude ratio
+    kd_ema_m: float = 0.99               # ema momentum (bias-corrected)
+    kd_ema_floor: float = 1e-4           # ema: floor on EMA(L_KD) in the denominator
+    kd_start_epoch: Optional[float] = None   # ema: KD on from this epoch (no ramp); None -> kd_ramp[0]
+    kd_draft_source: str = "tau0"        # tau0: perturbed sg(tau0) | human_mix: perturbed GT human traj (else sg(tau0))
+    ref_human_only_until: Optional[float] = None  # epoch < this: every draft = perturbed GT human (invalid -> unperturbed
+                                         #   GT human); from then on kd_draft_source applies.  None = off
+    kd_ratio_ramp_epochs: Optional[float] = None  # ema: ratio 0 -> kd_ratio linearly over [kd_start, kd_start + this]; None = off
+    kd_weight_max: Optional[float] = None         # ema: cap on the KD weight (after the ratio); None = no cap
+    grad_share_every: int = 50           # E1/E2: log ||dL/d bev_embed|| of E0 / surrogate / KD every n micro-batches (0 = off)
 
     @property
     def bev_grid_length(self) -> Tuple[float, float]:

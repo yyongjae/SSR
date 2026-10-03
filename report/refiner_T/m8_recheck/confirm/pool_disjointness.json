@@ -1,0 +1,32 @@
+{
+ "sweep": {
+  "n_tokens": 800,
+  "n_logs": 800
+ },
+ "confirm": {
+  "n_tokens": 842,
+  "n_logs": 91
+ },
+ "token_intersection": [],
+ "log_intersection": [],
+ "disjoint_tokens": true,
+ "disjoint_logs": true,
+ "eligible": 23820,
+ "eligible_logs": 891,
+ "unused_eligible": 1930,
+ "unused_logs": 91,
+ "cap_per_log": 12,
+ "seed": 0,
+ "target_n": 800,
+ "tokens_per_log": {
+  "count": 91.0,
+  "mean": 9.252747252747254,
+  "std": 3.2131445539063326,
+  "min": 2.0,
+  "25%": 6.0,
+  "50%": 11.0,
+  "75%": 12.0,
+  "max": 12.0
+ },
+ "created": "2026-09-28 12:14:10"
+}

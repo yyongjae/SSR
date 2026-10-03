@@ -1,0 +1,87 @@
+{
+ "run": "/home/external-user/ssd/yongjae_refiner/runs/stageT4_M_fold0_seed0",
+ "eval": "eval_train_fold0",
+ "liveness": 0.1254375851587884,
+ "n_live": 5984,
+ "frac_zlon_all_pos": 0.8209202389686616,
+ "frac_short_gt_0p5m": 0.09441358348181532,
+ "mean_short_m": 0.27551934829435204,
+ "n_valid": 47705,
+ "by_family": {
+  "identity": {
+   "n": 3895,
+   "liveness": 0.02336328626444159,
+   "n_live": 91,
+   "frac_zlon_all_pos": 0.9465982028241335,
+   "frac_short_gt_0p5m": 0.01386392811296534,
+   "mean_short_m": 0.022083232286010585
+  },
+  "small": {
+   "n": 11662,
+   "liveness": 0.03344194820785457,
+   "n_live": 390,
+   "frac_zlon_all_pos": 0.9295146630080604,
+   "frac_short_gt_0p5m": 0.018607442977190875,
+   "mean_short_m": 0.026532736629316763
+  },
+  "lconst": {
+   "n": 16624,
+   "liveness": 0.1257820019249278,
+   "n_live": 2091,
+   "frac_zlon_all_pos": 0.8163498556304138,
+   "frac_short_gt_0p5m": 0.08818575553416746,
+   "mean_short_m": 0.14578393804498035
+  },
+  "ignore_brake": {
+   "n": 1081,
+   "liveness": 0.18963922294172064,
+   "n_live": 205,
+   "frac_zlon_all_pos": 0.6984273820536541,
+   "frac_short_gt_0p5m": 0.09805735430157261,
+   "mean_short_m": 0.13064428128711883
+  },
+  "creep": {
+   "n": 125,
+   "liveness": 0.912,
+   "n_live": 114,
+   "frac_zlon_all_pos": 0.064,
+   "frac_short_gt_0p5m": 0.792,
+   "mean_short_m": 1.9763376655603515
+  },
+  "lat": {
+   "n": 7088,
+   "liveness": 0.041337471783295714,
+   "n_live": 293,
+   "frac_zlon_all_pos": 0.9068848758465011,
+   "frac_short_gt_0p5m": 0.020739277652370203,
+   "mean_short_m": 0.04035594387121886
+  },
+  "combined": {
+   "n": 3335,
+   "liveness": 0.14272863568215893,
+   "n_live": 476,
+   "frac_zlon_all_pos": 0.782608695652174,
+   "frac_short_gt_0p5m": 0.09895052473763119,
+   "mean_short_m": 0.17232226931631375
+  },
+  "cv": {
+   "n": 3890,
+   "liveness": 0.5974293059125964,
+   "n_live": 2324,
+   "frac_zlon_all_pos": 0.32339331619537276,
+   "frac_short_gt_0p5m": 0.5359897172236504,
+   "mean_short_m": 2.333082860565337
+  },
+  "hdrift": {
+   "n": 5,
+   "liveness": 0.0,
+   "n_live": 0,
+   "frac_zlon_all_pos": 1.0,
+   "frac_short_gt_0p5m": 0.0,
+   "mean_short_m": 0.00013156050396085918
+  }
+ },
+ "short_threshold_m": 0.5,
+ "min_liveness": 0.01,
+ "gate_pass": true
+}

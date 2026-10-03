@@ -1,0 +1,418 @@
+{
+ "what": "AMENDMENT 5 teacher-shuffle control (descriptive, dev only). R_T run 3 frozen ckpt_best, BEV lookup remapped by a seed-0 cyclic derangement of the 7930 dev tokens (each token reads another token's BEV); drafts, tokens, model, theta (0 for both arms) unchanged. Paired by (token, k); log-cluster bootstrap 10,000, seed 0, 95% pct CI.",
+ "sign": "a_minus_b: pdms_points + = a better; fail_*_pp + = a fails more",
+ "shuffle_meta": {
+  "run": "/home/external-user/ssd/yongjae_refiner/runs/stageT3_T_fold0_seed0",
+  "ckpt": "best",
+  "split": "dev",
+  "fold": null,
+  "n_tokens": 7930,
+  "mode": "A",
+  "arm": "T",
+  "sec": 56.0,
+  "created": "2026-09-29T13:54:14",
+  "tau1_eq_tau0_frac": 0.044097390629547,
+  "teacher_shuffle": {
+   "seed": 0,
+   "n": 7930,
+   "kind": "seeded cyclic derangement",
+   "fixed_points": 0,
+   "same_log_frac": 0.00605296343001261
+  }
+ },
+ "n_paired_drafts": 97386,
+ "n_logs": 295,
+ "orig": {
+  "pdms": 0.821472561202382,
+  "fail_nc_pct": 5.23483868317828,
+  "fail_ttc_pct": 11.388700634588133,
+  "fail_dac_pct": 7.971371655063356
+ },
+ "rates": {
+  "true": {
+   "pdms": 0.8955624079219051,
+   "fail_nc_pct": 1.3420820241102418,
+   "fail_ttc_pct": 5.842728934343746,
+   "fail_dac_pct": 3.5713552255971086,
+   "fail_ncttc_pct": 6.0368020043948825,
+   "new_fail_pct": 0.170455712320046
+  },
+  "shuf": {
+   "pdms": 0.7877497194978358,
+   "fail_nc_pct": 5.362167046598073,
+   "fail_ttc_pct": 11.52219004785082,
+   "fail_dac_pct": 9.90594130573183,
+   "fail_ncttc_pct": 11.74090731727353,
+   "new_fail_pct": 7.647916538311462
+  },
+  "none": {
+   "pdms": 0.8811753171359197,
+   "fail_nc_pct": 1.7754091963937322,
+   "fail_ttc_pct": 6.63237015587456,
+   "fail_dac_pct": 4.577660033269669,
+   "fail_ncttc_pct": 6.82747006756618,
+   "new_fail_pct": 0.375824040416487
+  }
+ },
+ "contrasts": {
+  "true_minus_shuf": {
+   "pdms_points": {
+    "mean": 10.781268842406918,
+    "lo": 10.190500536570473,
+    "hi": 11.400910364807212,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_nc_pp": {
+    "mean": -4.020085022487832,
+    "lo": -4.44189291808035,
+    "hi": -3.6043073551323954,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_ttc_pp": {
+    "mean": -5.679461113507075,
+    "lo": -6.251213536221717,
+    "hi": -5.120000497900926,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_dac_pp": {
+    "mean": -6.334586080134722,
+    "lo": -7.02038259549963,
+    "hi": -5.685094178196249,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_ncttc_pp": {
+    "mean": -5.704105312878648,
+    "lo": -6.276372806541865,
+    "hi": -5.13979767773533,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "new_fail_pp": {
+    "mean": -7.4774608259914155,
+    "lo": -8.042699073289377,
+    "hi": -6.940401495385681,
+    "n_logs": 295,
+    "n": 97386
+   }
+  },
+  "shuf_minus_none": {
+   "pdms_points": {
+    "mean": -9.342559763808389,
+    "lo": -9.945722879733156,
+    "hi": -8.759880343126772,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_nc_pp": {
+    "mean": 3.586757850204342,
+    "lo": 3.1872584562622235,
+    "hi": 3.988877924266433,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_ttc_pp": {
+    "mean": 4.889819891976259,
+    "lo": 4.299225729943037,
+    "hi": 5.487134062057895,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_dac_pp": {
+    "mean": 5.328281272462161,
+    "lo": 4.749540124632302,
+    "hi": 5.927334042030701,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_ncttc_pp": {
+    "mean": 4.91343724970735,
+    "lo": 4.322216928011023,
+    "hi": 5.513566218028015,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "new_fail_pp": {
+    "mean": 7.272092497894975,
+    "lo": 6.750639045397211,
+    "hi": 7.818495083311186,
+    "n_logs": 295,
+    "n": 97386
+   }
+  },
+  "true_minus_none": {
+   "pdms_points": {
+    "mean": 1.4387090785985288,
+    "lo": 1.1863711160618204,
+    "hi": 1.6940980569107915,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_nc_pp": {
+    "mean": -0.43332717228349044,
+    "lo": -0.586962160113749,
+    "hi": -0.2874306014776474,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_ttc_pp": {
+    "mean": -0.7896412215308155,
+    "lo": -1.0917022997249275,
+    "hi": -0.5032917839870632,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_dac_pp": {
+    "mean": -1.0063048076725607,
+    "lo": -1.199550113182221,
+    "hi": -0.8135557618770068,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "fail_ncttc_pp": {
+    "mean": -0.7906680631712978,
+    "lo": -1.0912914889930627,
+    "hi": -0.5046717375188317,
+    "n_logs": 295,
+    "n": 97386
+   },
+   "new_fail_pp": {
+    "mean": -0.20536832809644098,
+    "lo": -0.3248299272906717,
+    "hi": -0.09278978675600022,
+    "n_logs": 295,
+    "n": 97386
+   }
+  }
+ },
+ "share_of_true_minus_none_retained_by_shuffle": {
+  "pdms": -6.493710161966265,
+  "ncttc": -6.2142857142857135
+ },
+ "strata": {
+  "las_vegas": {
+   "n": 63025,
+   "n_logs": 187,
+   "true_minus_shuf": {
+    "pdms_points": {
+     "mean": 9.943716355926991,
+     "lo": 9.253925153985179,
+     "hi": 10.659842431738417,
+     "n_logs": 187,
+     "n": 63025
+    },
+    "fail_ncttc_pp": {
+     "mean": -6.613248710829037,
+     "lo": -7.266166992224586,
+     "hi": -5.9646655203446555,
+     "n_logs": 187,
+     "n": 63025
+    }
+   },
+   "shuf_minus_none": {
+    "pdms_points": {
+     "mean": -8.435407610813222,
+     "lo": -9.144195031188923,
+     "hi": -7.737484053095152,
+     "n_logs": 187,
+     "n": 63025
+    },
+    "fail_ncttc_pp": {
+     "mean": 5.39468464894883,
+     "lo": 4.602641003330703,
+     "hi": 6.1944957228637545,
+     "n_logs": 187,
+     "n": 63025
+    }
+   },
+   "true_minus_none": {
+    "pdms_points": {
+     "mean": 1.5083087451137693,
+     "lo": 1.1648411865875077,
+     "hi": 1.853376127515913,
+     "n_logs": 187,
+     "n": 63025
+    },
+    "fail_ncttc_pp": {
+     "mean": -1.2185640618802063,
+     "lo": -1.6248031733922073,
+     "hi": -0.8131870749448963,
+     "n_logs": 187,
+     "n": 63025
+    }
+   }
+  },
+  "other_cities": {
+   "n": 34361,
+   "n_logs": 108,
+   "true_minus_shuf": {
+    "pdms_points": {
+     "mean": 12.317508924488273,
+     "lo": 11.252742809275246,
+     "hi": 13.429559501641153,
+     "n_logs": 108,
+     "n": 34361
+    },
+    "fail_ncttc_pp": {
+     "mean": -4.036553068886238,
+     "lo": -4.92811419719232,
+     "hi": -3.227084290140867,
+     "n_logs": 108,
+     "n": 34361
+    }
+   },
+   "shuf_minus_none": {
+    "pdms_points": {
+     "mean": -11.006459663186183,
+     "lo": -11.939750689389474,
+     "hi": -10.083210271136917,
+     "n_logs": 108,
+     "n": 34361
+    },
+    "fail_ncttc_pp": {
+     "mean": 4.030732516515818,
+     "lo": 3.2563427924985704,
+     "hi": 4.84720461537884,
+     "n_logs": 108,
+     "n": 34361
+    }
+   },
+   "true_minus_none": {
+    "pdms_points": {
+     "mean": 1.3110492613020877,
+     "lo": 0.9173950789220668,
+     "hi": 1.699305699713245,
+     "n_logs": 108,
+     "n": 34361
+    },
+    "fail_ncttc_pp": {
+     "mean": -0.005820552370419953,
+     "lo": -0.2983029153656629,
+     "hi": 0.26146919642470784,
+     "n_logs": 108,
+     "n": 34361
+    }
+   }
+  },
+  "drive_sibling_in_train": {
+   "n": 91789,
+   "n_logs": 285,
+   "true_minus_shuf": {
+    "pdms_points": {
+     "mean": 10.768852941990314,
+     "lo": 10.156274813467066,
+     "hi": 11.420382583270545,
+     "n_logs": 285,
+     "n": 91789
+    },
+    "fail_ncttc_pp": {
+     "mean": -5.648825022606195,
+     "lo": -6.238180595455027,
+     "hi": -5.081450912024142,
+     "n_logs": 285,
+     "n": 91789
+    }
+   },
+   "shuf_minus_none": {
+    "pdms_points": {
+     "mean": -9.285681023375936,
+     "lo": -9.916987302375269,
+     "hi": -8.685641004528273,
+     "n_logs": 285,
+     "n": 91789
+    },
+    "fail_ncttc_pp": {
+     "mean": 4.79469217444356,
+     "lo": 4.206184171977858,
+     "hi": 5.411028992809916,
+     "n_logs": 285,
+     "n": 91789
+    }
+   },
+   "true_minus_none": {
+    "pdms_points": {
+     "mean": 1.4831719186143777,
+     "lo": 1.220274838055992,
+     "hi": 1.7542239033059608,
+     "n_logs": 285,
+     "n": 91789
+    },
+    "fail_ncttc_pp": {
+     "mean": -0.8541328481626339,
+     "lo": -1.1640459887409205,
+     "hi": -0.5655743342603491,
+     "n_logs": 285,
+     "n": 91789
+    }
+   }
+  },
+  "drive_heldout": {
+   "n": 5597,
+   "n_logs": 10,
+   "true_minus_shuf": {
+    "pdms_points": {
+     "mean": 10.98488561627501,
+     "lo": 9.09474362735809,
+     "hi": 13.368128176338622,
+     "n_logs": 10,
+     "n": 5597
+    },
+    "fail_ncttc_pp": {
+     "mean": -6.61068429515812,
+     "lo": -9.018742994623219,
+     "hi": -4.027770374318882,
+     "n_logs": 10,
+     "n": 5597
+    }
+   },
+   "shuf_minus_none": {
+    "pdms_points": {
+     "mean": -10.275352814648922,
+     "lo": -12.958634183724394,
+     "hi": -8.240320586137852,
+     "n_logs": 10,
+     "n": 5597
+    },
+    "fail_ncttc_pp": {
+     "mean": 6.860818295515454,
+     "lo": 3.7864096484428433,
+     "hi": 10.1214523222757,
+     "n_logs": 10,
+     "n": 5597
+    }
+   },
+   "true_minus_none": {
+    "pdms_points": {
+     "mean": 0.7095328016260892,
+     "lo": -0.16644673931542633,
+     "hi": 1.3500366267878103,
+     "n_logs": 10,
+     "n": 5597
+    },
+    "fail_ncttc_pp": {
+     "mean": 0.2501340003573343,
+     "lo": -0.737777638957304,
+     "hi": 1.262153072270237,
+     "n_logs": 10,
+     "n": 5597
+    }
+   }
+  }
+ },
+ "shuf_vs_orig_no_correction": {
+  "d_pdms_points": -3.3722841704546203,
+  "d_fail_nc_pp": 0.12732836341979326,
+  "d_fail_ttc_pp": 0.13348941326268715,
+  "d_fail_dac_pp": 1.9345696506684735
+ },
+ "check_true_minus_none_equals_decision_dev": {
+  "P1": 1.4387090785985288,
+  "P2": 0.7906680631712978,
+  "decision_dev_P1": 1.4387090785985288,
+  "decision_dev_P2": 0.7906680631712978
+ },
+ "reading": "R_T with wrong-scene BEV does NOT beat R_none: it is far worse than R_none (-9.3 pts PDMS, +4.9 pp NC+TTC, +5.3 pp DAC) and worse than applying no correction at all (-3.4 pts vs original drafts, DAC 9.9% vs 8.0%). R_T output is driven by the scene-specific content of the BEV; the R_T - R_none advantage is not an extra-channel/capacity effect. Same pattern in every stratum incl. the 10 drive-held-out logs. Limit: a cross-scene shuffle is out-of-distribution (BEV road layout contradicts the drafts), so it shows R_T relies on the BEV being of the right scene, not WHICH part (teacher object knowledge vs road layout vs place memory) carries the advantage; it does not address the drive-overlap threat (navtest does)."
+}

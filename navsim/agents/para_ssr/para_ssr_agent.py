@@ -308,6 +308,16 @@ class ParaSSRAgent(AbstractAgent):
         self.para_ssr_model = ParaSSRModel(model_config)
         self._loss = ParaSSRLoss(config)
         self.latest_logs: Dict[str, torch.Tensor] = {}
+        # Stage E (refiner/e2e.py): built only when switched on, so 'off' (E0)
+        # constructs, loads and computes exactly what it did before.
+        self._stage_e = None
+        if getattr(config, "refiner_mode", "off") != "off":
+            from .refiner.e2e import StageE, build_student
+
+            self.ref_student = build_student(
+                int(config.ref_seed), float(config.ref_bev_grad_scale), int(config.embed_dims)
+            )
+            self._stage_e = StageE(config)
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
@@ -476,6 +486,33 @@ class ParaSSRAgent(AbstractAgent):
                 "map_dir_interval must satisfy 1 <= interval < points/vector, "
                 f"got {config.map_dir_interval} and {config.map_num_pts_per_vec}"
             )
+        refiner_mode = getattr(config, "refiner_mode", "off")
+        if refiner_mode not in ("off", "E1", "E2"):
+            raise ValueError(f"refiner_mode must be off, E1 or E2, got {refiner_mode!r}")
+        if refiner_mode != "off":
+            if (config.bev_h, config.bev_w) != (50, 100) or tuple(config.pc_range) != (
+                -32.0, 0.0, -2.0, 32.0, 32.0, 2.0
+            ):
+                raise ValueError("the student refiner reads the 50 x 100 S grid (0.64 m, front ROI)")
+            if config.ref_eval_traj not in ("final", "tau0"):
+                raise ValueError(f"ref_eval_traj must be final or tau0, got {config.ref_eval_traj!r}")
+            if len(tuple(config.kd_ramp)) != 2:
+                raise ValueError(f"kd_ramp must be (start_epoch, end_epoch), got {config.kd_ramp}")
+            if getattr(config, "kd_balance", "fixed") not in ("fixed", "ema"):
+                raise ValueError(f"kd_balance must be fixed or ema, got {config.kd_balance!r}")
+            if getattr(config, "kd_draft_source", "tau0") not in ("tau0", "human_mix"):
+                raise ValueError(f"kd_draft_source must be tau0 or human_mix, got {config.kd_draft_source!r}")
+            if getattr(config, "kd_balance", "fixed") == "ema" and not (
+                0.0 < float(config.kd_ema_m) < 1.0 and float(config.kd_ema_floor) > 0.0 and float(config.kd_ratio) >= 0.0
+            ):
+                raise ValueError("kd_balance ema needs 0 < kd_ema_m < 1, kd_ema_floor > 0, kd_ratio >= 0")
+            hou = getattr(config, "ref_human_only_until", None)
+            if hou is not None and not float(hou) >= 0.0:
+                raise ValueError(f"ref_human_only_until must be null or >= 0, got {hou!r}")
+            for k in ("kd_ratio_ramp_epochs", "kd_weight_max"):
+                v = getattr(config, k, None)
+                if v is not None and not (float(v) > 0.0 and getattr(config, "kd_balance", "fixed") == "ema"):
+                    raise ValueError(f"{k} must be null or > 0 with kd_balance ema, got {v!r}")
         if trajectory_sampling.num_poses != config.fut_ts:
             raise ValueError(
                 "trajectory_sampling and fut_ts disagree: "
@@ -567,7 +604,11 @@ class ParaSSRAgent(AbstractAgent):
         # scales here also makes zero-share ablations effective on the very first
         # forward, before the first scheduled measurement.
         self._loss.apply_aux_scales(self.para_ssr_model)
-        return self.para_ssr_model(features)
+        predictions = self.para_ssr_model(features)
+        if self._stage_e is not None and not self.training:
+            # inference: trajectory = tau_final (or tau0 with ref_eval_traj=tau0)
+            predictions = self._stage_e.infer(self.ref_student, features, predictions)
+        return predictions
 
     def compute_loss(
         self,
@@ -583,11 +624,28 @@ class ParaSSRAgent(AbstractAgent):
         ``latest_logs`` and picked up by :class:`ParaSSRLoggingCallback`.
         """
         loss, logs = self._loss(self.para_ssr_model, features, targets, predictions)
+        if self._stage_e is not None and self.training:
+            # Added AFTER the grad balancer: its plan/det/map shares are unchanged.
+            ref_loss, ref_logs = self._stage_e.loss(
+                self.ref_student, features, targets, predictions,
+                iteration=self._loss.iteration - 1,
+                log_bev_grad="gnorm/plan" in logs,
+                e0_loss=loss,
+            )
+            logs["loss_e0"] = logs["loss"]
+            loss = loss + ref_loss
+            logs.update(ref_logs)
+            logs["loss"] = loss.detach()
         self.latest_logs = logs
         return loss
 
     def get_training_callbacks(self) -> List["pl.Callback"]:
-        return [ParaSSRLoggingCallback()]
+        callbacks: List[pl.Callback] = [ParaSSRLoggingCallback()]
+        if self._stage_e is not None:
+            from .refiner.e2e import make_callback
+
+            callbacks.append(make_callback(self))
+        return callbacks
 
     # ------------------------------------------------------------------ #
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
@@ -609,6 +667,17 @@ class ParaSSRAgent(AbstractAgent):
                 "lr_scale": cfg.backbone_lr_mult,
             },
         ]
+        if self._stage_e is not None:
+            from .refiner.e2e import refiner_parameters
+
+            groups.append(
+                {
+                    "params": refiner_parameters(self),
+                    "lr": self._lr * cfg.ref_lr_mult,
+                    "lr_scale": cfg.ref_lr_mult,
+                    "weight_decay": cfg.ref_weight_decay,
+                }
+            )
         optimizer_cls = getattr(torch.optim, cfg.optimizer_type)
         optimizer = optimizer_cls(groups, lr=self._lr, weight_decay=cfg.weight_decay)
 

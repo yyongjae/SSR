@@ -1,0 +1,112 @@
+{
+  "n_tokens": 85109,
+  "n_unique_tokens": 85109,
+  "n_logs": 978,
+  "columns": [
+    "token",
+    "log",
+    "frame_idx",
+    "city"
+  ],
+  "objects": {
+    "train": 19732,
+    "navtrain": 58743,
+    "dev": 6634
+  },
+  "objects_missing": 0,
+  "object_overlaps": {
+    "train-navtrain": 0,
+    "train-dev": 0,
+    "navtrain-dev": 0
+  },
+  "sdf_missing": 0,
+  "side_missing": 0,
+  "teacher_missing": {
+    "T": 0,
+    "M": 0
+  },
+  "human_meta": {
+    "split": "e2e_train_trainlogs",
+    "n": 85109,
+    "created": "2026-09-29 19:51:30",
+    "logs_dir": "/home/external-user/yongjae/SSR/data/dataset/navsim_logs/trainval",
+    "frame_idx_matches_split": true,
+    "frame_gap": 735,
+    "gap4": 582,
+    "n_avail_ge16": 84121,
+    "n_reg_ge16": 83005,
+    "seconds": 27.94069528579712
+  },
+  "human_missing": 0,
+  "human_frame_gap": 735,
+  "human_gap4": 582,
+  "human_nreg_min": 0,
+  "human_nreg_lt8": 582,
+  "non_train_logs": 0,
+  "val_overlap_logs": 0,
+  "test_overlap_logs": 0,
+  "sample": {
+    "n": 32,
+    "all_gt_ok": true,
+    "max_obj_count": 363,
+    "max_pose_diff": 0.0,
+    "nonfinite": [],
+    "example_shapes": {
+      "ref_obj_kf": [
+        800,
+        11,
+        6
+      ],
+      "ref_obj_first": [
+        800,
+        6
+      ],
+      "ref_obj_meta": [
+        800,
+        5
+      ],
+      "ref_obj_n": [],
+      "ref_obj_n_kf": [],
+      "ref_obj_R": [],
+      "ref_obj_ego_kf": [
+        11,
+        3
+      ],
+      "ref_sdf": [
+        320,
+        256
+      ],
+      "ref_cl_xy": [
+        1536,
+        2
+      ],
+      "ref_cl_valid": [
+        1536
+      ],
+      "ref_cl_n": [],
+      "ref_p_pdm": [],
+      "ref_gt_ok": [],
+      "ref_human_path": [
+        16,
+        3
+      ],
+      "ref_human_nreg": [],
+      "kd_bev_0": [
+        256,
+        50,
+        100
+      ],
+      "kd_ok_0": [],
+      "kd_bev_1": [
+        256,
+        50,
+        100
+      ],
+      "kd_ok_1": []
+    },
+    "kd_ok": {
+      "T": 32,
+      "M": 32
+    }
+  }
+}

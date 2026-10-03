@@ -103,6 +103,39 @@ config:
   backbone_lr_mult: 0.1
   optimizer_type: AdamW
 
+  # --- Stage E student refiner (report/refiner_T/stageE_impl_plan.md) -------
+  # off = E0 (nothing built or computed).  E1 = + student refiner trained with
+  # the GT surrogate; E2 = E1 + correction KD from kd_teacher_runs.
+  refiner_mode: "off"
+  ref_bev_grad_scale: 0.1
+  ref_w: 1.0
+  ref_term_weights: {col: 1.0, ttc: 1.0, dac: 1.0, prog: 2.0, cmf: 0.1, mod: 0.1}
+  ref_m_col: 0.15
+  ref_m_dac: 0.05
+  ref_m_ttc: 0.15
+  ref_lon_st_slope: 0.1
+  ref_perturb_frac: 0.5
+  ref_seed: 0
+  ref_lr_mult: 3.0
+  ref_weight_decay: 0.01
+  ref_clip: 1.0
+  ref_data_root: /home/external-user/ssd/yongjae_refiner
+  kd_teacher_runs: []
+  kd_lambda: 0.0
+  kd_space: ""
+  kd_ramp: [5.0, 10.0]
+  ref_eval_traj: final
+  kd_balance: fixed        # fixed | ema (w = kd_ratio * EMA(L_sur_w) / EMA(L_KD))
+  kd_ratio: 1.0
+  kd_ema_m: 0.99
+  kd_ema_floor: 1.0e-4
+  kd_start_epoch: null     # ema: KD on from this epoch, no ramp (null -> kd_ramp[0])
+  kd_draft_source: tau0    # tau0 | human_mix
+  ref_human_only_until: null   # epoch < this: all drafts = perturbed GT human (invalid -> unperturbed GT human)
+  kd_ratio_ramp_epochs: null   # ema: kd_ratio ramps 0 -> kd_ratio over [kd_start, kd_start + this]
+  kd_weight_max: null          # ema: cap on the KD weight
+  grad_share_every: 50
+
 trajectory_sampling:
   _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
   _convert_: 'all'

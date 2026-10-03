@@ -1,0 +1,10 @@
+{
+  "masked_nan": {
+    "loss": "nan",
+    "grad_finite": true
+  },
+  "opposite_teachers": {
+    "loss": 1.0,
+    "grad_maxabs": 0.0
+  }
+}

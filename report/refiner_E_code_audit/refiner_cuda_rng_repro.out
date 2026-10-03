@@ -1,0 +1,4 @@
+student_cpu_rng_preserved True
+student_cuda_reseed_calls [0, 7919, 7919]
+teacher_cpu_rng_preserved True
+teacher_cuda_reseed_calls [0, 7919, 0, 7919, 112648]

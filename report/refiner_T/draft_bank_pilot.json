@@ -1,0 +1,1269 @@
+{
+ "default": {
+  "cfg": {
+   "centerline_families": [
+    "creep"
+   ],
+   "layout": [
+    "identity",
+    "small",
+    "small",
+    "small",
+    "lconst",
+    "lconst",
+    "lconst",
+    "ignore_brake",
+    "creep",
+    "lat",
+    "lat",
+    "combined",
+    "cv"
+   ],
+   "lconst_ap": [
+    0.2,
+    1.3
+   ],
+   "max_tries": 8,
+   "mode": "A",
+   "version": "draft_bank_v1"
+  },
+  "cfg_hash": "5a54d21a29bc",
+  "n_tokens": 500,
+  "overall": {
+   "all_rows": {
+    "n": 6500,
+    "fail": 0.1166,
+    "fail_ttc": 0.1646,
+    "nc_fail": 0.0426,
+    "nc0": 0.0342,
+    "dac_fail": 0.0828,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.0957,
+    "comfort_fail": 0.0038,
+    "ep_mean": 0.7893,
+    "pdms_mean": 0.8233
+   },
+   "valid_rows": {
+    "n": 6153,
+    "fail": 0.1232,
+    "fail_ttc": 0.1739,
+    "nc_fail": 0.045,
+    "nc0": 0.0361,
+    "dac_fail": 0.0874,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1011,
+    "comfort_fail": 0.0036,
+    "ep_mean": 0.7853,
+    "pdms_mean": 0.8167
+   },
+   "valid_perturbed_rows": {
+    "n": 5653,
+    "fail": 0.1341,
+    "fail_ttc": 0.1893,
+    "nc_fail": 0.049,
+    "nc0": 0.0393,
+    "dac_fail": 0.0952,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.11,
+    "comfort_fail": 0.0037,
+    "ep_mean": 0.7778,
+    "pdms_mean": 0.8053
+   }
+  },
+  "valid_rate": 0.9466,
+  "per_family_fail": {
+   "combined": 0.2559,
+   "creep": 0.75,
+   "cv": 0.64,
+   "identity": 0.0,
+   "ignore_brake": 0.0391,
+   "lat": 0.2053,
+   "lconst": 0.0412,
+   "small": 0.0247
+  },
+  "per_family_fail_ttc": {
+   "combined": 0.3146,
+   "creep": 0.9375,
+   "cv": 0.792,
+   "identity": 0.0,
+   "ignore_brake": 0.1641,
+   "lat": 0.2375,
+   "lconst": 0.1072,
+   "small": 0.0373
+  },
+  "per_family_n": {
+   "combined": 426,
+   "creep": 16,
+   "cv": 500,
+   "identity": 500,
+   "ignore_brake": 128,
+   "lat": 901,
+   "lconst": 2182,
+   "small": 1500
+  },
+  "per_family_nc_fail": {
+   "combined": 0.0728,
+   "creep": 0.75,
+   "cv": 0.272,
+   "identity": 0.0,
+   "ignore_brake": 0.0391,
+   "lat": 0.0488,
+   "lconst": 0.0202,
+   "small": 0.0033
+  },
+  "lconst_combined_by_Ap": {
+   "[0.2, 0.4)": [
+    623,
+    0.0482,
+    0.008
+   ],
+   "[0.4, 0.6)": [
+    499,
+    0.0701,
+    0.0341
+   ],
+   "[0.6, 0.8)": [
+    480,
+    0.0708,
+    0.0292
+   ],
+   "[0.8, 1.0)": [
+    449,
+    0.0913,
+    0.0423
+   ],
+   "[1.0, 1.2)": [
+    393,
+    0.0916,
+    0.0331
+   ],
+   "[1.2, 1.4)": [
+    164,
+    0.1402,
+    0.0427
+   ]
+  },
+  "path_src": {
+   "centerline": [
+    16,
+    0.75,
+    0.75
+   ],
+   "draft": [
+    1000,
+    0.32,
+    0.136
+   ],
+   "human_long": [
+    5137,
+    0.0829,
+    0.0251
+   ]
+  },
+  "invalid_reasons": {
+   "path_too_short": 316,
+   "lon_acc": 29,
+   "continuity": 2
+  },
+  "token_level": {
+   "frac_tokens_with_fail": 0.728,
+   "mean_fail_per_token": 1.516,
+   "mean_valid_per_token": 12.306
+  },
+  "details": "draft_bank_pilot_default.json"
+ },
+ "ap16": {
+  "cfg": {
+   "centerline_families": [
+    "creep"
+   ],
+   "layout": [
+    "identity",
+    "small",
+    "small",
+    "small",
+    "lconst",
+    "lconst",
+    "lconst",
+    "ignore_brake",
+    "creep",
+    "lat",
+    "lat",
+    "combined",
+    "cv"
+   ],
+   "lconst_ap": [
+    0.2,
+    1.6
+   ],
+   "max_tries": 8,
+   "mode": "A",
+   "version": "draft_bank_v1"
+  },
+  "cfg_hash": "368c3aaca765",
+  "n_tokens": 500,
+  "overall": {
+   "all_rows": {
+    "n": 6500,
+    "fail": 0.1185,
+    "fail_ttc": 0.1691,
+    "nc_fail": 0.0435,
+    "nc0": 0.0354,
+    "dac_fail": 0.0835,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1,
+    "comfort_fail": 0.0042,
+    "ep_mean": 0.7889,
+    "pdms_mean": 0.8209
+   },
+   "valid_rows": {
+    "n": 6159,
+    "fail": 0.125,
+    "fail_ttc": 0.1784,
+    "nc_fail": 0.0459,
+    "nc0": 0.0373,
+    "dac_fail": 0.0882,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1055,
+    "comfort_fail": 0.0041,
+    "ep_mean": 0.785,
+    "pdms_mean": 0.8143
+   },
+   "valid_perturbed_rows": {
+    "n": 5659,
+    "fail": 0.1361,
+    "fail_ttc": 0.1942,
+    "nc_fail": 0.05,
+    "nc0": 0.0406,
+    "dac_fail": 0.096,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1149,
+    "comfort_fail": 0.0042,
+    "ep_mean": 0.7776,
+    "pdms_mean": 0.8027
+   }
+  },
+  "valid_rate": 0.9475,
+  "per_family_fail": {
+   "combined": 0.2607,
+   "creep": 0.75,
+   "cv": 0.64,
+   "identity": 0.0,
+   "ignore_brake": 0.0394,
+   "lat": 0.2029,
+   "lconst": 0.047,
+   "small": 0.0247
+  },
+  "per_family_fail_ttc": {
+   "combined": 0.327,
+   "creep": 0.9375,
+   "cv": 0.792,
+   "identity": 0.0,
+   "ignore_brake": 0.1654,
+   "lat": 0.2328,
+   "lconst": 0.12,
+   "small": 0.0373
+  },
+  "per_family_n": {
+   "combined": 422,
+   "creep": 16,
+   "cv": 500,
+   "identity": 500,
+   "ignore_brake": 127,
+   "lat": 902,
+   "lconst": 2192,
+   "small": 1500
+  },
+  "per_family_nc_fail": {
+   "combined": 0.0711,
+   "creep": 0.75,
+   "cv": 0.272,
+   "identity": 0.0,
+   "ignore_brake": 0.0394,
+   "lat": 0.0488,
+   "lconst": 0.0233,
+   "small": 0.0033
+  },
+  "lconst_combined_by_Ap": {
+   "[0.2, 0.4)": [
+    543,
+    0.0405,
+    0.0074
+   ],
+   "[0.4, 0.6)": [
+    437,
+    0.0847,
+    0.0343
+   ],
+   "[0.6, 0.8)": [
+    402,
+    0.0771,
+    0.0348
+   ],
+   "[0.8, 1.0)": [
+    372,
+    0.0806,
+    0.0376
+   ],
+   "[1.0, 1.2)": [
+    321,
+    0.0997,
+    0.0405
+   ],
+   "[1.2, 1.4)": [
+    291,
+    0.1031,
+    0.0378
+   ],
+   "[1.4, 1.6)": [
+    248,
+    0.125,
+    0.0403
+   ]
+  },
+  "path_src": {
+   "centerline": [
+    16,
+    0.75,
+    0.75
+   ],
+   "draft": [
+    1000,
+    0.32,
+    0.136
+   ],
+   "human_long": [
+    5143,
+    0.0852,
+    0.0262
+   ]
+  },
+  "invalid_reasons": {
+   "path_too_short": 305,
+   "lon_acc": 33,
+   "continuity": 3
+  },
+  "token_level": {
+   "frac_tokens_with_fail": 0.728,
+   "mean_fail_per_token": 1.54,
+   "mean_valid_per_token": 12.318
+  },
+  "details": "draft_bank_pilot_ap16.json"
+ },
+ "ap196": {
+  "cfg": {
+   "centerline_families": [
+    "creep"
+   ],
+   "layout": [
+    "identity",
+    "small",
+    "small",
+    "small",
+    "lconst",
+    "lconst",
+    "lconst",
+    "ignore_brake",
+    "creep",
+    "lat",
+    "lat",
+    "combined",
+    "cv"
+   ],
+   "lconst_ap": [
+    0.2,
+    1.96
+   ],
+   "max_tries": 8,
+   "mode": "A",
+   "version": "draft_bank_v1"
+  },
+  "cfg_hash": "5703de502558",
+  "n_tokens": 500,
+  "overall": {
+   "all_rows": {
+    "n": 6500,
+    "fail": 0.1223,
+    "fail_ttc": 0.1734,
+    "nc_fail": 0.0458,
+    "nc0": 0.0375,
+    "dac_fail": 0.0854,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1031,
+    "comfort_fail": 0.0037,
+    "ep_mean": 0.7864,
+    "pdms_mean": 0.8175
+   },
+   "valid_rows": {
+    "n": 6163,
+    "fail": 0.129,
+    "fail_ttc": 0.1829,
+    "nc_fail": 0.0484,
+    "nc0": 0.0396,
+    "dac_fail": 0.0901,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1087,
+    "comfort_fail": 0.0036,
+    "ep_mean": 0.7823,
+    "pdms_mean": 0.8107
+   },
+   "valid_perturbed_rows": {
+    "n": 5663,
+    "fail": 0.1404,
+    "fail_ttc": 0.199,
+    "nc_fail": 0.0526,
+    "nc0": 0.0431,
+    "dac_fail": 0.098,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1183,
+    "comfort_fail": 0.0037,
+    "ep_mean": 0.7747,
+    "pdms_mean": 0.7988
+   }
+  },
+  "valid_rate": 0.9482,
+  "per_family_fail": {
+   "combined": 0.2382,
+   "creep": 0.75,
+   "cv": 0.64,
+   "identity": 0.0,
+   "ignore_brake": 0.0394,
+   "lat": 0.2286,
+   "lconst": 0.0519,
+   "small": 0.0247
+  },
+  "per_family_fail_ttc": {
+   "combined": 0.3019,
+   "creep": 0.9375,
+   "cv": 0.792,
+   "identity": 0.0,
+   "ignore_brake": 0.1654,
+   "lat": 0.2553,
+   "lconst": 0.128,
+   "small": 0.0373
+  },
+  "per_family_n": {
+   "combined": 424,
+   "creep": 16,
+   "cv": 500,
+   "identity": 500,
+   "ignore_brake": 127,
+   "lat": 901,
+   "lconst": 2195,
+   "small": 1500
+  },
+  "per_family_nc_fail": {
+   "combined": 0.0778,
+   "creep": 0.75,
+   "cv": 0.272,
+   "identity": 0.0,
+   "ignore_brake": 0.0394,
+   "lat": 0.0544,
+   "lconst": 0.0264,
+   "small": 0.0033
+  },
+  "lconst_combined_by_Ap": {
+   "[0.2, 0.4)": [
+    498,
+    0.0281,
+    0.008
+   ],
+   "[0.4, 0.6)": [
+    392,
+    0.0612,
+    0.0153
+   ],
+   "[0.6, 0.8)": [
+    378,
+    0.0873,
+    0.0476
+   ],
+   "[0.8, 1.0)": [
+    309,
+    0.0939,
+    0.0453
+   ],
+   "[1.0, 1.2)": [
+    271,
+    0.059,
+    0.0295
+   ],
+   "[1.2, 1.4)": [
+    238,
+    0.1303,
+    0.0672
+   ],
+   "[1.4, 1.6)": [
+    219,
+    0.1324,
+    0.0457
+   ],
+   "[1.6, 1.8)": [
+    201,
+    0.1294,
+    0.0597
+   ],
+   "[1.8, 2.0)": [
+    113,
+    0.115,
+    0.0265
+   ]
+  },
+  "path_src": {
+   "centerline": [
+    16,
+    0.75,
+    0.75
+   ],
+   "draft": [
+    1000,
+    0.32,
+    0.136
+   ],
+   "human_long": [
+    5147,
+    0.09,
+    0.0291
+   ]
+  },
+  "invalid_reasons": {
+   "path_too_short": 292,
+   "lon_acc": 41,
+   "continuity": 3,
+   "lat_acc": 1
+  },
+  "token_level": {
+   "frac_tokens_with_fail": 0.742,
+   "mean_fail_per_token": 1.59,
+   "mean_valid_per_token": 12.326
+  },
+  "details": "draft_bank_pilot_ap196.json"
+ },
+ "hi": {
+  "cfg": {
+   "centerline_families": [
+    "creep"
+   ],
+   "layout": [
+    "identity",
+    "small",
+    "small",
+    "small",
+    "lconst",
+    "lconst",
+    "lconst",
+    "ignore_brake",
+    "creep",
+    "lat",
+    "lat",
+    "combined",
+    "cv"
+   ],
+   "lconst_ap": [
+    1.0,
+    1.96
+   ],
+   "max_tries": 8,
+   "mode": "A",
+   "version": "draft_bank_v1"
+  },
+  "cfg_hash": "21eb6d88d5f2",
+  "n_tokens": 500,
+  "overall": {
+   "all_rows": {
+    "n": 6500,
+    "fail": 0.1283,
+    "fail_ttc": 0.1905,
+    "nc_fail": 0.0488,
+    "nc0": 0.0406,
+    "dac_fail": 0.088,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.118,
+    "comfort_fail": 0.0037,
+    "ep_mean": 0.7819,
+    "pdms_mean": 0.8075
+   },
+   "valid_rows": {
+    "n": 5939,
+    "fail": 0.1404,
+    "fail_ttc": 0.2085,
+    "nc_fail": 0.0534,
+    "nc0": 0.0445,
+    "dac_fail": 0.0963,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1291,
+    "comfort_fail": 0.0039,
+    "ep_mean": 0.7746,
+    "pdms_mean": 0.7949
+   },
+   "valid_perturbed_rows": {
+    "n": 5439,
+    "fail": 0.1533,
+    "fail_ttc": 0.2276,
+    "nc_fail": 0.0583,
+    "nc0": 0.0485,
+    "dac_fail": 0.1052,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.141,
+    "comfort_fail": 0.004,
+    "ep_mean": 0.7659,
+    "pdms_mean": 0.7811
+   }
+  },
+  "valid_rate": 0.9137,
+  "per_family_fail": {
+   "combined": 0.2883,
+   "creep": 0.75,
+   "cv": 0.64,
+   "identity": 0.0,
+   "ignore_brake": 0.0391,
+   "lat": 0.2222,
+   "lconst": 0.0734,
+   "small": 0.0247
+  },
+  "per_family_fail_ttc": {
+   "combined": 0.3622,
+   "creep": 0.9375,
+   "cv": 0.792,
+   "identity": 0.0,
+   "ignore_brake": 0.1641,
+   "lat": 0.2467,
+   "lconst": 0.1927,
+   "small": 0.0373
+  },
+  "per_family_n": {
+   "combined": 392,
+   "creep": 16,
+   "cv": 500,
+   "identity": 500,
+   "ignore_brake": 128,
+   "lat": 900,
+   "lconst": 2003,
+   "small": 1500
+  },
+  "per_family_nc_fail": {
+   "combined": 0.0867,
+   "creep": 0.75,
+   "cv": 0.272,
+   "identity": 0.0,
+   "ignore_brake": 0.0391,
+   "lat": 0.0522,
+   "lconst": 0.0389,
+   "small": 0.0033
+  },
+  "lconst_combined_by_Ap": {
+   "[0.2, 0.4)": [
+    160,
+    0.0312,
+    0.0187
+   ],
+   "[0.4, 0.6)": [
+    62,
+    0.0645,
+    0.0323
+   ],
+   "[0.6, 0.8)": [
+    51,
+    0.2353,
+    0.1961
+   ],
+   "[0.8, 1.0)": [
+    41,
+    0.2439,
+    0.2439
+   ],
+   "[1.0, 1.2)": [
+    612,
+    0.0899,
+    0.0245
+   ],
+   "[1.2, 1.4)": [
+    434,
+    0.1175,
+    0.053
+   ],
+   "[1.4, 1.6)": [
+    414,
+    0.099,
+    0.0483
+   ],
+   "[1.6, 1.8)": [
+    368,
+    0.1332,
+    0.0489
+   ],
+   "[1.8, 2.0)": [
+    253,
+    0.1304,
+    0.0435
+   ]
+  },
+  "path_src": {
+   "centerline": [
+    16,
+    0.75,
+    0.75
+   ],
+   "draft": [
+    1000,
+    0.32,
+    0.136
+   ],
+   "human_long": [
+    4923,
+    0.102,
+    0.0343
+   ]
+  },
+  "invalid_reasons": {
+   "lon_acc": 276,
+   "path_too_short": 262,
+   "lat_acc": 13,
+   "continuity": 10
+  },
+  "token_level": {
+   "frac_tokens_with_fail": 0.734,
+   "mean_fail_per_token": 1.668,
+   "mean_valid_per_token": 11.878
+  },
+  "details": "draft_bank_pilot_hi.json"
+ },
+ "cl": {
+  "cfg": {
+   "centerline_families": [
+    "creep",
+    "lconst",
+    "ignore_brake",
+    "combined"
+   ],
+   "lat_dp": [
+    0.3,
+    1.5
+   ],
+   "layout": [
+    "identity",
+    "small",
+    "small",
+    "small",
+    "lconst",
+    "lconst",
+    "lconst",
+    "ignore_brake",
+    "creep",
+    "lat",
+    "lat",
+    "combined",
+    "cv"
+   ],
+   "lconst_ap": [
+    0.2,
+    1.3
+   ],
+   "max_tries": 8,
+   "mode": "A",
+   "version": "draft_bank_v1"
+  },
+  "cfg_hash": "0adf2ab92f78",
+  "n_tokens": 500,
+  "overall": {
+   "all_rows": {
+    "n": 6500,
+    "fail": 0.1418,
+    "fail_ttc": 0.2086,
+    "nc_fail": 0.0672,
+    "nc0": 0.058,
+    "dac_fail": 0.0837,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1394,
+    "comfort_fail": 0.0029,
+    "ep_mean": 0.7721,
+    "pdms_mean": 0.7937
+   },
+   "valid_rows": {
+    "n": 6468,
+    "fail": 0.1425,
+    "fail_ttc": 0.2096,
+    "nc_fail": 0.0676,
+    "nc0": 0.0583,
+    "dac_fail": 0.0841,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1401,
+    "comfort_fail": 0.0025,
+    "ep_mean": 0.7715,
+    "pdms_mean": 0.7929
+   },
+   "valid_perturbed_rows": {
+    "n": 5968,
+    "fail": 0.1545,
+    "fail_ttc": 0.2272,
+    "nc_fail": 0.0732,
+    "nc0": 0.0632,
+    "dac_fail": 0.0912,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1518,
+    "comfort_fail": 0.0025,
+    "ep_mean": 0.7633,
+    "pdms_mean": 0.7802
+   }
+  },
+  "valid_rate": 0.9951,
+  "per_family_fail": {
+   "combined": 0.2721,
+   "creep": 0.6875,
+   "cv": 0.64,
+   "identity": 0.0,
+   "ignore_brake": 0.1344,
+   "lat": 0.2075,
+   "lconst": 0.0908,
+   "small": 0.0247
+  },
+  "per_family_fail_ttc": {
+   "combined": 0.354,
+   "creep": 0.8125,
+   "cv": 0.792,
+   "identity": 0.0,
+   "ignore_brake": 0.3441,
+   "lat": 0.242,
+   "lconst": 0.1861,
+   "small": 0.0373
+  },
+  "per_family_n": {
+   "combined": 452,
+   "creep": 16,
+   "cv": 500,
+   "identity": 500,
+   "ignore_brake": 186,
+   "lat": 901,
+   "lconst": 2413,
+   "small": 1500
+  },
+  "per_family_nc_fail": {
+   "combined": 0.0973,
+   "creep": 0.6875,
+   "cv": 0.272,
+   "identity": 0.0,
+   "ignore_brake": 0.1344,
+   "lat": 0.0488,
+   "lconst": 0.0713,
+   "small": 0.0033
+  },
+  "lconst_combined_by_Ap": {
+   "[0.2, 0.4)": [
+    554,
+    0.0487,
+    0.009
+   ],
+   "[0.4, 0.6)": [
+    547,
+    0.0768,
+    0.042
+   ],
+   "[0.6, 0.8)": [
+    535,
+    0.0935,
+    0.0542
+   ],
+   "[0.8, 1.0)": [
+    519,
+    0.1387,
+    0.0963
+   ],
+   "[1.0, 1.2)": [
+    493,
+    0.1947,
+    0.144
+   ],
+   "[1.2, 1.4)": [
+    217,
+    0.2535,
+    0.1751
+   ]
+  },
+  "path_src": {
+   "centerline": [
+    591,
+    0.3435,
+    0.3333
+   ],
+   "draft": [
+    1000,
+    0.32,
+    0.136
+   ],
+   "human_long": [
+    4877,
+    0.0818,
+    0.0213
+   ]
+  },
+  "invalid_reasons": {
+   "lon_acc": 30,
+   "continuity": 2
+  },
+  "token_level": {
+   "frac_tokens_with_fail": 0.752,
+   "mean_fail_per_token": 1.844,
+   "mean_valid_per_token": 12.936
+  },
+  "details": "draft_bank_pilot_cl.json"
+ },
+ "lat18": {
+  "cfg": {
+   "centerline_families": [
+    "creep"
+   ],
+   "lat_dp": [
+    0.5,
+    1.8
+   ],
+   "layout": [
+    "identity",
+    "small",
+    "small",
+    "small",
+    "lconst",
+    "lconst",
+    "lconst",
+    "ignore_brake",
+    "creep",
+    "lat",
+    "lat",
+    "combined",
+    "cv"
+   ],
+   "lconst_ap": [
+    0.2,
+    1.3
+   ],
+   "max_tries": 8,
+   "mode": "A",
+   "version": "draft_bank_v1"
+  },
+  "cfg_hash": "e9f8b8c8ad05",
+  "n_tokens": 500,
+  "overall": {
+   "all_rows": {
+    "n": 6500,
+    "fail": 0.1254,
+    "fail_ttc": 0.1746,
+    "nc_fail": 0.0474,
+    "nc0": 0.0369,
+    "dac_fail": 0.0888,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.102,
+    "comfort_fail": 0.0038,
+    "ep_mean": 0.7817,
+    "pdms_mean": 0.8145
+   },
+   "valid_rows": {
+    "n": 6153,
+    "fail": 0.1325,
+    "fail_ttc": 0.1845,
+    "nc_fail": 0.0501,
+    "nc0": 0.039,
+    "dac_fail": 0.0938,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1078,
+    "comfort_fail": 0.0036,
+    "ep_mean": 0.7772,
+    "pdms_mean": 0.8073
+   },
+   "valid_perturbed_rows": {
+    "n": 5653,
+    "fail": 0.1442,
+    "fail_ttc": 0.2008,
+    "nc_fail": 0.0545,
+    "nc0": 0.0425,
+    "dac_fail": 0.1021,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1173,
+    "comfort_fail": 0.0037,
+    "ep_mean": 0.7691,
+    "pdms_mean": 0.7951
+   }
+  },
+  "valid_rate": 0.9466,
+  "per_family_fail": {
+   "combined": 0.3028,
+   "creep": 0.75,
+   "cv": 0.64,
+   "identity": 0.0,
+   "ignore_brake": 0.0391,
+   "lat": 0.2464,
+   "lconst": 0.0412,
+   "small": 0.0247
+  },
+  "per_family_fail_ttc": {
+   "combined": 0.3638,
+   "creep": 0.9375,
+   "cv": 0.792,
+   "identity": 0.0,
+   "ignore_brake": 0.1641,
+   "lat": 0.2863,
+   "lconst": 0.1072,
+   "small": 0.0373
+  },
+  "per_family_n": {
+   "combined": 426,
+   "creep": 16,
+   "cv": 500,
+   "identity": 500,
+   "ignore_brake": 128,
+   "lat": 901,
+   "lconst": 2182,
+   "small": 1500
+  },
+  "per_family_nc_fail": {
+   "combined": 0.0986,
+   "creep": 0.75,
+   "cv": 0.272,
+   "identity": 0.0,
+   "ignore_brake": 0.0391,
+   "lat": 0.071,
+   "lconst": 0.0202,
+   "small": 0.0033
+  },
+  "lconst_combined_by_Ap": {
+   "[0.2, 0.4)": [
+    624,
+    0.0593,
+    0.0128
+   ],
+   "[0.4, 0.6)": [
+    499,
+    0.0762,
+    0.0421
+   ],
+   "[0.6, 0.8)": [
+    480,
+    0.0729,
+    0.0292
+   ],
+   "[0.8, 1.0)": [
+    448,
+    0.0982,
+    0.0491
+   ],
+   "[1.0, 1.2)": [
+    396,
+    0.1061,
+    0.0354
+   ],
+   "[1.2, 1.4)": [
+    161,
+    0.1429,
+    0.0435
+   ]
+  },
+  "path_src": {
+   "centerline": [
+    16,
+    0.75,
+    0.75
+   ],
+   "draft": [
+    1000,
+    0.32,
+    0.136
+   ],
+   "human_long": [
+    5137,
+    0.094,
+    0.0311
+   ]
+  },
+  "invalid_reasons": {
+   "path_too_short": 316,
+   "lon_acc": 29,
+   "continuity": 2
+  },
+  "token_level": {
+   "frac_tokens_with_fail": 0.742,
+   "mean_fail_per_token": 1.63,
+   "mean_valid_per_token": 12.306
+  },
+  "details": "draft_bank_pilot_lat18.json"
+ },
+ "cl_lat18": {
+  "cfg": {
+   "centerline_families": [
+    "creep",
+    "lconst",
+    "ignore_brake",
+    "combined"
+   ],
+   "lat_dp": [
+    0.5,
+    1.8
+   ],
+   "layout": [
+    "identity",
+    "small",
+    "small",
+    "small",
+    "lconst",
+    "lconst",
+    "lconst",
+    "ignore_brake",
+    "creep",
+    "lat",
+    "lat",
+    "combined",
+    "cv"
+   ],
+   "lconst_ap": [
+    0.2,
+    1.3
+   ],
+   "max_tries": 8,
+   "mode": "A",
+   "version": "draft_bank_v1"
+  },
+  "cfg_hash": "a90ebc4b3904",
+  "n_tokens": 500,
+  "overall": {
+   "all_rows": {
+    "n": 6500,
+    "fail": 0.1505,
+    "fail_ttc": 0.2182,
+    "nc_fail": 0.0718,
+    "nc0": 0.0606,
+    "dac_fail": 0.0897,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1452,
+    "comfort_fail": 0.0029,
+    "ep_mean": 0.7646,
+    "pdms_mean": 0.7851
+   },
+   "valid_rows": {
+    "n": 6468,
+    "fail": 0.1512,
+    "fail_ttc": 0.2192,
+    "nc_fail": 0.0722,
+    "nc0": 0.0609,
+    "dac_fail": 0.0901,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1459,
+    "comfort_fail": 0.0025,
+    "ep_mean": 0.7639,
+    "pdms_mean": 0.7843
+   },
+   "valid_perturbed_rows": {
+    "n": 5968,
+    "fail": 0.1639,
+    "fail_ttc": 0.2376,
+    "nc_fail": 0.0783,
+    "nc0": 0.066,
+    "dac_fail": 0.0977,
+    "ddc_fail": 0.0,
+    "ttc_fail": 0.1582,
+    "comfort_fail": 0.0025,
+    "ep_mean": 0.7551,
+    "pdms_mean": 0.7708
+   }
+  },
+  "valid_rate": 0.9951,
+  "per_family_fail": {
+   "combined": 0.3142,
+   "creep": 0.6875,
+   "cv": 0.64,
+   "identity": 0.0,
+   "ignore_brake": 0.1344,
+   "lat": 0.2486,
+   "lconst": 0.0908,
+   "small": 0.0247
+  },
+  "per_family_fail_ttc": {
+   "combined": 0.3916,
+   "creep": 0.8125,
+   "cv": 0.792,
+   "identity": 0.0,
+   "ignore_brake": 0.3441,
+   "lat": 0.2919,
+   "lconst": 0.1861,
+   "small": 0.0373
+  },
+  "per_family_n": {
+   "combined": 452,
+   "creep": 16,
+   "cv": 500,
+   "identity": 500,
+   "ignore_brake": 186,
+   "lat": 901,
+   "lconst": 2413,
+   "small": 1500
+  },
+  "per_family_nc_fail": {
+   "combined": 0.1195,
+   "creep": 0.6875,
+   "cv": 0.272,
+   "identity": 0.0,
+   "ignore_brake": 0.1344,
+   "lat": 0.071,
+   "lconst": 0.0713,
+   "small": 0.0033
+  },
+  "lconst_combined_by_Ap": {
+   "[0.2, 0.4)": [
+    554,
+    0.0632,
+    0.0162
+   ],
+   "[0.4, 0.6)": [
+    547,
+    0.0804,
+    0.0475
+   ],
+   "[0.6, 0.8)": [
+    535,
+    0.0953,
+    0.0542
+   ],
+   "[0.8, 1.0)": [
+    519,
+    0.1445,
+    0.1021
+   ],
+   "[1.0, 1.2)": [
+    496,
+    0.2056,
+    0.1452
+   ],
+   "[1.2, 1.4)": [
+    214,
+    0.2523,
+    0.1729
+   ]
+  },
+  "path_src": {
+   "centerline": [
+    591,
+    0.3418,
+    0.3316
+   ],
+   "draft": [
+    1000,
+    0.32,
+    0.136
+   ],
+   "human_long": [
+    4877,
+    0.0935,
+    0.0277
+   ]
+  },
+  "invalid_reasons": {
+   "lon_acc": 30,
+   "continuity": 2
+  },
+  "token_level": {
+   "frac_tokens_with_fail": 0.766,
+   "mean_fail_per_token": 1.956,
+   "mean_valid_per_token": 12.936
+  },
+  "details": "draft_bank_pilot_cl_lat18.json"
+ },
+ "chosen": "default",
+ "target": "official bank failure rate (NC|DAC|DDC < 1) over valid drafts in [0.20, 0.35]",
+ "note": "Same 500 train tokens (drafts/_pilot/tokens.parquet) for every variant. The A_p range is not an effective lever: over the whole feasible range (decoder bound 0.98*A_UP = 1.96 m/s^2) the bank failure rate (NC|DAC|DDC<1, valid drafts) moves only 12.3% -> 14.0%, because L-const speed-ups along the human's own path fail 4-9% (a lead vehicle is rarely within reach in 4 s; per-A_p-bin failure plateaus at ~10-14% above 1.2). The most aggressive range [1.0,1.96] also drops the valid rate 94.7% -> 91.4% (lon_acc rejections) and removes the realistic 0.2-1.0 band. The 20-35% target is therefore not reachable by A_p alone; launched with the default U[0.2,1.3] (spec/draft value; D3 covers the student NC p99 +1.27). Non-A_p knobs, measured for the user's decision (not adopted): cl = speed-ups may continue on the route centerline (decoder open issue) 14.2% (centerline-continued drafts fail 34%, NC 33%; valid 99.5%); lat18 = |D_p| U[0.5,1.8] 13.3%; both 15.1%. TTC-inclusive label: 17.4% (default) .. 21.9% (cl_lat18). Structural limit: 4 of 13 slots are identity/small (fail ~2%), 3-5 are L-const."
+}

@@ -1,0 +1,42 @@
+{
+ "camera": {
+  "state": "done",
+  "sha_ok": true,
+  "sha256": "86a20b3ef6a5b1e2e3841a1d02dc0aafc1e2aec8c75b3a8172715df7ad7e99a9",
+  "lfs_oid": "86a20b3ef6a5b1e2e3841a1d02dc0aafc1e2aec8c75b3a8172715df7ad7e99a9",
+  "bytes": 1772587391,
+  "sec": 1316.638,
+  "MBps": 1.346,
+  "retries": 1,
+  "tar_rc": 0,
+  "not_found": 0,
+  "needed": 261,
+  "needed_extracted_size_gt0": 261,
+  "needed_bytes": 55819245,
+  "needed_present_on_real_disk": 0,
+  "provenance_files": 30,
+  "provenance_cmp_identical": 30
+ },
+ "lidar": {
+  "state": "done",
+  "sha_ok": true,
+  "sha256": "c796de6da6013e12564d5c3bc4f2ebd6d8a4ec7c55fe59595298d8870fc38b28",
+  "lfs_oid": "c796de6da6013e12564d5c3bc4f2ebd6d8a4ec7c55fe59595298d8870fc38b28",
+  "bytes": 1228436113,
+  "sec": 1834.439,
+  "MBps": 0.67,
+  "retries": 1,
+  "tar_rc": 0,
+  "not_found": 0,
+  "needed": 87,
+  "needed_extracted_size_gt0": 87,
+  "needed_bytes": 119612247,
+  "needed_present_on_real_disk": 0,
+  "provenance_files": 20,
+  "provenance_cmp_identical": 20
+ },
+ "files_in_extract_root": 398,
+ "extra_files_not_listed": 0,
+ "listed_missing": 0
+}
+TEST B: PASS

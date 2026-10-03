@@ -264,7 +264,7 @@ BPY=/home/external-user/miniconda3/envs/bevfusion/bin/python
 
 | 항목 | 이유 |
 |---|---|
-| `$REPO/tools/future_teacher_cache/` 중 `make_token_lists.py`, `cache_teacher_future.py`, `run_cache.sh`, `*.yaml`, `*.json` | **untracked**다. `infos/`는 새로 만든다. `cfg_cf3e02a/`(100×100 config)와 `old_100x100/`은 가져오지 않는다 |
+| `$REPO/tools/future_teacher_cache/` 중 `make_token_lists.py`, `cache_teacher_future.py`, `run_cache.sh`, `*.yaml`, `*.json`, `xfer/` | **2026-10-03부터 git에 포함**(branch `exp-refine`). clone하면 따라오므로 따로 옮기지 않는다. `infos/`, `logs/`는 gitignore 대상이라 새로 만든다. `memtest_out/`, `validate_out/`도 커밋하지 않았다. `cfg_cf3e02a/`(100×100 config)와 `old_100x100/`은 가져오지 않는다 |
 | `$BF` working tree 전체(`runs`, `data` 제외, `.git`·`build/` 포함 약 918 MB) 또는 `git diff` + untracked 2개(`tools/cache_teacher_bev.py`, `chain_stage2.sh`) | 캐시를 만든 코드는 커밋 `cf3e02a`가 아니라 그 위의 **dirty tree**(수정 10개 파일: config 4개, `navsim_dataset.py`, `transforms_3d.py`, `fov_utils.py`, `hungarian_assigner.py`, `setup_fix.md`, `docs/NAVSIM.md`)다. clone만 하면 config가 100×100(`voxel_size [0.04,0.08,0.2]`)이 된다. working tree를 통째로 옮겨도 `build/`와 `.so`는 단계 1에서 다시 빌드한다. `.git`이 없으면 manifest의 `git_commit`이 null이 된다 |
 | `$BF/data/infos/navsim_infos_val_navtest.pkl` (156,409,747 B) | 단계 4 infos 재현의 비교 기준. 위 "data 제외"에 걸리므로 따로 옮긴다 |
 | `$BF/runs/navsim-fusion-50x100/epoch_20.pth` (481,739,184 B) + `configs.yaml` | teacher 가중치와 학습 당시의 resolved config |
@@ -321,7 +321,7 @@ CUDA_VISIBLE_DEVICES="" $PY $W/make_token_lists.py
 cat $W/counts.json   # 기대: train future_frames_to_run 112152, logs 1192 / test 12900, logs 136
 ```
 - 절대경로가 하드코딩돼 있다(`$TC/bevfusion/cache_{train,val}_50x100`, `$DL/*_navsim_logs`). 같은 경로를 쓰면 고칠 필요가 없다.
-- 이 스크립트는 단계 0에서 옮긴 `future_*.yaml`, `future_index_*.json`, `validate_test.yaml`, `counts.json`을 **덮어쓴다**. 옮긴 사본을 다른 이름으로 두고 덮어쓴 결과와 `cmp`해서 같으면 통과로 본다. 다르면 현재 프레임 캐시나 log pkl이 옛 서버와 다르다는 뜻이다.
+- 이 스크립트는 git에 들어 있는 `future_*.yaml`, `future_index_*.json`, `validate_test.yaml`, `counts.json`을 **덮어쓴다**. 실행 뒤 `git status --short $W`에 이 파일들이 바뀐 것으로 나오지 않으면(= 옛 서버 결과와 같으면) 통과로 본다. 다르면 현재 프레임 캐시나 log pkl이 옛 서버와 다르다는 뜻이다.
 - 결과가 navtrain 전체 기준이다. E2E나 stage-T로 줄이려면 `future_index_train.json`과 `$D/splits/*.parquet`의 token으로 걸러 새 yaml을 쓴다 [새 코드, 수십 줄].
 
 ### 단계 4. 재현 검증 먼저 (§6-2)
@@ -591,7 +591,7 @@ torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
 - `report/future_motion_analysis/{cache_coverage.py,cache_coverage.json,future_frame_inventory.json}`
   - 주의: `cache_coverage.py`는 파일 존재가 아니라 메타데이터 필드만 확인했다. 그래서 "모든 프레임에 센서가 있다"는 33/34의 문장은 틀렸다.
 
-**미래 캐시 도구** (`tools/future_teacher_cache/`, untracked)
+**미래 캐시 도구** (`tools/future_teacher_cache/`, 2026-10-03부터 git에 포함. `infos/`, `logs/`, `memtest_out/`, `validate_out/`, `cfg_cf3e02a/`, `old_100x100/`은 제외)
 - `make_token_lists.py`, `cache_teacher_future.py`, `run_cache.sh`
 - `future_index_{train,test}.json`, `future_{train,test}.yaml`, `validate_test.yaml`
 - `counts.json`, `train_disk_availability.json`
@@ -649,10 +649,10 @@ torchpack dist-run -np $NGPU python $W/cache_teacher_future.py \
 - 네트워크는 약 10.3 GB를 썼다. archive 바이트는 디스크에 저장하지 않았다. GPU와 잡은 쓰지 않았다.
 - 검증 단계(같은 날): HF tree를 다시 받아 크기 합계를 재현했다. 집합별 run/DL/sweep, 추출 합, g별 최대치, 5 s 값, 전 프레임 값은 log pkl에서 독립 스크립트(`verify/v1.py`–`v3.py`)로 다시 계산해 모두 일치했다. 400/400 첫 member도 재확인했다. 고친 것은 버리는 비율, wget 재개 여부, P-full 합계, 8캠 크기, 반올림 몇 개다.
 
-스크립트와 결과는 세션 scratchpad에서 만들었고, 2026-10-03에 `$REPO/tools/future_teacher_cache/xfer/`(= `$W/xfer/`, 6 MB, untracked)로 옮겼다.
+스크립트와 결과는 세션 scratchpad에서 만들었고, 2026-10-03에 `$REPO/tools/future_teacher_cache/xfer/`(= `$W/xfer/`, 약 7 MB)로 옮겼다. 이 폴더는 git에 포함돼 있다.
 - `hf/{map_trainval.json,sizes.json,tree_*.json,info.json}`, `heads/`, `full/list_{camera,lidar}_0.txt`
 - `rstream.py`(xfer 바로 아래), `scripts/{headparse,needed,perarc,listing,nodisk,b_keep}.py`, `scripts/taskC/`, `scripts/verify/`, `results/{needed_result,perarc_result,listing_result_0,archives_*_4s}.json`, `results/full/`
-- `$W`는 git에 없다(untracked). 새 서버로 가져가려면 `tools/future_teacher_cache/` 전체를 따로 옮긴다(§4 단계 0).
+- `$W`의 스크립트·목록·`xfer/`는 git에 포함돼 있다(2026-10-03). 새 서버에서는 clone으로 받는다(§4 단계 0).
 
 **시나리오**
 - S1: 새 서버에 navtrain current+history 센서 패키지가 있다(39의 전제). 별도 표기가 없으면 S1 기준이다.
@@ -1050,7 +1050,7 @@ done; run_group $PREV
 - §9-8에서 [새 코드]였던 두 도구를 구현해 이 서버에서 시험했다(§10-5). 시험은 scratch 폴더에만 풀었다. `/home/external-user/{navsim,datasets,ssd}`의 기존 데이터에는 쓰지 않았다.
 - 수치는 이 서버에서 `make_needed_files.py`로 다시 센 값이다. 새 서버도 같은 navtrain 센서 패키지와 같은 현재 프레임 캐시를 가진다(S1)고 가정한다. 새 서버에서 목록을 다시 만들면 같은 값이 나와야 한다(§10-3 1번).
 
-도구 위치: `$W/xfer/` (= `$REPO/tools/future_teacher_cache/xfer/`, untracked. 새 서버로 `$W` 전체를 옮긴다, §4 단계 0)
+도구 위치: `$W/xfer/` (= `$REPO/tools/future_teacher_cache/xfer/`, git에 포함. 새 서버에서는 clone으로 받는다)
 
 | 파일 | 하는 일 | 상태 |
 |---|---|---|
@@ -1164,7 +1164,7 @@ SET=navtrain_5s; TOK=$W/future_index_train.json; HS=5          # 기본값 navtr
 R=$X/run_$SET       # 이 폴더에 lists/, state/, 로그가 쌓인다(수십 MB)
 ```
 
-**0. 준비 (§4 단계 0, 3)** — 단계 0의 항목과 `$W/xfer/` 전체(특히 `hf/`, `results/stream_test_146/`)와 bevfusion을 옮기고, 단계 3(`make_token_lists.py`)으로 `future_index_train.json`을 만든다. E2E 4 s면 39 S5(§5.2)의 `$D/splits/e2e_train_trainlogs.parquet`가 먼저 있어야 한다.
+**0. 준비 (§4 단계 0, 3)** — `$W`와 `$W/xfer/`는 git으로 받는다(clone, branch `exp-refine`). 단계 0의 나머지 항목(bevfusion working tree, 체크포인트, 비교 기준 infos)만 옮기고, 단계 3(`make_token_lists.py`)으로 `future_index_train.json`을 만든다. E2E 4 s면 39 S5(§5.2)의 `$D/splits/e2e_train_trainlogs.parquet`가 먼저 있어야 한다.
 - 5 s의 k=1..10 index(§10-1 1번)는 이 절의 1–11번에는 필요 없다. `make_needed_files.py`가 `--horizon-s`로 log pkl에서 미래 프레임을 직접 센다. k=1..10 index는 §4 단계 8 로더용이므로 그 전에 만들면 된다.
 ```bash
 ls $X/{make_needed_files.py,stream_extract.sh,rstream.py} $X/hf/{map_trainval.json,tree_openscene_sensor_trainval_camera.json,tree_openscene_sensor_trainval_lidar.json}

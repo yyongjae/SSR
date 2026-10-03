@@ -1,0 +1,60 @@
+{
+  "args": {
+    "tokens": [
+      "../future_index_train.json"
+    ],
+    "horizon_s": 4.0,
+    "logs_dir": "/home/external-user/navsim/download/trainval_navsim_logs/trainval",
+    "sensor_root": "/home/external-user/navsim/download/trainval_sensor_blobs",
+    "cache_dir": [
+      "/home/external-user/datasets/teacher_cache/bevfusion/cache_train_50x100"
+    ],
+    "map": "/home/external-user/yongjae/SSR/tools/future_teacher_cache/xfer/hf/map_trainval.json",
+    "tree_dir": "/home/external-user/yongjae/SSR/tools/future_teacher_cache/xfer/hf",
+    "cams": [
+      "CAM_F0",
+      "CAM_L0",
+      "CAM_R0"
+    ],
+    "max_sweeps": 2,
+    "no_sweeps": false,
+    "exact_listings": [],
+    "lf_cache": "/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/lf_cache.pkl",
+    "workers": 24,
+    "out": "/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/lists/navtrain_4s"
+  },
+  "frames_per_token": 8,
+  "input_tokens": 103288,
+  "input_tokens_not_in_logs": 0,
+  "input_tokens_without_current_npz": 0,
+  "future_frames_union": 204164,
+  "already_cached": 92012,
+  "run_frames": 112152,
+  "run_frames_on_disk": 18482,
+  "dl_frames": 93670,
+  "run_frames_on_disk_missing_some_sweep": 8075,
+  "sweep_only_lidar_frames_outside_run": 0,
+  "run_logs": 1192,
+  "anomalies": {},
+  "logs_not_in_map": [],
+  "totals": {
+    "camera_files": 281010,
+    "camera_est_bytes": 58611754420,
+    "camera_est_bytes_arcscaled": 59817816154,
+    "camera_tgz_bytes": 1242213272326,
+    "lidar_files": 93670,
+    "lidar_est_bytes": 131427252960,
+    "lidar_est_bytes_arcscaled": 129745380207,
+    "lidar_tgz_bytes": 882141233382
+  },
+  "est_extracted_GB": 190.03900738,
+  "est_extracted_GB_arcscaled": 189.563196361,
+  "tgz_total_GB": 2124.354505708,
+  "discard_fraction_compressed_est": 0.9107666842555439,
+  "archives_with_nonempty_list": {
+    "camera": 200,
+    "lidar": 200
+  },
+  "archives": 200,
+  "seconds": 3.7143380641937256
+}

@@ -1,0 +1,1 @@
+[rstream] done bytes=3456836376 sec=2821.4 MBps=1.225 retries=0

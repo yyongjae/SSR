@@ -175,6 +175,13 @@ class ParaSSRPlannerHead(nn.Module):
         use_stl: bool = True,
         plan_num_layers: int = 3,
         use_task_interaction: bool = False,
+        use_lidar: bool = False,
+        plan_anchor_file: Optional[str] = None,
+        plan_reward_weights: Sequence[float] = (0.1, 0.5, 0.5, 1.0),
+        plan_topk: int = 6,
+        plan_kinematic: bool = False,
+        plan_heading_from_xy: bool = False,
+        plan_rescore_refined: bool = False,
     ):
         super().__init__()
         if use_task_interaction and (use_metric_planner or use_stl):
@@ -195,13 +202,25 @@ class ParaSSRPlannerHead(nn.Module):
         self.num_plan_candidates = num_plan_candidates if use_metric_planner else 1
         self.use_stl = True if use_metric_planner else use_stl
         self.use_task_interaction = bool(use_task_interaction) and not self.use_stl
+        self.use_lidar = bool(use_lidar)
+        self.anchor_planner = None
+        self.plan_rescore_refined = False
+        if self.use_lidar and (self.use_stl or use_metric_planner):
+            raise ValueError("use_lidar requires the dense planner (use_stl=False)")
+        if plan_anchor_file and (self.use_stl or not self.use_task_interaction):
+            raise ValueError(
+                "plan_anchor_file requires the task-interaction planner "
+                "(use_stl=False, use_task_interaction=True)"
+            )
 
         self.transformer = transformer
         self.positional_encoding = LearnedPositionalEncoding(
             embed_dims // 2, bev_h, bev_w
         )
 
-        self.bev_embedding = nn.Embedding(bev_h * bev_w, embed_dims)
+        # LiDAR BEV replaces the learned queries (SafeDrive). Camera-only keeps
+        # the embedding so stage-1 can freeze it without a DDP unused parameter.
+        self.bev_embedding = None if self.use_lidar else nn.Embedding(bev_h * bev_w, embed_dims)
         self.navi_embedding = nn.Embedding(num_navi_cmd, embed_dims)
 
         def reg_fcs(out_dims: int) -> nn.Sequential:
@@ -289,7 +308,27 @@ class ParaSSRPlannerHead(nn.Module):
                     ffn_dropout=0.0,
                 )
                 decoders = (self.plan_decoder,)
-            self.ego_fut_decoder = reg_fcs(fut_ts * traj_dims)
+            # Anchor vocabulary replaces the single-trajectory regressor. An
+            # unused Linear would fail DDP's unused-parameter check.
+            self.anchor_planner = None
+            self.plan_rescore_refined = False
+            if plan_anchor_file:
+                from .anchor_planner import AnchorPlanner
+
+                self.anchor_planner = AnchorPlanner(
+                    plan_anchor_file,
+                    embed_dims,
+                    fut_ts,
+                    traj_dims,
+                    plan_reward_weights,
+                    plan_topk,
+                    kinematic=plan_kinematic,
+                    heading_from_xy=plan_heading_from_xy,
+                )
+                self.plan_rescore_refined = bool(plan_rescore_refined)
+                self.ego_fut_decoder = None
+            else:
+                self.ego_fut_decoder = reg_fcs(fut_ts * traj_dims)
 
         # Xavier initialization matching BaseModule convention
         for decoder in decoders:
@@ -319,6 +358,7 @@ class ParaSSRPlannerHead(nn.Module):
         only_bev: bool = False,
         cmd: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
+        lidar_bev: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor] | torch.Tensor:
         """
         Args:
@@ -332,11 +372,18 @@ class ParaSSRPlannerHead(nn.Module):
         """
         bs = mlvl_feats[0].shape[0]
         dtype = mlvl_feats[0].dtype
+        device = mlvl_feats[0].device
+        if self.bev_embedding is None:
+            if lidar_bev is None:
+                raise ValueError("planner head built with use_lidar needs lidar_bev")
+            bev_queries = None
+            lidar_bev = lidar_bev.to(dtype)
+        else:
+            if lidar_bev is not None:
+                raise ValueError("camera-only planner head received lidar_bev")
+            bev_queries = self.bev_embedding.weight.to(dtype)
 
-        bev_queries = self.bev_embedding.weight.to(dtype)
-        bev_mask = torch.zeros(
-            (bs, self.bev_h, self.bev_w), device=bev_queries.device, dtype=dtype
-        )
+        bev_mask = torch.zeros((bs, self.bev_h, self.bev_w), device=device, dtype=dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
 
         bev_embed = self.transformer.get_bev_features(
@@ -351,6 +398,7 @@ class ParaSSRPlannerHead(nn.Module):
             bev_shift=bev_shift,
             prev_bev=prev_bev,
             bev_yaw=bev_yaw,
+            lidar_bev=lidar_bev,
         )
         if only_bev:
             return bev_embed
@@ -449,6 +497,12 @@ class ParaSSRPlannerHead(nn.Module):
                     )
             h = h + self.ego_status_encoder(status).unsqueeze(1)
             plan_pos = self.plan_query_pos.weight.to(dtype).unsqueeze(0).expand(bs, -1, -1)
+            # One query per anchor. h_ego is the command/status feature used to
+            # re-encode refined trajectories at evaluation time.
+            h_ego = h
+            if self.anchor_planner is not None:
+                h = self.anchor_planner.queries(h)
+                plan_pos = plan_pos.expand(-1, h.shape[1], -1)
             plan_attn = None
             if self.use_task_interaction:
                 if det_out is None or map_out is None:
@@ -464,6 +518,10 @@ class ParaSSRPlannerHead(nn.Module):
                     else:
                         h = layer(h, plan_pos, bev_embed, pos_embd, **memories)
                 h = self.final_norm(h)
+                if self.anchor_planner is not None:
+                    return self._anchor_outputs(
+                        h, h_ego, plan_pos, bev_embed, pos_embd, memories, status, plan_attn,
+                    )
                 scene_query = h.transpose(0, 1)
             else:
                 plan_query = self.plan_decoder(
@@ -552,6 +610,63 @@ class ParaSSRPlannerHead(nn.Module):
             "scene_query": latent_query,
             "token_attn": selected,
             "ego_fut_preds": outputs_ego_trajs,
+        }
+
+    def _anchor_outputs(
+        self,
+        h: torch.Tensor,
+        h_ego: torch.Tensor,
+        plan_pos: torch.Tensor,
+        bev_embed: torch.Tensor,
+        bev_pos: torch.Tensor,
+        memories: Dict[str, torch.Tensor],
+        ego_status: torch.Tensor,
+        plan_attn: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """WoTE anchor + offset. ego_fut_preds stays the v1 per-step offset API."""
+        bs = h.shape[0]
+        out = self.anchor_planner(h, init_speed=ego_status[:, 0])
+        if self.plan_rescore_refined and not self.training:
+            out.update(self._rescore_refined(
+                out, h_ego, plan_pos, bev_embed, bev_pos, memories,
+            ))
+        poses = out["trajectory"]
+        steps = torch.diff(
+            torch.cat([poses.new_zeros(bs, 1, self.traj_dims), poses], dim=1), dim=1,
+        )
+        out.update(
+            bev_embed=bev_embed,
+            scene_query=h.transpose(0, 1),
+            token_attn=None,
+            ego_fut_preds=steps.unsqueeze(1).expand(
+                bs, self.ego_fut_mode, self.fut_ts, self.traj_dims,
+            ),
+        )
+        if plan_attn is not None:
+            out["plan_bev_attn"] = plan_attn
+        return out
+
+    def _rescore_refined(self, out, h_ego, plan_pos, bev_embed, bev_pos, memories):
+        """Evaluation only: re-encode anchor + offset and pick among the refined set."""
+        ap = self.anchor_planner
+        refined = (
+            ap.trajectory_anchors.unsqueeze(0).to(out["trajectory_offset"].dtype)
+            + out["trajectory_offset"]
+        )
+        h2 = ap.queries(h_ego, trajectories=refined)
+        for layer in self.planner_layers:
+            h2 = layer(h2, plan_pos, bev_embed, bev_pos, **memories)
+        _, sim2, final2 = ap.score(self.final_norm(h2))
+        k = min(ap.topk, ap.num_anchors)
+        top = final2.topk(k, dim=-1).indices
+        gather = top[:, :, None, None].expand(-1, -1, ap.fut_ts, ap.traj_dims)
+        top_traj = refined.gather(1, gather)
+        return {
+            "trajectory": top_traj[:, 0],
+            "plan_rescore_final_rewards": final2,
+            "plan_rescore_sim_rewards": sim2,
+            "plan_rescore_topk_index": top,
+            "plan_rescore_topk_trajectory": top_traj,
         }
 
     # navsim driving_command index order, from

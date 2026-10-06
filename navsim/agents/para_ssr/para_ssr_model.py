@@ -25,8 +25,25 @@ import torch.nn.functional as F
 
 from .modules.bevformer import BEVFormerEncoder, SSRPerceptionTransformer
 from .modules.det_motion_head import ParaDetMotionHead
+from .modules.lidar_encoder import build_lidar_encoder
 from .modules.map_head import ParaMapHead
 from .modules.planner_head import ParaSSRPlannerHead
+
+
+def heading_from_path(poses: torch.Tensor, min_step: float = 0.5) -> torch.Tensor:
+    """Evaluation-only: replace each pose heading by the path direction.
+
+    ``poses`` is ``[B, T, 3]`` in the NAVSIM ego frame. The direction at step
+    ``t`` is the central difference of the path, with the origin before the
+    first pose. Steps shorter than ``min_step`` metres keep the predicted heading.
+    """
+    xy = torch.cat([poses.new_zeros(poses.shape[0], 1, 2), poses[..., :2]], dim=1)
+    nxt = torch.cat([xy[:, 2:], xy[:, -1:]], dim=1)
+    delta = nxt - xy[:, :-1]
+    tangent = torch.atan2(delta[..., 1], delta[..., 0])
+    moving = delta.norm(dim=-1) >= min_step
+    heading = torch.where(moving, tangent, poses[..., 2])
+    return torch.cat([poses[..., :2], heading.unsqueeze(-1)], dim=-1)
 
 
 class _ScaleGrad(torch.autograd.Function):
@@ -122,6 +139,12 @@ class ParaSSRModel(nn.Module):
             not cfg.use_det_motion_head or not cfg.use_map_head
         ):
             raise ValueError("task interaction requires both the det/motion head and the map head")
+        plan_anchor = bool(getattr(cfg, "plan_anchor", False))
+        plan_anchor_file = getattr(cfg, "plan_anchor_file", None) if plan_anchor else None
+        if plan_anchor and not plan_anchor_file:
+            raise ValueError("plan_anchor requires plan_anchor_file")
+        if plan_anchor and not self.use_task_interaction:
+            raise ValueError("plan_anchor requires use_task_interaction=True")
         self._backbone_frozen_stages = int(getattr(cfg, "frozen_stages", -1))
         self._backbone_norm_requires_grad = bool(
             getattr(cfg, "norm_requires_grad", False)
@@ -151,6 +174,8 @@ class ParaSSRModel(nn.Module):
             feedforward_channels=cfg.ffn_channels,
             ffn_dropout=cfg.encoder_ffn_dropout,
             attn_dropout=cfg.encoder_attn_dropout,
+            use_lidar=bool(getattr(cfg, "use_lidar", False)),
+            num_points_lidar=int(getattr(cfg, "lidar_attn_points", 8)),
         )
         transformer = SSRPerceptionTransformer(
             embed_dims=cfg.embed_dims,
@@ -185,6 +210,16 @@ class ParaSSRModel(nn.Module):
             use_stl=getattr(cfg, "use_stl", False),
             plan_num_layers=getattr(cfg, "plan_num_layers", 3),
             use_task_interaction=self.use_task_interaction,
+            use_lidar=bool(getattr(cfg, "use_lidar", False)),
+            plan_anchor_file=plan_anchor_file,
+            plan_reward_weights=getattr(cfg, "plan_reward_weights", (0.1, 0.5, 0.5, 1.0)),
+            plan_topk=int(getattr(cfg, "plan_topk", 6)),
+            plan_kinematic=bool(getattr(cfg, "plan_kinematic", False)),
+            plan_heading_from_xy=bool(getattr(cfg, "plan_heading_from_xy", False)),
+            plan_rescore_refined=bool(getattr(cfg, "plan_rescore_refined", False)),
+        )
+        self.lidar_encoder = (
+            build_lidar_encoder(cfg) if getattr(cfg, "use_lidar", False) else None
         )
 
         if cfg.use_metric_planner:
@@ -291,6 +326,19 @@ class ParaSSRModel(nn.Module):
         _, C, h, w = feat.shape
         return [feat.view(B, N, C, h, w)]
 
+    def lidar_bev(self, features: Dict[str, torch.Tensor], t: int) -> Optional[torch.Tensor]:
+        """LiDAR BEV ``[B, C, bev_h, bev_w]`` at queue step ``t``, or ``None``."""
+        if self.lidar_encoder is None:
+            return None
+        if "lidar_points" not in features or "lidar_num_points" not in features:
+            raise ValueError(
+                "a use_lidar model needs lidar_points and lidar_num_points; "
+                "rebuild the feature cache with use_lidar enabled"
+            )
+        return self.lidar_encoder(
+            features["lidar_points"][:, t], features["lidar_num_points"][:, t]
+        )
+
     @torch.no_grad()
     def obtain_history_bev(self, features: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         """Run the encoder over the history frames without building a graph."""
@@ -300,23 +348,35 @@ class ParaSSRModel(nn.Module):
             return None
 
         was_training = self.training
-        self.eval()
-        prev_bev = None
-        for t in range(T - 1):
-            feats = self.extract_img_feat(cams[:, t])
-            prev_bev = self.pts_bbox_head(
-                feats,
-                lidar2img=features["lidar2img"],
-                image_hw=features["image_hw"],
-                ego_motion=features["ego_motion"][:, t],
-                bev_shift=features["bev_shift"][:, t],
-                bev_yaw=features["ego_motion"][:, t, 2].detach(),
-                prev_bev=prev_bev,
-                only_bev=True,
-            )
-        if was_training:
-            self.train()
-        return prev_bev
+        was_cache_enabled = torch.is_autocast_cache_enabled()
+        try:
+            # History and the current frame share weights. Caching a weight
+            # cast under no_grad would let the current frame reuse a detached
+            # copy. Disable only the cache; keep the caller's autocast state.
+            torch.set_autocast_cache_enabled(False)
+            self.eval()
+            if was_training and self.lidar_encoder is not None:
+                # Image BN stays frozen. The from-scratch LiDAR BN must use the
+                # same statistics mode for history and the current frame.
+                self.lidar_encoder.train()
+            prev_bev = None
+            for t in range(T - 1):
+                feats = self.extract_img_feat(cams[:, t])
+                prev_bev = self.pts_bbox_head(
+                    feats,
+                    lidar2img=features["lidar2img"],
+                    image_hw=features["image_hw"],
+                    ego_motion=features["ego_motion"][:, t],
+                    bev_shift=features["bev_shift"][:, t],
+                    bev_yaw=features["ego_motion"][:, t, 2].detach(),
+                    prev_bev=prev_bev,
+                    only_bev=True,
+                    lidar_bev=self.lidar_bev(features, t),
+                )
+            return prev_bev
+        finally:
+            torch.set_autocast_cache_enabled(was_cache_enabled)
+            self.train(was_training)
 
     # ------------------------------------------------------------------ #
     def forward(
@@ -344,6 +404,7 @@ class ParaSSRModel(nn.Module):
             prev_bev=prev_bev,
             cmd=features["command"],
             ego_status=ego_status,
+            lidar_bev=self.lidar_bev(features, -1),
         )
         if not self.use_task_interaction:
             outs = self.pts_bbox_head(cur_feats, **head_kwargs)
@@ -369,10 +430,48 @@ class ParaSSRModel(nn.Module):
         }
         if "plan_bev_attn" in planned:
             predictions["plan_bev_attn"] = planned["plan_bev_attn"]
+        if "trajectory_offset" in planned:
+            # Anchor planner already selected an absolute pose. Keep the offset
+            # and reward tensors the anchor loss reads.
+            for key in (
+                "trajectory",
+                "plan_topk_trajectory",
+                "plan_topk_reward",
+                "plan_topk_index",
+                "plan_final_rewards",
+                "trajectory_offset",
+                "im_rewards",
+                "sim_rewards",
+                "trajectory_anchors",
+            ):
+                predictions[key] = planned[key]
+            predictions.update({
+                key: value for key, value in planned.items() if key.startswith("plan_rescore_")
+            })
+        predictions["trajectory"] = self._postprocess_trajectory(
+            predictions["trajectory"], features
+        )
         if self.training or run_aux:
             predictions.update(det_out)
             predictions.update(map_out)
         return predictions
+
+    def _postprocess_trajectory(
+        self, trajectory: torch.Tensor, features: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Evaluation-only heading and kinematic projection. Training is unchanged."""
+        cfg = self._config
+        if self.training:
+            return trajectory
+        if getattr(cfg, "heading_from_path", False):
+            trajectory = heading_from_path(trajectory)
+        if getattr(cfg, "kinematic_projection", False):
+            from .modules.kinematics import bicycle_rollout, clamp_controls, poses_to_controls
+
+            v0 = features["status_feature"][:, cfg.num_navi_cmd].to(trajectory.dtype)
+            controls = clamp_controls(poses_to_controls(trajectory, v0, 0.5))
+            trajectory, _ = bicycle_rollout(controls, v0, 0.5)
+        return trajectory
 
     def _predictions_from_plan(
         self,
@@ -428,4 +527,7 @@ class ParaSSRModel(nn.Module):
             bev_map = bev_embed if s == 1.0 else _ScaleGrad.apply(bev_embed, s)
             predictions.update(self.map_head(bev_map))
 
+        predictions["trajectory"] = self._postprocess_trajectory(
+            predictions["trajectory"], features
+        )
         return predictions

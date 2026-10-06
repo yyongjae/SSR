@@ -108,7 +108,8 @@ class TeacherAdapterPlanner(nn.Module):
         # A parameter that never receives a gradient makes DDP abort, and it is
         # invisible in single-process testing. requires_grad is not part of
         # state_dict, so a stage-1 checkpoint still loads into the full model.
-        self.planner.bev_embedding.weight.requires_grad_(False)
+        if self.planner.bev_embedding is not None:
+            self.planner.bev_embedding.weight.requires_grad_(False)
 
     def forward(
         self,

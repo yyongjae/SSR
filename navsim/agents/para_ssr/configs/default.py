@@ -8,7 +8,7 @@ Values fall into three groups:
 * **optimisation** -- the WoTE/SeerDrive-derived recipe (see report #09 §4).
 """
 from dataclasses import dataclass, field
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
@@ -113,6 +113,21 @@ class ParaSSRConfig:
     use_cams_embeds: bool = True
     use_grid_mask: bool = True
 
+    # LiDAR branch (km/para-ssr-v2, modules/lidar_encoder.py). Off keeps the
+    # learned BEV queries and the existing feature-cache key. On, the front-ROI
+    # cloud seeds the queries and a gated deformable cross-attention.
+    use_lidar: bool = False
+    lidar_max_points: int = 65536
+    lidar_z_range: Tuple[float, float] = (-3.0, 5.0)
+    lidar_encoder: str = "sparse"
+    lidar_voxel_size: Tuple[float, float, float] = (0.08, 0.08, 0.2)
+    lidar_pillar_size: Tuple[float, float] = (0.16, 0.16)
+    lidar_pillar_channels: int = 64
+    lidar_backbone_channels: Tuple[int, ...] = (64, 128, 256)
+    lidar_backbone_layers: Tuple[int, ...] = (3, 5, 5)
+    lidar_neck_channels: int = 128
+    lidar_attn_points: int = 8
+
     # ------------------------------------------------------------------ #
     # planning head
     # ------------------------------------------------------------------ #
@@ -157,6 +172,24 @@ class ParaSSRConfig:
     metric_detach_bev: bool = False
     metric_cache_path: str = ""     # world cache for BOTH training/validation
     metric_cache_size: int = 8      # max decompressed scenes per training process
+
+    # WoTE-style anchor vocabulary (km/para-ssr-v2 modules/anchor_planner.py).
+    # Off keeps the single-query L1 regressor. Requires use_task_interaction
+    # and a plan_anchor_file; sim_reward targets come from plan_score_file.
+    plan_anchor: bool = False
+    plan_anchor_file: Optional[str] = None
+    plan_score_file: Optional[str] = None
+    plan_reward_weights: Tuple[float, float, float, float] = (0.1, 0.5, 0.5, 1.0)
+    plan_topk: int = 6
+    plan_kinematic: bool = False
+    plan_heading_from_xy: bool = False
+    plan_rescore_refined: bool = False
+    plan_offset_loss_weight: float = 1.0
+    plan_im_reward_weight: float = 1.0
+    plan_sim_reward_weight: float = 1.0
+    # Evaluation-only post-process. Training still regresses the raw poses.
+    heading_from_path: bool = False
+    kinematic_projection: bool = False
 
     # ------------------------------------------------------------------ #
     # auxiliary head 1: detection + motion

@@ -269,6 +269,64 @@ class ParaSSRAgent(AbstractAgent):
                 "det_fov_half_angle_deg must be in (0, 90], got "
                 f"{config.det_fov_half_angle_deg}"
             )
+        if getattr(config, "use_lidar", False):
+            from .modules.lidar_encoder import (
+                LIDAR_BACKBONE_STRIDES,
+                LIDAR_ENCODERS,
+                pillar_downsample_ratio,
+                sparse_grid,
+            )
+
+            z_range = tuple(config.lidar_z_range)
+            if (
+                len(z_range) != 2
+                or not all(math.isfinite(float(v)) for v in z_range)
+                or not float(z_range[0]) < float(z_range[1])
+            ):
+                raise ValueError(
+                    f"lidar_z_range must be (low, high) metres with low < high, got {z_range}"
+                )
+            max_points = config.lidar_max_points
+            if isinstance(max_points, bool) or not isinstance(max_points, int) or max_points < 1:
+                raise ValueError(
+                    f"lidar_max_points must be a positive integer, got {max_points!r}"
+                )
+            encoder = str(config.lidar_encoder)
+            if encoder not in LIDAR_ENCODERS:
+                raise ValueError(
+                    f"lidar_encoder must be one of {LIDAR_ENCODERS}, got {encoder!r}"
+                )
+            if encoder == "sparse":
+                sparse_grid(
+                    config.pc_range, config.bev_h, config.bev_w,
+                    config.lidar_z_range, config.lidar_voxel_size,
+                )
+            else:
+                pillar_downsample_ratio(
+                    config.pc_range, config.bev_h, config.bev_w, config.lidar_pillar_size
+                )
+                stages = len(LIDAR_BACKBONE_STRIDES)
+                if (
+                    len(config.lidar_backbone_channels) != stages
+                    or len(config.lidar_backbone_layers) != stages
+                ):
+                    raise ValueError(
+                        "lidar_backbone_channels and lidar_backbone_layers need one entry "
+                        f"per backbone stage ({stages}), got "
+                        f"{tuple(config.lidar_backbone_channels)} and "
+                        f"{tuple(config.lidar_backbone_layers)}"
+                    )
+            if int(config.lidar_attn_points) < 1:
+                raise ValueError(
+                    f"lidar_attn_points must be positive, got {config.lidar_attn_points}"
+                )
+        if getattr(config, "plan_anchor", False):
+            if not getattr(config, "plan_anchor_file", None):
+                raise ValueError("plan_anchor requires plan_anchor_file")
+            if getattr(config, "use_stl", False) or getattr(config, "use_metric_planner", False):
+                raise ValueError("plan_anchor requires the dense task-interaction planner")
+            if not getattr(config, "use_task_interaction", True):
+                raise ValueError("plan_anchor requires use_task_interaction=True")
         if not 1 <= config.map_dir_interval < config.map_num_pts_per_vec:
             raise ValueError(
                 "map_dir_interval must satisfy 1 <= interval < points/vector, "
@@ -368,7 +426,7 @@ class ParaSSRAgent(AbstractAgent):
             cam_r1=frames if "cam_r1" in wanted else False,
             cam_r2=frames if "cam_r2" in wanted else False,
             cam_b0=frames if "cam_b0" in wanted else False,
-            lidar_pc=False,
+            lidar_pc=frames if getattr(self._config, "use_lidar", False) else False,
         )
 
     def get_feature_builders(self) -> List[AbstractFeatureBuilder]:

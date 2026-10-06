@@ -1,7 +1,7 @@
 """BEVFormer encoder for PARA-SSR on navsim, without mmcv.
 
-Structurally identical to the nuScenes ``SSRPerceptionTransformer`` /
-``BEVFormerEncoder``: N surround images -> per-camera deformable spatial
+Adapted from the nuScenes ``SSRPerceptionTransformer`` /
+``BEVFormerEncoder``: N camera images -> per-camera deformable spatial
 cross-attention into a BEV grid, with temporal self-attention against the
 previous frame's BEV.
 
@@ -12,12 +12,17 @@ Two things change because navsim is not nuScenes:
    navsim gives history ego poses already expressed in the *current* ego frame,
    so the shift is computed directly in the feature builder and arrives as an
    explicit ``bev_shift`` tensor. Together with the cached relative yaw, it
-   warps the previous BEV with one SE(2) ``grid_sample`` before temporal
-   attention. The 18-d ego-status vector is not added to BEV queries unless
-   ``use_ego_motion`` is set; the planner consumes it.
+   warps the full previous BEV into the current frame before temporal
+   attention. Legacy ``ego_motion`` query conditioning
+   remains optional in this wrapper; PARA-SSR disables it and instead sends
+   current velocity/acceleration directly to the planning query.
 
 2. **No ``img_metas`` dicts.**  ``lidar2img`` and image shapes are ordinary
    batched tensors, built once in the feature builder.
+
+One addition, from SafeDrive: an optional LiDAR BEV (``modules/lidar_encoder``)
+replaces the learned BEV query embedding and is read by a deformable
+``lidar_cross_attn`` in every layer, gated against the camera cross-attention.
 
 Coordinate frames
 -----------------
@@ -28,18 +33,18 @@ by the feature builder, so everything below stays in the SSR frame.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
-from .temporal_alignment import warp_previous_bev
 from .ms_deform_attn import (
     CustomMSDeformableAttention,
     MSDeformableAttention3D,
     TemporalSelfAttention,
 )
 from .transformer_blocks import FFN
+from .temporal_alignment import warp_previous_bev
 
 
 class SpatialCrossAttention(nn.Module):
@@ -79,6 +84,7 @@ class SpatialCrossAttention(nn.Module):
         reference_points_cam: Optional[torch.Tensor] = None,
         bev_mask: Optional[torch.Tensor] = None,
         level_start_index: Optional[torch.Tensor] = None,
+        add_residual: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         inp_residual = query if residual is None else residual
@@ -139,11 +145,18 @@ class SpatialCrossAttention(nn.Module):
         count = torch.clamp(count, min=1.0)
         slots = slots / count[..., None]
         slots = self.output_proj(slots)
+        if not add_residual:
+            # SafeDrive's gated LiDAR/camera blend adds the residual itself.
+            return self.dropout(slots)
         return self.dropout(slots) + inp_residual
 
 
 class BEVFormerLayer(nn.Module):
-    """``('self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm')``."""
+    """``('self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm')``.
+
+    With ``use_lidar`` the middle becomes SafeDrive's
+    ``('lidar_cross_attn', 'cross_attn')`` pair blended by a learned gate.
+    """
 
     def __init__(
         self,
@@ -156,6 +169,8 @@ class BEVFormerLayer(nn.Module):
         num_levels: int = 1,
         ffn_dropout: float = 0.1,
         attn_dropout: float = 0.1,
+        use_lidar: bool = False,
+        num_points_lidar: int = 8,
     ):
         super().__init__()
         self.temporal_self_attn = TemporalSelfAttention(
@@ -177,6 +192,29 @@ class BEVFormerLayer(nn.Module):
         self.norms = nn.ModuleList([nn.LayerNorm(embed_dims) for _ in range(3)])
         self.ffn = FFN(embed_dims, feedforward_channels, ffn_drop=ffn_dropout)
 
+        # SafeDrive's ``lidar_cross_attn``: the BEV queries sample the LiDAR BEV
+        # through plain 2D deformable attention before the camera
+        # cross-attention, and a per-channel sigmoid gate blends the two.  The
+        # gate starts at zero (an even 0.5 / 0.5 blend); SafeDrive draws its
+        # ``nn.Embedding(1, C)`` gate from N(0, 1) instead.
+        if use_lidar:
+            self.lidar_cross_attn: Optional[nn.Module] = CustomMSDeformableAttention(
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                num_levels=1,
+                num_points=num_points_lidar,
+                dropout=attn_dropout,
+                batch_first=True,
+            )
+            self.lidar_gate: Optional[nn.Parameter] = nn.Parameter(torch.zeros(embed_dims))
+        else:
+            self.lidar_cross_attn = None
+            self.lidar_gate = None
+        # Detached per-forward magnitudes of the camera (and LiDAR) attention
+        # outputs, read by the loss logger: a camera branch that stays two
+        # orders of magnitude below the LiDAR one is being starved.
+        self.last_attn_norms: Dict[str, torch.Tensor] = {}
+
     def forward(
         self,
         query: torch.Tensor,
@@ -192,6 +230,8 @@ class BEVFormerLayer(nn.Module):
         reference_points_cam: Optional[torch.Tensor] = None,
         bev_mask: Optional[torch.Tensor] = None,
         prev_bev: Optional[torch.Tensor] = None,
+        lidar_feat: Optional[torch.Tensor] = None,
+        lidar_ref_2d: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         bev_spatial_shapes = torch.tensor(
@@ -211,17 +251,60 @@ class BEVFormerLayer(nn.Module):
         )
         query = self.norms[0](query)
 
-        query = self.spatial_cross_attn(
-            query,
-            key,
-            value,
-            residual=query,
-            query_pos=None,
-            reference_points_cam=reference_points_cam,
-            bev_mask=bev_mask,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index,
-        )
+        if self.lidar_cross_attn is None:
+            if lidar_feat is not None:
+                raise ValueError(
+                    "BEVFormerLayer was built without use_lidar but received lidar_feat"
+                )
+            attended = self.spatial_cross_attn(
+                query,
+                key,
+                value,
+                residual=query,
+                query_pos=None,
+                reference_points_cam=reference_points_cam,
+                bev_mask=bev_mask,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+            )
+            self.last_attn_norms = {"camera": (attended - query).detach().norm()}
+            query = attended
+        else:
+            if lidar_feat is None or lidar_ref_2d is None:
+                raise ValueError(
+                    "BEVFormerLayer built with use_lidar needs lidar_feat and lidar_ref_2d"
+                )
+            # SafeDrive order: self_attn -> norm -> lidar_cross_attn -> cross_attn
+            # -> gate.  The camera attention reads the LiDAR-attended query and
+            # returns no residual of its own; the blend adds the post-norm query
+            # once as this block's residual.
+            identity = query
+            query_lidar = self.lidar_cross_attn(
+                query,
+                value=lidar_feat,
+                identity=query,
+                query_pos=bev_pos,
+                reference_points=lidar_ref_2d,
+                spatial_shapes=bev_spatial_shapes,
+                level_start_index=bev_level_start_index,
+            )
+            query_camera = self.spatial_cross_attn(
+                query_lidar,
+                key,
+                value,
+                query_pos=None,
+                reference_points_cam=reference_points_cam,
+                bev_mask=bev_mask,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                add_residual=False,
+            )
+            gate = torch.sigmoid(self.lidar_gate)
+            self.last_attn_norms = {
+                "lidar": (query_lidar - identity).detach().norm(),
+                "camera": query_camera.detach().norm(),
+            }
+            query = gate * query_lidar + (1.0 - gate) * query_camera + identity
         query = self.norms[1](query)
 
         query = self.ffn(query)
@@ -245,10 +328,13 @@ class BEVFormerEncoder(nn.Module):
         feedforward_channels: int = 512,
         ffn_dropout: float = 0.1,
         attn_dropout: float = 0.1,
+        use_lidar: bool = False,
+        num_points_lidar: int = 8,
     ):
         super().__init__()
         self.pc_range = list(pc_range)
         self.num_points_in_pillar = num_points_in_pillar
+        self.use_lidar = use_lidar
         self.layers = nn.ModuleList(
             [
                 BEVFormerLayer(
@@ -261,6 +347,8 @@ class BEVFormerEncoder(nn.Module):
                     num_levels=num_levels,
                     ffn_dropout=ffn_dropout,
                     attn_dropout=attn_dropout,
+                    use_lidar=use_lidar,
+                    num_points_lidar=num_points_lidar,
                 )
                 for _ in range(num_layers)
             ]
@@ -324,57 +412,60 @@ class BEVFormerEncoder(nn.Module):
             lidar2img: ``[bs, num_cam, 4, 4]``
             image_hw: ``[bs, num_cam, 2]`` as (H, W)
         """
-        lidar2img = lidar2img.to(reference_points.dtype)
-        reference_points = reference_points.clone()
+        # FP32 casts alone do not protect matmul from an enclosing autocast.
+        # Keep the complete projection/division in FP32: low precision changes
+        # camera visibility at the image edges and can overflow behind-camera
+        # coordinates before spatial attention discards the invisible queries.
+        with torch.autocast(device_type=reference_points.device.type, enabled=False):
+            lidar2img = lidar2img.float()
+            reference_points = reference_points.float().clone()
 
-        reference_points[..., 0:1] = (
-            reference_points[..., 0:1] * (pc_range[3] - pc_range[0]) + pc_range[0]
-        )
-        reference_points[..., 1:2] = (
-            reference_points[..., 1:2] * (pc_range[4] - pc_range[1]) + pc_range[1]
-        )
-        reference_points[..., 2:3] = (
-            reference_points[..., 2:3] * (pc_range[5] - pc_range[2]) + pc_range[2]
-        )
-        reference_points = torch.cat(
-            (reference_points, torch.ones_like(reference_points[..., :1])), -1
-        )
+            reference_points[..., 0:1] = (
+                reference_points[..., 0:1] * (pc_range[3] - pc_range[0]) + pc_range[0]
+            )
+            reference_points[..., 1:2] = (
+                reference_points[..., 1:2] * (pc_range[4] - pc_range[1]) + pc_range[1]
+            )
+            reference_points[..., 2:3] = (
+                reference_points[..., 2:3] * (pc_range[5] - pc_range[2]) + pc_range[2]
+            )
+            reference_points = torch.cat(
+                (reference_points, torch.ones_like(reference_points[..., :1])), -1
+            )
 
-        reference_points = reference_points.permute(1, 0, 2, 3)
-        D, B, num_query = reference_points.size()[:3]
-        num_cam = lidar2img.size(1)
+            reference_points = reference_points.permute(1, 0, 2, 3)
+            D, B, num_query = reference_points.size()[:3]
+            num_cam = lidar2img.size(1)
 
-        reference_points = (
-            reference_points.view(D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
-        )
-        lidar2img = lidar2img.view(1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
+            reference_points = (
+                reference_points.view(D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
+            )
+            lidar2img = lidar2img.view(1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
 
-        reference_points_cam = torch.matmul(
-            lidar2img.to(torch.float32), reference_points.to(torch.float32)
-        ).squeeze(-1)
-        eps = 1e-5
+            reference_points_cam = torch.matmul(lidar2img, reference_points).squeeze(-1)
+            eps = 1e-5
 
-        bev_mask = reference_points_cam[..., 2:3] > eps
-        reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
-            reference_points_cam[..., 2:3],
-            torch.ones_like(reference_points_cam[..., 2:3]) * eps,
-        )
+            bev_mask = reference_points_cam[..., 2:3] > eps
+            reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
+                reference_points_cam[..., 2:3],
+                torch.ones_like(reference_points_cam[..., 2:3]) * eps,
+            )
 
-        image_hw = image_hw.to(reference_points_cam.dtype)
-        reference_points_cam[..., 0] /= image_hw[None, :, :, None, 1]
-        reference_points_cam[..., 1] /= image_hw[None, :, :, None, 0]
+            image_hw = image_hw.float()
+            reference_points_cam[..., 0] /= image_hw[None, :, :, None, 1]
+            reference_points_cam[..., 1] /= image_hw[None, :, :, None, 0]
 
-        bev_mask = (
-            bev_mask
-            & (reference_points_cam[..., 1:2] > 0.0)
-            & (reference_points_cam[..., 1:2] < 1.0)
-            & (reference_points_cam[..., 0:1] < 1.0)
-            & (reference_points_cam[..., 0:1] > 0.0)
-        )
-        bev_mask = torch.nan_to_num(bev_mask)
+            bev_mask = (
+                bev_mask
+                & (reference_points_cam[..., 1:2] > 0.0)
+                & (reference_points_cam[..., 1:2] < 1.0)
+                & (reference_points_cam[..., 0:1] < 1.0)
+                & (reference_points_cam[..., 0:1] > 0.0)
+            )
+            bev_mask = torch.nan_to_num(bev_mask)
 
-        reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
-        bev_mask = bev_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
+            reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
+            bev_mask = bev_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
         return reference_points_cam, bev_mask
 
     def forward(
@@ -390,8 +481,10 @@ class BEVFormerEncoder(nn.Module):
         lidar2img: torch.Tensor,
         image_hw: torch.Tensor,
         prev_bev: Optional[torch.Tensor] = None,
-        shift: Optional[torch.Tensor] = None,
+        lidar_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``lidar_feat``: ``[bs, bev_h * bev_w, C]`` LiDAR BEV, required iff
+        the layers were built with ``use_lidar``."""
         bs = bev_query.size(1)
         ref_3d = self.get_reference_points(
             bev_h,
@@ -401,18 +494,16 @@ class BEVFormerEncoder(nn.Module):
             dim="3d",
             bs=bs,
             device=bev_query.device,
-            dtype=bev_query.dtype,
+            # Geometry must not inherit FP16/BF16 feature quantization before
+            # the FP32 projection can protect it.
+            dtype=torch.float32,
         )
         ref_2d = self.get_reference_points(
-            bev_h, bev_w, dim="2d", bs=bs, device=bev_query.device, dtype=bev_query.dtype
+            bev_h, bev_w, dim="2d", bs=bs, device=bev_query.device, dtype=torch.float32
         )
         reference_points_cam, bev_mask = self.point_sampling(
             ref_3d, self.pc_range, lidar2img, image_hw
         )
-
-        shift_ref_2d = ref_2d.clone()
-        if shift is not None:
-            shift_ref_2d = shift_ref_2d + shift[:, None, None, :]
 
         bev_query = bev_query.permute(1, 0, 2)
         bev_pos = bev_pos.permute(1, 0, 2)
@@ -421,13 +512,12 @@ class BEVFormerEncoder(nn.Module):
         if prev_bev is not None:
             prev_bev = prev_bev.permute(1, 0, 2)
             prev_bev = torch.stack([prev_bev, bev_query], 1).reshape(bs * 2, len_bev, -1)
-            hybrid_ref_2d = torch.stack([shift_ref_2d, ref_2d], 1).reshape(
-                bs * 2, len_bev, num_bev_level, 2
-            )
-        else:
-            hybrid_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(
-                bs * 2, len_bev, num_bev_level, 2
-            )
+        # History has already been warped once by the perception wrapper.
+        # Both streams now share the current frame; another reference shift
+        # would double-apply the translation.
+        hybrid_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(
+            bs * 2, len_bev, num_bev_level, 2
+        )
 
         output = bev_query
         for layer in self.layers:
@@ -445,12 +535,14 @@ class BEVFormerEncoder(nn.Module):
                 reference_points_cam=reference_points_cam,
                 bev_mask=bev_mask,
                 prev_bev=prev_bev,
+                lidar_feat=lidar_feat,
+                lidar_ref_2d=ref_2d,
             )
         return output
 
 
 class SSRPerceptionTransformer(nn.Module):
-    """Wraps the encoder with camera/level embeddings and ego-motion conditioning."""
+    """Encoder with camera/level embeddings and optional legacy ego conditioning."""
 
     def __init__(
         self,
@@ -475,8 +567,8 @@ class SSRPerceptionTransformer(nn.Module):
 
         self.level_embeds = nn.Parameter(torch.empty(num_feature_levels, embed_dims))
         self.cams_embeds = nn.Parameter(torch.empty(num_cams, embed_dims))
-        # The 18-d status vector is a planner input. Building the MLP only when
-        # it is actually added keeps an unused parameter out of DDP.
+        # Do not retain unused trainable parameters when the model routes
+        # status to planning. Geometric bev_shift is independent of this MLP.
         self.ego_motion_mlp = None
         if use_ego_motion:
             ego_motion_layers = [
@@ -486,8 +578,7 @@ class SSRPerceptionTransformer(nn.Module):
                 nn.ReLU(inplace=True),
             ]
             if ego_motion_norm:
-                # Original SSR default: can_bus_norm=True.  NAVSIM replaces the
-                # CAN vector, not the conditioning network's output contract.
+                # Legacy SSR can_bus_norm=True output contract.
                 ego_motion_layers.append(nn.LayerNorm(embed_dims))
             self.ego_motion_mlp = nn.Sequential(*ego_motion_layers)
         self.init_weights()
@@ -516,7 +607,7 @@ class SSRPerceptionTransformer(nn.Module):
     def get_bev_features(
         self,
         mlvl_feats: Sequence[torch.Tensor],
-        bev_queries: torch.Tensor,
+        bev_queries: Optional[torch.Tensor],
         bev_h: int,
         bev_w: int,
         bev_pos: torch.Tensor,
@@ -525,47 +616,67 @@ class SSRPerceptionTransformer(nn.Module):
         ego_motion: Optional[torch.Tensor],
         bev_shift: torch.Tensor,
         prev_bev: Optional[torch.Tensor] = None,
+        lidar_bev: Optional[torch.Tensor] = None,
         bev_yaw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             mlvl_feats: list of ``[bs, num_cam, C, H, W]``
-            bev_queries: ``[bev_h * bev_w, embed_dims]``
+            bev_queries: ``[bev_h * bev_w, embed_dims]`` learned queries, or
+                ``None`` when ``lidar_bev`` supplies them
             bev_pos: ``[bs, embed_dims, bev_h, bev_w]``
             lidar2img: ``[bs, num_cam, 4, 4]``
             image_hw: ``[bs, num_cam, 2]``
-            ego_motion: ``[bs, ego_motion_dims]``
+            ego_motion: legacy ``[bs, ego_motion_dims]``, or ``None`` when
+                learned BEV ego conditioning is disabled (PARA-SSR default)
             bev_shift: ``[bs, 2]`` normalised (shift_x, shift_y)
-            bev_yaw: ``[bs]`` current heading minus previous heading, radians
+            bev_yaw: ``[bs]`` current minus previous heading in radians;
+                required when previous BEV exists and ``use_shift=True``
+            prev_bev: previous BEV ``[bs, HW, C]`` (preferred) or ``[HW, bs, C]``
+            lidar_bev: ``[bs, embed_dims, bev_h, bev_w]`` LiDAR BEV.  As in
+                SafeDrive it *is* the initial query set, and a copy of it is
+                what every layer's ``lidar_cross_attn`` samples from.
         Returns:
             ``[bs, bev_h * bev_w, embed_dims]``
         """
         bs = mlvl_feats[0].size(0)
-        bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)
+        lidar_feat = None
+        if lidar_bev is not None:
+            if lidar_bev.shape[0] != bs or tuple(lidar_bev.shape[-2:]) != (bev_h, bev_w):
+                raise ValueError(
+                    f"lidar_bev must be [bs, C, {bev_h}, {bev_w}], got {tuple(lidar_bev.shape)}"
+                )
+            lidar_feat = lidar_bev.flatten(2).permute(0, 2, 1)  # [bs, HW, C]
+            bev_queries = lidar_feat.permute(1, 0, 2)  # [HW, bs, C]
+        elif bev_queries is not None:
+            bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)
+        else:
+            raise ValueError("get_bev_features needs learned bev_queries or a lidar_bev")
         bev_pos = bev_pos.flatten(2).permute(2, 0, 1)
 
-        shift = bev_shift.to(bev_queries.dtype)
-        if not self.use_shift:
-            shift = torch.zeros_like(shift)
-
-        if prev_bev is not None and prev_bev.shape[1] == bev_h * bev_w:
+        if prev_bev is not None:
+            batch_first_shape = (bs, bev_h * bev_w, self.embed_dims)
+            sequence_first_shape = (bev_h * bev_w, bs, self.embed_dims)
+            if tuple(prev_bev.shape) == batch_first_shape:
+                previous_batch = prev_bev
+            elif tuple(prev_bev.shape) == sequence_first_shape:
+                previous_batch = prev_bev.permute(1, 0, 2)
+            else:
+                raise ValueError(
+                    f"prev_bev must have shape {batch_first_shape} or "
+                    f"{sequence_first_shape}, got {tuple(prev_bev.shape)}"
+                )
             if self.use_shift:
                 if bev_yaw is None:
-                    raise ValueError(
-                        "bev_yaw is required to align previous BEV when use_shift=True"
-                    )
-                # Warp the whole history map once. The encoder must not also
-                # shift its temporal reference points, or the translation is
-                # applied twice.
-                previous_grid = prev_bev.permute(0, 2, 1).reshape(
+                    raise ValueError("bev_yaw is required to align previous BEV when use_shift=True")
+                previous_grid = previous_batch.permute(0, 2, 1).reshape(
                     bs, self.embed_dims, bev_h, bev_w
                 )
                 previous_grid = warp_previous_bev(
-                    previous_grid, shift, bev_yaw, self.encoder.pc_range
+                    previous_grid, bev_shift, bev_yaw, self.encoder.pc_range
                 )
-                prev_bev = previous_grid.flatten(2).permute(0, 2, 1)
-            prev_bev = prev_bev.permute(1, 0, 2)
-            shift = None
+                previous_batch = previous_grid.flatten(2).permute(0, 2, 1)
+            prev_bev = previous_batch.permute(1, 0, 2)
 
         if self.use_ego_motion:
             if ego_motion is None:
@@ -605,5 +716,5 @@ class SSRPerceptionTransformer(nn.Module):
             lidar2img=lidar2img,
             image_hw=image_hw,
             prev_bev=prev_bev,
-            shift=shift,
+            lidar_feat=lidar_feat,
         )

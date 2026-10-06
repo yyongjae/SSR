@@ -352,6 +352,31 @@ class ParaSSRLoss(torch.nn.Module):
             logs["loss_plan_tail_lat"] = lat_tail.detach()
             logs["loss_plan_tail_progress"] = prog_tail.detach()
             logs["loss_plan_ttc_proxy"] = ttc_proxy.detach()
+            if "trajectory_offset" in predictions:
+                # Anchor planner: WoTE's three terms replace the L1 regression.
+                # loss_plan_reg above stays the selected-trajectory L1 for logs.
+                from .modules.anchor_planner import anchor_plan_losses
+
+                if "sim_reward" not in targets or "sim_reward_valid" not in targets:
+                    raise KeyError(
+                        "plan_anchor needs sim_reward and sim_reward_valid targets; "
+                        "set plan_score_file"
+                    )
+                anchor_losses = anchor_plan_losses(
+                    predictions,
+                    targets["trajectory"],
+                    targets["sim_reward"],
+                    targets["sim_reward_valid"],
+                )
+                plan_total = (
+                    float(getattr(cfg, "plan_offset_loss_weight", 1.0)) * anchor_losses["traj_offset_loss"]
+                    + float(getattr(cfg, "plan_im_reward_weight", 1.0)) * anchor_losses["im_reward_loss"]
+                    + float(getattr(cfg, "plan_sim_reward_weight", 1.0)) * anchor_losses["sim_reward_loss"]
+                )
+                balance_plan = plan_total
+                logs.update({
+                    f"plan_v2/{name}": value.detach() for name, value in anchor_losses.items()
+                })
         plan_w = tw.get("plan", 1.0)
         task_losses["plan"] = plan_total * plan_w
         plan_for_balance = balance_plan * plan_w

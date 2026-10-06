@@ -31,6 +31,20 @@ config:
   image_scale: 0.4
   crop_top: 16
 
+  # --- LiDAR (km/para-ssr-v2, SafeDrive wiring). Off = camera student. ----
+  # sparse = SpMiddleResNetFHD (needs spconv). pillar = spconv-free fallback.
+  use_lidar: false
+  lidar_encoder: sparse
+  lidar_max_points: 65536
+  lidar_z_range: [-3.0, 5.0]
+  lidar_voxel_size: [0.08, 0.08, 0.2]
+  lidar_pillar_size: [0.16, 0.16]
+  lidar_pillar_channels: 64
+  lidar_backbone_channels: [64, 128, 256]
+  lidar_backbone_layers: [3, 5, 5]
+  lidar_neck_channels: 128
+  lidar_attn_points: 8
+
   # --- heads --------------------------------------------------------------
   use_det_motion_head: true
   use_map_head: true
@@ -41,6 +55,20 @@ config:
   use_ego_motion: false
   # BEV cross-attn, then parallel det/motion and map cross-attn, then sum.
   use_task_interaction: true
+  # WoTE anchor planner (modules/anchor_planner.py). Off keeps L1 regression.
+  plan_anchor: false
+  plan_anchor_file: null
+  plan_score_file: null
+  plan_reward_weights: [0.1, 0.5, 0.5, 1.0]
+  plan_topk: 6
+  plan_kinematic: false
+  plan_heading_from_xy: false
+  plan_rescore_refined: false
+  plan_offset_loss_weight: 1.0
+  plan_im_reward_weight: 1.0
+  plan_sim_reward_weight: 1.0
+  heading_from_path: false
+  kinematic_projection: false
   # v4: lateral tail off. Progress shortfall stops at 90% of GT length.
   # The bumper probe stays in code at weight 0.
   plan_tail_lat_weight: 0.0

@@ -94,6 +94,48 @@ config:
   grad_balance_interval: 200
   grad_norm_log_interval: 200
 
+  # --- planning-readout distillation (report/19) ---------------------------
+  # Off by default.  kd_mode: none | readout | random | feature | attn_feature | sens_feature.
+  # map_label_source: gt | teacher (map head supervised by ReSMap predictions).
+  kd_mode: none
+  kd_teacher_cache: null
+  kd_readout_ckpt: null
+  kd_distance: cosine
+  kd_weight: 1.0
+  kd_warmup_iters: 0
+  kd_ramp_iters: 0
+  kd_adapter: false
+  # none | global | command: z에서 장면과 무관한 성분(command별 평균)을 빼고 거리를 잰다.
+  kd_center: none
+  kd_center_momentum: 0.99
+  kd_random_seed: 0
+  kd_sens_probes: 4
+  # Image backbone (timm tag).  v1 = resnet50.tv_in1k; v2 uses resnet34.tv_in1k,
+  # the NAVSIM-standard ResNet-34 (TransFuser / WoTE / DiffusionDrive).
+  image_architecture: resnet50.tv_in1k
+  # v2 planner: WoTE-style anchors + PDM-score rewards (modules/anchor_planner.py).
+  plan_anchor: false
+  plan_anchor_file: null
+  plan_score_file: null
+  plan_reward_weights: [0.1, 0.5, 0.5, 1.0]
+  plan_topk: 6
+  plan_kinematic: false
+  plan_heading_from_xy: false
+  plan_rescore_refined: false   # evaluation-only: WoTE-style rescoring of anchor + offset
+  plan_offset_loss_weight: 1.0
+  plan_im_reward_weight: 1.0
+  plan_sim_reward_weight: 1.0
+  heading_from_path: false   # evaluation-only: heading := path direction
+  kinematic_projection: false   # evaluation-only: TOAD projection (IK -> clamp -> bicycle rollout)
+  # Planning-side map consistency (plan_map.py); 0 = off.
+  plan_map_weight: 0.0
+  plan_map_margin: 0.0
+  plan_map_extent: [-8.0, 72.0, -32.0, 32.0]
+  plan_map_res: 0.25
+  plan_map_clip: 10.0
+  map_label_source: gt
+  map_pseudo_score_thr: 0.3
+
   # --- optimisation (WoTE/SeerDrive recipe, report #09 4) -----------------
   training_precision: 32
   max_epochs: 30

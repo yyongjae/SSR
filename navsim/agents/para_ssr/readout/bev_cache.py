@@ -1,0 +1,152 @@
+"""Reader for sharded per-frame BEV caches (ReSMap teacher and PARA-SSR student).
+
+Both caches share one on-disk format, written by
+``tools/readout/resmap/cache_teacher_kd.py`` (teacher) and
+``tools/readout/cache_student_bev.py`` (student)::
+
+    <root>/index.json          token -> [shard_name, row]
+    <root>/meta.json           geometry, checkpoint digest, tensor dtypes
+    <root>/<field>/<shard>.npy one stacked array per field per shard
+
+Everything downstream of this reader sees the PARA-SSR student layout
+``(C, forward rows, right columns)`` = ``(256, 50, 100)``, row 0 at 0 m forward
+and column 0 at -32 m (left).  The ReSMap teacher stores ``(C, lateral,
+forward)`` = ``(256, 100, 50)`` with row 0 at +32 m left, which is the same
+physical grid transposed -- no flip, no resample.  This was measured, not
+assumed: ``tools/readout/verify_teacher_alignment.py`` correlates the teacher's
+own segmentation logits (same layout as its BEV) with PARA-SSR map GT under all
+four transpose/flip variants; only the plain transpose correlates (report/19).
+
+The teacher's vector head is converted the same way.  Its points are
+normalised ``(u, v)`` in nuPlan ego axes, ``u = x_forward / 32`` and
+``v = (y_left + 32) / 64``, so the student's normalised ``(x_right, y_forward)``
+is ``(1 - v, u)``.  The verification script measures 0.43 m chamfer to GT for
+this mapping against >= 5 m for each of the other seven swap/flip variants.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+
+# (C, forward, right): PARA-SSR bev_embed viewed as [B, C, bev_h, bev_w]
+STUDENT_LAYOUT = "forward_right"
+# (C, lateral-from-left, forward): ReSMap / MapTracker neck output
+TEACHER_LAYOUT = "left_forward"
+
+# meta.json of the teacher cache predates the "layout" key
+_DEFAULT_LAYOUT = TEACHER_LAYOUT
+
+
+class BevCache:
+    """Random access to one frame of a sharded cache without loading a shard.
+
+    Memmaps are opened lazily and kept per process, so a DataLoader worker pays
+    one ``open`` per shard, not one per sample.  Do not share an instance's
+    open memmaps across ``fork`` -- they are reopened on first use in each
+    worker because ``_maps`` is keyed by pid.
+    """
+
+    def __init__(self, root: os.PathLike, index: Optional[Dict[str, list]] = None):
+        self.root = Path(root)
+        meta_path = self.root / "meta.json"
+        self.meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        self.layout = self.meta.get("layout", _DEFAULT_LAYOUT)
+        if self.layout not in (STUDENT_LAYOUT, TEACHER_LAYOUT):
+            raise ValueError(f"{self.root}: unknown BEV layout {self.layout!r}")
+        if index is None:
+            index = json.loads((self.root / "index.json").read_text())
+        self.index = index
+        self._maps: Dict[Tuple[int, str, str], np.ndarray] = {}
+
+    # ------------------------------------------------------------------ #
+    def __contains__(self, token: str) -> bool:
+        return token in self.index
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def tokens(self):
+        return list(self.index)
+
+    def fields(self):
+        return sorted(p.name for p in self.root.iterdir() if p.is_dir())
+
+    def _array(self, field: str, shard: str) -> np.ndarray:
+        key = (os.getpid(), field, shard)
+        arr = self._maps.get(key)
+        if arr is None:
+            arr = np.load(self.root / field / f"{shard}.npy", mmap_mode="r")
+            self._maps[key] = arr
+        return arr
+
+    def raw(self, token: str, field: str) -> np.ndarray:
+        """One frame of ``field`` exactly as stored (layout untouched)."""
+        shard, row = self.index[token]
+        return np.asarray(self._array(field, shard)[row])
+
+    def bev(self, token: str) -> np.ndarray:
+        """``(C, 50, 100)`` float16 BEV in the student layout."""
+        arr = self.raw(token, "bev")
+        if self.layout == TEACHER_LAYOUT:
+            arr = arr.transpose(0, 2, 1)
+        return np.ascontiguousarray(arr)
+
+
+# ---------------------------------------------------------------------- #
+# teacher vector head -> PARA-SSR map targets
+# ---------------------------------------------------------------------- #
+def teacher_vectors_to_student(vectors: np.ndarray) -> np.ndarray:
+    """Teacher normalised ``(u_fwd, v)`` -> student normalised ``(x_right, y_fwd)``."""
+    v = np.asarray(vectors, dtype=np.float32)
+    return np.stack([1.0 - v[..., 1], v[..., 0]], axis=-1)
+
+
+def pseudo_map_targets(
+    cache: BevCache,
+    token: str,
+    *,
+    score_thr: float,
+    max_vec: int,
+    num_orders: int,
+    num_pts: int,
+    pc_range,
+    closed_tol_m: float = 0.5,
+) -> Dict[str, np.ndarray]:
+    """Teacher predictions in the exact format of ``ParaSSRTargetBuilder``.
+
+    Kept instances are the teacher's queries above ``score_thr``, ranked by
+    score.  Equivalent orderings are generated by the same routine as GT, so the
+    map head's permutation-invariant point loss treats them identically.  An
+    instance is treated as closed when its end points coincide within
+    ``closed_tol_m``; the teacher never emits an exact duplicate end point.
+    """
+    from ..para_ssr_targets import _equivalent_orders  # heavy import, lazy
+
+    vec = teacher_vectors_to_student(cache.raw(token, "vectors")).astype(np.float64)
+    scores = cache.raw(token, "scores").astype(np.float32)
+    labels = cache.raw(token, "labels").astype(np.int64)
+
+    x0, y0, x1, y1 = pc_range[0], pc_range[1], pc_range[3], pc_range[4]
+    extent = np.array([x1 - x0, y1 - y0])
+    origin = np.array([x0, y0])
+
+    gt_pts = np.zeros((max_vec, num_orders, num_pts, 2), dtype=np.float32)
+    gt_labels = np.zeros(max_vec, dtype=np.int64)
+    gt_valid = np.zeros(max_vec, dtype=bool)
+
+    keep = np.flatnonzero(scores > score_thr)
+    keep = keep[np.argsort(-scores[keep], kind="stable")][:max_vec]
+    for slot, q in enumerate(keep):
+        metres = vec[q] * extent + origin
+        closed = bool(np.linalg.norm(metres[0] - metres[-1]) < closed_tol_m)
+        if closed:
+            metres = np.concatenate([metres[:-1], metres[:1]], axis=0)
+        orders = _equivalent_orders(metres, num_orders, closed, num_pts=num_pts)
+        gt_pts[slot] = ((orders - origin) / extent).astype(np.float32)
+        gt_labels[slot] = labels[q]
+        gt_valid[slot] = True
+    return {"gt_map_pts": gt_pts, "gt_map_labels": gt_labels, "gt_map_valid": gt_valid}

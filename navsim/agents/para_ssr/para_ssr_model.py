@@ -32,6 +32,25 @@ from .modules.map_head import ParaMapHead
 from .modules.planner_head import ParaSSRPlannerHead
 
 
+
+def heading_from_path(poses: torch.Tensor, min_step: float = 0.5) -> torch.Tensor:
+    """Evaluation-only: replace each pose's heading by the path's direction of travel.
+
+    ``poses`` [B, T, 3] (x forward, y left, heading).  The direction at pose t is
+    the central difference p[t+1] - p[t-1] (origin before the first pose, backward
+    difference at the last).  Where the car barely moves (< ``min_step`` metres
+    over that span) the predicted heading is kept.  The PDM simulator tracks
+    position AND heading, so a heading that disagrees with the path steers the
+    simulated car off the planned line.
+    """
+    xy = torch.cat([poses.new_zeros(poses.shape[0], 1, 2), poses[..., :2]], dim=1)   # [B, T+1, 2]
+    nxt = torch.cat([xy[:, 2:], xy[:, -1:]], dim=1)                                 # p[t+1], last repeats
+    d = nxt - xy[:, :-1]                                                            # p[t+1] - p[t-1]
+    tangent = torch.atan2(d[..., 1], d[..., 0])
+    moving = d.norm(dim=-1) >= min_step
+    heading = torch.where(moving, tangent, poses[..., 2])
+    return torch.cat([poses[..., :2], heading.unsqueeze(-1)], dim=-1)
+
 class GridMask(nn.Module):
     """SSR's input augmentation: erase a regular grid of image patches."""
 
@@ -181,6 +200,12 @@ class ParaSSRModel(nn.Module):
             use_stl=cfg.use_stl,
             plan_num_layers=cfg.plan_num_layers,
             use_task_interaction=self.use_task_interaction,
+            plan_anchor_file=getattr(cfg, "plan_anchor_file", None) if getattr(cfg, "plan_anchor", False) else None,
+            plan_reward_weights=getattr(cfg, "plan_reward_weights", (0.1, 0.5, 0.5, 1.0)),
+            plan_topk=getattr(cfg, "plan_topk", 6),
+            plan_kinematic=bool(getattr(cfg, "plan_kinematic", False)),
+            plan_heading_from_xy=bool(getattr(cfg, "plan_heading_from_xy", False)),
+            plan_rescore_refined=bool(getattr(cfg, "plan_rescore_refined", False)),
         )
         self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
 
@@ -387,6 +412,20 @@ class ParaSSRModel(nn.Module):
                 outs["ego_fut_preds"], features["command"]
             ),
         }
+        if "trajectory_offset" in outs:  # v2 anchor planner: selected anchor + offset, and what its losses need
+            predictions.update({k: outs[k] for k in (
+                "trajectory", "plan_topk_trajectory", "plan_topk_reward", "plan_topk_index",
+                "plan_final_rewards", "trajectory_offset", "im_rewards", "sim_rewards", "trajectory_anchors")})
+            predictions.update({k: v for k, v in outs.items() if k.startswith("plan_rescore_")})
+        if getattr(cfg, "heading_from_path", False) and not self.training:
+            predictions["trajectory"] = heading_from_path(predictions["trajectory"])
+        if getattr(cfg, "kinematic_projection", False) and not self.training:
+            # TOAD's test-time projection without its CEM search: inverse kinematics
+            # -> clamp to the comfort envelope -> kinematic-bicycle rollout
+            from .modules.kinematics import bicycle_rollout, clamp_controls, poses_to_controls
+            v0 = features["status_feature"][:, cfg.num_navi_cmd].to(predictions["trajectory"].dtype)
+            ctrl = clamp_controls(poses_to_controls(predictions["trajectory"], v0, 0.5))
+            predictions["trajectory"], _ = bicycle_rollout(ctrl, v0, 0.5)
         # Training always exposes predictions needed by every supervised loss,
         # even when a caller explicitly passes run_aux=False.
         if self.training or run_aux:

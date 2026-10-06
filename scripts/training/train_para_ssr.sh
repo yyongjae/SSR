@@ -54,6 +54,7 @@ BATCH_SIZE="${BATCH_SIZE:-4}"        # per GPU
 ACCUMULATE="${ACCUMULATE:-16}"       # -> global 128 on 2 GPUs
 MAX_EPOCHS="${MAX_EPOCHS:-30}"
 WORKERS="${WORKERS:-8}"
+VAL_EVERY="${VAL_EVERY:-5}"   # validate every N epochs
 LR="${LR:-1e-4}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 
@@ -102,7 +103,7 @@ exec "${TRAIN_PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
   dataloader.params.num_workers="${WORKERS}" \
   trainer.params.max_epochs="${MAX_EPOCHS}" \
   trainer.params.accumulate_grad_batches="${ACCUMULATE}" \
-  trainer.params.check_val_every_n_epoch=5 \
+  trainer.params.check_val_every_n_epoch="${VAL_EVERY}" \
   trainer.params.precision=32 \
   +trainer.params.devices="${NUM_GPUS}" \
   trainer.params.gradient_clip_val=35.0 \

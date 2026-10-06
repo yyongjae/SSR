@@ -241,6 +241,86 @@ class ParaSSRConfig:
     grad_balance_warmup_iters: int = 10600
     grad_norm_log_interval: int = 200
 
+    # ------------------------------------------------------------------ #
+    # planning-readout distillation from the cached ReSMap teacher
+    # (report/19_planning_readout.md).  All off by default.
+    # ------------------------------------------------------------------ #
+    # none | readout | random | feature   (see readout/distill.py)
+    kd_mode: str = "none"
+    # Root of the sharded ReSMap cache (index.json, bev/, vectors/, ...).
+    kd_teacher_cache: Optional[str] = None
+    # Stage-1 readout trained on the teacher BEV; its h_enc is frozen.
+    kd_readout_ckpt: Optional[str] = None
+    # cosine | mse, on z (readout/random) or on the BEV (feature).
+    kd_distance: str = "cosine"
+    # Fixed lambda.  With "distill" in grad_balance_target the balancer then
+    # rescales the term's BEV gradient on top of this.
+    kd_weight: float = 1.0
+    # Micro-batch counts, the grad_balance_warmup_iters convention: lambda is 0
+    # for kd_warmup_iters, then ramps linearly to kd_weight over kd_ramp_iters.
+    # z_S is meaningless while the student BEV is still random.
+    kd_warmup_iters: int = 0
+    kd_ramp_iters: int = 0
+    # Identity-initialised 1x1 conv on the student BEV before h_enc (design s05).
+    kd_adapter: bool = False
+    # none | global | command.  Remove the scene-independent part of z before the
+    # distance (report/19 s3): 95% of the energy of z is the per-command mean, and
+    # matching it carries no scene information.  Only for kd_mode readout|random.
+    kd_center: str = "none"
+    # EMA momentum of those running means over micro-batches.
+    kd_center_momentum: float = 0.99
+    # kd_mode=random: seed of the fixed random 256-d projection.
+    kd_random_seed: int = 0
+    # kd_mode=sens_feature: random trajectory-space probes per step (K backward
+    # passes through the frozen reader) estimating the per-cell trajectory change.
+    kd_sens_probes: int = 4
+
+    # Planning-side map consistency (plan_map.py): hinge on the commanded
+    # trajectory's footprint corners against the SDF of the drivable area the
+    # DAC metric uses.  0 = off: no target builder, no term.
+    # ---- v2 planner: WoTE-style anchors + PDM-score rewards (modules/anchor_planner.py) ----
+    # Off = the v1 single-query L1 regression.  The two files are WoTE's released
+    # extra data (K-means anchors, and the PDM scores of every anchor per token).
+    plan_anchor: bool = False
+    plan_anchor_file: Optional[str] = None
+    plan_score_file: Optional[str] = None
+    plan_reward_weights: Tuple[float, float, float, float] = (0.1, 0.5, 0.5, 1.0)   # WoTE reward_weights
+    plan_topk: int = 6
+    # Kinematic-bicycle output layer (modules/kinematics.py, from TOAD): the offset
+    # head predicts control corrections and the poses are their rollout.
+    plan_kinematic: bool = False
+    # Heading from the path (modules/kinematics.bezier_xyyaw, from DiffusionDriveV2):
+    # the offset head predicts x, y only.  v2 regressing heading separately left it
+    # ~3 deg off the path direction (median, epoch 1), which the PDM tracker follows.
+    plan_heading_from_xy: bool = False
+    # evaluation-only diagnostic: select among anchor + offset re-encoded and rescored (WoTE test time)
+    plan_rescore_refined: bool = False
+    plan_offset_loss_weight: float = 1.0       # WoTE traj_offset_loss_weight
+    plan_im_reward_weight: float = 1.0         # WoTE im_reward_loss (unweighted)
+    plan_sim_reward_weight: float = 1.0        # WoTE sim_reward_loss (unweighted; x5 inside)
+
+    # Evaluation-only post-processing: heading := direction of travel of the planned
+    # path (para_ssr_model.heading_from_path).  On the v1 control it lifts PDMS
+    # 84.74 -> 85.61 (DAC +0.70, EP +0.75): the PDM simulator tracks position AND
+    # heading, and predicted headings that disagree with the path pull it off line.
+    heading_from_path: bool = False
+    # Evaluation-only: TOAD's kinematic projection (modules/kinematics.py) of the
+    # planned trajectory, i.e. its test-time step without the CEM search.
+    kinematic_projection: bool = False
+
+    plan_map_weight: float = 0.0
+    plan_map_margin: float = 0.0
+    # (x0, x1, y0, y1) in the current ego frame of NAVSIM trajectories:
+    # x forward, y left, rear axle.  4 s at 18 m/s stays inside x1.
+    plan_map_extent: Tuple[float, float, float, float] = (-8.0, 72.0, -32.0, 32.0)
+    plan_map_res: float = 0.25
+    plan_map_clip: float = 10.0
+    # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
+    # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
+    # always uses GT.
+    map_label_source: str = "gt"
+    map_pseudo_score_thr: float = 0.3
+
     # Eval auxiliary predictions. With interaction on, decoders always run;
     # with it off, evaluation can omit their computation as well.
     test_aux_heads: bool = False

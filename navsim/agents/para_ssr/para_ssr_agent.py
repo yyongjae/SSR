@@ -50,6 +50,10 @@ from .para_ssr_targets import (
     MAP_CLASS_NAMES,
     ParaSSRTargetBuilder,
 )
+from .readout.distill import KD_DISTANCES, KD_MODES
+from .readout.teacher_targets import ResMapTeacherTargetBuilder
+from .plan_map import DrivableAreaTargetBuilder
+from .plan_score_targets import AnchorScoreTargetBuilder
 
 
 class WarmupCosLR(_LRScheduler):
@@ -486,6 +490,7 @@ class ParaSSRAgent(AbstractAgent):
                 "map_dir_interval must satisfy 1 <= interval < points/vector, "
                 f"got {config.map_dir_interval} and {config.map_num_pts_per_vec}"
             )
+        # ---- Stage E student refiner (exp-refine) ----
         refiner_mode = getattr(config, "refiner_mode", "off")
         if refiner_mode not in ("off", "E1", "E2"):
             raise ValueError(f"refiner_mode must be off, E1 or E2, got {refiner_mode!r}")
@@ -513,6 +518,42 @@ class ParaSSRAgent(AbstractAgent):
                 v = getattr(config, k, None)
                 if v is not None and not (float(v) > 0.0 and getattr(config, "kd_balance", "fixed") == "ema"):
                     raise ValueError(f"{k} must be null or > 0 with kd_balance ema, got {v!r}")
+        # ---- v2: readout KD / anchor planner / plan_map (km/para-ssr-v2) ----
+        # Independent of Stage E: the two 'kd_*' families are separate systems
+        # (v2: kd_mode/kd_teacher_cache/kd_weight/kd_*_iters = ReSMap BEV readout
+        # distillation inside ParaSSRLoss; Stage E: kd_teacher_runs/kd_lambda/kd_ramp/
+        # kd_space/kd_balance = correction KD of the student refiner).
+        kd_mode = getattr(config, "kd_mode", "none")
+        label_source = getattr(config, "map_label_source", "gt")
+        if kd_mode not in KD_MODES:
+            raise ValueError(f"kd_mode must be one of {KD_MODES}, got {kd_mode!r}")
+        if label_source not in ("gt", "teacher"):
+            raise ValueError(f"map_label_source must be gt|teacher, got {label_source!r}")
+        if (kd_mode != "none" or label_source == "teacher") and not config.kd_teacher_cache:
+            raise ValueError("kd_mode / map_label_source=teacher need kd_teacher_cache")
+        if label_source == "teacher" and not config.use_map_head:
+            raise ValueError("map_label_source=teacher needs use_map_head=true")
+        if kd_mode != "none":
+            if config.kd_distance not in KD_DISTANCES:
+                raise ValueError(f"kd_distance must be one of {KD_DISTANCES}, got {config.kd_distance!r}")
+            if kd_mode in ("readout", "attn_feature", "sens_feature") and not config.kd_readout_ckpt:
+                raise ValueError("kd_mode=readout needs kd_readout_ckpt")
+            if min(int(config.kd_warmup_iters), int(config.kd_ramp_iters)) < 0:
+                raise ValueError("kd_warmup_iters and kd_ramp_iters must be non-negative")
+        if getattr(config, "plan_anchor", False):
+            if not config.plan_anchor_file:
+                raise ValueError("plan_anchor=true needs plan_anchor_file")
+            if config.traj_dims != 3:
+                raise ValueError("plan_anchor=true needs traj_dims=3 (the anchors are x, y, heading)")
+        plan_map_weight = float(getattr(config, "plan_map_weight", 0.0))
+        if plan_map_weight < 0:
+            raise ValueError(f"plan_map_weight must be >= 0, got {plan_map_weight}")
+        if plan_map_weight > 0:
+            x0, x1, y0, y1 = config.plan_map_extent
+            if not (x1 > x0 and y1 > y0 and float(config.plan_map_res) > 0 and float(config.plan_map_clip) > 0):
+                raise ValueError(
+                    f"plan_map_extent/res/clip invalid: {config.plan_map_extent}, "
+                    f"{config.plan_map_res}, {config.plan_map_clip}")
         if trajectory_sampling.num_poses != config.fut_ts:
             raise ValueError(
                 "trajectory_sampling and fut_ts disagree: "
@@ -568,7 +609,36 @@ class ParaSSRAgent(AbstractAgent):
 
         # Fresh training is required after the parity fixes.  Strict loading is
         # intentional so a pre-fix or unrelated checkpoint cannot be scored.
-        self.load_state_dict(state_dict, strict=True)
+        # The one exception is the distillation adapter (readout/distill.py):
+        # it is training-only, so a KD checkpoint must evaluate without it and
+        # a KD fine-tune must start from a checkpoint that never had it.
+        kd_prefix = "_loss.distiller."
+        own = self.state_dict()
+        state_dict = {
+            k: v for k, v in state_dict.items() if not k.startswith(kd_prefix) or k in own
+        }
+        # v1 -> v2 init: the anchor planner replaces the single-trajectory regressor.
+        v1_regressor = "para_ssr_model.pts_bbox_head.ego_fut_decoder."
+        if not any(k.startswith(v1_regressor) for k in own):
+            state_dict = {k: v for k, v in state_dict.items() if not k.startswith(v1_regressor)}
+        result = self.load_state_dict(state_dict, strict=False)
+        missing = [k for k in result.missing_keys if not k.startswith(kd_prefix)]
+        # The v2 anchor planner may be initialised from a v1 checkpoint: its new
+        # modules start fresh, but only when the checkpoint has NONE of them (a
+        # partial match is a different vocabulary/architecture, not an upgrade).
+        anchor_prefix = "para_ssr_model.pts_bbox_head.anchor_planner."
+        if not any(k.startswith(anchor_prefix) for k in state_dict):
+            fresh = [k for k in missing if k.startswith(anchor_prefix)]
+            if fresh:
+                logger.info("v1 checkpoint: %d anchor-planner tensors start fresh", len(fresh))
+            missing = [k for k in missing if not k.startswith(anchor_prefix)]
+        if missing or result.unexpected_keys:
+            # same wording as torch's strict load, which callers match on
+            raise RuntimeError(
+                "Error(s) in loading PARA-SSR checkpoint: "
+                f"Missing key(s): {missing[:10]}; "
+                f"Unexpected key(s): {list(result.unexpected_keys)[:10]}"
+            )
 
     def get_sensor_config(self) -> SensorConfig:
         """Load only the cameras, LiDAR frames and history this config consumes.
@@ -594,7 +664,18 @@ class ParaSSRAgent(AbstractAgent):
         return [ParaSSRFeatureBuilder(self._config)]
 
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
-        return [ParaSSRTargetBuilder(self._config, self._trajectory_sampling)]
+        builders: List[AbstractTargetBuilder] = [
+            ParaSSRTargetBuilder(self._config, self._trajectory_sampling)
+        ]
+        cfg = self._config
+        if getattr(cfg, "kd_mode", "none") != "none" or getattr(cfg, "map_label_source", "gt") == "teacher":
+            builders.append(ResMapTeacherTargetBuilder(cfg))
+        if float(getattr(cfg, "plan_map_weight", 0.0)) > 0:
+            builders.append(DrivableAreaTargetBuilder(cfg))
+        # plan_score_file is training-only: evaluation leaves it null and gets no builder
+        if getattr(cfg, "plan_anchor", False) and getattr(cfg, "plan_score_file", None):
+            builders.append(AnchorScoreTargetBuilder(cfg))
+        return builders
 
     # ------------------------------------------------------------------ #
     def forward(
@@ -658,6 +739,9 @@ class ParaSSRAgent(AbstractAgent):
                 backbone_params.append(param)
             else:
                 other_params.append(param)
+
+        # training-only modules owned by the loss (the distillation adapter)
+        other_params += [p for p in self._loss.parameters() if p.requires_grad]
 
         groups = [
             {"params": other_params, "lr": self._lr, "lr_scale": 1.0},

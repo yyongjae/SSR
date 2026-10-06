@@ -21,6 +21,9 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from .modules.anchor_planner import anchor_plan_losses
+from .plan_map import plan_map_loss
+from .readout.distill import ReadoutDistiller
 from .modules.grad_balance import (
     GradBalancer,
     all_reduce_mean,
@@ -95,15 +98,24 @@ class ParaSSRLoss(torch.nn.Module):
         self._config = config
         self.iteration = 0
         self.balancer: Optional[GradBalancer] = None
+        self.distiller: Optional[ReadoutDistiller] = None
+        if getattr(config, "kd_mode", "none") != "none":
+            self.distiller = ReadoutDistiller(config)
         if config.grad_balance_target:
             target = dict(config.grad_balance_target)
-            unsupported = set(target) - {"plan", "det", "map"}
+            unsupported = set(target) - {"plan", "det", "map", "distill"}
             if unsupported:
                 raise ValueError(
                     "unsupported grad_balance_target keys "
                     f"{sorted(unsupported)}; use 'det' for the shared "
-                    "detection+motion valve and only plan/det/map targets"
+                    "detection+motion valve and only plan/det/map/distill targets"
                 )
+            # The distillation term reaches the model only through bev_embed
+            # (its reader is frozen), so the BEV-level correction scales it
+            # exactly.  Without a distillation term there is nothing to steer.
+            if "distill" in target and getattr(config, "kd_mode", "none") == "none":
+                logger.info("grad_balance_target drops 'distill': kd_mode is none")
+                del target["distill"]
             # Head ablations (use_det_motion_head / use_map_head = false) keep
             # the default target dict -- a Hydra override merges keys, it cannot
             # remove one -- so drop the valve of a head that does not exist.
@@ -138,6 +150,8 @@ class ParaSSRLoss(torch.nn.Module):
     def get_extra_state(self) -> Dict:
         """Persist controller state through regular Lightning checkpoints."""
         state = {"iteration": int(self.iteration)}
+        if self.distiller is not None and self.distiller.start_iter is not None:
+            state["kd_start_iter"] = int(self.distiller.start_iter)
         if self.balancer is not None:
             state["balancer"] = {
                 "scale": dict(self.balancer.scale),
@@ -149,6 +163,8 @@ class ParaSSRLoss(torch.nn.Module):
         if not state:
             return
         self.iteration = int(state.get("iteration", 0))
+        if self.distiller is not None and "kd_start_iter" in state:
+            self.distiller.start_iter = int(state["kd_start_iter"])
         balancer_state = state.get("balancer")
         if self.balancer is not None and balancer_state is not None:
             restored_scale = balancer_state.get("scale", {})
@@ -161,6 +177,7 @@ class ParaSSRLoss(torch.nn.Module):
         """Synchronize task-origin coefficients (never decoder input valves)."""
         if self.balancer is None:
             return
+        # distill has no decoder valve; its scale is applied at BEV in forward()
         model.aux_grad_scale = {
             task: self.balancer.scale_for(task) for task in ("det", "map")
         }
@@ -181,7 +198,7 @@ class ParaSSRLoss(torch.nn.Module):
         # predictions to FP32. Also reject AMP during controller warm-up, rather
         # than letting a long run fail only once its scales become non-neutral.
         active_scales = (
-            {task: self.balancer.scale_for(task) for task in ("det", "map")}
+            {task: self.balancer.scale_for(task) for task in ("det", "map", "distill")}
             if self.balancer is not None
             else dict(getattr(model, "aux_grad_scale", {}))
         )
@@ -204,10 +221,39 @@ class ParaSSRLoss(torch.nn.Module):
         )
         task_losses["plan"] = plan_loss * tw.get("plan", 1.0)
         logs["loss_plan_reg"] = plan_loss.detach()
+        if "trajectory_offset" in predictions:
+            # v2 anchor planner: WoTE's three terms replace the L1 regression.  The L1
+            # of the SELECTED trajectory stays in the logs (loss_plan_reg and the
+            # per-command sums) as the v1-comparable planning error; it is not trained.
+            if "sim_reward" not in targets:
+                raise KeyError("plan_anchor needs the sim_reward target: set plan_score_file")
+            al = anchor_plan_losses(predictions, targets["trajectory"], targets["sim_reward"],
+                                    targets["sim_reward_valid"])
+            task_losses["plan"] = tw.get("plan", 1.0) * (
+                float(cfg.plan_offset_loss_weight) * al["traj_offset_loss"]
+                + float(cfg.plan_im_reward_weight) * al["im_reward_loss"]
+                + float(cfg.plan_sim_reward_weight) * al["sim_reward_loss"])
+            logs.update({f"plan_v2/{k}": v.detach() for k, v in al.items()})
         # Keep the historical raw metric, but expose the value that actually
         # enters total_loss so plan=2.0 is not hidden in dashboards.
         logs["loss_plan_reg_weighted"] = task_losses["plan"].detach()
         logs.update(plan_metrics)
+
+        # ---- planning-side map consistency (plan_map.py) ---------------
+        plan_map_weight = float(getattr(cfg, "plan_map_weight", 0.0))
+        if plan_map_weight > 0:
+            if "drivable_sdf" not in targets:
+                if model.training:
+                    raise KeyError("plan_map_weight > 0 needs the drivable_sdf target (DrivableAreaTargetBuilder)")
+            else:
+                pm_loss, pm_metrics = plan_map_loss(
+                    predictions["ego_fut_preds"], targets["command"], targets["trajectory_offsets"],
+                    targets["trajectory_mask"], targets["drivable_sdf"], tuple(cfg.plan_map_extent),
+                    float(cfg.plan_map_margin),
+                )
+                task_losses["plan"] = task_losses["plan"] + plan_map_weight * pm_loss
+                logs["loss_plan_map"] = pm_loss.detach()
+                logs.update(pm_metrics)
 
         # ---- detection + motion ---------------------------------------
         if model.det_motion_head is not None and "all_cls_scores" in predictions:
@@ -232,14 +278,23 @@ class ParaSSRLoss(torch.nn.Module):
 
         # ---- vector map -----------------------------------------------
         if model.map_head is not None and "all_map_cls_scores" in predictions:
-            map_losses = model.map_head.loss(
-                predictions,
-                targets["gt_map_pts"],
-                targets["gt_map_labels"],
-                targets["gt_map_valid"],
-            )
+            map_pts, map_labels, map_valid = self._map_labels(targets, logs)
+            map_losses = model.map_head.loss(predictions, map_pts, map_labels, map_valid)
             task_losses["map"] = sum(map_losses.values()) * tw.get("map", 1.0)
             logs.update({k: v.detach() for k, v in map_losses.items()})
+
+        # ---- readout-space distillation (report/19) ---------------------
+        if self.distiller is not None and "teacher_bev" in targets:
+            ego = features.get("status_feature")
+            ego = ego[:, cfg.num_navi_cmd:] if ego is not None else None
+            kd = self.distiller(predictions["bev_embed"], targets, self.iteration, ego=ego)
+            task_losses["distill"] = kd["loss"]
+            logs["loss_distill"] = kd["loss"].detach()
+            logs["kd/raw"] = kd["raw"]
+            logs["kd/coef"] = kd["coef"]
+            logs["kd/valid_frac"] = kd["valid_frac"]
+            if "raw_uncentered" in kd:
+                logs["kd/raw_uncentered"] = kd["raw_uncentered"]
 
         # ---- shared-BEV gradient measurement / balancing ---------------
         bev_embed = predictions["bev_embed"]
@@ -303,6 +358,25 @@ class ParaSSRLoss(torch.nn.Module):
         return total_loss, logs
 
     # ------------------------------------------------------------------ #
+    def _map_labels(self, targets, logs):
+        """GT map labels, or the teacher's where the teacher has the frame."""
+        gt = (targets["gt_map_pts"], targets["gt_map_labels"], targets["gt_map_valid"])
+        if getattr(self._config, "map_label_source", "gt") != "teacher":
+            return gt
+        if "teacher_map_pts" not in targets:
+            raise KeyError(
+                "map_label_source='teacher' but the batch has no teacher_map_pts; "
+                "is ResMapTeacherTargetBuilder registered?"
+            )
+        hit = targets["teacher_valid"].view(-1).bool()
+        logs["kd/pseudo_frac"] = hit.float().mean().detach()
+        pick = lambda t, g: torch.where(hit.view(-1, *([1] * (g.dim() - 1))), t.to(g.dtype), g)
+        return (
+            pick(targets["teacher_map_pts"], gt[0]),
+            pick(targets["teacher_map_labels"], gt[1]),
+            pick(targets["teacher_map_valid"], gt[2]),
+        )
+
     @staticmethod
     def _measure_bev_grad_norms(
         bev_embed: torch.Tensor, task_losses: Dict[str, torch.Tensor]

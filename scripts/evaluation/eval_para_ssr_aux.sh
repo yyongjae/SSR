@@ -9,10 +9,14 @@ export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
 export NUPLAN_MAPS_ROOT="${AUX_REPO}/data/dataset/maps"
 export OPENSCENE_DATA_ROOT="${AUX_REPO}/data/dataset"
 export NAVSIM_DEVKIT_ROOT="${AUX_REPO}"
-export NAVSIM_EXP_ROOT="${AUX_REPO}/work_dirs"
+export NAVSIM_EXP_ROOT="${NAVSIM_EXP_ROOT_OVERRIDE:-${AUX_REPO}/work_dirs}"
 export HYDRA_FULL_ERROR=1
 
-AUX_PYTHON="${SSR_NAVSIM_PYTHON:-python}"
+if [[ -x "/root/miniconda3/envs/ssr/bin/python" ]]; then
+  AUX_PYTHON="${SSR_NAVSIM_PYTHON:-/root/miniconda3/envs/ssr/bin/python}"
+else
+  AUX_PYTHON="${SSR_NAVSIM_PYTHON:-python}"
+fi
 AUX_CHECKPOINT="${AUX_CHECKPOINT:-${AUX_REPO}/work_dirs/para_ssr/para_ssr_ep30_final.ckpt}"
 AUX_TRAINING_CONFIG="${AUX_TRAINING_CONFIG:-${AUX_REPO}/work_dirs/para_ssr/code/hydra/config.yaml}"
 AUX_EXPERIMENT="${AUX_EXPERIMENT:-eval/para_ssr_ep30_aux}"

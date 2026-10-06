@@ -8,7 +8,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EVAL_ONE="${REPO}/scripts/evaluation/eval_para_ssr_distill_snapshot.sh"
 EXPORT_PY="${REPO}/scripts/evaluation/export_student_ckpt.py"
 
-if [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
+if [[ -x "/root/miniconda3/envs/ssr/bin/python" ]]; then
+  PYTHON="${PYTHON:-/root/miniconda3/envs/ssr/bin/python}"
+elif [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
   PYTHON="${PYTHON:-/home/external-user/miniconda3/envs/ssr/bin/python}"
 elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
   PYTHON="${PYTHON:-${CONDA_PREFIX}/bin/python}"
@@ -16,23 +18,23 @@ else
   PYTHON="${PYTHON:-python}"
 fi
 
-GPU0="${GPU0:-4}"
-GPU1="${GPU1:-5}"
-CKPT_SRC="${CKPT_SRC:-${REPO}/work_dirs/paradrive_distill_stage2_dual_distill/lightning_logs/version_0/checkpoints/epoch=29-step=19950.ckpt}"
-SNAPSHOT_DIR="${SNAPSHOT_DIR:-${REPO}/work_dirs/eval_snapshots/paradrive_distill_stage2_epoch29}"
+EXP_ROOT="${NAVSIM_EXP_ROOT_OVERRIDE:-${REPO}/work_dirs}"
+GPU0="${GPU0:-6}"
+GPU1="${GPU1:-7}"
+CKPT_SRC="${CKPT_SRC:-${EXP_ROOT}/paradrive_distill_bev_selector/lightning_logs/version_0/checkpoints/epoch=29-step=19950.ckpt}"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-${EXP_ROOT}/eval_snapshots/paradrive_distill_bev_selector_v3_epoch29}"
 SNAPSHOT_CKPT="${SNAPSHOT_CKPT:-${SNAPSHOT_DIR}/epoch29.ckpt}"
 STUDENT_CKPT="${STUDENT_CKPT:-${SNAPSHOT_DIR}/epoch29_student.ckpt}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-eval/paradrive_distill_stage2_epoch29}"
-MERGE_DIR="${REPO}/work_dirs/${EXPERIMENT_NAME}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-eval/paradrive_distill_bev_selector_v3_epoch29}"
+MERGE_DIR="${EXP_ROOT}/${EXPERIMENT_NAME}"
 SMOKE="${SMOKE:-0}"
-# This repo's data/dataset/navsim_logs symlink is trainval only.
-# Official navtest logs and blobs live in the download trees.
-NAVTEST_LOGS="${NAVTEST_LOGS:-/home/external-user/navsim/download/test_navsim_logs/test}"
-NAVTEST_BLOBS="${NAVTEST_BLOBS:-/home/external-user/navsim/download/test_sensor_blobs/test}"
+# Official navtest logs and blobs live in data/dataset/navsim_logs/test and sensor_blobs/test
+NAVTEST_LOGS="${NAVTEST_LOGS:-${REPO}/data/dataset/navsim_logs/test}"
+NAVTEST_BLOBS="${NAVTEST_BLOBS:-${REPO}/data/dataset/sensor_blobs/test}"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "usage: $0 [hydra overrides...]"
-  echo "env: GPU0=4 GPU1=5 SMOKE=1 CKPT_SRC=/path/to/epoch=29-*.ckpt"
+  echo "env: GPU0=6 GPU1=7 SMOKE=1 CKPT_SRC=/path/to/epoch=29-*.ckpt"
   echo "     IMAGE_ARCHITECTURE=resnet34.tv_in1k"
   echo "     or: agent.config.image_architecture=resnet34.tv_in1k"
   echo "     PDM and det/map mAP both use that backbone. Default is resnet50.tv_in1k."
@@ -49,8 +51,8 @@ if [[ ! -x "${EVAL_ONE}" && ! -f "${EVAL_ONE}" ]]; then
 fi
 
 mkdir -p "${SNAPSHOT_DIR}" "${MERGE_DIR}" \
-  "${REPO}/work_dirs/${EXPERIMENT_NAME}_shard0of2" \
-  "${REPO}/work_dirs/${EXPERIMENT_NAME}_shard1of2"
+  "${EXP_ROOT}/${EXPERIMENT_NAME}_shard0of2" \
+  "${EXP_ROOT}/${EXPERIMENT_NAME}_shard1of2"
 
 if [[ ! -f "${SNAPSHOT_CKPT}" ]]; then
   echo "copying ${CKPT_SRC} -> ${SNAPSHOT_CKPT}"
@@ -101,8 +103,8 @@ run_shard() {
     bash "${EVAL_ONE}" "$@" >"${log}" 2>&1
 }
 
-LOG0="${REPO}/work_dirs/${EXPERIMENT_NAME}_shard0of2/run.log"
-LOG1="${REPO}/work_dirs/${EXPERIMENT_NAME}_shard1of2/run.log"
+LOG0="${EXP_ROOT}/${EXPERIMENT_NAME}_shard0of2/run.log"
+LOG1="${EXP_ROOT}/${EXPERIMENT_NAME}_shard1of2/run.log"
 pids=()
 cleanup() {
   local pid
@@ -134,8 +136,8 @@ if [[ "${st0}" -ne 0 || "${st1}" -ne 0 ]]; then
   exit 1
 fi
 
-"${PYTHON}" - "${REPO}/work_dirs/${EXPERIMENT_NAME}_shard0of2" \
-  "${REPO}/work_dirs/${EXPERIMENT_NAME}_shard1of2" \
+"${PYTHON}" - "${EXP_ROOT}/${EXPERIMENT_NAME}_shard0of2" \
+  "${EXP_ROOT}/${EXPERIMENT_NAME}_shard1of2" \
   "${MERGE_DIR}/merged.csv" <<'PY'
 from pathlib import Path
 import sys
@@ -240,7 +242,7 @@ SSR_NAVSIM_PYTHON="${PYTHON}" \
     "navsim_log_path=${NAVTEST_LOGS}" \
     "sensor_blobs_path=${NAVTEST_BLOBS}"
 
-"${PYTHON}" - "${REPO}/work_dirs/${AUX_EXPERIMENT}/aux_metrics.json" <<'PY'
+"${PYTHON}" - "${EXP_ROOT}/${AUX_EXPERIMENT}/aux_metrics.json" <<'PY'
 import json
 import sys
 from pathlib import Path

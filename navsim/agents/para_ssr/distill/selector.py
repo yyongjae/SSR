@@ -44,6 +44,10 @@ class BEVRegisterSelector(nn.Module):
         anchor_sigma_end_m: float = 2.0,
         plan_tau: float = 0.3,
         struct_mix: float = 0.5,
+        use_proj: bool = False,
+        tok_scale: float = 1.0,
+        loss_type: str = "l2",
+        struct_mask_boost: float = 0.0,
     ) -> None:
         super().__init__()
         if num_registers < 2:
@@ -60,6 +64,10 @@ class BEVRegisterSelector(nn.Module):
         self.anchor_sigma_end_m = float(anchor_sigma_end_m)
         self.plan_tau = float(plan_tau)
         self.struct_mix = float(struct_mix)
+        self.use_proj = bool(use_proj)
+        self.tok_scale = float(tok_scale)
+        self.loss_type = str(loss_type)
+        self.struct_mask_boost = float(struct_mask_boost)
         if not 0.0 <= self.struct_mix <= 1.0:
             raise ValueError(f"struct_mix must be in [0, 1], got {struct_mix}")
         if self.plan_tau <= 0.0:
@@ -73,6 +81,14 @@ class BEVRegisterSelector(nn.Module):
         self.status_to_channel = nn.Linear(4, self.channels)
         self.query_proj = nn.Linear(self.channels, self.channels)
         self.key_proj = nn.Linear(self.channels, self.channels)
+        if self.use_proj:
+            self.student_proj = nn.ModuleList([
+                nn.Linear(self.channels, self.channels),
+                nn.Linear(self.channels, self.channels),
+            ])
+            for proj in self.student_proj:
+                nn.init.eye_(proj.weight)
+                nn.init.zeros_(proj.bias)
         self.register_buffer("steps", torch.zeros((), dtype=torch.long), persistent=True)
         grid_y, grid_x = bev_cell_centers(
             self.pc_range, self.bev_h, self.bev_w, device=torch.device("cpu"), dtype=torch.float32,
@@ -201,14 +217,25 @@ class BEVRegisterSelector(nn.Module):
                 raise ValueError(
                     f"{name} tokens {tuple(teacher.shape)} != student {tuple(student_bev.shape)}"
                 )
-            token_terms.append(token_match_loss(student_bev, teacher.detach(), weights))
+            student_feat = self.student_proj[bank](student_bev) if self.use_proj else student_bev
+            token_terms.append(
+                token_match_loss(
+                    student_feat,
+                    teacher.detach(),
+                    weights,
+                    structure_mask=structure_by_bank[bank],
+                    tok_scale=self.tok_scale,
+                    loss_type=self.loss_type,
+                    struct_boost=self.struct_mask_boost,
+                )
+            )
             with torch.no_grad():
                 cell_w = _normalize_rows(weights.detach().sum(dim=1))
                 cos = F.cosine_similarity(
-                    _layernorm(student_bev), _layernorm(teacher), dim=-1
+                    _layernorm(student_feat), _layernorm(teacher), dim=-1
                 )
                 metrics[f"distill_sel_cos/{name}"] = (cell_w * cos).sum(dim=-1).mean()
-                gathered_s = torch.matmul(weights, student_bev)
+                gathered_s = torch.matmul(weights, student_feat)
                 gathered_t = torch.matmul(weights, teacher)
                 metrics[f"distill_sel_cos_pooled/{name}"] = F.cosine_similarity(
                     _layernorm(gathered_s), _layernorm(gathered_t), dim=-1
@@ -331,16 +358,36 @@ def token_match_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
     attention: torch.Tensor,
+    structure_mask: Optional[torch.Tensor] = None,
+    tok_scale: float = 1.0,
+    loss_type: str = "l2",
+    struct_boost: float = 0.0,
 ) -> torch.Tensor:
-    """Per-cell LN MSE. Attention is detached, so this loss does not move it.
+    """Per-cell LN loss. Optional projection, hybrid loss, and spatial boost.
 
     ``student`` and ``teacher`` are ``[B, HW, C]``. ``attention`` is ``[B, R, HW]``.
     The cell weight is the normalised sum of the bank's registers. The square
     is averaged over channels so the scale does not grow with ``C``.
     """
     cell_w = _normalize_rows(attention.detach().sum(dim=1))
-    per_cell = (_layernorm(student) - _layernorm(teacher)).pow(2).mean(dim=-1)
-    return (cell_w * per_cell).sum(dim=-1).mean()
+    if structure_mask is not None and float(struct_boost) > 0.0:
+        mask = structure_mask.clamp_min(0).detach().to(dtype=cell_w.dtype)
+        cell_w = _normalize_rows(cell_w * (1.0 + float(struct_boost) * mask))
+
+    s_ln = _layernorm(student)
+    t_ln = _layernorm(teacher)
+
+    if loss_type == "hybrid":
+        l2_diff = (s_ln - t_ln).pow(2).mean(dim=-1)
+        cos_diff = 1.0 - F.cosine_similarity(s_ln, t_ln, dim=-1)
+        per_cell = 0.5 * l2_diff + 0.5 * cos_diff
+    elif loss_type == "cos":
+        per_cell = 1.0 - F.cosine_similarity(s_ln, t_ln, dim=-1)
+    else:
+        per_cell = (s_ln - t_ln).pow(2).mean(dim=-1)
+
+    base_loss = (cell_w * per_cell).sum(dim=-1).mean()
+    return float(tok_scale) * base_loss
 
 
 def diversity_loss(

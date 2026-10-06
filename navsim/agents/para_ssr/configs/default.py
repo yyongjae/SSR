@@ -326,6 +326,11 @@ class ParaSSRConfig:
     # Late cover target: sharpen planner attention, then mix the bank prior.
     distill_selector_plan_tau: float = 0.3
     distill_selector_struct_mix: float = 0.5
+    # Advanced distillation: linear projection adapter, loss un-dilution, hybrid loss, spatial boost
+    distill_selector_proj: bool = False
+    distill_selector_tok_scale: float = 1.0
+    distill_selector_loss_type: str = "l2"
+    distill_selector_struct_mask_boost: float = 0.0
 
     # Stage 1: train one adapter + the unchanged planning decoder from the
     # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.

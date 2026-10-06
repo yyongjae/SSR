@@ -15,11 +15,13 @@ export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
 export NUPLAN_MAPS_ROOT="${REPO}/data/dataset/maps"
 export OPENSCENE_DATA_ROOT="${REPO}/data/dataset"
 export NAVSIM_DEVKIT_ROOT="${REPO}"
-export NAVSIM_EXP_ROOT="${REPO}/work_dirs"
+export NAVSIM_EXP_ROOT="${NAVSIM_EXP_ROOT_OVERRIDE:-${REPO}/work_dirs}"
 export HYDRA_FULL_ERROR=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
-if [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
+if [[ -x "/root/miniconda3/envs/ssr/bin/python" ]]; then
+  PYTHON="${PYTHON:-/root/miniconda3/envs/ssr/bin/python}"
+elif [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
   PYTHON="${PYTHON:-/home/external-user/miniconda3/envs/ssr/bin/python}"
 elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
   PYTHON="${PYTHON:-${CONDA_PREFIX}/bin/python}"
@@ -27,13 +29,13 @@ else
   PYTHON="${PYTHON:-python}"
 fi
 
-SNAPSHOT_DIR="${SNAPSHOT_DIR:-${REPO}/work_dirs/eval_snapshots/paradrive_distill_stage2_epoch18}"
-CKPT_SRC="${CKPT_SRC:-${REPO}/work_dirs/paradrive_distill_stage2_dual_distill/lightning_logs/version_0/checkpoints/last.ckpt}"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-${NAVSIM_EXP_ROOT}/eval_snapshots/paradrive_distill_stage2_epoch18}"
+CKPT_SRC="${CKPT_SRC:-${NAVSIM_EXP_ROOT}/paradrive_distill_stage2_dual_distill/lightning_logs/version_0/checkpoints/last.ckpt}"
 SNAPSHOT_CKPT="${SNAPSHOT_CKPT:-${SNAPSHOT_DIR}/last.ckpt}"
 STUDENT_CKPT="${STUDENT_CKPT:-${SNAPSHOT_DIR}/last_student.ckpt}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eval/paradrive_distill_stage2_epoch18}"
-NAVTEST_LOGS="${NAVTEST_LOGS:-/home/external-user/navsim/download/test_navsim_logs/test}"
-NAVTEST_BLOBS="${NAVTEST_BLOBS:-/home/external-user/navsim/download/test_sensor_blobs/test}"
+NAVTEST_LOGS="${NAVTEST_LOGS:-${REPO}/data/dataset/navsim_logs/test}"
+NAVTEST_BLOBS="${NAVTEST_BLOBS:-${REPO}/data/dataset/sensor_blobs/test}"
 METRIC_CACHE="${METRIC_CACHE:-${REPO}/data/exp/metric_cache}"
 SMOKE="${SMOKE:-0}"
 

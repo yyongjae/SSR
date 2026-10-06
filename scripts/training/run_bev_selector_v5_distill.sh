@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# BEV selector distillation. One stage, no adapter checkpoints.
-# The v4 recipe is unchanged:
-#   FORCE_RETRAIN=stage1a,stage2 bash ./scripts/training/run_all_stages_distill.sh
+# Advanced BEV selector distillation (v5).
+# Incorporates:
+#   1. Linear projection adapter (student_proj) for channel basis alignment.
+#   2. Loss scale un-dilution (tok_scale=25.0) to match det/map gradient norms naturally.
+#   3. Hybrid Normalized L2 + Cosine distance loss.
+#   4. Spatially boosted masks to resolve bank conflicts.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO}"
+
+if [[ -f "${REPO}/env.vast.sh" ]]; then
+  source "${REPO}/env.vast.sh"
+fi
 
 export PYTHONPATH="${REPO}:${PYTHONPATH:-}"
 export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
@@ -17,21 +24,23 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-lo}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-export DISTILL_FEATURE_ROOT="${DISTILL_FEATURE_ROOT:-/home/external-user/datasets/teacher_cache}"
+export DISTILL_FEATURE_ROOT="${DISTILL_FEATURE_ROOT:-/workspace/teacher_cache}"
 
-if [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
+if [[ -x "/root/miniconda3/envs/ssr/bin/python" ]]; then
+  PYTHON="${PYTHON:-/root/miniconda3/envs/ssr/bin/python}"
+elif [[ -x "/home/external-user/miniconda3/envs/ssr/bin/python" ]]; then
   PYTHON="${PYTHON:-/home/external-user/miniconda3/envs/ssr/bin/python}"
 else
   PYTHON="${PYTHON:-python}"
 fi
 
-EXPERIMENT="${EXPERIMENT:-paradrive_distill_bev_selector}"
+EXPERIMENT="${EXPERIMENT:-paradrive_distill_bev_selector_v5}"
 MAX_EPOCHS="${MAX_EPOCHS:-30}"
 WANDB="${WANDB:-1}"
 WANDB_ENTITY="${WANDB_ENTITY:-e2ekd}"
 WANDB_PROJECT="${WANDB_PROJECT:-v1_distill}"
 WANDB_GROUP="${WANDB_GROUP:-bev-selector}"
-WANDB_RUN_PREFIX="${WANDB_RUN_PREFIX:-r34_sel_trial}"
+WANDB_RUN_PREFIX="${WANDB_RUN_PREFIX:-r34_sel_v5}"
 
 _WANDB_NETRC_FILE=""
 cleanup_wandb() {
@@ -88,25 +97,35 @@ if [[ "${WANDB}" != "0" ]]; then
     "wandb.project=${WANDB_PROJECT}"
     "wandb.group=${WANDB_GROUP}"
     "wandb.name=${run_name}"
-    "wandb.tags=[bev-selector,r34,v3]"
+    "wandb.tags=[bev-selector,r34,v5,adv_distill]"
   )
 fi
 
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPU_IDS[@]}"
 
-echo " Selector distill. v4 stays: FORCE_RETRAIN=stage1a,stage2 bash ./scripts/training/run_all_stages_distill.sh"
+echo "=========================================================================="
+echo " Advanced BEV Selector Distillation v5"
 echo " Experiment   : ${EXPERIMENT}"
-echo " GPUs         : ${CUDA_VISIBLE_DEVICES}"
-echo " GradBalancer : off"
+echo " GPUs         : ${CUDA_VISIBLE_DEVICES} (${NUM_GPUS} devices)"
+echo " Feature root : ${DISTILL_FEATURE_ROOT}"
+echo " Output root  : ${NAVSIM_EXP_ROOT}"
+echo " Agent config : para_ssr_selector_v5_agent"
+echo "=========================================================================="
 
 "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
-  agent=para_ssr_selector_agent \
+  agent=para_ssr_selector_v5_agent \
   agent.lr="1e-4" \
   agent.config.max_epochs="${MAX_EPOCHS}" \
   agent.config.distill_feature_root="${DISTILL_FEATURE_ROOT}" \
   agent.config.image_architecture=resnet34.tv_in1k \
   agent.config.distill_selector=true \
+  agent.config.distill_selector_proj=true \
+  agent.config.distill_selector_tok_scale=25.0 \
+  agent.config.distill_selector_loss_type=hybrid \
+  agent.config.distill_selector_struct_mask_boost=2.0 \
+  agent.config.distill_selector_plan_tau=0.25 \
+  agent.config.distill_selector_struct_mix=0.6 \
   agent.config.use_corridor_mask=false \
   agent.config.use_stl=false \
   agent.config.plan_num_layers=3 \
@@ -122,7 +141,7 @@ echo " GradBalancer : off"
   trainer.params.accumulate_grad_batches=16 \
   trainer.params.check_val_every_n_epoch=5 \
   trainer.params.precision=32 \
-  +trainer.params.devices="${NUM_GPUS}" \
+  ++trainer.params.devices="${NUM_GPUS}" \
   checkpoint.every_n_epochs=5 \
   checkpoint.save_top_k=-1 \
   checkpoint.save_last=true \

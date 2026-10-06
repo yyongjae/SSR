@@ -128,6 +128,10 @@ class PlanningDistillation(nn.Module):
         selector_anchor_sigma_end: float = 2.0,
         selector_plan_tau: float = 0.3,
         selector_struct_mix: float = 0.5,
+        selector_proj: bool = False,
+        selector_tok_scale: float = 1.0,
+        selector_loss_type: str = "l2",
+        selector_struct_mask_boost: float = 0.0,
     ) -> None:
         super().__init__()
         if not branches:
@@ -177,6 +181,10 @@ class PlanningDistillation(nn.Module):
         self.selector_anchor_sigma_end = float(selector_anchor_sigma_end)
         self.selector_plan_tau = float(selector_plan_tau)
         self.selector_struct_mix = float(selector_struct_mix)
+        self.selector_proj = bool(selector_proj)
+        self.selector_tok_scale = float(selector_tok_scale)
+        self.selector_loss_type = str(selector_loss_type)
+        self.selector_struct_mask_boost = float(selector_struct_mask_boost)
 
         self.adapters = nn.ModuleDict()
         self.stores: Dict[str, TeacherFeatureStore] = {}
@@ -260,6 +268,10 @@ class PlanningDistillation(nn.Module):
                 anchor_sigma_end_m=self.selector_anchor_sigma_end,
                 plan_tau=self.selector_plan_tau,
                 struct_mix=self.selector_struct_mix,
+                use_proj=self.selector_proj,
+                tok_scale=self.selector_tok_scale,
+                loss_type=self.selector_loss_type,
+                struct_mask_boost=self.selector_struct_mask_boost,
             )
 
     # ------------------------------------------------------------------ #
@@ -725,6 +737,10 @@ def build_planning_distillation(config):
         ),
         selector_plan_tau=float(getattr(config, "distill_selector_plan_tau", 0.3)),
         selector_struct_mix=float(getattr(config, "distill_selector_struct_mix", 0.5)),
+        selector_proj=bool(getattr(config, "distill_selector_proj", False)),
+        selector_tok_scale=float(getattr(config, "distill_selector_tok_scale", 1.0)),
+        selector_loss_type=str(getattr(config, "distill_selector_loss_type", "l2")),
+        selector_struct_mask_boost=float(getattr(config, "distill_selector_struct_mask_boost", 0.0)),
     )
     module.validate_manifests(config)
     return module

@@ -433,7 +433,16 @@ class ParaSSRAgent(AbstractAgent):
         return [ParaSSRFeatureBuilder(self._config)]
 
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
-        return [ParaSSRTargetBuilder(self._config, self._trajectory_sampling)]
+        builders: List[AbstractTargetBuilder] = [
+            ParaSSRTargetBuilder(self._config, self._trajectory_sampling)
+        ]
+        cfg = self._config
+        # Scores are training labels. Evaluation can leave plan_score_file empty.
+        if getattr(cfg, "plan_anchor", False) and getattr(cfg, "plan_score_file", None):
+            from .plan_score_targets import AnchorScoreTargetBuilder
+
+            builders.append(AnchorScoreTargetBuilder(cfg))
+        return builders
 
     # ------------------------------------------------------------------ #
     def forward(

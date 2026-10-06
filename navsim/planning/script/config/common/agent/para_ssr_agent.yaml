@@ -55,10 +55,10 @@ config:
   use_ego_motion: false
   # BEV cross-attn, then parallel det/motion and map cross-attn, then sum.
   use_task_interaction: true
-  # WoTE anchor planner (modules/anchor_planner.py). Off keeps L1 regression.
-  plan_anchor: false
-  plan_anchor_file: null
-  plan_score_file: null
+  # WoTE anchor planner: 256 trajectories, offset + PDM reward, then select.
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
   plan_reward_weights: [0.1, 0.5, 0.5, 1.0]
   plan_topk: 6
   plan_kinematic: false

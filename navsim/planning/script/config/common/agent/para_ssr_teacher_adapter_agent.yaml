@@ -13,6 +13,11 @@ defaults:
 _target_: navsim.agents.para_ssr.distill.teacher_adapter.ParaSSRTeacherAdapterAgent
 
 config:
+  # Stage 1 trains the BEV adapter with the single-trajectory decoder.
+  # The stage-2 student is the one that plans from the 256 anchors.
+  plan_anchor: false
+  plan_anchor_file: null
+  plan_score_file: null
   # use_distill emits targets[scene_token]; input_target hands targets to
   # forward(), which is how the cache is addressed.
   use_distill: true

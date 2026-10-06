@@ -8,7 +8,11 @@ Values fall into three groups:
 * **optimisation** -- the WoTE/SeerDrive-derived recipe (see report #09 §4).
 """
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
+
+# WoTE's released 256 K-means trajectories and the packed per-token PDM scores.
+_PLAN_VB = Path(__file__).resolve().parents[4] / "data" / "planning_vb"
 
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
@@ -174,11 +178,11 @@ class ParaSSRConfig:
     metric_cache_size: int = 8      # max decompressed scenes per training process
 
     # WoTE-style anchor vocabulary (km/para-ssr-v2 modules/anchor_planner.py).
-    # Off keeps the single-query L1 regressor. Requires use_task_interaction
-    # and a plan_anchor_file; sim_reward targets come from plan_score_file.
-    plan_anchor: bool = False
-    plan_anchor_file: Optional[str] = None
-    plan_score_file: Optional[str] = None
+    # The student plans by scoring the 256 anchors and adding an offset.
+    # Requires use_task_interaction. sim_reward targets come from plan_score_file.
+    plan_anchor: bool = True
+    plan_anchor_file: Optional[str] = str(_PLAN_VB / "trajectory_anchors_256.npy")
+    plan_score_file: Optional[str] = str(_PLAN_VB / "pdm_score_256")
     plan_reward_weights: Tuple[float, float, float, float] = (0.1, 0.5, 0.5, 1.0)
     plan_topk: int = 6
     plan_kinematic: bool = False

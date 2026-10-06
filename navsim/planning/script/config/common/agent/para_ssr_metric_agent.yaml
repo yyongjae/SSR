@@ -3,6 +3,10 @@ defaults:
   - _self_
 
 config:
+  # This agent ranks its own candidates. It does not use the WoTE anchor planner.
+  plan_anchor: false
+  plan_anchor_file: null
+  plan_score_file: null
   use_metric_planner: true
   use_task_interaction: false
   use_ego_motion: true

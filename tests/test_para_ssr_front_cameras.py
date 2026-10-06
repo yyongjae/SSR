@@ -160,6 +160,7 @@ def test_front_camera_model_has_finite_backward_on_front_only_bev():
         map_num_pts_per_vec=4,
         map_num_decoder_layers=1,
         use_grid_mask=False,
+        plan_anchor=False,
     )
     model = ParaSSRModel(config).train()
     features = {

@@ -207,10 +207,9 @@ class ParaSSRPlannerHead(nn.Module):
         self.plan_rescore_refined = False
         if self.use_lidar and (self.use_stl or use_metric_planner):
             raise ValueError("use_lidar requires the dense planner (use_stl=False)")
-        if plan_anchor_file and (self.use_stl or not self.use_task_interaction):
+        if plan_anchor_file and self.use_stl:
             raise ValueError(
-                "plan_anchor_file requires the task-interaction planner "
-                "(use_stl=False, use_task_interaction=True)"
+                "plan_anchor_file requires dense planner (use_stl=False)"
             )
 
         self.transformer = transformer
@@ -297,6 +296,15 @@ class ParaSSRPlannerHead(nn.Module):
                 )
                 self.final_norm = nn.LayerNorm(embed_dims)
                 decoders = tuple(self.planner_layers)
+            elif plan_anchor_file:
+                self.planner_layers = nn.ModuleList(
+                    PlanTaskMemoryLayer(
+                        embed_dims, num_heads, feedforward_channels, False
+                    )
+                    for _ in range(plan_num_layers)
+                )
+                self.final_norm = nn.LayerNorm(embed_dims)
+                decoders = tuple(self.planner_layers)
             else:
                 self.plan_decoder = build_self_attn_decoder(
                     plan_num_layers,
@@ -359,6 +367,7 @@ class ParaSSRPlannerHead(nn.Module):
         cmd: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
         lidar_bev: Optional[torch.Tensor] = None,
+        return_bev_attn: bool = False,
     ) -> Dict[str, torch.Tensor] | torch.Tensor:
         """
         Args:
@@ -402,7 +411,9 @@ class ParaSSRPlannerHead(nn.Module):
         )
         if only_bev:
             return bev_embed
-        return self.forward_from_bev(bev_embed, cmd, bev_pos=bev_pos, ego_status=ego_status)
+        return self.forward_from_bev(
+            bev_embed, cmd, bev_pos=bev_pos, ego_status=ego_status, return_bev_attn=return_bev_attn
+        )
 
     def prepare_task_memories(
         self,
@@ -523,6 +534,20 @@ class ParaSSRPlannerHead(nn.Module):
                         h, h_ego, plan_pos, bev_embed, pos_embd, memories, status, plan_attn,
                     )
                 scene_query = h.transpose(0, 1)
+            elif self.anchor_planner is not None:
+                last = len(self.planner_layers) - 1
+                for index, layer in enumerate(self.planner_layers):
+                    if return_bev_attn and index == last:
+                        h, plan_attn = layer(
+                            h, plan_pos, bev_embed, pos_embd,
+                            return_bev_attn=True,
+                        )
+                    else:
+                        h = layer(h, plan_pos, bev_embed, pos_embd)
+                h = self.final_norm(h)
+                return self._anchor_outputs(
+                    h, h_ego, plan_pos, bev_embed, pos_embd, {}, status, plan_attn,
+                )
             else:
                 plan_query = self.plan_decoder(
                     query=h.transpose(0, 1),  # [1, B, C]

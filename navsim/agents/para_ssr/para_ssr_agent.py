@@ -324,9 +324,7 @@ class ParaSSRAgent(AbstractAgent):
             if not getattr(config, "plan_anchor_file", None):
                 raise ValueError("plan_anchor requires plan_anchor_file")
             if getattr(config, "use_stl", False) or getattr(config, "use_metric_planner", False):
-                raise ValueError("plan_anchor requires the dense task-interaction planner")
-            if not getattr(config, "use_task_interaction", True):
-                raise ValueError("plan_anchor requires use_task_interaction=True")
+                raise ValueError("plan_anchor requires the dense planner (use_stl=False)")
         if not 1 <= config.map_dir_interval < config.map_num_pts_per_vec:
             raise ValueError(
                 "map_dir_interval must satisfy 1 <= interval < points/vector, "
@@ -488,16 +486,23 @@ class ParaSSRAgent(AbstractAgent):
                     "planning distillation needs targets['scene_token']; "
                     "regenerate the target cache with use_distill=True"
                 )
+            status = features.get("ego_status")
+            status_feature = features.get("status_feature")
+            if (
+                status is None
+                and status_feature is not None
+                and status_feature.shape[-1] > self._config.num_navi_cmd
+            ):
+                status = status_feature[:, self._config.num_navi_cmd:]
+
             distill_kwargs = {}
-            if getattr(self._distill, "selector_mode", False):
-                status = features.get("ego_status")
-                status_feature = features.get("status_feature")
-                if (
-                    status is None
-                    and status_feature is not None
-                    and status_feature.shape[-1] > self._config.num_navi_cmd
-                ):
-                    status = status_feature[:, self._config.num_navi_cmd:]
+            if getattr(self._distill, "selector_v6", False):
+                distill_kwargs = {
+                    "trajectory_anchors": predictions.get("trajectory_anchors"),
+                    "command": features.get("command"),
+                    "ego_status": status,
+                }
+            elif getattr(self._distill, "selector_mode", False):
                 distill_kwargs = {
                     "plan_attn": predictions.get("plan_bev_attn"),
                     "command": features.get("command"),

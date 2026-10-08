@@ -1,0 +1,39 @@
+# BEV Selector v6: Trajectory-Anchor-Guided Distillation with Plan-Only Student.
+# - Student: Pure Plan-Only (no aux task heads, no task interaction, 256 anchor planner)
+# - Distill: TrajectoryAnchorDistillation directly distilling BEVFusion (NC) & ReSMap (DAC)
+# - GradBalancer: OFF (grad_balance_target: null)
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Student architecture (ResNet-34 camera backbone)
+  image_architecture: resnet34.tv_in1k
+
+  # Pure Plan-Only Student configuration
+  use_task_interaction: false
+  use_det_motion_head: false
+  use_map_head: false
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+
+  # v6 Trajectory-Anchor-Guided Distillation
+  distill_selector: false
+  distill_selector_v6: true
+  distill_anchor_winner_boost: 1.0
+  distill_anchor_tau: 2.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  distill_anchor_mode: cross_attn
+
+  # Legacy distill options turned off
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0
+
+  # No auxiliary tasks -> No gradient competition -> No GradBalancer
+  grad_balance_target: null

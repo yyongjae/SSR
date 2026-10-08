@@ -143,8 +143,6 @@ class ParaSSRModel(nn.Module):
         plan_anchor_file = getattr(cfg, "plan_anchor_file", None) if plan_anchor else None
         if plan_anchor and not plan_anchor_file:
             raise ValueError("plan_anchor requires plan_anchor_file")
-        if plan_anchor and not self.use_task_interaction:
-            raise ValueError("plan_anchor requires use_task_interaction=True")
         self._backbone_frozen_stages = int(getattr(cfg, "frozen_stages", -1))
         self._backbone_norm_requires_grad = bool(
             getattr(cfg, "norm_requires_grad", False)
@@ -405,6 +403,7 @@ class ParaSSRModel(nn.Module):
             cmd=features["command"],
             ego_status=ego_status,
             lidar_bev=self.lidar_bev(features, -1),
+            return_bev_attn=bool(getattr(cfg, "distill_selector", False) or getattr(cfg, "distill_selector_v6", False)),
         )
         if not self.use_task_interaction:
             outs = self.pts_bbox_head(cur_feats, **head_kwargs)
@@ -486,7 +485,28 @@ class ParaSSRModel(nn.Module):
         }
         if outs.get("token_attn") is not None:
             predictions["token_attn"] = outs["token_attn"]
-        if cfg.use_metric_planner:
+        if "plan_bev_attn" in outs:
+            predictions["plan_bev_attn"] = outs["plan_bev_attn"]
+        if "trajectory_offset" in outs:
+            for key in (
+                "trajectory",
+                "plan_topk_trajectory",
+                "plan_topk_reward",
+                "plan_topk_index",
+                "plan_final_rewards",
+                "trajectory_offset",
+                "im_rewards",
+                "sim_rewards",
+                "trajectory_anchors",
+            ):
+                if key in outs:
+                    predictions[key] = outs[key]
+            predictions.update({
+                key: value for key, value in outs.items() if key.startswith("plan_rescore_")
+            })
+            if "ego_fut_preds" in outs:
+                predictions["ego_fut_preds"] = outs["ego_fut_preds"]
+        elif cfg.use_metric_planner:
             from .modules.candidate_planner import (
                 commanded_candidates, offsets_to_poses, rank_candidates,
             )

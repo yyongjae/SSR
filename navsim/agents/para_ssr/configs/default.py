@@ -369,6 +369,15 @@ class ParaSSRConfig:
     distill_selector_loss_type: str = "l2"
     distill_selector_struct_mask_boost: float = 0.0
 
+    # v6: Trajectory-Anchor-Guided Distillation (Pure Plan-Only Student)
+    distill_selector_v6: bool = False
+    distill_anchor_winner_boost: float = 1.0
+    distill_anchor_tau: float = 2.0
+    distill_anchor_loss_scale: float = 10.0
+    distill_anchor_loss_type: str = "hybrid"
+    distill_anchor_proj: bool = True
+    distill_anchor_mode: str = "cross_attn"
+
     # Stage 1: train one adapter + the unchanged planning decoder from the
     # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.
     teacher_adapter_branch: str = "bevfusion"

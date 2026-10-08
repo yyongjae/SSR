@@ -584,6 +584,10 @@ def _load_training_agent_config(
     # Strict checkpoint loading replaces every model tensor.  Avoid an
     # unnecessary timm download/cache dependency during held-out evaluation.
     agent_config.config.backbone_pretrained = False
+    # Anchor PDM scores are training labels. Leaving the path set adds
+    # AnchorScoreTargetBuilder beside ParaSSRTargetBuilder, and aux mAP
+    # accepts only the detection/map target builder.
+    agent_config.config.plan_score_file = None
     return agent_config
 
 

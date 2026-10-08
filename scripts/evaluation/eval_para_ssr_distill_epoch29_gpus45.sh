@@ -209,6 +209,7 @@ with initialize_config_dir(config_dir=str(config_dir), version_base="1.2"):
             "agent=para_ssr_agent",
             "agent.config.backbone_pretrained=false",
             "agent.config.test_aux_heads=true",
+            "agent.config.plan_score_file=null",
             f"agent.config.image_architecture={image_architecture}",
         ],
     )

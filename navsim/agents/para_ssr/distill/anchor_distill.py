@@ -68,10 +68,6 @@ class TrajectoryAnchorDistillation(nn.Module):
         self.status_mlp = nn.Linear(4, self.channels)
         self.query_norm = nn.LayerNorm(self.channels)
 
-        # 2D Positional Encoding for BEV spatial coordinate grounding
-        self.positional_encoding = LearnedPositionalEncoding(
-            self.channels // 2, self.bev_h, self.bev_w
-        )
 
         # Cross-Attention interaction decoders:
         # Bank 0: Obstacle interaction (BEVFusion)
@@ -288,10 +284,8 @@ class TrajectoryAnchorDistillation(nn.Module):
                 device=device, dtype=dtype,
             )
 
-            # Generate BEV positional encoding if not provided
             if bev_pos is None:
-                bev_mask = torch.zeros((bs, self.bev_h, self.bev_w), device=device, dtype=dtype)
-                bev_pos = self.positional_encoding(bev_mask).to(dtype).flatten(2).permute(0, 2, 1)
+                raise ValueError("bev_pos must be provided by planner_head for TrajectoryAnchorDistillation")
 
             if self.version == "v7":
                 # -------------------------------------------------------------

@@ -162,6 +162,7 @@ exec "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
   trainer.params.accumulate_grad_batches="${ACCUMULATE}" \
   trainer.params.check_val_every_n_epoch=5 \
   trainer.params.precision=32 \
+  trainer.params.strategy="ddp_find_unused_parameters_true" \
   +trainer.params.devices="${NUM_GPUS}" \
   checkpoint.every_n_epochs=5 \
   checkpoint.save_top_k=-1 \

@@ -488,25 +488,28 @@ class ParaSSRAgent(AbstractAgent):
                 )
             status = features.get("ego_status")
             status_feature = features.get("status_feature")
+            command = features.get("command")
             if (
                 status is None
                 and status_feature is not None
                 and status_feature.shape[-1] > self._config.num_navi_cmd
             ):
                 status = status_feature[:, self._config.num_navi_cmd:]
+                if command is None:
+                    command = status_feature[:, :self._config.num_navi_cmd]
 
             distill_kwargs = {}
             if getattr(self._distill, "selector_v6", False) or getattr(self._distill, "selector_v7", False):
                 distill_kwargs = {
                     "trajectory_anchors": predictions.get("trajectory_anchors"),
-                    "command": features.get("command"),
+                    "command": command,
                     "ego_status": status,
                     "bev_pos": predictions.get("bev_pos"),
                 }
             elif getattr(self._distill, "selector_mode", False):
                 distill_kwargs = {
                     "plan_attn": predictions.get("plan_bev_attn"),
-                    "command": features.get("command"),
+                    "command": command,
                     "ego_status": status,
                 }
             distill_losses, distill_metrics = self._distill(

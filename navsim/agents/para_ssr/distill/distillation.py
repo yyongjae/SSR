@@ -133,6 +133,10 @@ class PlanningDistillation(nn.Module):
         selector_loss_type: str = "l2",
         selector_struct_mask_boost: float = 0.0,
         selector_v6: bool = False,
+        selector_v7: bool = False,
+        spatial_sigma: float = 4.0,
+        attn_loss_scale: float = 5.0,
+        resmap_scale: float = 3.0,
         anchor_winner_boost: float = 1.0,
         anchor_tau: float = 2.0,
         anchor_loss_scale: float = 10.0,
@@ -193,6 +197,10 @@ class PlanningDistillation(nn.Module):
         self.selector_loss_type = str(selector_loss_type)
         self.selector_struct_mask_boost = float(selector_struct_mask_boost)
         self.selector_v6 = bool(selector_v6)
+        self.selector_v7 = bool(selector_v7)
+        self.spatial_sigma = float(spatial_sigma)
+        self.attn_loss_scale = float(attn_loss_scale)
+        self.resmap_scale = float(resmap_scale)
         self.anchor_winner_boost = float(anchor_winner_boost)
         self.anchor_tau = float(anchor_tau)
         self.anchor_loss_scale = float(anchor_loss_scale)
@@ -207,7 +215,7 @@ class PlanningDistillation(nn.Module):
         self.teacher_tokens_student_grid: Dict[str, torch.Tensor] = {}
         self.student_tokens_student_grid: Dict[str, torch.Tensor] = {}
 
-        if self.selector_mode or self.selector_v6:
+        if self.selector_mode or self.selector_v6 or self.selector_v7:
             # Registers / Anchors replace the frozen adapter. Stage-1 checkpoints are not
             # read, so the v4 launcher is the only path that requires them.
             active_branch_names = [
@@ -233,7 +241,7 @@ class PlanningDistillation(nn.Module):
         for name in active_branch_names:
             raw = branches[name]
             cfg = dict(raw)
-            if self.selector_mode or self.selector_v6:
+            if self.selector_mode or self.selector_v6 or self.selector_v7:
                 cfg.pop("adapter", None)
             else:
                 adapter = PlanningBEVAdapter(**dict(cfg.pop("adapter", {})))
@@ -289,7 +297,7 @@ class PlanningDistillation(nn.Module):
             )
 
         self.anchor_distill: Optional[TrajectoryAnchorDistillation] = None
-        if self.selector_v6:
+        if self.selector_v6 or self.selector_v7:
             from .anchor_distill import TrajectoryAnchorDistillation
 
             self.anchor_distill = TrajectoryAnchorDistillation(
@@ -300,9 +308,13 @@ class PlanningDistillation(nn.Module):
                 winner_boost=self.anchor_winner_boost,
                 tau=self.anchor_tau,
                 loss_scale=self.anchor_loss_scale,
+                attn_loss_scale=self.attn_loss_scale,
+                resmap_scale=self.resmap_scale,
+                spatial_sigma=self.spatial_sigma,
                 loss_type=self.anchor_loss_type,
                 use_proj=self.anchor_proj,
                 mode=self.anchor_mode,
+                version="v7" if self.selector_v7 else "v6",
             )
 
     # ------------------------------------------------------------------ #
@@ -542,12 +554,13 @@ class PlanningDistillation(nn.Module):
         command: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
         trajectory_anchors: Optional[torch.Tensor] = None,
+        bev_pos: Optional[torch.Tensor] = None,
     ):
         """``student_bev`` is ``[B, bev_h*bev_w, C]``; returns (losses, metrics)."""
-        if self.selector_v6:
+        if self.selector_v6 or self.selector_v7:
             return self._anchor_forward(
                 student_bev, tokens, trajectory_anchors, trajectories,
-                command=command, ego_status=ego_status,
+                command=command, ego_status=ego_status, bev_pos=bev_pos,
             )
         if self.selector_mode:
             return self._selector_forward(
@@ -687,6 +700,7 @@ class PlanningDistillation(nn.Module):
         gt_trajectory: Optional[torch.Tensor],
         command: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
+        bev_pos: Optional[torch.Tensor] = None,
     ):
         if self.anchor_distill is None:
             raise RuntimeError("trajectory anchor distillation was not constructed")
@@ -711,6 +725,7 @@ class PlanningDistillation(nn.Module):
         return self.anchor_distill(
             student_bev, teachers, trajectory_anchors,
             gt_trajectory=gt_trajectory, command=command, ego_status=ego_status,
+            bev_pos=bev_pos,
         )
 
     def _selector_forward(
@@ -813,8 +828,24 @@ def build_planning_distillation(config):
         selector_loss_type=str(getattr(config, "distill_selector_loss_type", "l2")),
         selector_struct_mask_boost=float(getattr(config, "distill_selector_struct_mask_boost", 0.0)),
         selector_v6=bool(getattr(config, "distill_selector_v6", False)),
-        anchor_winner_boost=float(getattr(config, "distill_anchor_winner_boost", 1.0)),
-        anchor_tau=float(getattr(config, "distill_anchor_tau", 2.0)),
+        selector_v7=bool(getattr(config, "distill_selector_v7", False)),
+        spatial_sigma=float(getattr(config, "distill_spatial_sigma", 4.0)),
+        attn_loss_scale=float(getattr(config, "distill_attn_loss_scale", 5.0)),
+        resmap_scale=float(getattr(config, "distill_resmap_scale", 3.0)),
+        anchor_winner_boost=float(
+            getattr(
+                config,
+                "distill_anchor_winner_boost",
+                2.0 if getattr(config, "distill_selector_v7", False) else 1.0,
+            )
+        ),
+        anchor_tau=float(
+            getattr(
+                config,
+                "distill_anchor_tau",
+                1.0 if getattr(config, "distill_selector_v7", False) else 2.0,
+            )
+        ),
         anchor_loss_scale=float(getattr(config, "distill_anchor_loss_scale", 10.0)),
         anchor_loss_type=str(getattr(config, "distill_anchor_loss_type", "hybrid")),
         anchor_proj=bool(getattr(config, "distill_anchor_proj", True)),

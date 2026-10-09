@@ -403,7 +403,11 @@ class ParaSSRModel(nn.Module):
             cmd=features["command"],
             ego_status=ego_status,
             lidar_bev=self.lidar_bev(features, -1),
-            return_bev_attn=bool(getattr(cfg, "distill_selector", False) or getattr(cfg, "distill_selector_v6", False)),
+            return_bev_attn=bool(
+                getattr(cfg, "distill_selector", False)
+                or getattr(cfg, "distill_selector_v6", False)
+                or getattr(cfg, "distill_selector_v7", False)
+            ),
         )
         if not self.use_task_interaction:
             outs = self.pts_bbox_head(cur_feats, **head_kwargs)
@@ -483,6 +487,8 @@ class ParaSSRModel(nn.Module):
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
         }
+        if "bev_pos" in outs and outs["bev_pos"] is not None:
+            predictions["bev_pos"] = outs["bev_pos"]
         if outs.get("token_attn") is not None:
             predictions["token_attn"] = outs["token_attn"]
         if "plan_bev_attn" in outs:

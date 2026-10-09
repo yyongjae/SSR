@@ -661,6 +661,7 @@ class ParaSSRPlannerHead(nn.Module):
         )
         out.update(
             bev_embed=bev_embed,
+            bev_pos=bev_pos,
             scene_query=h.transpose(0, 1),
             token_attn=None,
             ego_fut_preds=steps.unsqueeze(1).expand(

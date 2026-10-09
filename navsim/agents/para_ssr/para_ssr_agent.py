@@ -496,11 +496,12 @@ class ParaSSRAgent(AbstractAgent):
                 status = status_feature[:, self._config.num_navi_cmd:]
 
             distill_kwargs = {}
-            if getattr(self._distill, "selector_v6", False):
+            if getattr(self._distill, "selector_v6", False) or getattr(self._distill, "selector_v7", False):
                 distill_kwargs = {
                     "trajectory_anchors": predictions.get("trajectory_anchors"),
                     "command": features.get("command"),
                     "ego_status": status,
+                    "bev_pos": predictions.get("bev_pos"),
                 }
             elif getattr(self._distill, "selector_mode", False):
                 distill_kwargs = {

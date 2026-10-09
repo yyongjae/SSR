@@ -378,6 +378,12 @@ class ParaSSRConfig:
     distill_anchor_proj: bool = True
     distill_anchor_mode: str = "cross_attn"
 
+    # v7: Trajectory-Anchor-Guided Distillation with Spatial Bias & Attention Alignment
+    distill_selector_v7: bool = False
+    distill_spatial_sigma: float = 4.0
+    distill_attn_loss_scale: float = 5.0
+    distill_resmap_scale: float = 3.0
+
     # Stage 1: train one adapter + the unchanged planning decoder from the
     # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.
     teacher_adapter_branch: str = "bevfusion"

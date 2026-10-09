@@ -1,0 +1,49 @@
+# BEV Selector v7: Trajectory-Anchor-Guided Distillation with Spatial Bias & Attention Alignment.
+# - Student: Pure Plan-Only (no aux task heads, no task interaction, 256 anchor planner, ResNet-34)
+# - Distill v7:
+#     * 2D Positional Encoding on BEV Keys (Spatial coordinate awareness)
+#     * Soft Gaussian Relative Spatial Distance Bias per Trajectory Anchor (Trajectory grounding)
+#     * Teacher Attention Map Alignment (KL Divergence on Teacher's Cross-Attention weights)
+#     * Attended Feature Distillation (Hybrid L2 + Cosine on Teacher & Student features)
+#     * ReSMap Domain Loss Scaling (3.0x multiplier to resolve DAC gradient starvation)
+#     * Sharpened Winner & Softmax Importance Weighting (tau=1.0, winner_boost=2.0)
+# - GradBalancer: OFF (grad_balance_target: null)
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Student architecture (ResNet-34 camera backbone)
+  image_architecture: resnet34.tv_in1k
+
+  # Pure Plan-Only Student configuration
+  use_task_interaction: false
+  use_det_motion_head: false
+  use_map_head: false
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+
+  # v7 Trajectory-Anchor-Guided Distillation
+  distill_selector: false
+  distill_selector_v6: false
+  distill_selector_v7: true
+  distill_spatial_sigma: 4.0
+  distill_attn_loss_scale: 5.0
+  distill_resmap_scale: 3.0
+  distill_anchor_winner_boost: 2.0
+  distill_anchor_tau: 1.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  distill_anchor_mode: cross_attn
+
+  # Legacy distill options turned off
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0
+
+  # No auxiliary tasks -> No gradient competition -> No GradBalancer
+  grad_balance_target: null

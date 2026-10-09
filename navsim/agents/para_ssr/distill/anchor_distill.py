@@ -1,28 +1,25 @@
-"""Trajectory-Anchor-Guided Interaction Distillation (BEV Selector v6).
+"""Trajectory-Anchor-Guided Interaction Distillation (BEV Selector v6 & v7).
 
-Method 2: 256 Anchor Query Cross-Attention (Interaction-Aware Selection)
-Directly guides the student's 256 trajectory anchors by dynamically querying
-the multi-modal teachers for interaction-relevant context across the BEV:
-- Teacher 1 (BEVFusion): 3D Dynamic Obstacles & Collision context (NC)
-- Teacher 2 (ReSMap): HD Map, Road Boundaries & Drivable Area context (DAC)
-
-Rather than merely sampling points on the centerline, the 256 trajectory anchor
-queries dynamically cross-attend to the entire BEV scene to discover all objects,
-cut-in agents, and road boundaries that interact with each specific trajectory plan.
-
-Winner-aware Softmax weighting focuses distillation capacity on viable paths,
-eliminating the need for arbitrary learnable registers, coverage/diversity losses,
-and closed-loop gradient balancers.
+v7 Upgrade:
+- 2D Positional Encoding on BEV Keys (Spatial Coordinate Grounding)
+- Soft Relative Spatial Gaussian Distance Bias per Trajectory Anchor
+- Teacher-Guided Attention Map Distillation (KL Divergence on Attention Weights)
+- Attended Feature Distillation (Hybrid L2 + Cosine)
+- ReSMap Domain Loss Scaling (3.0x multiplier to eliminate gradient starvation)
+- Sharpened Winner & Softmax Importance Weighting (tau=1.0, winner_boost=2.0)
 """
 
 from typing import Dict, Optional, Sequence, Tuple
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..modules.transformer_blocks import LearnedPositionalEncoding
+
 
 class TrajectoryAnchorDistillation(nn.Module):
-    """v6 Trajectory-Anchor-Guided Interaction Distillation module."""
+    """Trajectory-Anchor-Guided Interaction Distillation module (v6 & v7)."""
 
     def __init__(
         self,
@@ -31,25 +28,35 @@ class TrajectoryAnchorDistillation(nn.Module):
         pc_range: Sequence[float] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0),
         bev_h: int = 50,
         bev_w: int = 100,
-        winner_boost: float = 1.0,
-        tau: float = 2.0,
+        winner_boost: float = 2.0,
+        tau: float = 1.0,
         loss_scale: float = 10.0,
+        attn_loss_scale: float = 5.0,
+        resmap_scale: float = 3.0,
+        spatial_sigma: float = 4.0,
         loss_type: str = "hybrid",
         use_proj: bool = True,
         mode: str = "cross_attn",
+        version: str = "v7",
+        trajectory_anchors_file: Optional[str] = "/workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy",
     ) -> None:
         super().__init__()
         self.channels = int(channels)
         self.num_heads = int(num_heads)
+        self.head_dim = self.channels // self.num_heads
         self.pc_range = tuple(float(v) for v in pc_range)
         self.bev_h = int(bev_h)
         self.bev_w = int(bev_w)
         self.winner_boost = float(winner_boost)
         self.tau = float(tau)
         self.loss_scale = float(loss_scale)
+        self.attn_loss_scale = float(attn_loss_scale)
+        self.resmap_scale = float(resmap_scale)
+        self.spatial_sigma = float(spatial_sigma)
         self.loss_type = str(loss_type).lower()
         self.use_proj = bool(use_proj)
-        self.mode = str(mode).lower()  # "cross_attn" (Method 2) or "corridor" (Method 1)
+        self.mode = str(mode).lower()
+        self.version = str(version).lower()
 
         # 256 Anchor Query Generator: embeds [fut_ts=8 * traj_dims=3] into C
         self.anchor_mlp = nn.Sequential(
@@ -59,17 +66,37 @@ class TrajectoryAnchorDistillation(nn.Module):
         )
         self.cmd_mlp = nn.Linear(4, self.channels)
         self.status_mlp = nn.Linear(4, self.channels)
+        self.query_norm = nn.LayerNorm(self.channels)
+
+        # 2D Positional Encoding for BEV spatial coordinate grounding
+        self.positional_encoding = LearnedPositionalEncoding(
+            self.channels // 2, self.bev_h, self.bev_w
+        )
 
         # Cross-Attention interaction decoders:
         # Bank 0: Obstacle interaction (BEVFusion)
         # Bank 1: Road Boundary / Map interaction (ReSMap)
         if self.mode == "cross_attn":
-            self.attn_det = nn.MultiheadAttention(
-                self.channels, self.num_heads, batch_first=True
-            )
-            self.attn_map = nn.MultiheadAttention(
-                self.channels, self.num_heads, batch_first=True
-            )
+            if self.version == "v7":
+                # v7: Explicit Q, K, V projections for asymmetric teacher-guided alignment
+                self.q_proj = nn.Linear(self.channels, self.channels)
+                self.k_proj = nn.ModuleList([
+                    nn.Linear(self.channels, self.channels) for _ in range(2)
+                ])
+                self.v_proj = nn.ModuleList([
+                    nn.Linear(self.channels, self.channels) for _ in range(2)
+                ])
+                self.out_proj = nn.ModuleList([
+                    nn.Linear(self.channels, self.channels) for _ in range(2)
+                ])
+            else:
+                # v6 fallback: standard MultiheadAttention
+                self.attn_det = nn.MultiheadAttention(
+                    self.channels, self.num_heads, batch_first=True
+                )
+                self.attn_map = nn.MultiheadAttention(
+                    self.channels, self.num_heads, batch_first=True
+                )
 
         # Bank-specific Linear Projection Adapter for student feature alignment
         if self.use_proj:
@@ -81,6 +108,37 @@ class TrajectoryAnchorDistillation(nn.Module):
                 nn.init.zeros_(proj.bias)
         else:
             self.student_proj = None
+
+        # Precompute spatial distance bias for 256 anchors if anchors file is available
+        if trajectory_anchors_file is not None and os.path.exists(trajectory_anchors_file):
+            import numpy as np
+            anchors_np = np.load(trajectory_anchors_file)
+            bias = self._build_spatial_bias(torch.tensor(anchors_np, dtype=torch.float32))
+            self.register_buffer("spatial_bias", bias)
+        else:
+            self.spatial_bias = None
+
+    def _build_spatial_bias(self, anchors: torch.Tensor) -> torch.Tensor:
+        """Compute Gaussian spatial distance bias [K, HW] for 256 anchors."""
+        device = anchors.device
+        r = torch.arange(self.bev_h, dtype=torch.float32, device=device)
+        c = torch.arange(self.bev_w, dtype=torch.float32, device=device)
+        y_min, y_max = self.pc_range[1], self.pc_range[4]
+        x_min, x_max = self.pc_range[0], self.pc_range[3]
+        grid_y = y_min + (r + 0.5) * ((y_max - y_min) / self.bev_h)
+        grid_x = x_min + (c + 0.5) * ((x_max - x_min) / self.bev_w)
+        grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+        grid_pts = torch.stack([grid_x, grid_y], dim=-1).view(-1, 2)  # [HW, 2]
+
+        # Convert anchors to SSR coordinates: x_ssr = -y_left, y_ssr = x_fwd
+        x_ssr = -anchors[..., 1]
+        y_ssr = anchors[..., 0]
+        wp_pts = torch.stack([x_ssr, y_ssr], dim=-1)  # [K, T, 2]
+
+        dists = torch.norm(wp_pts.unsqueeze(2) - grid_pts.unsqueeze(0).unsqueeze(0), dim=-1)  # [K, T, HW]
+        min_dist = dists.min(dim=1).values  # [K, HW]
+        spatial_bias = -0.5 * (min_dist / max(self.spatial_sigma, 1e-4)) ** 2
+        return spatial_bias  # [K, HW]
 
     def _build_anchor_queries(
         self,
@@ -106,7 +164,7 @@ class TrajectoryAnchorDistillation(nn.Module):
             stat = ego_status[..., :4].to(device=device, dtype=dtype)
             q = q + self.status_mlp(stat).unsqueeze(1)
 
-        return q
+        return self.query_norm(q)
 
     def _compute_anchor_weights(
         self,
@@ -123,7 +181,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         dist = torch.norm(flat_anchors - flat_gt, dim=-1)  # [B, K]
         winner = dist.argmin(dim=-1)  # [B]
 
-        # Softmax over distance
+        # Softmax over distance with sharpened tau
         w = F.softmax(-dist / self.tau, dim=-1)
 
         # Winner anchor boost
@@ -189,6 +247,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         gt_trajectory: Optional[torch.Tensor] = None,
         command: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
+        bev_pos: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Compute trajectory-anchor interaction distillation loss.
 
@@ -199,6 +258,7 @@ class TrajectoryAnchorDistillation(nn.Module):
             gt_trajectory: [B, T, 3] (optional)
             command: [B, 4] (optional)
             ego_status: [B, 4] (optional)
+            bev_pos: [B, HW, C] (optional 2D positional encoding)
         """
         if len(teacher_by_bank) != 2:
             raise ValueError(f"TrajectoryAnchorDistillation expects 2 teachers, got {len(teacher_by_bank)}")
@@ -206,12 +266,13 @@ class TrajectoryAnchorDistillation(nn.Module):
         bs = student_bev.size(0)
         device = student_bev.device
         dtype = student_bev.dtype
+        k = trajectory_anchors.size(0)
+        hw = student_bev.size(1)
 
         # Compute importance weights
         if gt_trajectory is not None and gt_trajectory.numel() > 0:
             weights, winner = self._compute_anchor_weights(trajectory_anchors, gt_trajectory)
         else:
-            k = trajectory_anchors.size(0)
             weights = torch.full((bs, k), 1.0 / k, device=device, dtype=dtype)
             winner = torch.zeros((bs,), device=device, dtype=torch.long)
 
@@ -221,46 +282,110 @@ class TrajectoryAnchorDistillation(nn.Module):
         total_distill_terms = []
 
         if self.mode == "cross_attn":
-            # -------------------------------------------------------------
-            # Method 2: Dynamic Cross-Attention Interaction Selection
-            # -------------------------------------------------------------
             # Generate 256 anchor queries conditioned on driving intent
             q = self._build_anchor_queries(
                 trajectory_anchors, bs, command=command, ego_status=ego_status,
                 device=device, dtype=dtype,
             )
 
-            attns = (self.attn_det, self.attn_map)
-            for bank, name in enumerate(names):
-                t_bev = teacher_by_bank[bank].detach()
-                proj = self.student_proj[bank] if self.use_proj else None
-                s_bev = proj(student_bev) if proj is not None else student_bev
-                attn_layer = attns[bank]
+            # Generate BEV positional encoding if not provided
+            if bev_pos is None:
+                bev_mask = torch.zeros((bs, self.bev_h, self.bev_w), device=device, dtype=dtype)
+                bev_pos = self.positional_encoding(bev_mask).to(dtype).flatten(2).permute(0, 2, 1)
 
-                # Teacher extracts interaction features for all 256 trajectories
-                feat_t, _ = attn_layer(q, t_bev, t_bev)
-                # Student extracts interaction features for all 256 trajectories
-                feat_s, _ = attn_layer(q, s_bev, s_bev)
+            if self.version == "v7":
+                # -------------------------------------------------------------
+                # v7: Asymmetric Teacher-Guided Alignment with Spatial Bias
+                # -------------------------------------------------------------
+                q_proj = self.q_proj(q).view(bs, k, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, K, D]
 
-                bank_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t, weights)
-                scaled_loss = self.loss_scale * bank_loss
+                # Ensure spatial distance bias is available
+                if not hasattr(self, "spatial_bias") or self.spatial_bias is None:
+                    spatial_bias = self._build_spatial_bias(trajectory_anchors)
+                    self.register_buffer("spatial_bias", spatial_bias)
+                bias = self.spatial_bias.to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(1)  # [1, 1, K, HW]
 
-                losses[f"loss_distill_{name}"] = scaled_loss
-                total_distill_terms.append(scaled_loss)
-                metrics[f"distill_cos/{name}"] = bank_cos.detach()
+                scale = 1.0 / (self.head_dim ** 0.5)
 
-                with torch.no_grad():
-                    winner_cos = F.cosine_similarity(
-                        F.layer_norm(feat_s[torch.arange(bs), winner], (self.channels,)),
-                        F.layer_norm(feat_t[torch.arange(bs), winner], (self.channels,)),
-                        dim=-1,
-                    ).mean()
-                    metrics[f"distill_winner_cos/{name}"] = winner_cos.detach()
+                for bank, name in enumerate(names):
+                    t_bev = teacher_by_bank[bank].detach()
+                    proj = self.student_proj[bank] if self.use_proj else None
+                    s_bev = proj(student_bev) if proj is not None else student_bev
+
+                    # Keys with 2D Spatial Positional Encoding
+                    k_t = self.k_proj[bank](t_bev + bev_pos).view(bs, hw, self.num_heads, self.head_dim).transpose(1, 2)
+                    v_t = self.v_proj[bank](t_bev).view(bs, hw, self.num_heads, self.head_dim).transpose(1, 2)
+
+                    k_s = self.k_proj[bank](s_bev + bev_pos).view(bs, hw, self.num_heads, self.head_dim).transpose(1, 2)
+                    v_s = self.v_proj[bank](s_bev).view(bs, hw, self.num_heads, self.head_dim).transpose(1, 2)
+
+                    # Attention Logits with Relative Spatial Bias
+                    logits_t = torch.matmul(q_proj, k_t.transpose(-2, -1)) * scale + bias
+                    logits_s = torch.matmul(q_proj, k_s.transpose(-2, -1)) * scale + bias
+
+                    attn_t = F.softmax(logits_t, dim=-1)  # [B, H, K, HW]
+                    attn_s = F.softmax(logits_s, dim=-1)
+
+                    # Teacher-Attended Features
+                    out_t = torch.matmul(attn_t, v_t).transpose(1, 2).contiguous().view(bs, k, self.channels)
+                    feat_t = self.out_proj[bank](out_t)
+
+                    out_s = torch.matmul(attn_s, v_s).transpose(1, 2).contiguous().view(bs, k, self.channels)
+                    feat_s = self.out_proj[bank](out_s)
+
+                    # 1. Attended Feature Loss (Hybrid L2 + Cosine)
+                    feat_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t.detach(), weights)
+
+                    # 2. Attention Alignment Loss (KL Divergence: Student matches Teacher Attention)
+                    kl = F.kl_div(attn_s.clamp_min(1e-8).log(), attn_t.detach(), reduction="none").sum(dim=-1).mean(dim=1)
+                    attn_loss = (weights * kl).sum(dim=-1).mean()
+
+                    # Domain Scaling: ReSMap (3.0x) vs BEVFusion (1.0x)
+                    domain_scale = self.resmap_scale if name == "resmap" else 1.0
+                    bank_loss = domain_scale * (self.loss_scale * feat_loss + self.attn_loss_scale * attn_loss)
+
+                    losses[f"loss_distill_{name}"] = bank_loss
+                    losses[f"loss_attn_{name}"] = (domain_scale * self.attn_loss_scale * attn_loss).detach()
+                    total_distill_terms.append(bank_loss)
+                    metrics[f"distill_cos/{name}"] = bank_cos.detach()
+
+                    with torch.no_grad():
+                        winner_cos = F.cosine_similarity(
+                            F.layer_norm(feat_s[torch.arange(bs), winner], (self.channels,)),
+                            F.layer_norm(feat_t[torch.arange(bs), winner], (self.channels,)),
+                            dim=-1,
+                        ).mean()
+                        metrics[f"distill_winner_cos/{name}"] = winner_cos.detach()
+
+            else:
+                # v6 fallback: MultiheadAttention without explicit guidance
+                attns = (self.attn_det, self.attn_map)
+                for bank, name in enumerate(names):
+                    t_bev = teacher_by_bank[bank].detach()
+                    proj = self.student_proj[bank] if self.use_proj else None
+                    s_bev = proj(student_bev) if proj is not None else student_bev
+                    attn_layer = attns[bank]
+
+                    feat_t, _ = attn_layer(q, t_bev + bev_pos, t_bev)
+                    feat_s, _ = attn_layer(q, s_bev + bev_pos, s_bev)
+
+                    bank_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t, weights)
+                    scaled_loss = self.loss_scale * bank_loss
+
+                    losses[f"loss_distill_{name}"] = scaled_loss
+                    total_distill_terms.append(scaled_loss)
+                    metrics[f"distill_cos/{name}"] = bank_cos.detach()
+
+                    with torch.no_grad():
+                        winner_cos = F.cosine_similarity(
+                            F.layer_norm(feat_s[torch.arange(bs), winner], (self.channels,)),
+                            F.layer_norm(feat_t[torch.arange(bs), winner], (self.channels,)),
+                            dim=-1,
+                        ).mean()
+                        metrics[f"distill_winner_cos/{name}"] = winner_cos.detach()
 
         else:
-            # -------------------------------------------------------------
             # Method 1: Spatial Trajectory Corridor Sampling
-            # -------------------------------------------------------------
             grid_base = self._navsim_to_bev_grid(trajectory_anchors, device, dtype)
             grid = grid_base.unsqueeze(0).expand(bs, -1, -1, -1)
 
@@ -277,7 +402,8 @@ class TrajectoryAnchorDistillation(nn.Module):
                 feat_t = F.grid_sample(t_map, grid, mode="bilinear", align_corners=True).permute(0, 2, 3, 1).mean(dim=2)
 
                 bank_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t, weights)
-                scaled_loss = self.loss_scale * bank_loss
+                domain_scale = self.resmap_scale if name == "resmap" else 1.0
+                scaled_loss = domain_scale * self.loss_scale * bank_loss
 
                 losses[f"loss_distill_{name}"] = scaled_loss
                 total_distill_terms.append(scaled_loss)

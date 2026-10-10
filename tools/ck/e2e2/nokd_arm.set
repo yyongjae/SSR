@@ -1,0 +1,15 @@
+# CK2 e2e "no KD" control (user 2026-10-11: KD 효과를 배제한 student 성능): ck_e2e2 key=value lines applied on top of
+# ck_e2e2.yaml with E2E_CK_SET=tools/ck/e2e2/nokd_arm.set (ARM=main).  Same recipe, data, seed and schedule as ck2e2e_main;
+# every teacher -> student term is switched off:
+#   score KD (Bernoulli KL to the calibrated DET/MAP probabilities, 0.5)  -> 0
+#   lateral KD (L1 to the mean DET/MAP e_lat, EMA ratio 0.5)              -> fixed weight 0
+#   BEV KD (bevkd arm only)                                               -> off
+# What stays: label BCE on official labels (warm-up raw256 + variants, then on-policy labels of the student's own pool,
+# lambda_score 1.0) + the lateral GT surrogate (lambda_sur 1.0) + v2's own planning / det / map losses.
+# The teachers still run a no-grad forward every step (TeacherPair2 is always built), so their run dirs (ckpt_last.pt,
+# config.json, norm*.npz, done.json) and the kd_calib json must exist; their outputs get zero weight.  A token without a
+# teacher BEV only sets kd_ok = False (KD off for that token), which is moot here.
+lambda_kd_score=0.0
+lat_kd.balance=fixed
+lat_kd.fixed=0.0
+bev_kd.enabled=false

@@ -8,7 +8,7 @@ Values fall into three groups:
 * **optimisation** -- the WoTE/SeerDrive-derived recipe (see report #09 §4).
 """
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
@@ -378,6 +378,21 @@ class ParaSSRConfig:
     kd_ratio_ramp_epochs: Optional[float] = None  # ema: ratio 0 -> kd_ratio linearly over [kd_start, kd_start + this]; None = off
     kd_weight_max: Optional[float] = None         # ema: cap on the KD weight (after the ratio); None = no cap
     grad_share_every: int = 50           # E1/E2: log ||dL/d bev_embed|| of E0 / surrogate / KD every n micro-batches (0 = off)
+
+    # ------------------------------------------------------------------ #
+    # CK Phase 2 (report 45; navsim/agents/para_ssr/ck/online.py): v2 + CK
+    # end-to-end.  Empty dict / enabled false = off: nothing is built,
+    # loaded or computed (v2 bit-identical).  Parsed by CKE2EConfig.from_any.
+    # ------------------------------------------------------------------ #
+    ck_e2e: Dict[str, Any] = field(default_factory=dict)
+    # CK2 e2e (navsim/agents/para_ssr/ck/online2.py; SSR/report/47 s9): v2 + CK2 student
+    # from scratch.  Empty dict / enabled false = off (nothing built / loaded / computed).
+    # Parsed by CKE2E2Config.from_any; exclusive with ck_e2e.
+    ck_e2e2: Dict[str, Any] = field(default_factory=dict)
+    # self.log(..., sync_dist=...) of the per-micro-batch loss logs
+    # (ParaSSRLoggingCallback, AgentLightningModule).  True = previous
+    # behaviour; False removes the per-micro-batch all-reduce (DDP -14 %).
+    log_sync_dist: bool = True
 
     @property
     def bev_grid_length(self) -> Tuple[float, float]:

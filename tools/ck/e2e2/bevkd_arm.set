@@ -1,0 +1,11 @@
+# CK2 + simple BEV KD arm (GPUs 2,3): ck_e2e2 key=value lines applied on top of ck_e2e2.yaml (E2E_CK_SET / ARM=bevkd).
+# Teachers DET (BEVFusion t0) + MAP (ReSMap) BEVs (user 2026-10-08 ~20:40 KST "BEV KD에 Resmap도 추가해"), MSE, one
+# zero-init 1x1 adapter per teacher, per-teacher strength: each teacher's BEV gradient ~0.1 x |g_plan|, capped at 0.25 x
+# (one RatioController per teacher).  Written out explicitly so the arm's effective config is self-documenting.
+bev_kd.enabled=true
+bev_kd.teachers=[det,map]
+bev_kd.distance=mse
+bev_kd.init=zero
+bev_kd.ratio=0.1
+bev_kd.cap=0.25
+bev_kd.start_mb=10600

@@ -138,6 +138,8 @@ class ParaSSRLoggingCallback(pl.Callback):
         logs = getattr(pl_module.agent, "latest_logs", None)
         if not logs:
             return
+        # ParaSSRConfig.log_sync_dist = False: no per-micro-batch all-reduce (default True = unchanged)
+        sync_dist = bool(getattr(getattr(pl_module.agent, "config", None), "log_sync_dist", True))
         for key, value in logs.items():
             if key == "loss":  # already logged by AgentLightningModule
                 continue
@@ -147,7 +149,7 @@ class ParaSSRLoggingCallback(pl.Callback):
                 on_step=True,
                 on_epoch=True,
                 prog_bar=False,
-                sync_dist=True,
+                sync_dist=sync_dist,
             )
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -286,6 +288,14 @@ class ParaSSRLoggingCallback(pl.Callback):
 
 
 class ParaSSRAgent(AbstractAgent):
+    # CK Phase 2 helper (plain object, set in __init__ when config.ck_e2e is on).  Class-level default so agents built
+    # without __init__ (tests use ParaSSRAgent.__new__) still read "CK off".
+    _ck_e2e = None
+    # CK2 e2e helper (ck/online2.py; config.ck_e2e2), same class-level "off" default.  The optional BEV-KD arm
+    # (ck/bev_kd_arm.py) is a registered submodule `ck_bev_kd`: deliberately NO class attribute of that name (it would
+    # shadow nn.Module.__getattr__ and hide the registered module); read it with getattr(self, "ck_bev_kd", None).
+    _ck_e2e2 = None
+
     def __init__(
         self,
         config,
@@ -322,9 +332,55 @@ class ParaSSRAgent(AbstractAgent):
                 int(config.ref_seed), float(config.ref_bev_grad_scale), int(config.embed_dims)
             )
             self._stage_e = StageE(config)
+        # CK Phase 2 (ck/online.py): built only when ck_e2e is enabled, so the default
+        # (empty dict) constructs, loads and computes exactly what v2 did.  The teachers,
+        # LabelStore and recorder are created lazily at the first training step and are
+        # never registered modules (not in the state_dict / DDP / optimiser).
+        self._ck_e2e = None
+        ckcfg = self._ck_e2e_config(config)
+        if ckcfg is not None and ckcfg.enabled:
+            from .ck.online import CKE2E, build_student_ck
+
+            self.ck_student = build_student_ck(ckcfg, apply_prior=not checkpoint_path)
+            self._ck_e2e = CKE2E(ckcfg, max_epochs=int(config.max_epochs))
+        # CK2 e2e (ck/online2.py): built only when ck_e2e2.enabled (default {} = off: v2 bit-identical).  Every
+        # constructor below forks the RNG (CKNet trunk / score head, BEVKDAdapter), so the v2 init and the data order
+        # are the same with and without CK2 / the BEV-KD arm.  Teachers / LabelStore2 / recorder are lazy plain objects.
+        self._ck_e2e2 = None
+        ck2 = self._ck_e2e2_config(config)
+        if ck2 is not None and ck2.enabled:
+            from .ck.online2 import CKE2E2, build_student_ck2
+
+            self.ck_student = build_student_ck2(ck2, apply_prior=not checkpoint_path)
+            self._ck_e2e2 = CKE2E2(ck2, max_epochs=int(config.max_epochs))
+            self.ck_bev_kd = None
+            if ck2.bev_kd["enabled"]:
+                from .ck.bev_kd_arm import build_bev_kd_arm
+
+                self.ck_bev_kd = build_bev_kd_arm(ck2)       # nn.Module: state_dict / DDP / own optimiser group
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
+
+    @staticmethod
+    def _ck_e2e_config(config):
+        """CKE2EConfig of config.ck_e2e, or None when it is empty (the module is then never imported)."""
+        raw = getattr(config, "ck_e2e", None)
+        if not raw:
+            return None
+        from .ck.online import CKE2EConfig
+
+        return CKE2EConfig.from_any(raw)
+
+    @staticmethod
+    def _ck_e2e2_config(config):
+        """CKE2E2Config of config.ck_e2e2, or None when it is empty (ck/online2.py is then never imported)."""
+        raw = getattr(config, "ck_e2e2", None)
+        if not raw:
+            return None
+        from .ck.online2 import CKE2E2Config
+
+        return CKE2E2Config.from_any(raw)
 
     @staticmethod
     def _validate_config(config, trajectory_sampling: TrajectorySampling) -> None:
@@ -518,6 +574,14 @@ class ParaSSRAgent(AbstractAgent):
                 v = getattr(config, k, None)
                 if v is not None and not (float(v) > 0.0 and getattr(config, "kd_balance", "fixed") == "ema"):
                     raise ValueError(f"{k} must be null or > 0 with kd_balance ema, got {v!r}")
+        # ---- CK Phase 2 e2e (ck/online.py; off unless ck_e2e.enabled) ----
+        ckcfg = ParaSSRAgent._ck_e2e_config(config)
+        if ckcfg is not None:
+            ckcfg.validate(config)
+        # ---- CK2 e2e (ck/online2.py; off unless ck_e2e2.enabled; rejects ck_e2e + ck_e2e2 both on) ----
+        ck2cfg = ParaSSRAgent._ck_e2e2_config(config)
+        if ck2cfg is not None:
+            ck2cfg.validate(config)
         # ---- v2: readout KD / anchor planner / plan_map (km/para-ssr-v2) ----
         # Independent of Stage E: the two 'kd_*' families are separate systems
         # (v2: kd_mode/kd_teacher_cache/kd_weight/kd_*_iters = ReSMap BEV readout
@@ -675,6 +739,14 @@ class ParaSSRAgent(AbstractAgent):
         # plan_score_file is training-only: evaluation leaves it null and gets no builder
         if getattr(cfg, "plan_anchor", False) and getattr(cfg, "plan_score_file", None):
             builders.append(AnchorScoreTargetBuilder(cfg))
+        if self._ck_e2e is not None:
+            from .ck.e2e_data import CKE2ETargetBuilder
+
+            builders.append(CKE2ETargetBuilder(cfg))
+        if self._ck_e2e2 is not None:
+            from .ck.e2e_data2 import CK2E2ETargetBuilder
+
+            builders.append(CK2E2ETargetBuilder(cfg))
         return builders
 
     # ------------------------------------------------------------------ #
@@ -689,6 +761,14 @@ class ParaSSRAgent(AbstractAgent):
         if self._stage_e is not None and not self.training:
             # inference: trajectory = tau_final (or tau0 with ref_eval_traj=tau0)
             predictions = self._stage_e.infer(self.ref_student, features, predictions)
+        if self._ck_e2e is not None and not self.training and self._ck_e2e.cfg.infer_outputs:
+            # ck_* outputs only; predictions['trajectory'] stays the v2 one
+            predictions = dict(predictions)
+            predictions.update(self._ck_e2e.infer(self.ck_student, features, predictions))
+        if self._ck_e2e2 is not None and not self.training and self._ck_e2e2.cfg.infer_outputs:
+            # ck2_* outputs over the 96-candidate pool only; predictions['trajectory'] stays the v2 one
+            predictions = dict(predictions)
+            predictions.update(self._ck_e2e2.infer(self.ck_student, features, predictions))
         return predictions
 
     def compute_loss(
@@ -717,6 +797,22 @@ class ParaSSRAgent(AbstractAgent):
             loss = loss + ref_loss
             logs.update(ref_logs)
             logs["loss"] = loss.detach()
+        if self._ck_e2e is not None and self.training:
+            # CK loss added AFTER the grad balancer (its plan/det/map shares are unchanged)
+            ck_loss, ck_logs = self._ck_e2e.loss(self.ck_student, features, targets, predictions, v2_loss=loss)
+            logs["loss_v2"] = logs["loss"]
+            loss = loss + ck_loss
+            logs.update(ck_logs)
+            logs["loss"] = loss.detach()
+        if self._ck_e2e2 is not None and self.training:
+            # CK2 loss (+ the BEV-KD arm term) added AFTER the grad balancer (v2's plan/det/map shares unchanged);
+            # v2_logs = the v2 loss logs (the BEV-KD measurement fires on the 'gnorm/plan' micro-batches)
+            ck_loss, ck_logs = self._ck_e2e2.loss(self.ck_student, features, targets, predictions, v2_loss=loss,
+                                                  v2_logs=logs, bev_kd=getattr(self, "ck_bev_kd", None))
+            logs["loss_v2"] = logs["loss"]
+            loss = loss + ck_loss
+            logs.update(ck_logs)
+            logs["loss"] = loss.detach()
         self.latest_logs = logs
         return loss
 
@@ -726,6 +822,14 @@ class ParaSSRAgent(AbstractAgent):
             from .refiner.e2e import make_callback
 
             callbacks.append(make_callback(self))
+        if self._ck_e2e is not None:
+            from .ck.online import make_ck_callback
+
+            callbacks.append(make_ck_callback(self))
+        if self._ck_e2e2 is not None:
+            from .ck.online2 import make_ck2_callback
+
+            callbacks.append(make_ck2_callback(self))
         return callbacks
 
     # ------------------------------------------------------------------ #
@@ -762,6 +866,42 @@ class ParaSSRAgent(AbstractAgent):
                     "weight_decay": cfg.ref_weight_decay,
                 }
             )
+        if self._ck_e2e is not None:
+            from .ck.online import ck_parameters
+
+            ckc = self._ck_e2e.cfg
+            groups.append(
+                {
+                    "params": ck_parameters(self),
+                    "lr": self._lr * ckc.lr_mult,
+                    "lr_scale": ckc.lr_mult,
+                    "weight_decay": ckc.weight_decay,
+                }
+            )
+        if self._ck_e2e2 is not None:
+            from .ck.online2 import ck2_parameters
+
+            ck2c = self._ck_e2e2.cfg
+            groups.append(
+                {
+                    "params": ck2_parameters(self),
+                    "lr": self._lr * ck2c.lr_mult,
+                    "lr_scale": ck2c.lr_mult,
+                    "weight_decay": ck2c.weight_decay,
+                }
+            )
+            if getattr(self, "ck_bev_kd", None) is not None:
+                from .ck.bev_kd_arm import bev_kd_parameters
+
+                bk = ck2c.bev_kd
+                groups.append(
+                    {
+                        "params": bev_kd_parameters(self),
+                        "lr": self._lr * bk["lr_mult"],
+                        "lr_scale": bk["lr_mult"],
+                        "weight_decay": bk["weight_decay"],
+                    }
+                )
         optimizer_cls = getattr(torch.optim, cfg.optimizer_type)
         optimizer = optimizer_cls(groups, lr=self._lr, weight_decay=cfg.weight_decay)
 

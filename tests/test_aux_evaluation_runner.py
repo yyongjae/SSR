@@ -153,3 +153,30 @@ def test_existing_final_receipt_rejects_changed_record_digest(tmp_path):
         runner._publish_final_results(
             tmp_path, "a" * 64, identity, metrics, records_sha256="2" * 64
         )
+
+
+@pytest.mark.parametrize("helper", [
+    "modules/temporal_alignment.py", "modules/lidar_encoder.py", "modules/new_helper.py",
+])
+def test_model_helper_changes_invalidate_resumed_evaluation(tmp_path, monkeypatch, helper):
+    # Only the helper changes: checkpoint/config/token set remain the same.
+    # A future helper must be discovered without editing an evaluator file list.
+    source_root = tmp_path / "source"
+    for relative in runner.SOURCE_PATHS:
+        path = source_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original source\n")
+    helper_path = source_root / "navsim/agents/para_ssr" / helper
+    helper_path.parent.mkdir(parents=True, exist_ok=True)
+    helper_path.write_text("original helper\n")
+    monkeypatch.setattr(runner, "REPO_ROOT", source_root)
+    manifest = tmp_path / "manifest.json"
+    before = {"sources": runner._source_hashes()}
+    runner._write_or_validate_manifest(manifest, before)
+    assert runner._write_or_validate_manifest(manifest, before)
+
+    helper_path.write_text("changed inference behavior\n")
+    after = {"sources": runner._source_hashes()}
+    assert before != after
+    with pytest.raises(RuntimeError, match="another auxiliary evaluation"):
+        runner._write_or_validate_manifest(manifest, after)

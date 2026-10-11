@@ -193,6 +193,7 @@ teacher_det_run / kd_calib / io_dir / _ck_sets; teachers.json `forecaster_equals
 - **launch 02:47 KST** `RUN=ck2e2e_v3T CK2_E2E_APPROVED=1 E2E_CK_SET=…/v3teacher_arm.set train_e2e2.sh start --gpus 0,1`
   (wandb online). overrides = dry run과 동일 (diff 0); ck2e2e_main 대비 차이 = teacher_det_run, kd_calib.det, run 경로뿐.
   teachers.json det ckpt sha16 43cda8bc5210fe67, ep_target official, kd_objects pack d004c23d… same_as_teacher_training true.
-- 속도: epoch 0 1.43 it/s × 10,639 step → epoch ≈ 2.1 h, 30 epoch ≈ 62 h (예상 종료 10/14 오후–저녁 KST).
+- 속도: epoch 0 step 132 1.43 it/s, step 612 1.71 it/s (main 같은 구간 1.84–1.97 it/s, 약 1.1배 느림). main 52.6 h 기준
+  55–62 h → 예상 종료 10-14 10:00–17:00 KST.
 - 학습 중 online2.py / e2e_data2.py / model.py / temporal/** 수정 금지.
 - Step 1 판정은 STEP1_RESULT.md (진단상 NO-GO; 이 run은 user 지시로 GO 여부와 무관하게 진행).

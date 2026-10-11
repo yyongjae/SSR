@@ -1,6 +1,6 @@
 # refiner-v3 Step 1 결과 — temporal DET teacher arm a/b/c 판정
 
-작성: 2026-10-12 03:00 KST. 단일 seed 최종 판정 (user: seed ablation 하지 않음).
+작성: 2026-10-12 02:55 KST. 단일 seed 최종 판정 (user: seed ablation 하지 않음).
 산출물: `D3/decide/step1_official_refused.log` (공식 decide, REFUSED), `D3/decide/step1_diag_no_arm_check_20261012`
 (`--no-arm-check` 진단 JSON, v3_decide_4). D3 = `/home/external-user/ssd/yongjae_refiner/ck/v3`.
 

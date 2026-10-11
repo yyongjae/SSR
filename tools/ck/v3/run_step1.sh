@@ -8,6 +8,8 @@
 #   a    learned arm, critic training with the pre-trained forecaster FROZEN, 2-GPU DDP on GPUs 0,1
 #   b    analytic CA arm, 2-GPU DDP on GPUs 0,1
 #   d    (optional) GT-future oracle, PRIVILEGED, 2-GPU DDP on GPUs 0,1
+# V3_GPUS=4,5 (user 2026-10-12: GPUs 4,5 only for short jobs and only when idle) runs a / b / d on GPUs 4,5 instead;
+#   pre accepts V3_GPUS=0 | 4.  Any other list is refused.
 # Arguments come from `tools/ck/v3/arms.py cli --arm <stage>` (the single source of the arm definitions:
 # tools/ck/v3/arms/*.json = ck2T10 recipe + the temporal flags).
 # Refuses unless: V3_USER_APPROVED=1; the GPUs used are idle (< 1 GB); the K_OBJ = 96 object packs of navtrain_train /
@@ -27,7 +29,13 @@ PK=$D3/objpack_k96/bevfusion
 PY=/venv/ssr/bin/python
 ENVP="PYTHONPATH=$V3 PYTHONDONTWRITEBYTECODE=1"
 cd "$V3"
-if [ "$ARM" = pre ]; then GPUS="0"; else GPUS="0 1"; fi
+if [ "$ARM" = pre ]; then CVD=${V3_GPUS:-0}; else CVD=${V3_GPUS:-0,1}; fi
+if [ "$ARM" = pre ]; then
+  case "$CVD" in 0|4) ;; *) echo "refusing: V3_GPUS='$CVD' for pre (0 or 4)"; exit 2 ;; esac
+else
+  case "$CVD" in 0,1|4,5) ;; *) echo "refusing: V3_GPUS='$CVD' (0,1 or 4,5)"; exit 2 ;; esac
+fi
+GPUS=${CVD//,/ }
 for g in $GPUS; do
   used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g" | tr -d ' ')
   [ "$used" -lt 1024 ] || { echo "refusing: GPU $g uses ${used} MiB (needs < 1024)"; exit 3; }
@@ -55,29 +63,29 @@ fi
 mkdir -p "$D3/train"
 TGZ="$D3/train/$NAME.code.tgz"
 [ -f "$TGZ" ] || tar czf "$TGZ" --exclude=__pycache__ -C "$V3" navsim tools docs/refiner_v3
-env $ENVP $PY -B - "$D3/train/$NAME.launch.json" "$TGZ" "$ARM" "$ARGS" <<'EOF'
+env $ENVP $PY -B - "$D3/train/$NAME.launch.json" "$TGZ" "$ARM" "$ARGS" "$CVD" <<'EOF'
 import hashlib, json, os, sys, time
 sys.path.insert(0, "/workspace/yongjae/SSR-v3")
 from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
 from tools.ck.v3 import provenance as PV
-out, tgz, arm, args = sys.argv[1:5]
+out, tgz, arm, args, gpus = sys.argv[1:6]
 rec = json.load(open(out)) if os.path.isfile(out) else {"launches": []}
 prov = PV.run_provenance(TemporalCfg(on=True, forecaster="ca", n_modes=1), splits=["navtrain_train", "navtrain_val"])
 rec["launches"].append(dict(kst=time.strftime("%Y-%m-%d %H:%M:%S KST", time.gmtime(time.time() + 9 * 3600)), arm=arm,
-                            args=args, code_tgz=tgz, code_tgz_sha256=PV.sha256_file(tgz), provenance=prov))
+                            args=args, gpus=gpus, code_tgz=tgz, code_tgz_sha256=PV.sha256_file(tgz), provenance=prov))
 json.dump(rec, open(out, "w"), indent=1)
 print("[run_step1] train-code sha", prov["code"]["train"]["sha256"][:16], "worktree", prov["code"]["worktree"].get("sha256", "")[:16])
 EOF
-echo "[run_step1] $(TZ=Asia/Seoul date '+%F %T KST') stage $ARM -> $D3/train/$NAME"
+echo "[run_step1] $(TZ=Asia/Seoul date '+%F %T KST') stage $ARM (GPUs $CVD) -> $D3/train/$NAME"
 if [ "$ARM" = pre ]; then
   echo "[run_step1] pretrain_forecaster.py $ARGS"
   # shellcheck disable=SC2086
-  setsid nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$V3" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  setsid nohup env CUDA_VISIBLE_DEVICES="$CVD" PYTHONPATH="$V3" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
     nice -n 10 $PY -B tools/ck/v3/pretrain_forecaster.py $ARGS > "$D3/train/$NAME.launch.log" 2>&1 < /dev/null &
 else
   echo "[run_step1] train_ck2.py $ARGS"
   # shellcheck disable=SC2086
-  setsid nohup env CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH="$V3" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  setsid nohup env CUDA_VISIBLE_DEVICES="$CVD" PYTHONPATH="$V3" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
     nice -n 10 /venv/ssr/bin/torchrun --standalone --nproc_per_node=2 tools/ck/train_ck2.py $ARGS \
     > "$D3/train/$NAME.launch.log" 2>&1 < /dev/null &
 fi

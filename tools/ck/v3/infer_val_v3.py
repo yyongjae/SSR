@@ -8,7 +8,7 @@ runs (arms a / b / d) and temporal-off runs (arm c = ck2/train/ck2T10).
       [--which last] [--out D3/infer/<run name>] [--allow-privileged] [--device cuda] [--batch 8] [--workers 6]
   CPU check (no GPU): CUDA_VISIBLE_DEVICES= ... --device cpu --limit 64 --out /tmp/...
 
-GPU: only GPU 0 or 1 (CUDA_VISIBLE_DEVICES must be exactly "0" or "1"); GPUs 2-7 are refused.  Run by the main
+GPU: only GPU 0, 1, 4 or 5 (CUDA_VISIBLE_DEVICES exactly one of them; 4 / 5 user 2026-10-12, short jobs, idle only).  Run by the main
 session after training (~4 min per arm [추정 from ck2T10's 207 s]); builders run it on CPU only.
 
 Inputs: every packed navtrain_val row (18,179), CKDataset(bev 'T', k 16, labels None, gt False, objects =
@@ -143,8 +143,8 @@ def save_npy(path: Path, arr) -> None:
 def device_guard(device: str) -> None:
     if device.startswith("cuda"):
         cv = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if cv not in ("0", "1"):
-            raise SystemExit(f"cuda inference only on GPU 0 or 1 (CUDA_VISIBLE_DEVICES='0' or '1'), got {cv!r}")
+        if cv not in ("0", "1", "4", "5"):        # 4 / 5: user 2026-10-12, short jobs only and only when idle
+            raise SystemExit(f"cuda inference only on GPU 0, 1, 4 or 5 (CUDA_VISIBLE_DEVICES one of them), got {cv!r}")
     elif device != "cpu":
         raise SystemExit(f"--device {device!r}: cuda | cpu")
 

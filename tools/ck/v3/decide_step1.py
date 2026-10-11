@@ -9,9 +9,10 @@
 
 CPU only, read-only on every input, writes only --out (default D3/decide/step1.json; D3 =
 /home/external-user/ssd/yongjae_refiner/ck/v3).  navtest is never read.  Each --a/--b/--c/--d is an infer dir of
-tools/ck/v3/infer_val_v3.py (prob16 [N,16,5], prob80 [N,80,5], done [N], infer_meta.json; N = 18,179 packed
-navtrain_val rows).  Arm (c) must be a FRESH r34 dump of ck2T10 (infer_val_v3.py --run ck2/train/ck2T10): the
-sd_plugin ck2T10 dump is on SafeDrive candidates (its own-DAC top-16 PDMS is 82.78, not ck2T10's 90.32) [실측].
+tools/ck/v3/infer_val_v3.py (prob16 [N,16,5], prob80 [N,80,5], done [N], infer_meta.json, cache_key.json; N =
+18,179 packed navtrain_val rows).  Arm (c) must be a FRESH r34 dump of ck2T10 (infer_val_v3.py --run
+ck2/train/ck2T10): the sd_plugin ck2T10 dump is on SafeDrive candidates (its own-DAC top-16 PDMS is 82.78, not
+ck2T10's 90.32) [실측].
 
 Protocol (all arms, ckpt_last, navtrain_val r34 top-16, no best-epoch selection):
   decision PDMS  p = arm prob16 with p_dac FROZEN = lead_remedy/infer/ck2T/prob16[..., 1] (the ck2T10 recipe does not
@@ -29,11 +30,13 @@ Protocol (all arms, ckpt_last, navtrain_val r34 top-16, no best-epoch selection)
                  log p_nc + log p_ttc strictly higher for the parent (A_novelty cv_st_baseline.py 435-467).  Paired
                  CI: log-cluster bootstrap of the per-pair indicator difference.
 GO iff all (SPEC 8, as revised by the main session's review decision D4, 2026-10-11 KST):
-  G1  Delta PDMS (a - b) >= +0.20 and its CI lower bound > 0.  ONE seed per arm: the CI covers token / log sampling,
-      NOT training-seed noise (recorded in the output); if |Delta - 0.20| <= 0.15 the output says a second seed of
-      (a) and (b) is to be run before the decision is final (second_seed_required).  Reported next to G1 (not
-      gating): the same delta on the full-history subset and split by past-frame cache source (review causality
-      findings 2, 3).
+  G1  Delta PDMS (a - b) >= +0.20 and its CI lower bound > 0.  ONE seed per arm and the decision is FINAL on it
+      (user decision 2026-10-11: no seed ablation; output field seed_policy).  The CI covers token / log sampling,
+      NOT training-seed noise.  If |Delta - 0.20| <= 0.15 while G2-G4 pass (only then could G1 alone flip the
+      decision), the output carries the warning near_threshold = "single seed; delta within 0.15 of the threshold ->
+      low confidence" (gates.G1.within_band is the raw band test); the decision text is unchanged.  Reported next
+      to G1 (not gating): the same delta on the full-history subset and split by past-frame cache source (review
+      causality findings 2, 3).
   G2  lead-decel TTC AUC of (a) >= .855 (absolute) -- plus the paired deltas (a) - (b), (a) - (c) with log-cluster
       bootstrap CIs and the (b), (c) values next to the threshold (reported, not gating)
   G3  lead-decel NC|TTC fail of (a) <= 6.97 % (absolute) -- plus (a) - (b), (a) - (c) with CIs (reported)
@@ -46,13 +49,25 @@ the clean val object pack, when built), forecast metrics of (a) vs CA when the i
 Arm checks (refuse unless --no-arm-check, which marks the result valid_for_decision = false): infer_meta split
 navtrain_val, which last, r34 candidates (cand_sha16 of packed cand.npy) and the lead_remedy variants
 (variants_sha16), temporal forecaster a learned / b ca / d oracle_gt, (c) temporal off; privileged only for (d);
-the inference reproduce check passed (infer_meta check.ok, review fix D6); PROVENANCE (review fix D5): arms a, b, d
-must share the training-code sha, K_OBJ, the train / val object-pack shas and the CA-scales sha
-(tools/ck/v3/provenance.compare on infer_meta provenance.train), arm a's forecaster must be pre-trained on the same
-train pack, and each arm's inference must have read the val pack it was trained with.  A differing worktree sha is
-a warning only.  The frozen-DAC file's token order (lead_remedy/infer/ck2T/tokens.parquet) must equal the packed
-order.
-A token set smaller than all 18,179 rows also marks the result invalid (--allow-partial to run anyway).
+the inference reproduce check passed (infer_meta check.ok, review fix D6); the checkpoint the scores came from is
+unchanged (sha16 of infer_meta ckpt recomputed == ckpt_sha16; tooling fix F2, 2026-10-11); the dump carries the
+inference cache key (infer_meta cache_key == <dir>/cache_key.json, consistent with ckpt / which / temporal and the
+current cand / variants shas; F2).  LEGACY dumps without a cache key (written before F2, e.g. the arm-(c) dump
+D3/infer/ck2T10) are accepted only if ONE inference session computed every row (sessions == 1, its n == n_done ==
+n_rows: no row can come from an earlier session with other inputs) and the ckpt / cand / variants checks above pass;
+they are marked in step1.json (inputs.<arm>.cache.mode 'legacy', legacy_dumps, a note).  The run the scores came
+from has finished (<meta run>/done.json exists: ckpt_last is the final checkpoint; review 2, 2026-10-12).
+PROVENANCE (review fix D5): arms a, b, d must share the training-code sha, K_OBJ, the train / val object-pack shas
+and the CA-scales sha (tools/ck/v3/provenance.compare on infer_meta provenance.train), arm a's forecaster must be
+pre-trained on the same train pack, and each arm's inference must have read the val pack it was trained with.  A
+differing worktree sha is a warning only.  FORWARD CODE (review 2 finding 1, 2026-10-12): every arm with a cache key
+must have been scored by the same forward code (cache_key code.sha256) and precision (cache_key amp) -- an error
+listing the differing files; a legacy dump's recorded code_sha256 (MODEL_FILES, without infer_val_v3.py) and amp are
+compared with the first keyed arm's (a, b, d, c order) -- a warning.  The frozen-DAC file's token order
+(lead_remedy/infer/ck2T/tokens.parquet) must equal the packed order.
+A token set smaller than all 18,179 rows also marks the result invalid (--allow-partial to run anyway), and so does a
+bootstrap other than the pre-registered n_boot 2,000 / seed 0 (review 2 finding 2: diagnostic, never final).
+Forecast metrics (fc_metrics.json, descriptive) covering fewer rows than the dump's done rows are noted.
 """
 from __future__ import annotations
 
@@ -95,16 +110,28 @@ LBL = {k: i for i, k in enumerate(("nc", "dac", "ep", "ttc", "comfort", "ddc", "
                                    "pdm_progress_eff"))}
 PK = {k: i for i, k in enumerate(("nc", "dac", "ep", "ttc", "comfort"))}      # CK_KEYS order of prob16 / prob80
 N_BOOT, SEED = 2000, 0
-GO_RULE = {"G1": {"pair": "a-b", "min_delta_pdms": 0.20, "ci_lo_gt": 0.0, "second_seed_band": 0.15,
-                  "note": "one seed per arm: seed noise not covered by the CI; a second seed of (a) and (b) is run "
-                          "if |Delta - 0.20| <= 0.15 (main-session decision D4)"},
+SEED_POLICY = "single seed (user decision 2026-10-11)"
+NEAR_THRESHOLD_MSG = "single seed; delta within 0.15 of the threshold -> low confidence"
+GO_RULE = {"G1": {"pair": "a-b", "min_delta_pdms": 0.20, "ci_lo_gt": 0.0, "near_threshold_band": 0.15,
+                  "note": "one seed per arm and the decision is final on it (user decision 2026-10-11: no seed "
+                          "ablation); the CI covers log / token sampling, not training-seed noise; |Delta - 0.20| <= "
+                          "0.15 with G2-G4 passing is reported as near_threshold (low confidence), not re-run"},
            "G2": {"arm": "a", "min_lead_ttc_auc": 0.855, "report": ["a-b", "a-c"]},
            "G3": {"arm": "a", "max_lead_ncttc_fail_pct": 6.97, "report": ["a-b", "a-c"]},
            "G4": {"pair": "a-c", "min_delta": -0.01, "min_ci_lo": -0.03, "report": ["a-b"],
                   "note": "pre-registered non-inferiority (main-session decision D4)"}}
 PAIRS = ("a-b", "b-c", "a-c", "d-b", "d-a")
 EXPECT_FORECASTER = {"a": "learned", "b": "ca", "d": "oracle_gt"}
-VERSION = "v3_decide_2"          # 2: review fixes D4 (gates), D5 (provenance), D6 (check)
+VERSION = "v3_decide_4"          # 2: review fixes D4 (gates), D5 (provenance), D6 (check); 3: single-seed final
+#                                  decision + near_threshold (F1), ckpt / cache-key checks + legacy dumps (F2);
+#                                  4: forward-code check between arms, finished-run check, non-pre-registered
+#                                  bootstrap = invalid, fc_metrics coverage note (review 2, 2026-10-12)
+CACHE_KEY_PREFIX = "v3_infer_cache"            # tools/ck/v3/infer_val_v3.CACHE_KEY_VERSION
+INFER_SCRIPT = "tools/ck/v3/infer_val_v3.py"   # excluded from the legacy code comparison (changed by F2 itself)
+CODE_ORDER = ("a", "b", "d", "c")              # reference arm of the forward-code check = first keyed arm
+LEGACY_RULE = ("dump without cache_key (infer_val_v3 before tooling fix F2, 2026-10-11): accepted only if ONE "
+               "inference session computed every row (sessions == 1, n == n_done == n_rows) and the recorded ckpt "
+               "sha16 / cand_sha16 / variants_sha16 equal the files now")
 KST = 9 * 3600
 
 
@@ -286,6 +313,8 @@ def load_infer(d: Path) -> Dict:
     out["prob16_sha16"] = sha16(d / "prob16.npy") if (d / "prob16.npy").is_file() else None
     fm = d / "fc_metrics.json"
     out["fc_metrics"] = json.load(open(fm)) if fm.is_file() else None
+    ck = d / "cache_key.json"                      # tooling fix F2: the key the rows were computed under
+    out["cache_key_file"] = json.load(open(ck)) if ck.is_file() else None
     if (d / "tokens.parquet").is_file():
         import pandas as pd
         out["tokens"] = pd.read_parquet(d / "tokens.parquet").token.astype(str).to_numpy()
@@ -342,8 +371,61 @@ def load_data(done: np.ndarray) -> Data:
 
 
 # ----------------------------------------------------------------------------------------------- arm checks
-def check_arm_meta(key: str, meta: Dict, ref: Optional[Dict] = None) -> List[str]:
-    """Problems (empty = ok) of an infer_meta.json for arm key a / b / c / d (module docstring)."""
+def cache_mode(meta: Dict) -> str:
+    """'cache_key' for dumps written by infer_val_v3 with the F2 cache key, else 'legacy'."""
+    return "cache_key" if isinstance(meta.get("cache_key"), dict) else "legacy"
+
+
+def ckpt_problems(key: str, meta: Dict) -> List[str]:
+    """F2: the checkpoint file the scores came from must be unchanged since the inference (sha16 recomputed)."""
+    ck, rec = meta.get("ckpt"), meta.get("ckpt_sha16")
+    if not ck or not rec:
+        return [f"arm {key}: infer_meta has no ckpt / ckpt_sha16"]
+    if not Path(ck).is_file():
+        return [f"arm {key}: ckpt {ck} missing (cannot verify the weights the scores came from)"]
+    now = sha16(ck)
+    if now != rec:
+        return [f"arm {key}: ckpt {ck} sha16 is now {now}, the inference recorded {rec} (scores are of other weights)"]
+    return []
+
+
+def cache_problems(key: str, meta: Dict, ref: Optional[Dict] = None,
+                   cache_key_file: Optional[Dict] = None) -> List[str]:
+    """F2: with a cache key, it must be the one in the dir and agree with the meta / current reference shas; without
+    one (legacy dump), the rows must come from a single complete session (LEGACY_RULE)."""
+    ck = meta.get("cache_key")
+    if isinstance(ck, dict):
+        bad = []
+        if not str(ck.get("version", "")).startswith(CACHE_KEY_PREFIX):
+            bad.append(f"cache_key version {ck.get('version')!r}")
+        if str(ck.get("ckpt_sha256") or "")[:16] != meta.get("ckpt_sha16"):
+            bad.append(f"cache_key ckpt {str(ck.get('ckpt_sha256'))[:16]} != meta ckpt_sha16 {meta.get('ckpt_sha16')}")
+        for k in ("which", "temporal"):
+            if ck.get(k) != meta.get(k):
+                bad.append(f"cache_key {k} {ck.get(k)!r} != meta {meta.get(k)!r}")
+        if ref is not None:
+            if str((ck.get("packed") or {}).get("cand.npy") or "")[:16] != ref.get("cand_sha16"):
+                bad.append(f"cache_key cand.npy sha != current {ref.get('cand_sha16')}")
+            if str(ck.get("variants_sha256") or "")[:16] != ref.get("variants_sha16"):
+                bad.append(f"cache_key variants sha != current {ref.get('variants_sha16')}")
+        if cache_key_file is None:
+            bad.append("cache_key.json missing in the infer dir")
+        elif cache_key_file != ck:
+            bad.append("cache_key.json in the infer dir != infer_meta cache_key (the dir was changed after this meta)")
+        return [f"arm {key}: {b}" for b in bad]
+    s = meta.get("sessions") or []
+    n_rows, n_done = meta.get("n_rows"), meta.get("n_done")
+    if not (len(s) == 1 and n_rows and s[0].get("n") == n_done == n_rows):
+        return [f"arm {key}: no cache_key (dump written before tooling fix F2) and not a single complete inference "
+                f"session (sessions {[x.get('n') for x in s]}, n_done {n_done}, n_rows {n_rows}): rows may come from "
+                f"an earlier session with other inputs; rerun infer_val_v3.py into a new --out"]
+    return []
+
+
+def check_arm_meta(key: str, meta: Dict, ref: Optional[Dict] = None,
+                   cache_key_file: Optional[Dict] = None) -> List[str]:
+    """Problems (empty = ok) of an infer_meta.json for arm key a / b / c / d (module docstring).  Hashes the
+    checkpoint named in the meta (F2)."""
     bad = []
     t = meta.get("temporal") or {}
     on = bool(t.get("on"))
@@ -379,6 +461,12 @@ def check_arm_meta(key: str, meta: Dict, ref: Optional[Dict] = None) -> List[str
             vi = (((inf.get("data") or {}).get("packs") or {}).get(SPLIT) or {}).get("build_sha256")
             if vt is None or vt != vi:
                 bad.append(f"arm {key}: inference read val pack {vi} but the run was trained / evaluated with {vt}")
+    run = meta.get("run")
+    if run and not (Path(run) / "done.json").is_file():
+        bad.append(f"arm {key}: run {run} has no done.json (training not finished: ckpt_last is not the final "
+                   f"checkpoint)")
+    bad += ckpt_problems(key, meta)
+    bad += cache_problems(key, meta, ref, cache_key_file)
     return bad
 
 
@@ -387,6 +475,62 @@ def provenance_check(raw: Dict[str, Dict]) -> Dict[str, List[str]]:
     from tools.ck.v3 import provenance as PV
     provs = {k: ((r["meta"].get("provenance") or {}).get("train") or {}) for k, r in raw.items() if k in ("a", "b", "d")}
     return PV.compare(provs)
+
+
+def _file_diff(f1: Dict, f2: Dict, skip=()) -> List[str]:
+    """files whose (sha16-truncated) hashes differ or that only one side has."""
+    return sorted(f for f in set(f1) | set(f2) if f not in skip
+                  and str(f1.get(f, "<absent>"))[:16] != str(f2.get(f, "<absent>"))[:16])
+
+
+def code_check(raw: Dict[str, Dict]) -> Dict:
+    """review 2 finding 1: the forward code (and precision) the scores were computed with must be the same for every
+    arm with a cache key (errors naming the differing files of cache_key code.files); a legacy dump's recorded
+    code_sha256 (MODEL_FILES, minus infer_val_v3.py, which F2 itself changed) and amp are compared with the reference
+    arm (the first keyed arm in CODE_ORDER) -- warnings, since a legacy dump never recorded its full closure."""
+    errors, warnings = [], []
+    metas = {k: r["meta"] for k, r in raw.items()}
+    keyed = [k for k in CODE_ORDER if k in metas and cache_mode(metas[k]) == "cache_key"]
+    out = {"errors": errors, "warnings": warnings, "ref": keyed[0] if keyed else None,
+           "sha256": {k: ((metas[k].get("cache_key") or {}).get("code") or {}).get("sha256") for k in keyed},
+           "legacy_compared": {}}
+    if not keyed:
+        if metas:
+            warnings.append("no arm has a cache key: forward code not compared")
+        return out
+    ref = keyed[0]
+    rk = metas[ref]["cache_key"]
+    rc = rk.get("code") or {}
+    if not rc.get("sha256"):
+        errors.append(f"arm {ref}: cache_key has no code.sha256")
+    for k in keyed[1:]:
+        ck_ = metas[k]["cache_key"]
+        c = ck_.get("code") or {}
+        if not c.get("sha256") or c.get("sha256") != rc.get("sha256"):
+            fd = _file_diff(rc.get("files") or {}, c.get("files") or {})
+            errors.append(f"forward code of arm {k} ({str(c.get('sha256'))[:16]}) != arm {ref} "
+                          f"({str(rc.get('sha256'))[:16]}): files differ {fd[:20]}{' ...' if len(fd) > 20 else ''}"
+                          f" (scores of the two arms come from different code: rerun the infer of both arms on one "
+                          f"code state)")
+        if ck_.get("amp") != rk.get("amp"):
+            errors.append(f"arm {k} inferred with amp {ck_.get('amp')!r}, arm {ref} with {rk.get('amp')!r}")
+    rfiles = rc.get("files") or {}
+    for k in CODE_ORDER:
+        if k not in metas or k in keyed:
+            continue
+        m = metas[k]
+        rec = {f: s for f, s in (m.get("code_sha256") or {}).items() if f != INFER_SCRIPT}
+        if not rec:
+            warnings.append(f"legacy arm {k}: no recorded code shas, forward code not compared with arm {ref}")
+            continue
+        fd = _file_diff(rec, {f: rfiles.get(f, "<absent>") for f in rec})
+        out["legacy_compared"][k] = {"files": sorted(rec), "differ": fd}
+        if fd:
+            warnings.append(f"legacy arm {k}: recorded model-code shas differ from arm {ref}'s forward code in {fd} "
+                            f"(compared: {len(rec)} files, {INFER_SCRIPT} excluded)")
+        if m.get("amp") is not None and m.get("amp") != rk.get("amp"):
+            warnings.append(f"legacy arm {k} inferred with amp {m.get('amp')!r}, arm {ref} with {rk.get('amp')!r}")
+    return out
 
 
 # ----------------------------------------------------------------------------------------------- decision
@@ -446,9 +590,12 @@ def arm_metrics(data: Data, arm: Arm) -> Tuple[Dict, Dict]:
 
 
 def decide(data: Data, arms: Dict[str, Arm], n_boot: int = N_BOOT, seed: int = SEED,
-           arm_check: Optional[Dict[str, List[str]]] = None, prov_check: Optional[Dict] = None) -> Dict:
+           arm_check: Optional[Dict[str, List[str]]] = None, prov_check: Optional[Dict] = None,
+           code_check: Optional[Dict] = None, preregistered: bool = True) -> Dict:
     """Section-8 metrics, paired deltas and the GO rule on aligned inputs (synthetic or real).  The result is
-    valid_for_decision only with arm checks run and clean (arm_check not None, no problems) on the full token set."""
+    valid_for_decision only with the arm, provenance and forward-code checks run and clean (arm_check, prov_check,
+    code_check not None, no problems), on the full token set, with the pre-registered bootstrap (preregistered: run()
+    passes n_boot == N_BOOT and seed == SEED; synthetic tests use small n_boot and leave it True)."""
     for k in ("a", "b", "c"):
         if k not in arms:
             raise ValueError(f"arm {k} missing (a, b, c required; d optional)")
@@ -490,14 +637,14 @@ def decide(data: Data, arms: Dict[str, Arm], n_boot: int = N_BOOT, seed: int = S
     g1 = deltas["a-b"]["pdms_decision"]
     g4 = deltas["a-c"]["hazard_pref"]
     R = GO_RULE
-    near = bool(abs(g1["mean"] - R["G1"]["min_delta_pdms"]) <= R["G1"]["second_seed_band"])
+    within = bool(abs(g1["mean"] - R["G1"]["min_delta_pdms"]) <= R["G1"]["near_threshold_band"])
     side = {pr: {"lead_ttc_auc": deltas[pr]["lead_ttc_auc"], "lead_fail_pp": deltas[pr]["lead_fail_pp"]}
             for pr in ("a-b", "a-c") if pr in deltas}
     gates = {
         "G1": {"value": g1["mean"], "lo": g1["lo"], "hi": g1["hi"],
                "pass": bool(g1["mean"] >= R["G1"]["min_delta_pdms"] and g1["lo"] > R["G1"]["ci_lo_gt"]),
-               "rule": "Delta PDMS (a - b) >= +0.20 and CI lo > 0 (one seed: CI excludes seed noise)",
-               "second_seed_required": near,
+               "rule": "Delta PDMS (a - b) >= +0.20 and CI lo > 0 (single seed, final: CI excludes seed noise)",
+               "within_band": within,
                "co_report": {k: deltas["a-b"].get(k) for k in ("full_history_pdms", "pdms_past_future_cache",
                                                                "pdms_past_current_only", "pdms_ncttc_only")}},
         "G2": {"value": M["a"]["lead"]["ttc_auc"],
@@ -517,10 +664,14 @@ def decide(data: Data, arms: Dict[str, Arm], n_boot: int = N_BOOT, seed: int = S
                "rule": "a-1.0 hazard pref non-inferiority vs (c): pref(a) - pref(c) >= -0.01 and CI lo >= -0.03"},
     }
     go = all(g["pass"] for g in gates.values())
+    # F1: single seed, decision final.  The near-threshold warning only where G1 alone decides (G2-G4 pass).
+    near = bool(within and all(gates[g]["pass"] for g in ("G2", "G3", "G4")))
     partial = len(data.lab) < data.n_total
     problems = {k: v for k, v in (arm_check or {}).items() if v}
     prov_bad = bool(prov_check is not None and prov_check.get("errors"))
-    valid = (arm_check is not None) and (prov_check is not None) and not problems and not prov_bad and not partial
+    code_bad = bool(code_check is not None and code_check.get("errors"))
+    valid = ((arm_check is not None) and (prov_check is not None) and (code_check is not None) and not problems
+             and not prov_bad and not code_bad and not partial and bool(preregistered))
     notes = []
     if partial:
         notes.append(f"token set {len(data.lab)} < {data.n_total} rows: not the pre-registered set")
@@ -528,10 +679,23 @@ def decide(data: Data, arms: Dict[str, Arm], n_boot: int = N_BOOT, seed: int = S
         notes.append("arm checks skipped (--no-arm-check): not a decision")
     if problems:
         notes.append(f"arm check problems: {problems}")
+    if arm_check is not None and code_check is None:
+        notes.append("forward-code check not run: not a decision")
+    if not preregistered:
+        notes.append(f"bootstrap n_boot {n_boot} / seed {seed} != the pre-registered {N_BOOT} / {SEED}: diagnostic, "
+                     f"not a decision")
+    for k, arm in sorted(arms.items()):
+        fm = arm.fc_metrics
+        nd = (arm.meta or {}).get("n_done")
+        if fm is not None and nd is not None and fm.get("n_rows") != nd:
+            notes.append(f"arm {k}: forecast metrics (fc_metrics.json, descriptive) cover {fm.get('n_rows')} rows, "
+                         f"the dump has {nd} done rows (an earlier partial session?)")
     if near:
-        notes.append(f"G1 delta {g1['mean']:+.3f} is within {R['G1']['second_seed_band']} of the +0.20 threshold: run a "
-                     f"second seed of (a) and (b) before the decision is final (D4)")
-    notes.append("single seed per arm: the G1 CI covers log / token sampling, not training-seed noise")
+        notes.append(f"near_threshold: G1 delta {g1['mean']:+.3f} is within {R['G1']['near_threshold_band']} of the "
+                     f"+0.20 threshold and G2-G4 pass: {NEAR_THRESHOLD_MSG} (the decision stays final; no second "
+                     f"seed, {SEED_POLICY})")
+    notes.append(f"seed policy: {SEED_POLICY}; the decision is final on it, and the G1 CI covers log / token "
+                 f"sampling, not training-seed noise")
     bc = deltas.get("b-c", {}).get("pdms_decision")
     if bc is not None and bc["lo"] <= 0.0:
         notes.append("(b) - (c) CI includes or is below 0: the temporal branch itself (not the forecaster) may be "
@@ -541,14 +705,22 @@ def decide(data: Data, arms: Dict[str, Arm], n_boot: int = N_BOOT, seed: int = S
             notes.append(f"provenance errors: {prov_check['errors']}")
         if prov_check.get("warnings"):
             notes.append(f"provenance warnings: {prov_check['warnings']}")
+    if code_check is not None:
+        if code_check.get("errors"):
+            notes.append(f"forward-code errors: {code_check['errors']}")
+        if code_check.get("warnings"):
+            notes.append(f"forward-code warnings: {code_check['warnings']}")
     return {"version": VERSION, "n": int(len(data.lab)), "n_total": int(data.n_total),
             "n_logs": int(len(np.unique(logs))), "n_lead": int(L.sum()),
             "n_hazard_pairs": int(M["a"]["hazard_a-1.0"]["n_pairs"]),
             "arms": M, "deltas": deltas, "gates": gates, "go": bool(go and valid),
             "decision": ("GO" if go else "NO-GO") if valid else ("INVALID (would be GO)" if go else
                                                                  "INVALID (would be NO-GO)"),
-            "valid_for_decision": bool(valid), "rule": GO_RULE, "n_boot": n_boot, "seed": seed, "notes": notes,
-            "arm_check": arm_check, "provenance_check": prov_check, "info": data.info}
+            "final": bool(valid), "seed_policy": SEED_POLICY,
+            "near_threshold": NEAR_THRESHOLD_MSG if near else None,
+            "valid_for_decision": bool(valid), "rule": GO_RULE, "n_boot": n_boot, "seed": seed,
+            "preregistered_bootstrap": bool(preregistered), "notes": notes,
+            "arm_check": arm_check, "provenance_check": prov_check, "code_check": code_check, "info": data.info}
 
 
 # ----------------------------------------------------------------------------------------------- main
@@ -596,10 +768,10 @@ def run(dirs: Dict[str, str], out: Optional[Path], arm_check: bool = True, allow
     for k, r in raw.items():
         if "tokens" in r and (len(r["tokens"]) != len(ptok) or not (r["tokens"] == ptok).all()):
             raise SystemExit(f"arm {k}: {r['dir']}/tokens.parquet order != packed {SPLIT}")
-    checks, prov = None, None
+    checks, prov, code = None, None, None
     if arm_check:
         ref = reference_shas()
-        checks = {k: check_arm_meta(k, r["meta"], ref) for k, r in raw.items()}
+        checks = {k: check_arm_meta(k, r["meta"], ref, r.get("cache_key_file")) for k, r in raw.items()}
         bad = {k: v for k, v in checks.items() if v}
         if bad:
             raise SystemExit(f"arm checks failed (use --no-arm-check for a diagnostic, invalid run): {bad}")
@@ -607,16 +779,31 @@ def run(dirs: Dict[str, str], out: Optional[Path], arm_check: bool = True, allow
         if prov["errors"]:
             raise SystemExit(f"provenance mismatch between arms (D5; --no-arm-check for a diagnostic, invalid run): "
                              f"{prov['errors']}")
+        code = code_check(raw)
+        if code["errors"]:
+            raise SystemExit(f"forward code differs between arms (review 2 finding 1; --no-arm-check for a "
+                             f"diagnostic, invalid run): {code['errors']}")
     if len(data.lab) < N_VAL and not allow_partial:
         raise SystemExit(f"only {len(data.lab)} of {N_VAL} rows evaluable (--allow-partial for a diagnostic run)")
     rows = data.rows
     arms = {k: Arm(p16=np.asarray(r["p16"], np.float64)[rows], p80=np.asarray(r["p80"], np.float64)[rows],
                    meta=r["meta"], fc_metrics=r["fc_metrics"]) for k, r in raw.items()}
-    res = decide(data, arms, n_boot, seed, arm_check=checks, prov_check=prov)
+    res = decide(data, arms, n_boot, seed, arm_check=checks, prov_check=prov, code_check=code,
+                 preregistered=bool(n_boot == N_BOOT and seed == SEED))
     res["inputs"] = {k: {"dir": r["dir"], "prob16_sha16": r["prob16_sha16"],
-                         "meta": {kk: r["meta"].get(kk) for kk in ("teacher", "run", "which", "ckpt_sha16", "temporal",
-                                                                   "privileged", "cand_sha16", "variants_sha16")}}
+                         "meta": {kk: r["meta"].get(kk) for kk in ("teacher", "run", "which", "ckpt", "ckpt_sha16",
+                                                                   "temporal", "privileged", "cand_sha16",
+                                                                   "variants_sha16", "sessions", "n_rows", "n_done",
+                                                                   "amp", "run_done")},
+                         "cache": {"mode": cache_mode(r["meta"]), "key": r["meta"].get("cache_key"),
+                                   "legacy_rule": LEGACY_RULE if cache_mode(r["meta"]) == "legacy" else None,
+                                   "checked": bool(arm_check)}}
                      for k, r in raw.items()}
+    res["legacy_dumps"] = sorted(k for k, r in raw.items() if cache_mode(r["meta"]) == "legacy")
+    if res["legacy_dumps"]:
+        res["notes"].append(f"legacy dumps {res['legacy_dumps']} (no cache_key, written before tooling fix F2): "
+                            + ("accepted under the legacy rule: " + LEGACY_RULE if arm_check else
+                               "NOT checked (--no-arm-check)"))
     res["created"] = kst()
     res["sec"] = round(time.time() - t0, 1)
     res["code_sha16"] = sha16(__file__)
@@ -627,8 +814,17 @@ def run(dirs: Dict[str, str], out: Optional[Path], arm_check: bool = True, allow
 
 def summary_lines(res: Dict) -> List[str]:
     A = res["arms"]
-    out = [f"decision: {res['decision']}  (n {res['n']}, logs {res['n_logs']}, lead {res['n_lead']}, hazard pairs "
-           f"{res['n_hazard_pairs']})"]
+    fin = f"  [final; {res.get('seed_policy', SEED_POLICY)}]" if res.get("final") else ""
+    out = [f"decision: {res['decision']}{fin}  (n {res['n']}, logs {res['n_logs']}, lead {res['n_lead']}, hazard "
+           f"pairs {res['n_hazard_pairs']})"]
+    if res.get("near_threshold"):
+        out.append(f"  WARNING near_threshold: {res['near_threshold']}")
+    cc = res.get("code_check")
+    if cc is not None:
+        out.append(f"  forward code: reference arm {cc.get('ref')}, sha16 "
+                   + ", ".join(f"{k} {str(v)[:16]}" for k, v in (cc.get("sha256") or {}).items())
+                   + "".join(f"; legacy {k} differs in {v['differ']}" if v["differ"] else f"; legacy {k} model files "
+                             f"equal" for k, v in (cc.get("legacy_compared") or {}).items()))
     for k in sorted(A):
         a = A[k]
         out.append(f"  arm {k}: PDMS {a['pdms']:.3f} (w_dac0 {a['pdms_wdac0']:.3f}, v2dac {a['pdms_v2dac']:.3f}, own "
@@ -646,8 +842,8 @@ def summary_lines(res: Dict) -> List[str]:
             extra += "  values " + ", ".join(f"{k} {x:.4f}" for k, x in sorted(v["values"].items()) if x is not None)
             extra += "  " + ", ".join(f"{pr} {d['mean']:+.4f} [{d['lo']:+.4f}, {d['hi']:+.4f}]"
                                       for pr, d in v["deltas"].items() if d)
-        if g == "G1" and v.get("second_seed_required"):
-            extra += "  SECOND SEED REQUIRED (within 0.15 of the threshold)"
+        if g == "G1" and v.get("within_band"):
+            extra += "  (within 0.15 of the threshold)"
         out.append(f"  {g} {'PASS' if v['pass'] else 'fail'}: {v['rule']} -> {v['value']:.4f}{extra}")
     for n in res.get("notes", []):
         out.append(f"  note: {n}")
@@ -670,7 +866,8 @@ def main(argv=None):
     if not str(out.resolve()).startswith(str(D3.resolve())) and not str(out.resolve()).startswith("/tmp/"):
         raise SystemExit(f"--out must be under {D3} (or /tmp for tests)")
     if a.n_boot != N_BOOT or a.seed != SEED:
-        print(f"[warn] n_boot {a.n_boot} / seed {a.seed} differ from the pre-registered {N_BOOT} / {SEED}")
+        print(f"[warn] n_boot {a.n_boot} / seed {a.seed} differ from the pre-registered {N_BOOT} / {SEED}: the "
+              f"result is a diagnostic (INVALID, never final)")
     res = run({"a": a.a, "b": a.b, "c": a.c, "d": a.d}, out, arm_check=not a.no_arm_check,
               allow_partial=a.allow_partial, n_boot=a.n_boot, seed=a.seed)
     print("\n".join(summary_lines(res)))

@@ -20,6 +20,11 @@ Contents
                                 variants of the newest generation <= max_epoch (one-epoch lag, option B); rows without
                                 one -> has False (the caller fills them with the warm-up fallback set, cands2.fill_fallback)
   ck2_warmup_prior              expected label mean of the student's warm-up mix (= ck2_dataset.ck2_label_prior, n_var 32)
+  KDObjRows / teacher_temporal  refiner-v3 temporal DET teacher (docs/refiner_v3/STEP2_E2E.md): the teacher's CLEAN causal
+                                object rows per packed row (object pack, ObjPack.item; no augmentation, no fc_* targets)
+                                -> target keys kd_obj_in_0 / kd_obj_mask_0 / kd_frame_valid_0 / kd_obj_ok_0.  Only built
+                                when the DET teacher run's config.json has temporal.on (a CK2 teacher: no new key, no
+                                file opened, batches bit-identical).
 
 EP target (ck_e2e2.ep_target, user 2026-10-08 ~20:10 KST; default EP_TARGET_DEFAULT = 'decoupled'): every conversion
 of the 9 label columns (LABEL_COLS) into the 5 CK targets goes through ep_target.ck_targets -- warm-up ck2_raw_y /
@@ -31,7 +36,8 @@ TTC / C) never sees EP.
 
 Every file / memmap / GTLoader is opened lazily per process (pid check); pickling drops them (DataLoader workers, fork or
 spawn).  No collectives.  A structurally wrong data file (shape) raises at first open; a missing / unreadable ROW never
-raises inside the builder: zeros + ck2_wu_ok False.  No torch-heavy imports (variants / decoder) here: the labeler and
+raises inside the builder: zeros + ck2_wu_ok False (exception: KDObjRows raises on a changed pack or a read error of
+a packed row -- a silently KD-off unattended run is worse than a crash).  No torch-heavy imports (variants / decoder) here: the labeler and
 the dataloader workers import this module.
 """
 from __future__ import annotations
@@ -39,6 +45,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -400,6 +407,120 @@ def wu_row(src: _WUArrays, r: int) -> Dict[str, np.ndarray]:
         return empty_wu_row()
 
 
+# ----------------------------------------------------------------------------------------------- KD object rows (v3)
+# refiner-v3 temporal DET teacher (teacher index 0 = the DET teacher, GTLoader kd_bev_0 / kd_ok_0 order): its causal
+# object rows, keyed like the trainer's model inputs (ck.temporal.config.OBJ_INPUT_KEYS) with the 'kd_' prefix and the
+# teacher index suffix.  kd_obj_ok_0 False (token without a packed row, obj_ok False) -> zeros and the
+# DET teacher's kd_ok False for the token (online2.TeacherPair2.run).
+KD_OBJ_KEYS = ("kd_obj_in_0", "kd_obj_mask_0", "kd_frame_valid_0")
+KD_OBJ_OK = "kd_obj_ok_0"
+KD_OBJ_INPUT = dict(zip(KD_OBJ_KEYS, ("obj_in", "obj_mask", "frame_valid")))      # target key -> OBJ_INPUT_KEYS name
+
+
+def teacher_temporal(run):
+    """TemporalCfg of a CK teacher run's config.json 'temporal' (no run / no config.json / no key -> off)."""
+    from .temporal.config import TemporalCfg
+    if not run:
+        return TemporalCfg()
+    cj = Path(str(run)) / "config.json"
+    if not cj.is_file():
+        return TemporalCfg()
+    return TemporalCfg.from_dict(json.loads(cj.read_text()).get("temporal"))
+
+
+def _obj_pack_cls():
+    """tools/ck/data/obj_pack.ObjPack of THIS worktree (the reader train_ck2 / infer_val_v3 use; imported only for a
+    temporal teacher).  The repo root is added to sys.path if needed; a tools package of another worktree is refused."""
+    repo = Path(__file__).resolve().parents[4]
+    if str(repo) not in sys.path:
+        sys.path.append(str(repo))
+    from tools.ck.data import obj_pack as OP
+    if Path(OP.__file__).resolve().parents[3] != repo:
+        raise ImportError(f"tools.ck.data.obj_pack from {OP.__file__}, expected the worktree {repo}")
+    return OP.ObjPack
+
+
+class KDObjRows:
+    """Causal object rows of a temporal DET teacher for the e2e training rows (SPEC refiner-v3 STEP2_E2E.md).
+
+    tcfg = the teacher's TemporalCfg (on, not privileged); packed = ck_e2e2.warmup.packed (split = its basename,
+    navtrain_train).  The pack is tools/ck/data/obj_pack.ObjPack(split, tcfg.source, tcfg.pack_root, targets=False)
+    with expect_tokens = the packed tokens (row r of the pack = packed row r = targets['ck_row']); it is opened (and
+    checked: version, source / split, complete, token order, shapes) at construction, memory-mapped lazily per process
+    and picklable (DataLoader workers).  item(r) = ObjPack.item(r) obj_in / obj_mask / frame_valid / obj_ok as torch
+    tensors (CLEAN rows: never obj_pack.augment_objects; targets=False -> the fc_* forecast targets are never opened);
+    r < 0 or r out of range (token without a packed row; strict_rows guards that rate) -> zeros + kd_obj_ok_0 False.
+    Fail-loud for unattended runs: the pack fingerprint (build.json sha256 + size / mtime of every file ObjPack maps)
+    is taken at construction and re-checked once per process before the first read (ObjPack re-opens its mmaps per
+    process without re-reading build.json); a changed / missing pack or a read error of a packed row RAISES (crashes
+    the worker -> the run) instead of silently turning the DET KD off."""
+
+    def __init__(self, tcfg, packed: PathLike):
+        if not tcfg.on:
+            raise ValueError("KDObjRows needs a temporal teacher cfg (on)")
+        if tcfg.privileged:
+            raise ValueError(f"KDObjRows: PRIVILEGED temporal teacher (forecaster {tcfg.forecaster!r}, source "
+                             f"{tcfg.source!r}) can never be a KD teacher")
+        if tcfg.forecaster == "oracle_gt":           # pragma: no cover (privileged above)
+            raise ValueError("KDObjRows: the oracle forecaster needs privileged inputs")
+        self.cfg = tcfg
+        self.packed = str(packed)
+        self.split = Path(self.packed).name
+        rm = ED.RowMap(self.packed)
+        self.pack = _obj_pack_cls()(self.split, source=tcfg.source, root=tcfg.pack_root, targets=False,
+                                    expect_tokens=np.asarray(rm.tokens))
+        from .temporal.config import D_OBJ, K_OBJ, N_FRAMES
+        self.shape = (N_FRAMES, K_OBJ, D_OBJ)
+        self.fingerprint = self._fingerprint()
+        self._pid: Optional[int] = None             # process whose first read re-checked the fingerprint
+
+    def _fingerprint(self) -> Dict[str, Any]:
+        """build.json sha256 + (size, mtime_ns) of tokens.parquet and every .npy the ObjPack memory-maps."""
+        import hashlib
+        d = Path(self.pack.dir)
+        fp: Dict[str, Any] = {"build_sha256": hashlib.sha256((d / "build.json").read_bytes()).hexdigest()}
+        for f in ["tokens.parquet"] + [f"{k}.npy" for k in getattr(self.pack, "_names", ())]:
+            st = os.stat(d / f)
+            fp[f] = (int(st.st_size), int(st.st_mtime_ns))
+        return fp
+
+    def verify(self) -> None:
+        """Re-check the pack fingerprint (RuntimeError when the pack changed / vanished since construction)."""
+        try:
+            now = self._fingerprint()
+        except OSError as e:
+            raise RuntimeError(f"KDObjRows: object pack {self.pack.dir} unreadable since the e2e start: {e}") from None
+        if now != self.fingerprint:
+            diff = sorted(k for k in set(now) | set(self.fingerprint) if now.get(k) != self.fingerprint.get(k))
+            raise RuntimeError(f"KDObjRows: object pack {self.pack.dir} changed since the e2e start ({diff}); the KD "
+                               f"objects would no longer be the checked rows")
+
+    def describe(self) -> Dict[str, Any]:
+        return {"dir": str(self.pack.dir), "split": self.split, "source": self.cfg.source, "n": int(self.pack.n),
+                "version": self.pack.build.get("version"), "status": self.pack.build.get("status"),
+                "kst_end": self.pack.build.get("kst_end"), "targets_opened": bool(self.pack.targets)}
+
+    def empty(self) -> Dict[str, torch.Tensor]:
+        F, K, Dm = self.shape
+        return {"kd_obj_in_0": torch.zeros((F, K, Dm), dtype=torch.float32),
+                "kd_obj_mask_0": torch.zeros((F, K), dtype=torch.bool),
+                "kd_frame_valid_0": torch.zeros((F,), dtype=torch.bool), KD_OBJ_OK: torch.tensor(False)}
+
+    def item(self, r: int) -> Dict[str, torch.Tensor]:
+        r = int(r)
+        if r < 0 or r >= self.pack.n:
+            return self.empty()
+        pid = os.getpid()
+        if self._pid != pid:                        # first read in this process (DataLoader worker / main)
+            self.verify()
+            self._pid = pid
+        it = self.pack.item(r)                      # a read error raises (never a silent KD-off)
+        return {"kd_obj_in_0": torch.from_numpy(np.ascontiguousarray(it["obj_in"], np.float32)),
+                "kd_obj_mask_0": torch.from_numpy(np.ascontiguousarray(it["obj_mask"], bool)),
+                "kd_frame_valid_0": torch.from_numpy(np.ascontiguousarray(it["frame_valid"], bool)),
+                KD_OBJ_OK: torch.tensor(bool(it["obj_ok"]))}
+
+
 # ----------------------------------------------------------------------------------------------- target builder
 try:
     from navsim.planning.training.abstract_feature_target_builder import AbstractTargetBuilder as _ATB
@@ -419,6 +540,9 @@ class CK2E2ETargetBuilder(_ATB):
         labels as CK targets, CK_KEYS, EP per ck_e2e2.ep_target), ck2_raw_ok bool [256], ck2_var_traj f32 [96,8,3],
         ck2_var_y f32 [96,5] (same rule), ck2_var_ok bool [96],
         ck2_var_valid bool [96] (index.npz valid, k-major), ck2_var_anchor int64 [16]
+      ONLY with a temporal DET teacher (its config.json temporal.on; refiner-v3): kd_obj_in_0 f32 [3,96,17],
+        kd_obj_mask_0 bool [3,96], kd_frame_valid_0 bool [3], kd_obj_ok_0 bool [] (KDObjRows of ck_row; CLEAN
+        causal rows of the train object pack).  A CK2 (non-temporal) DET teacher: none of these keys, nothing opened.
     Emitted for every token in every epoch (the workers do not know the epoch, NU09).
     """
 
@@ -445,6 +569,14 @@ class CK2E2ETargetBuilder(_ATB):
         self._gtl = None
         self._pid = None
         self.n_calls = 0
+        # refiner-v3: a temporal DET teacher needs its causal object rows (opened and checked here, in the main
+        # process); a CK2 teacher -> None (no key, no file: the old builder exactly)
+        self.kd_objs: Optional[KDObjRows] = None
+        if mp and teacher_temporal(mp).on:
+            raise ValueError(f"CK2E2ETargetBuilder: MAP teacher {mp} has a temporal branch (only the DET teacher may)")
+        tdet = teacher_temporal(det)
+        if tdet.on:
+            self.kd_objs = KDObjRows(tdet, self.wcfg["packed"])
 
     def __getstate__(self):
         d = self.__dict__.copy()
@@ -456,7 +588,10 @@ class CK2E2ETargetBuilder(_ATB):
 
     def check(self) -> Dict[str, Any]:
         """Open every source once (raises on a structural error); main-process sanity check."""
-        return self.src.check(len(self.rows))
+        rec = self.src.check(len(self.rows))
+        if self.kd_objs is not None:
+            rec["kd_objects"] = self.kd_objs.describe()
+        return rec
 
     def _loader(self):
         if self._gtl is None or self._pid != os.getpid():
@@ -480,6 +615,8 @@ class CK2E2ETargetBuilder(_ATB):
         out: Dict[str, torch.Tensor] = {"ck_row": torch.tensor(int(r), dtype=torch.int64)}
         out.update(self._loader().load(str(token)))       # ref_* + kd_bev_i / kd_ok_i (GTLoader rules)
         out.update(self.warmup_row(r))
+        if self.kd_objs is not None:                      # temporal DET teacher only (refiner-v3)
+            out.update(self.kd_objs.item(r))
         return out
 
 

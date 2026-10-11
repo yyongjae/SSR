@@ -522,7 +522,7 @@ to cols 6, 7 where mask (rows zeroed elsewhere). Targets untouched. Basis: in-sa
   8 tokens/rank].
 - ck2T10 ran 53,190 steps in 2.8 h [실측 critic]. Budget per arm <= 3.5 h (+25%) and <= +3 GB/GPU, checked by the
   smoke (section 5.4) before Step 1. Sequential a + b <= 7 h; inference 4 x ~4 min [추정].
-- One seed per arm (seed variance not covered; extra seeds only with user approval).
+- One seed per arm (seed variance not covered; extra seeds only with user approval). **2026-10-11 사용자 결정: seed ablation은 하지 않음.** Step-1 결정은 단일 seed로 확정(§12 D4, §12.1 F1).
 
 ## 8. Decision metrics and GO rule (pre-registered)
 
@@ -541,7 +541,8 @@ All on navtrain_val r34 top-16 (18,179 tokens, 214 logs), `ckpt_last` of each ar
   both valid (`valid96 | identity`, finite); pref = share with log p_nc + log p_ttc higher for the parent (A_novelty
   cv_st_baseline.py 435-467; 1,583 pairs [실측 A_novelty notes]). CI by `lib.boot` on paired pair indicators by log.
 - GO iff all of:
-  - G1: Delta PDMS (a - b) >= +0.20 and CI lower bound > 0.
+  - G1: Delta PDMS (a - b) >= +0.20 and CI lower bound > 0. (단일 seed, 결정 확정; |Delta - 0.20| <= 0.15이고 G2-G4가
+    통과하면 `near_threshold` 경고만 기록 -- §12 D4, §12.1 F1.)
   - G2: lead-decel TTC AUC of (a) >= .855.
   - G3: lead-decel NC|TTC fail of (a) <= 6.97%.
   - G4 (superseded by section 12 D4: non-inferiority, pref(a) - pref(c) >= -0.01 and CI lower bound >= -0.03): a-1.0
@@ -681,8 +682,18 @@ Full record (finding -> fix -> verification): `docs/refiner_v3/REVIEW_FIXES.md`;
 | D1' | singleton rule in match_targets: GT tracks first annotated after t0 never matched; matched one-keyframe tracks -> state 4 FC_SINGLE (oracle: as OBS; loss / metrics / CA scales: excluded) | objects.py, forecast.py |
 | D2 | CA Laplace scales fitted on the augmented train stream (every row x epochs 0-9, `augment_objects` seed 0) -> `D3/ca_scales.json` v3_ca_scales_2 (records source, k_obj, aug, b_clean) | fit_ca_scales.py |
 | D3 | forecaster pre-training stage `pre` (`tools/ck/v3/pretrain_forecaster.py`, forecast loss only, train split, own dir `D3/train/v3fc_pre_learned6`); arm (a) loads it (`--t-fc-init`) and keeps it FROZEN (`TemporalCfg.fc_train = 'frozen'`, default): no forecast-loss term, no gradient, one optimiser group, same trainable count as (b). `fc_train 'joint'` = optional fine-tuning | config.py, branch.py, train_ck2.py |
-| D4 | G1 unchanged (single seed; second seed if abs(Delta - 0.20) <= 0.15); G2 / G3 absolute + paired (a) - (b), (a) - (c) deltas with log-cluster CIs; G4 non-inferiority vs (c): Delta >= -0.01 and CI lo >= -0.03 (vs (b) reported) | decide_step1.py |
+| D4 | G1 unchanged (single seed). ~~second seed if abs(Delta - 0.20) <= 0.15~~ → **2026-10-11 사용자 결정(seed ablation 없음)으로 변경: 결정은 단일 seed로 확정(final). abs(Delta - 0.20) <= 0.15 이고 G2-G4가 모두 통과하면 경고 필드 `near_threshold` = "single seed; delta within 0.15 of the threshold -> low confidence" (낮은 신뢰도 표시일 뿐 결론은 그대로); `seed_policy` = "single seed (user decision 2026-10-11)"**; G2 / G3 absolute + paired (a) - (b), (a) - (c) deltas with log-cluster CIs; G4 non-inferiority vs (c): Delta >= -0.01 and CI lo >= -0.03 (vs (b) reported) | decide_step1.py |
 | D5 | provenance (training-code sha, worktree diff sha, pack / ca_scales / forecaster shas) in every run's config.json and infer_meta.json; decide refuses arms whose code / data differ; run_step1 writes a code tarball | provenance.py, train_ck2.py, infer_val_v3.py, decide_step1.py, run_step1.sh |
 | D6 | infer reproduce check: per-token logits vs the trainer's saved last r34 eval (q99.9 of abs(dlogit) <= 2e-4, <= 0.1 % flipped picks), reported (decide requires it), never an exit | infer_val_v3.py, train_ck2.py |
 | D7 | runtime x1.3-1.45 per step accepted (about 4 h per arm on 2 GPUs) | - |
 | D8 | fresh arm-(c) dump `D3/infer/ck2T10` (pdms_ck_noim 0.9032467603683472 = val_metrics exactly) | - |
+
+### 12.1 Tooling fixes 2026-10-11 (F1-F4; 적대적 검증으로 확인된 결함, 기록: `docs/refiner_v3/REVIEW_FIXES.md` §5)
+
+| id | 변경 | where |
+|---|---|---|
+| F1 | 단일 seed 결정 확정 (사용자 결정 2026-10-11, seed ablation 없음): `second_seed_required` 삭제, `near_threshold` 경고 (abs(Delta - 0.20) <= 0.15 이고 G2-G4 pass일 때만), `seed_policy`, `final`; decision 텍스트는 GO / NO-GO / INVALID 그대로 (`v3_decide_3`) | decide_step1.py |
+| F2 | infer cache key (`<out>/cache_key.json`: ckpt sha256, which, packed / variants sha, temporal cfg, 정밀도, val pack / ca_scales / fc_init sha, forward 코드 sha): done 행이 있는 `--out`에 다른 키나 키 없음 → 거부. decide: meta ckpt 재해시 == ckpt_sha16, cache_key 필수 (meta == 폴더 파일, 현재 cand / variants와 일치). F2 이전 덤프(arm c `D3/infer/ck2T10`)는 단일 완전 세션 + ckpt / cand / variants 일치일 때만 legacy로 허용, step1.json에 표시 | infer_val_v3.py, decide_step1.py |
+| F3 | forecaster pre-training resume: batch / n_train / steps_per_epoch / total_steps를 config.json과 ckpt_last.pt에 기록, 다르면 재개 거부 | pretrain_forecaster.py |
+| F4 | object pack 빌드 재개: part_key에 입력 fingerprint (provenance - git head, MATCH_GATE_M, FC_T, N_FRAMES, GT manifest sha) 포함, worker init / assembly에서도 검사, build.json에 inputs_sha256 기록; 기존 complete pack은 그대로 로드 | build_obj_pack.py |
+| R2 (2026-10-12, F1-F4 리뷰 후속) | decide: cache key가 있는 arm끼리 forward 코드 sha와 정밀도(amp)가 같아야 함(다르면 거부, 다른 파일 나열), legacy arm (c)는 기록된 MODEL_FILES sha를 비교해 경고; meta의 run에 done.json 필수(학습 완료); n_boot 2,000 / seed 0이 아니면 INVALID(final 아님); fc_metrics 행 수 != n_done이면 note (`v3_decide_4`). infer: `--which last`는 done.json 필수(`--allow-unfinished`는 점검용), 로드 전후 ckpt sha 비교, 기본 `--out`은 last가 아니면 `<run>_<which>`, fc_metrics는 같은 키 재개 시 합산 | decide_step1.py, infer_val_v3.py |

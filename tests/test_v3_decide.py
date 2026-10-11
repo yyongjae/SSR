@@ -97,6 +97,7 @@ def probs_picking(data, pick, g, sharp=0.97):
 
 
 PROV_OK = {"errors": [], "warnings": []}
+CODE_OK = {"errors": [], "warnings": [], "ref": "a", "sha256": {}, "legacy_compared": {}}
 
 
 # ----------------------------------------------------------------------------------------------- unit
@@ -122,7 +123,7 @@ def test_auc_boot_matches_roc_auc_and_brute_force():
     assert (same["mean"], same["lo"], same["hi"]) == (0.0, 0.0, 0.0)
 
 
-def test_decide_d4_reports_and_second_seed_flag():
+def test_decide_d4_reports_and_band_flag():
     data, arms, exp = designed()
     res = DS.decide(data, arms, n_boot=200, arm_check={"a": [], "b": [], "c": []}, prov_check=PROV_OK)
     g = res["gates"]
@@ -131,19 +132,78 @@ def test_decide_d4_reports_and_second_seed_flag():
     for pr in ("a-b", "a-c"):
         d = g["G2"]["deltas"][pr]
         assert d["lo"] <= d["mean"] <= d["hi"]
-    assert g["G1"]["second_seed_required"] == bool(abs(exp.mean() - 0.20) <= 0.15)
+    assert g["G1"]["within_band"] == bool(abs(exp.mean() - 0.20) <= 0.15)
+    assert "second_seed_required" not in g["G1"]                        # F1: no second-seed semantics any more
     assert any("single seed" in s for s in res["notes"])
+    assert not any("second seed of" in s for s in res["notes"])
     assert "pdms_ncttc_only" not in res["deltas"]["a-b"]                 # no ck2T probabilities in the synthetic world
-    # the G1 band: a designed delta right at the threshold flags a second seed
+    # a zero delta is outside the band
     r2 = DS.decide(data, {**arms, "b": arms["a"]}, n_boot=100, arm_check={"a": [], "b": [], "c": []},
                    prov_check=PROV_OK)
-    assert r2["gates"]["G1"]["value"] == 0.0 and r2["gates"]["G1"]["second_seed_required"] is False
+    assert r2["gates"]["G1"]["value"] == 0.0 and r2["gates"]["G1"]["within_band"] is False
     # provenance errors make the result invalid
     r3 = DS.decide(data, arms, n_boot=100, arm_check={"a": [], "b": [], "c": []},
                    prov_check={"errors": ["code differs"], "warnings": []})
     assert not r3["valid_for_decision"] and r3["decision"].startswith("INVALID")
     r4 = DS.decide(data, arms, n_boot=100, arm_check={"a": [], "b": [], "c": []}, prov_check=None)
     assert not r4["valid_for_decision"]
+
+
+def near_world(d_pdms: float, ttc_ranker: bool = True, seed: int = 11):
+    """G2-G4 pass by construction, G1 delta = 10 x d_pdms with CI lo > 0: 120 tokens / 12 logs, candidate 15 TTC-unsafe
+    everywhere (p_ttc perfect ranker in every arm -> lead TTC AUC 1.0, no unsafe pick -> lead fail 0 %), c = b, a picks
+    candidate 1 (pdms + d_pdms) instead of 0 on one token per log.  ttc_ranker False: a's p_ttc constant (AUC .5)."""
+    data = world(seed=seed)
+    n = len(data.lab)
+    nc = np.ones((n, 16))
+    ttc = np.ones((n, 16))
+    ttc[:, 15] = 0.0
+    pdms = np.full((n, 16), 0.5)
+    gain = np.arange(12)                                           # tokens 0..11: one per log (log i % 12)
+    pdms[gain, 1] += d_pdms
+    data.lab = lab_of(nc, ttc, pdms)
+
+    def arm(pick, ranker=True):
+        p = np.full((n, 16, 5), 0.5)
+        p[..., DS.PK["nc"]] = 0.6
+        p[np.arange(n), pick, DS.PK["nc"]] = 0.97
+        p[..., DS.PK["ttc"]] = np.where(ttc < 1, 0.1, 0.9) if ranker else 0.5
+        return DS.Arm(p, np.full((n, 80, 5), 0.5))
+
+    pick_b = np.zeros(n, np.int64)
+    pick_a = pick_b.copy()
+    pick_a[gain] = 1
+    return data, {"a": arm(pick_a, ttc_ranker), "b": arm(pick_b), "c": arm(pick_b)}
+
+
+def test_single_seed_decision_final_and_near_threshold():
+    """F1 (user decision 2026-10-11, no seed ablation): GO / NO-GO is final on the single seed; near_threshold is a
+    warning only, set iff |delta - 0.20| <= 0.15 AND G2-G4 pass; the decision text never mentions a second seed."""
+    ac = {"a": [], "b": [], "c": []}
+    cases = ((0.03, True, "GO", True), (0.10, True, "GO", False), (0.01, True, "NO-GO", True),
+             (0.03, False, "NO-GO", False))
+    for d, ranker, want, near in cases:
+        data, arms = near_world(d, ranker)
+        r = DS.decide(data, arms, n_boot=300, arm_check=ac, prov_check=PROV_OK, code_check=CODE_OK)
+        g = r["gates"]
+        assert g["G1"]["value"] == pytest.approx(10 * d, abs=1e-9), d
+        assert g["G1"]["lo"] > 0, d
+        assert g["G3"]["pass"] and g["G4"]["pass"] and g["G2"]["pass"] == ranker, (d, ranker)
+        assert r["decision"] == want and r["go"] == (want == "GO") and r["valid_for_decision"], (d, ranker)
+        assert r["final"] is True and r["seed_policy"] == DS.SEED_POLICY
+        assert g["G1"]["within_band"] == bool(abs(10 * d - 0.20) <= 0.15)
+        assert r["near_threshold"] == (DS.NEAR_THRESHOLD_MSG if near else None), (d, ranker)
+        assert any("near_threshold" in x for x in r["notes"]) == near
+        assert not any("second seed of" in x or "before the decision is final" in x for x in r["notes"])
+        lines = DS.summary_lines(r)
+        assert lines[0].startswith(f"decision: {want}  [final; single seed (user decision 2026-10-11)]")
+        assert any(x.strip() == f"WARNING near_threshold: {DS.NEAR_THRESHOLD_MSG}" for x in lines) == near
+        assert not any("SECOND SEED" in x for x in lines)
+    # an invalid run is never final, whatever the gates say
+    data, arms = near_world(0.03)
+    r = DS.decide(data, arms, n_boot=100, arm_check=None, prov_check=PROV_OK, code_check=CODE_OK)
+    assert r["decision"] == "INVALID (would be GO)" and r["final"] is False and not r["go"]
+    assert "[final" not in DS.summary_lines(r)[0]
 
 
 def test_g4_noninferiority_edges():
@@ -178,7 +238,10 @@ def test_preregistered_constants():
     assert R["G1"]["min_delta_pdms"] == 0.20 and R["G1"]["ci_lo_gt"] == 0.0 and R["G1"]["pair"] == "a-b"
     assert R["G2"]["min_lead_ttc_auc"] == 0.855 and R["G3"]["max_lead_ncttc_fail_pct"] == 6.97
     assert R["G4"]["pair"] == "a-c" and R["G4"]["min_delta"] == -0.01 and R["G4"]["min_ci_lo"] == -0.03
-    assert R["G1"]["second_seed_band"] == 0.15 and R["G2"]["report"] == ["a-b", "a-c"] == R["G3"]["report"]
+    assert R["G1"]["near_threshold_band"] == 0.15 and R["G2"]["report"] == ["a-b", "a-c"] == R["G3"]["report"]
+    assert "second_seed_band" not in R["G1"] and "no seed ablation" in R["G1"]["note"]
+    assert DS.SEED_POLICY == "single seed (user decision 2026-10-11)"
+    assert DS.NEAR_THRESHOLD_MSG == "single seed; delta within 0.15 of the threshold -> low confidence"
     assert DS.N_BOOT == 2000 and DS.SEED == 0 and DS.W_NOIM == (0.0, 0.5, 0.5, 1.0) and DS.N_VAL == 18179
     assert DS.FROZEN_DAC == DS.CK / "ck2" / "analysis" / "lead_remedy" / "infer" / "ck2T" / "prob16.npy"
 
@@ -289,7 +352,8 @@ def designed(seed=0, gain_tokens=30):
 
 def test_decide_synthetic_g1_and_identity():
     data, arms, exp = designed()
-    res = DS.decide(data, arms, n_boot=500, arm_check={"a": [], "b": [], "c": []}, prov_check=PROV_OK)
+    res = DS.decide(data, arms, n_boot=500, arm_check={"a": [], "b": [], "c": []}, prov_check=PROV_OK,
+                    code_check=CODE_OK)
     d = res["deltas"]["a-b"]["pdms_decision"]
     assert d["mean"] == pytest.approx(exp.mean(), abs=1e-12)
     ref = DS.boot(exp, data.logs, 500, 0)
@@ -391,42 +455,115 @@ def test_full_history_subset_reported():
     assert r["arms"]["a"]["full_history"]["n"] == int(data.full_hist.sum())
 
 
-def test_check_arm_meta_rules():
-    ref = {"cand_sha16": "c", "variants_sha16": "v"}
+C16, V16 = "c" * 16, "v" * 16                    # stand-ins for the sha16s of packed cand.npy / the variants
+
+
+def _fake_ckpt(tmp_path, name="ckpt_last.pt", payload=b"weights-v1"):
+    p = tmp_path / name
+    p.write_bytes(payload)
+    return p
+
+
+def _key_for(meta, ckp):
+    """an infer_val_v3-style cache key consistent with meta (cand / variants full shas start with the sha16s)."""
+    return {"version": "v3_infer_cache_1", "split": "navtrain_val", "which": meta["which"], "ckpt_name": ckp.name,
+            "ckpt_sha256": DS.sha16(ckp) + "0" * 48, "packed": {"cand.npy": meta["cand_sha16"] + "0" * 48},
+            "variants_sha256": meta["variants_sha16"] + "0" * 48, "temporal": meta["temporal"],
+            "privileged": meta["privileged"], "amp": "fp16 autocast", "data": {}, "code": {"sha256": "x"}}
+
+
+def test_check_arm_meta_rules(tmp_path):
+    ref = {"cand_sha16": C16, "variants_sha16": V16}
+    ckp = _fake_ckpt(tmp_path)
 
     def meta(on, fc=None, priv=False, **kw):
         t = {"on": on, "forecaster": fc or "learned", "privileged": priv}
         vp = {"data": {"packs": {"navtrain_val": {"build_sha256": "V"}}}}
-        return dict(split="navtrain_val", which="last", temporal=t, privileged=priv, cand_sha16="c",
-                    variants_sha16="v", check={"ok": True}, provenance={"train": vp, "infer": vp}, **kw)
+        m = dict(split="navtrain_val", which="last", temporal=t, privileged=priv, cand_sha16=C16,
+                 variants_sha16=V16, check={"ok": True}, provenance={"train": vp, "infer": vp}, ckpt=str(ckp),
+                 ckpt_sha16=DS.sha16(ckp), n_rows=18179, n_done=18179, sessions=[{"n": 18179}], **kw)
+        m["cache_key"] = _key_for(m, ckp)
+        return m
+
+    def chk(k, m, key_file="same"):
+        return DS.check_arm_meta(k, m, ref, json.loads(json.dumps(m.get("cache_key"))) if key_file == "same"
+                                 else key_file)
 
     m = meta(True, "learned")
     m["check"] = {"ok": False, "rule": "x"}
-    assert any("reproduce check" in x for x in DS.check_arm_meta("a", m, ref))           # D6: check required
+    assert any("reproduce check" in x for x in chk("a", m))                                # D6: check required
     m = meta(True, "ca")
     m["provenance"] = {"train": m["provenance"]["train"], "infer": {"data": {"packs": {"navtrain_val":
                                                                                    {"build_sha256": "OTHER"}}}}}
-    assert any("val pack" in x for x in DS.check_arm_meta("b", m, ref))                  # D5: same val pack
+    assert any("val pack" in x for x in chk("b", m))                                       # D5: same val pack
     m = meta(True, "ca")
     m["provenance"] = {}
-    assert any("provenance" in x for x in DS.check_arm_meta("b", m, ref))                # pre-fix run
+    assert any("provenance" in x for x in chk("b", m))                                     # pre-fix run
 
-    assert DS.check_arm_meta("a", meta(True, "learned"), ref) == []
-    assert DS.check_arm_meta("b", meta(True, "ca"), ref) == []
-    assert DS.check_arm_meta("c", meta(False), ref) == []
-    assert DS.check_arm_meta("d", meta(True, "oracle_gt", True), ref) == []
-    assert DS.check_arm_meta("a", meta(True, "ca"), ref)                       # wrong forecaster
-    assert DS.check_arm_meta("a", meta(False), ref)                            # off
-    assert DS.check_arm_meta("c", meta(True, "ca"), ref)                       # c must be off
-    assert DS.check_arm_meta("d", meta(True, "oracle_gt", False), ref)         # d must be privileged
-    assert DS.check_arm_meta("a", meta(True, "learned", True), ref)            # a must not be
+    assert chk("a", meta(True, "learned")) == []
+    assert chk("b", meta(True, "ca")) == []
+    assert chk("c", meta(False)) == []
+    assert chk("d", meta(True, "oracle_gt", True)) == []
+    assert chk("a", meta(True, "ca"))                                          # wrong forecaster
+    assert chk("a", meta(False))                                               # off
+    assert chk("c", meta(True, "ca"))                                          # c must be off
+    assert chk("d", meta(True, "oracle_gt", False))                            # d must be privileged
+    assert chk("a", meta(True, "learned", True))                               # a must not be
     m = meta(True, "learned")
     m["which"] = "best"
-    assert DS.check_arm_meta("a", m, ref)
+    assert chk("a", m)
     m = meta(True, "learned")
     m["cand_sha16"] = "other"                                                 # e.g. SafeDrive candidates
-    assert DS.check_arm_meta("a", m, ref)
-    assert DS.check_arm_meta("c", {"teacher": "ck2T10"}, ref)                # no shas -> refused
+    assert chk("a", m)
+    assert DS.check_arm_meta("c", {"teacher": "ck2T10"}, ref)                 # no shas -> refused
+
+
+def test_check_arm_meta_ckpt_and_cache_key(tmp_path):
+    """F2: the ckpt is re-hashed; the cache key must exist in meta AND in the dir, equal, and agree with the meta and
+    the current reference shas."""
+    ref = {"cand_sha16": C16, "variants_sha16": V16}
+    ckp = _fake_ckpt(tmp_path)
+    m = dict(split="navtrain_val", which="last", temporal={"on": False}, privileged=False, cand_sha16=C16,
+             variants_sha16=V16, check={"ok": True}, ckpt=str(ckp), ckpt_sha16=DS.sha16(ckp), n_rows=10, n_done=10,
+             sessions=[{"n": 10}])
+    m["cache_key"] = _key_for(m, ckp)
+    kf = json.loads(json.dumps(m["cache_key"]))
+    assert DS.check_arm_meta("c", m, ref, kf) == [] and DS.cache_mode(m) == "cache_key"
+    # the checkpoint was replaced after the inference (e.g. retrain / resume in the same run dir)
+    ckp.write_bytes(b"weights-v2")
+    assert any("sha16 is now" in x for x in DS.check_arm_meta("c", m, ref, kf))
+    ckp.write_bytes(b"weights-v1")
+    gone = dict(m, ckpt=str(tmp_path / "nope.pt"))
+    assert any("missing" in x for x in DS.check_arm_meta("c", gone, ref, kf))
+    assert any("no ckpt" in x for x in DS.check_arm_meta("c", {k: v for k, v in m.items() if k != "ckpt"}, ref, kf))
+    # dir key missing / different from the meta's
+    assert any("cache_key.json missing" in x for x in DS.check_arm_meta("c", m, ref, None))
+    assert any("!= infer_meta cache_key" in x for x in DS.check_arm_meta("c", m, ref, dict(kf, which="ep7")))
+    # key inconsistent with the meta or with the current reference files
+    for field, val, msg in (("which", "ep7", "cache_key which"), ("ckpt_sha256", "f" * 64, "cache_key ckpt"),
+                            ("variants_sha256", "0" * 64, "variants sha"), ("version", "x", "version")):
+        k2 = dict(m["cache_key"], **{field: val})
+        assert any(msg in x for x in DS.check_arm_meta("c", dict(m, cache_key=k2), ref, k2)), field
+    k2 = dict(m["cache_key"], packed={"cand.npy": "9" * 64})
+    assert any("cand.npy" in x for x in DS.check_arm_meta("c", dict(m, cache_key=k2), ref, k2))
+
+
+def test_check_arm_meta_legacy_dump(tmp_path):
+    """F2 legacy path: a dump without cache_key passes only if one session computed every row and the ckpt / cand /
+    variants shas still match; decide marks it."""
+    ref = {"cand_sha16": C16, "variants_sha16": V16}
+    ckp = _fake_ckpt(tmp_path)
+    m = dict(split="navtrain_val", which="last", temporal={"on": False}, privileged=False, cand_sha16=C16,
+             variants_sha16=V16, check={"ok": True}, ckpt=str(ckp), ckpt_sha16=DS.sha16(ckp), n_rows=18179,
+             n_done=18179, sessions=[{"n": 18179}])
+    assert DS.cache_mode(m) == "legacy" and DS.check_arm_meta("c", m, ref, None) == []
+    for bad in (dict(m, sessions=[{"n": 18179}, {"n": 0}]),             # a later session reused the rows
+                dict(m, sessions=[{"n": 64}], n_done=64 + 18115),         # resumed: rows of two sessions
+                dict(m, sessions=[]), {k: v for k, v in m.items() if k != "sessions"}):
+        assert any("no cache_key" in x for x in DS.check_arm_meta("c", bad, ref, None))
+    assert any("variants_sha16" in x for x in DS.check_arm_meta("c", dict(m, variants_sha16="old"), ref, None))
+    ckp.write_bytes(b"other")
+    assert any("sha16 is now" in x for x in DS.check_arm_meta("c", m, ref, None))
 
 
 def test_provenance_check_between_arms():
@@ -438,6 +575,82 @@ def test_provenance_check_between_arms():
     assert DS.provenance_check({"a": raw(), "b": raw(), "c": {"meta": {}}}) == PROV_OK
     assert DS.provenance_check({"a": raw(), "b": raw(code="x")})["errors"]
     assert DS.provenance_check({"a": raw(), "b": raw(tr="x")})["errors"]
+
+
+def _keyed(code_sha, files, amp="fp16 autocast"):
+    return {"meta": {"cache_key": {"version": "v3_infer_cache_1", "amp": amp,
+                                   "code": {"sha256": code_sha, "files": dict(files)}}}}
+
+
+def test_code_check_between_arms():
+    """review 2 finding 1: keyed arms must share the forward code and precision (error naming the files); a legacy
+    dump's recorded model-file shas are compared with the reference arm (warning), infer_val_v3.py excluded."""
+    f = {"navsim/m.py": "1" * 16, "tools/d.py": "2" * 16, DS.INFER_SCRIPT: "3" * 16}
+    leg = {"meta": {"amp": "fp16 autocast", "code_sha256": {"navsim/m.py": "1" * 64, DS.INFER_SCRIPT: "9" * 64}}}
+    r = DS.code_check({"a": _keyed("S", f), "b": _keyed("S", f), "c": leg})
+    assert r["errors"] == [] and r["warnings"] == [] and r["ref"] == "a" and r["sha256"] == {"a": "S", "b": "S"}
+    assert r["legacy_compared"]["c"] == {"files": ["navsim/m.py"], "differ": []}     # infer script excluded
+    r = DS.code_check({"a": _keyed("S", f), "b": _keyed("T", dict(f, **{"tools/d.py": "4" * 16})), "c": leg})
+    assert len(r["errors"]) == 1 and "arm b" in r["errors"][0] and "['tools/d.py']" in r["errors"][0]
+    r = DS.code_check({"a": _keyed("S", f), "b": _keyed("T", dict(f, **{"navsim/new.py": "5" * 16}))})
+    assert "['navsim/new.py']" in r["errors"][0]                                      # a file only b has
+    assert any("amp" in e for e in DS.code_check({"a": _keyed("S", f), "b": _keyed("S", f, "fp32 (cpu)")})["errors"])
+    assert DS.code_check({"a": _keyed("S", f), "b": _keyed("S", f), "d": _keyed("X", f)})["errors"]  # d compared
+    assert DS.code_check({"a": _keyed("S", f), "c": _keyed("X", f)})["errors"]          # a keyed c too
+    r = DS.code_check({"a": _keyed("S", f), "b": _keyed("S", f), "c": {"meta": {"code_sha256": {"navsim/m.py": "7" * 64}}}})
+    assert r["errors"] == [] and any("navsim/m.py" in w for w in r["warnings"])        # legacy: warning only
+    r = DS.code_check({"a": _keyed("S", f), "c": {"meta": {"code_sha256": {"navsim/gone.py": "7" * 64}}}})
+    assert any("navsim/gone.py" in w for w in r["warnings"])                            # not in a's closure
+    r = DS.code_check({"a": _keyed("S", f), "c": {"meta": {"amp": "fp32 (cpu)", "code_sha256": {"navsim/m.py": "1" * 64}}}})
+    assert r["errors"] == [] and any("amp" in w for w in r["warnings"])
+    r = DS.code_check({"c": leg})
+    assert r["errors"] == [] and r["ref"] is None and r["warnings"]                      # nothing to compare with
+    assert DS.code_check({"b": _keyed("S", f), "c": leg})["ref"] == "b"
+    assert DS.code_check({"a": {"meta": {"cache_key": {"amp": "x"}}}, "b": _keyed("S", f)})["errors"]  # no code sha
+
+
+def test_decide_code_check_preregistered_and_fc_coverage():
+    """review 2: a forward-code error / a skipped code check / a non-pre-registered bootstrap make the result INVALID
+    and never final (warnings do not); fc_metrics covering fewer rows than n_done is noted."""
+    data, arms = near_world(0.10)                                                       # GO by construction
+    kw = dict(n_boot=200, arm_check={"a": [], "b": [], "c": []}, prov_check=PROV_OK)
+    ok = DS.decide(data, arms, code_check=CODE_OK, **kw)
+    assert ok["decision"] == "GO" and ok["final"] and ok["go"] and ok["preregistered_bootstrap"]
+    assert ok["code_check"] == CODE_OK
+    r = DS.decide(data, arms, code_check=None, **kw)
+    assert r["decision"] == "INVALID (would be GO)" and not r["final"] and not r["go"]
+    assert any("forward-code check not run" in x for x in r["notes"])
+    r = DS.decide(data, arms, code_check=dict(CODE_OK, errors=["forward code of arm b != arm a"]), **kw)
+    assert r["decision"] == "INVALID (would be GO)" and any("forward-code errors" in x for x in r["notes"])
+    r = DS.decide(data, arms, code_check=dict(CODE_OK, warnings=["legacy arm c: ..."]), **kw)
+    assert r["decision"] == "GO" and r["final"] and any("forward-code warnings" in x for x in r["notes"])
+    r = DS.decide(data, arms, code_check=CODE_OK, preregistered=False, **kw)
+    assert r["decision"] == "INVALID (would be GO)" and r["final"] is False and not r["go"]
+    assert r["preregistered_bootstrap"] is False and any("pre-registered" in x for x in r["notes"])
+    assert "[final" not in DS.summary_lines(r)[0]
+    a = DS.Arm(arms["a"].p16, arms["a"].p80, meta={"n_done": 120}, fc_metrics={"n_rows": 8})
+    r = DS.decide(data, {**arms, "a": a}, code_check=CODE_OK, **kw)
+    assert r["decision"] == "GO" and any("arm a: forecast metrics" in x and "cover 8 rows" in x for x in r["notes"])
+    a.fc_metrics = {"n_rows": 120}
+    r = DS.decide(data, {**arms, "a": a}, code_check=CODE_OK, **kw)
+    assert not any("forecast metrics" in x for x in r["notes"])
+    assert any(x.startswith("  forward code: reference arm a") for x in DS.summary_lines(r))
+
+
+def test_check_arm_meta_requires_finished_run(tmp_path):
+    """review 2: the run named in the meta must have done.json (ckpt_last is then the final checkpoint)."""
+    ref = {"cand_sha16": C16, "variants_sha16": V16}
+    run = tmp_path / "run"
+    run.mkdir()
+    ckp = _fake_ckpt(run)
+    m = dict(split="navtrain_val", which="last", temporal={"on": False}, privileged=False, cand_sha16=C16,
+             variants_sha16=V16, check={"ok": True}, ckpt=str(ckp), ckpt_sha16=DS.sha16(ckp), n_rows=10, n_done=10,
+             sessions=[{"n": 10}], run=str(run))
+    m["cache_key"] = _key_for(m, ckp)
+    kf = json.loads(json.dumps(m["cache_key"]))
+    assert any("no done.json" in x for x in DS.check_arm_meta("c", m, ref, kf))
+    (run / "done.json").write_text("{}")
+    assert DS.check_arm_meta("c", m, ref, kf) == []
 
 
 # ----------------------------------------------------------------------------------------------- real
@@ -471,6 +684,31 @@ def test_real_arm_checks_refuse_wrong_dumps(tmp_path):
         with pytest.raises(SystemExit, match="cand_sha16"):
             DS.run({"a": str(CK2T), "b": str(CK2T), "c": str(SD_CK2T10)}, tmp_path / "y.json", arm_check=True)
     assert not (tmp_path / "x.json").exists()
+
+
+ARM_C = DS.D3 / "infer" / "ck2T10"
+
+
+@pytest.mark.skipif(not (_have_real() and (ARM_C / "infer_meta.json").is_file()), reason="arm-(c) dump absent")
+def test_real_arm_c_legacy_dump_accepted():
+    """F2 legacy path on the real arm-(c) dump D3/infer/ck2T10 (written before the cache key; read-only here): one
+    complete session, ckpt / cand / variants shas re-verified -> accepted and marked legacy; the same meta with a
+    second (reusing) session or another ckpt sha is refused."""
+    r = DS.load_infer(ARM_C)
+    m = r["meta"]
+    assert r["cache_key_file"] is None and DS.cache_mode(m) == "legacy"
+    ref = DS.reference_shas()
+    assert DS.check_arm_meta("c", m, ref, None) == []
+    assert DS.check_arm_meta("c", dict(m, sessions=m["sessions"] + [{"n": 0}]), ref, None)
+    assert any("sha16 is now" in x for x in DS.check_arm_meta("c", dict(m, ckpt_sha16="0" * 16), ref, None))
+    # review 2: its recorded model-file shas are compared with a keyed arm's forward code (current closure here)
+    from tools.ck.v3 import infer_val_v3 as IV
+    keyed = {"meta": {"cache_key": {"amp": m.get("amp"), "code": IV.forward_code()}}}
+    cc = DS.code_check({"a": keyed, "c": r})
+    assert cc["errors"] == [] and cc["ref"] == "a"
+    assert cc["legacy_compared"]["c"]["files"] == sorted(set(m["code_sha256"]) - {DS.INFER_SCRIPT})
+    assert set(cc["legacy_compared"]["c"]["files"]) == set(IV.MODEL_FILES)
+    print("legacy c model files differing from the current closure:", cc["legacy_compared"]["c"]["differ"])
 
 
 @real

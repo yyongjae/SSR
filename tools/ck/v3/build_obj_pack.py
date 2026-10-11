@@ -12,10 +12,16 @@ frame_why.npy, frame_token.npy, fc_xyh.npy, fc_state.npy, fc_track.npy) + build.
 CK_DATA/packed/<split>/tokens.parquet.
 
 Resumable: work is split into chunks of --chunk tokens (default 64); each chunk is written atomically to
-P/_parts/c<i>.npz (tmp + rename) and skipped on a re-run if its token list and layout key (version, K_OBJ, D_OBJ,
-thresholds, targets) match; otherwise it is rebuilt.  The final arrays are assembled
-into *.npy.tmp and renamed only after every chunk is in; build.json (status complete) is written last; _parts is then
-removed (--keep-parts keeps it).  A complete pack is never overwritten.
+P/_parts/c<i>.npz (tmp + rename) and skipped on a re-run if its token list and part key match; otherwise it is
+rebuilt.  Part key = layout (version, K_OBJ, D_OBJ, thresholds, targets) + an INPUT FINGERPRINT (tooling fix F4,
+2026-10-11): sha256 of the build provenance without git head (BEVFusion cache manifest shas, frames parquet sha,
+code shas of objects / obj_pack / build_obj_pack / config / future_teacher / gt_future, GT dir + index sha),
+MATCH_GATE_M, FC_T, N_FRAMES and the sha256 of the GT per-file manifest (D3/gt_objects/_manifests/<split>.json).
+Before F4 a build interrupted and resumed after such an input changed mixed old and new chunks while build.json
+recorded only the new provenance.  The assembly re-checks every part's key.  build.json records the fingerprint
+(inputs_sha256, inputs); packs built before F4 carry neither and load unchanged (ObjPack does not read them).
+The final arrays are assembled into *.npy.tmp and renamed only after every chunk is in; build.json (status complete)
+is written last; _parts is then removed (--keep-parts keeps it).  A complete pack is never overwritten.
 
 Fails (exit 2, build.json status failed_*) if a CausalityError occurs (raised by the worker, never swallowed), if more
 than 1 % of the valid frames of a FULL split are truncated at K_OBJ (96 since the review fix) (SPEC 3.4: K_OBJ is then raised in a spec
@@ -83,15 +89,34 @@ def gt_dir_for(split: str) -> Path:
 _W = {}
 
 
-def part_key(targets: bool) -> str:
-    """identifies the layout of a part file: a resumed build reuses a part only if this matches."""
+def part_key(targets: bool, inputs_sha256: str = "") -> str:
+    """identifies a part file: layout + the input fingerprint (F4); a resumed build reuses a part only if it matches."""
     return json.dumps(dict(version=OP.PACK_VERSION, objects=O.OBJECTS_VERSION, K_OBJ=TC.K_OBJ, D_OBJ=TC.D_OBJ,
-                           SCORE_THR=list(TC.SCORE_THR), DT_RANGE=list(TC.DT_RANGE), targets=bool(targets)),
-                      sort_keys=True)
+                           SCORE_THR=list(TC.SCORE_THR), DT_RANGE=list(TC.DT_RANGE), targets=bool(targets),
+                           inputs=str(inputs_sha256)), sort_keys=True)
 
 
-def _init(subset, gt_dir, targets):
-    _W["part_key"] = part_key(targets)
+def gt_manifest(gt_dir):
+    """the per-file sha256 manifest of a GT dir (tools/ck/v3/setup_gt_objects.sh), or None."""
+    if not gt_dir:
+        return None
+    p = Path(gt_dir).parent / "_manifests" / f"{Path(gt_dir).name}.json"
+    return dict(path=str(p), sha256=sha256_file(p)) if p.is_file() else dict(path=str(p), sha256=None)
+
+
+def input_fingerprint(prov, gt_dir):
+    """F4: (sha256, dict) of every input a chunk's content depends on besides the layout of part_key: the provenance
+    (minus git head / note: the code shas cover the code), MATCH_GATE_M, FC_T, N_FRAMES and the GT manifest sha."""
+    d = dict(provenance={k: v for k, v in prov.items() if k not in ("git_head", "git_note")},
+             match_gate_m=float(O.MATCH_GATE_M), FC_T=[float(x) for x in getattr(O, "FC_T", TC.FC_T)],
+             N_FRAMES=int(TC.N_FRAMES),
+             gt_manifest=gt_manifest(gt_dir))
+    d = json.loads(json.dumps(d, sort_keys=True))
+    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest(), d
+
+
+def _init(subset, gt_dir, targets, pkey=None):
+    _W["part_key"] = pkey if pkey is not None else part_key(targets)
     _W["src"] = O.BevfusionObjectSource(subset)
     _W["gt_dir"] = Path(gt_dir) if gt_dir else None
     _W["targets"] = bool(targets)
@@ -271,6 +296,10 @@ def main(argv=None):
         toks = toks[: a.limit]
     n = len(toks)
     chunks = [(i, list(range(s, min(s + a.chunk, n)))) for i, s in enumerate(range(0, n, a.chunk))]
+    # F4: the provenance is taken BEFORE any chunk is built and is the one build.json records
+    prov = provenance(subset, gt_dir, targets)
+    inputs_sha, inputs = input_fingerprint(prov, gt_dir)
+    pkey = part_key(targets, inputs_sha)
     todo = []
     for ci, rows in chunks:
         pp = parts / f"c{ci:05d}.npz"
@@ -278,20 +307,21 @@ def main(argv=None):
             try:
                 with np.load(pp, allow_pickle=False) as z:
                     if np.array_equal(z["tokens"].astype(str), toks[rows]) and np.array_equal(z["rows"], rows) \
-                            and "part_key" in z.files and str(z["part_key"]) == part_key(targets):
+                            and "part_key" in z.files and str(z["part_key"]) == pkey:
                         continue
             except Exception:  # noqa: BLE001  (corrupt / partial part: rebuild it)
                 pass
         todo.append((ci, rows, [str(t) for t in toks[rows]], pp))
     print(f"[{now_kst()}] {a.split}: {n} tokens, {len(chunks)} chunks, {len(todo)} to build, workers {a.workers}, "
-          f"targets {targets}, out {P}", flush=True)
+          f"targets {targets}, inputs {inputs_sha[:16]}, out {P}", flush=True)
     status = "complete"
     fail_msg = None
     if todo:
         ctx = get_context("fork")
         done = 0
         try:
-            with ctx.Pool(a.workers, initializer=_init, initargs=(subset, str(gt_dir) if gt_dir else "", targets)) as pool:
+            with ctx.Pool(a.workers, initializer=_init,
+                          initargs=(subset, str(gt_dir) if gt_dir else "", targets, pkey)) as pool:
                 for ci, k in pool.imap_unordered(run_chunk, todo, chunksize=1):
                     done += 1
                     if done % 50 == 0 or done == len(todo):
@@ -311,6 +341,8 @@ def main(argv=None):
             with np.load(parts / f"c{ci:05d}.npz", allow_pickle=False) as z:
                 if not np.array_equal(z["tokens"].astype(str), toks[rows]):
                     raise RuntimeError(f"chunk {ci}: token mismatch")
+                if "part_key" not in z.files or str(z["part_key"]) != pkey:      # F4: never assemble mixed inputs
+                    raise RuntimeError(f"chunk {ci}: part key != this build's (inputs {inputs_sha[:16]})")
                 for k in names:
                     mm[k][rows[0]:rows[-1] + 1] = z[k]
                 for r, s in zip(rows, json.loads(str(z["stats"]))):
@@ -352,7 +384,8 @@ def main(argv=None):
                src_codes={"0": "none", "1": "current-frame cache", "2": "_future-named cache"},
                fc_state_codes={"0": "no target", "1": "OBS", "2": "matched, ABSENT_OFFICIAL", "3": "t > t_avail",
                                "4": "matched singleton GT track (official hold; oracle only, never a motion target)"},
-               provenance=provenance(subset, gt_dir, targets), counts=counts, workers=a.workers, chunk=a.chunk,
+               provenance=prov, inputs_sha256=inputs_sha, inputs={k: v for k, v in inputs.items() if k != "provenance"},
+               counts=counts, workers=a.workers, chunk=a.chunk,
                kst_start=kst_start, kst_end=now_kst(), wall_s=round(time.time() - t_start, 1))
     if status == "complete":
         out["files"] = {f.name: dict(sha256=sha256_file(f), bytes=f.stat().st_size)

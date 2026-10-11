@@ -22,6 +22,17 @@ Fit data (the KD-like candidates the teacher never trained on): navtrain_train t
   KD is off for it too); a candidate counts when its label is ok and its logits / targets are finite.
 Teacher forward: model.load_ck(run, which) and the ops of online2.TeacherPair2.run (trunk.scene, trunk.candidates on
   the 16 candidates, score; fp16 autocast on CUDA when --amp 1 = ck_e2e2.teacher_amp true) -> score logits [N, 16, 5].
+Temporal DET teacher (refiner-v3, its config.json temporal.on; docs/refiner_v3/STEP2_E2E.md): load_ck refuses a
+  PRIVILEGED run; the fit tokens additionally get the teacher's CLEAN causal object rows of the train object pack
+  (CKDataset objects = {cfg, aug False, targets False}: obj_in / obj_mask / frame_valid only, never the fc_* targets)
+  and the forward is online2.teacher_forward (TemporalBranch.scene + hook = CKNet.forward(..., objs=)), the function
+  TeacherPair2.run uses; tokens with obj_ok False are dropped (the student's KD is off for them too).  The inference
+  cache key and the JSON 'inference' / 'data' records then also carry the temporal cfg, the pack build.json sha16 and
+  the object counts.
+  # v3 temporal DET teacher (GPU 0 after its training run; -> <CK_DATA>/ck2/kd_calib/v3T10_a_learned__last.json):
+  cd /workspace/yongjae/SSR-v3 && CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    /venv/ssr/bin/python tools/ck/e2e2/fit_kd_calib.py --run /home/external-user/ssd/yongjae_refiner/ck/v3/train/v3T10_a_learned \
+    --which last --n-tokens 16384
 Fit (CPU, float64; kd_calib.fit_platt): per KD key of this teacher (DET nc / ep / ttc, MAP dac / ep; --kd-keys), the
   soft-target BCE (NLL) minimiser (a, b), a >= 1e-3.  Held-out check: log-level 2-fold split of the fit tokens (seed
   --fold-seed): fit on one half, NLL / ECE on the other, both ways (out-of-fold); then the FINAL parameters are
@@ -86,22 +97,29 @@ def resolve_run(run: str) -> Path:
 
 
 def run_info(run: Path, which: str, allow_unfinished: bool = False) -> Dict[str, Any]:
-    """config.json checks (trainer train_ck2, arm T / M, done.json unless allow_unfinished) -> cfg, arm, ep_target,
-    ckpt path and sha16."""
+    """config.json checks (trainer train_ck2, arm T / M, done.json unless allow_unfinished; refiner-v3: a temporal
+    run must be a non-privileged DET teacher) -> cfg, arm, ep_target, ckpt path and sha16, temporal (TemporalCfg)."""
     from navsim.agents.para_ssr.ck.ep_target import run_ep_target
+    from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
     cj = run / "config.json"
     if not cj.is_file():
         raise SystemExit(f"{run}: no config.json")
     cfg = json.loads(cj.read_text())
     if cfg.get("trainer") != "train_ck2" or cfg.get("arm") not in KC.TEACHER_OF_ARM:
         raise SystemExit(f"{run}: not a CK2 teacher run (trainer {cfg.get('trainer')!r}, arm {cfg.get('arm')!r})")
+    tc = TemporalCfg.from_dict(cfg.get("temporal"))
+    if tc.on and tc.privileged:
+        raise SystemExit(f"{run}: PRIVILEGED temporal run (forecaster {tc.forecaster!r}, source {tc.source!r}): never a "
+                         f"KD teacher, no calibration")
+    if tc.on and cfg.get("arm") != "T":
+        raise SystemExit(f"{run}: temporal branch on arm {cfg.get('arm')!r} (only the DET teacher, arm T)")
     if not allow_unfinished and not (run / "done.json").is_file():
         raise SystemExit(f"{run}: no done.json (teacher still training): fit the calibration after it has finished")
     ck = run / (which if which.endswith(".pt") else f"ckpt_{which}.pt")
     if not ck.is_file():
         raise SystemExit(f"{run}: {ck.name} missing")
     return {"cfg": cfg, "arm": cfg["arm"], "ep_target": run_ep_target(cfg), "ckpt": ck,
-            "ckpt_sha16": U.sha256_file(ck), "split": cfg.get("split", "navtrain_train")}
+            "ckpt_sha16": U.sha256_file(ck), "split": cfg.get("split", "navtrain_train"), "temporal": tc}
 
 
 def fit_rows(cfg: Dict[str, Any], n_tokens: int, seed: int = 0, limit: int = 0, root=None):
@@ -129,9 +147,10 @@ def fit_rows(cfg: Dict[str, Any], n_tokens: int, seed: int = 0, limit: int = 0, 
 
 
 # ----------------------------------------------------------------------------------------------- inference
-def teacher_logits(net, bev, cand, status, amp: bool):
+def teacher_logits(net, bev, cand, status, amp: bool, objs=None):
     """score logits f32 [B, K, 5] with the ops of online2.TeacherPair2.run (scene once, candidates, score; fp16
-    autocast on CUDA when amp)."""
+    autocast on CUDA when amp).  objs (refiner-v3 temporal DET teacher only: {obj_in, obj_mask, frame_valid} on the
+    candidates' device) -> online2.teacher_forward, the very function TeacherPair2.run calls; None -> the CK2 ops."""
     import torch
 
     from navsim.agents.para_ssr.refiner.e2e import ego_inputs
@@ -139,6 +158,11 @@ def teacher_logits(net, bev, cand, status, amp: bool):
     B, K = cand.shape[:2]
     ego = ego_inputs(status.detach().float().to(dev))
     ac = torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=bool(amp) and dev.type == "cuda")
+    if objs is not None or getattr(net, "temporal", None) is not None:
+        from navsim.agents.para_ssr.ck.online2 import teacher_forward
+        with torch.no_grad(), ac:
+            s, _ = teacher_forward(net, bev.to(dev).float(), cand.float(), ego, objs)
+        return s.float()
     with torch.no_grad(), ac:
         feat, mem = net.trunk.scene(bev.to(dev).float(), B)
         o = net.trunk.candidates(feat, mem, cand.float(), *ego)
@@ -146,10 +170,29 @@ def teacher_logits(net, bev, cand, status, amp: bool):
     return s.float()
 
 
+def objects_spec(tc) -> Optional[Dict[str, Any]]:
+    """CKDataset `objects` kwarg of a temporal teacher (None when off): CLEAN rows, no forecast targets."""
+    if tc is None or not tc.on:
+        return None
+    return {"cfg": tc.to_dict(), "aug": False, "targets": False}
+
+
+def objects_record(tc, split: str) -> Optional[Dict[str, Any]]:
+    """object pack of the fit split (dir, build.json sha16, version, n) for the cache key / JSON; None when off."""
+    if tc is None or not tc.on:
+        return None
+    d = Path(tc.pack_root) / tc.source / split
+    bj = d / "build.json"
+    b = json.loads(bj.read_text()) if bj.is_file() else {}
+    return {"dir": str(d), "build_sha16": U.sha256_file(bj) if bj.is_file() else None, "version": b.get("version"),
+            "status": b.get("status"), "n": b.get("n"), "k_obj": b.get("K_OBJ"), "kst_end": b.get("kst_end")}
+
+
 def infer(run: Path, which: str, arm: str, split: str, rows: np.ndarray, ep_target: str, device: str, batch: int,
-          workers: int, amp: bool, root=None) -> Dict[str, Any]:
+          workers: int, amp: bool, root=None, tc=None) -> Dict[str, Any]:
     """-> logits f32 [n, 16, 5], y f32 [n, 16, 5] (CK targets, EP per ep_target), y_ok bool [n, 16], bev_ok bool [n],
-    sanity (first batch: teacher_logits vs CKNet.forward max |diff|), timing."""
+    obj_ok bool [n] (temporal teacher: object pack obj_ok; True otherwise), sanity (first batch: teacher_logits vs
+    CKNet.forward max |diff|), timing.  tc: the run's TemporalCfg (on -> CLEAN object rows + temporal forward)."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -161,29 +204,40 @@ def infer(run: Path, which: str, arm: str, split: str, rows: np.ndarray, ep_targ
     else:
         dev = torch.device("cpu")
     torch.set_num_threads(max(1, int(os.environ.get("OMP_NUM_THREADS", "1"))))
-    net, _ = load_ck(run, which=which, device=str(dev))
+    net, _ = load_ck(run, which=which, device=str(dev))          # refuses a PRIVILEGED run
     net.eval()
+    on = getattr(net, "temporal", None) is not None
+    if on != bool(tc is not None and tc.on):
+        raise SystemExit(f"{run}: loaded net temporal={on} but config.json temporal.on={bool(tc is not None and tc.on)}")
     n = len(rows)
     out = {"logits": np.full((n, K16, 5), np.nan, np.float32), "y": np.full((n, K16, 5), np.nan, np.float32),
-           "y_ok": np.zeros((n, K16), bool), "bev_ok": np.zeros(n, bool)}
+           "y_ok": np.zeros((n, K16), bool), "bev_ok": np.zeros(n, bool), "obj_ok": np.ones(n, bool)}
     pos = {int(r): i for i, r in enumerate(rows)}
-    ds = CKDataset(split, bev=arm, k=K16, labels="cand", gt=False, rows=rows, root=root, ep_target=ep_target)
+    okw = {"objects": objects_spec(tc)} if on else {}               # CK2 teacher: no objects kwarg (old dataset)
+    ds = CKDataset(split, bev=arm, k=K16, labels="cand", gt=False, rows=rows, root=root, ep_target=ep_target, **okw)
     dl = DataLoader(ds, batch_size=int(batch), shuffle=False, collate_fn=collate_ck, num_workers=int(workers),
                     pin_memory=dev.type == "cuda", prefetch_factor=4 if workers > 0 else None)
     t0, done, sanity = time.time(), 0, None
     for b in dl:
         idx = np.asarray([pos[int(r)] for r in b["rows"].numpy()], np.int64)
         cand = b["cand"].to(dev).float()
-        s = teacher_logits(net, b["bev"], cand, b["status"], amp)
+        objs = None
+        if on:
+            from navsim.agents.para_ssr.ck.temporal.config import OBJ_INPUT_KEYS
+            objs = {k: b[k].to(dev) for k in OBJ_INPUT_KEYS}            # model inputs only (no fc_* targets)
+        s = teacher_logits(net, b["bev"], cand, b["status"], amp, objs=objs)
         if sanity is None:
             with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16,
                                                  enabled=bool(amp) and dev.type == "cuda"):
-                ref = net(b["bev"].to(dev).float(), cand, b["status"].to(dev).float(), decode=False)
+                ref = net(b["bev"].to(dev).float(), cand, b["status"].to(dev).float(), decode=False,
+                          **({"objs": objs} if on else {}))
             sanity = {"fwd_score_maxdiff_vs_cknet": float((ref["score_logit"].float() - s).abs().max())}
         out["logits"][idx] = s.cpu().numpy()
         out["y"][idx] = b["y"].numpy().astype(np.float32)
         out["y_ok"][idx] = b["y_ok"].numpy().astype(bool)
         out["bev_ok"][idx] = b["bev_ok"].numpy().astype(bool).reshape(-1)
+        if on:
+            out["obj_ok"][idx] = b["obj_ok"].numpy().astype(bool).reshape(-1)
         done += len(idx)
         if done % (int(batch) * 50) < int(batch) or done == n:
             el = time.time() - t0
@@ -195,8 +249,13 @@ def infer(run: Path, which: str, arm: str, split: str, rows: np.ndarray, ep_targ
 
 
 def _cache_meta(info: Dict[str, Any], rows_sha16: str, amp: bool, which: str) -> Dict[str, Any]:
-    return {"version": INFER_VERSION, "run": str(info["run"]), "which": which, "ckpt_sha16": info["ckpt_sha16"],
-            "ep_target": info["ep_target"], "rows_sha16": rows_sha16, "amp": bool(amp), "labels": "cand"}
+    m = {"version": INFER_VERSION, "run": str(info["run"]), "which": which, "ckpt_sha16": info["ckpt_sha16"],
+         "ep_target": info["ep_target"], "rows_sha16": rows_sha16, "amp": bool(amp), "labels": "cand"}
+    tc = info.get("temporal")
+    if tc is not None and tc.on:          # temporal teacher only: CK2 cache keys (and their caches) stay unchanged
+        m["temporal"] = tc.to_dict()
+        m["objects"] = objects_record(tc, info["split"])
+    return m
 
 
 def load_cache(path: Path, want: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -209,6 +268,7 @@ def load_cache(path: Path, want: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         log(f"inference cache {path} does not match {diff}: recomputing")
         return None
     out = {k: z[k] for k in ("logits", "y", "y_ok", "bev_ok")}
+    out["obj_ok"] = z["obj_ok"] if "obj_ok" in z.files else np.ones(len(out["bev_ok"]), bool)
     out.update(sanity=meta.get("sanity", {}), sec=meta.get("sec"), device=meta.get("device"), cached=True)
     return out
 
@@ -217,7 +277,9 @@ def save_cache(path: Path, R: Dict[str, Any], meta: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.stem}.tmp{os.getpid()}.npz")
     m = dict(meta, sanity=R.get("sanity", {}), sec=R.get("sec"), device=R.get("device"), saved=kst())
-    np.savez(tmp, logits=R["logits"], y=R["y"], y_ok=R["y_ok"], bev_ok=R["bev_ok"], meta=np.asarray(json.dumps(m)))
+    extra = {"obj_ok": R["obj_ok"]} if "temporal" in meta else {}      # temporal teacher only (CK2 npz unchanged)
+    np.savez(tmp, logits=R["logits"], y=R["y"], y_ok=R["y_ok"], bev_ok=R["bev_ok"], meta=np.asarray(json.dumps(m)),
+             **extra)
     os.replace(tmp, path)
 
 
@@ -307,8 +369,11 @@ def main(argv=None) -> Dict[str, Any]:
         raise SystemExit(f"--out {out}: never write under {FORBIDDEN_OUT}")
     if "=" in str(out):
         raise SystemExit(f"--out {out}: '=' not allowed (Hydra override value)")
+    tc = info["temporal"]
     log(f"run {run} arm {arm} ({KC.TEACHER_OF_ARM[arm]}) which {a.which} ckpt sha16 {info['ckpt_sha16']} ep_target {ep}"
-        f" fitted keys {KC.fit_keys(arm, kd_keys)} -> {out}")
+        f" fitted keys {KC.fit_keys(arm, kd_keys)} -> {out}"
+        + (f"; temporal teacher (forecaster {tc.forecaster}, objects {objects_record(tc, info['split'])})"
+           if tc.on else ""))
     rows, logs, n_pool, toks = fit_rows(info["cfg"], a.n_tokens, a.seed, a.limit, a.data_root)
     rows_sha16 = sha16_bytes(rows.astype(np.int64).tobytes())
     log(f"fit rows: {len(rows)} tokens from {len(np.unique(logs))} logs (pool {n_pool} training rows, rows sha16 "
@@ -317,7 +382,8 @@ def main(argv=None) -> Dict[str, Any]:
     want = _cache_meta(info, rows_sha16, bool(a.amp), a.which)
     R = None if a.force_infer else load_cache(cache, want)
     if R is None:
-        R = infer(run, a.which, arm, info["split"], rows, ep, a.device, a.batch, a.workers, bool(a.amp), a.data_root)
+        R = infer(run, a.which, arm, info["split"], rows, ep, a.device, a.batch, a.workers, bool(a.amp), a.data_root,
+                  tc=tc)
         save_cache(cache, R, want)
         R["cached"] = False
         log(f"inference {R['sec']} s on {R['device']} -> {cache}; sanity {R['sanity']}")
@@ -325,6 +391,8 @@ def main(argv=None) -> Dict[str, Any]:
         log(f"inference cache reused: {cache}")
     fold_tok = KC.log_folds(logs, a.fold_seed)
     ok = R["y_ok"] & R["bev_ok"][:, None]
+    if tc.on:                    # temporal DET teacher: tokens without object rows have KD off in the student too
+        ok = ok & R["obj_ok"][:, None]
     F = fit_all(R["logits"], R["y"], ok, fold_tok, arm, kd_keys)
     print_table(F["metrics"])
     data = {"split": info["split"], "labels": "cand (v2 r34 top-16 executed, official labels)",
@@ -340,6 +408,12 @@ def main(argv=None) -> Dict[str, Any]:
                  "forward": "online2.TeacherPair2.run ops (trunk.scene, trunk.candidates, score)",
                  "cache": str(cache), "cached": bool(R.get("cached")), "sec": R.get("sec"),
                  "sanity": R.get("sanity", {})}
+    if tc.on:                    # refiner-v3 temporal DET teacher (CK2 records unchanged)
+        data["n_tokens_obj_ok"] = int(R["obj_ok"].sum())
+        data["objects"] = objects_record(tc, info["split"])
+        inference["forward"] = ("online2.teacher_forward (trunk.scene, TemporalBranch.scene + hook on the CLEAN causal "
+                                "object rows, trunk.candidates, score) = TeacherPair2.run")
+        inference["temporal"] = tc.to_dict()
     rec = KC.build_record(run=str(run), which=a.which, arm=arm, ckpt=str(info["ckpt"]), ckpt_sha16=info["ckpt_sha16"],
                           ep_target=ep, params=F["params"], kd_keys=kd_keys, metrics=F["metrics"], data=data,
                           inference=inference,

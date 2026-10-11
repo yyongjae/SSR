@@ -43,6 +43,13 @@ Student CK loss (added after the v2 grad balancer, outside it; ParaSSRAgent.comp
   No longitudinal head: trunk.lon_head is zeroed + frozen and every decode passes z_lon = 0 explicitly (student and
   teachers); trunk.gate_head is frozen.  No tau'_KD, no rescore KD, no control KD on c_lon.
   KD is off for a token without a DET or MAP BEV (combine_teacher kd_ok = det ok & map ok).
+Temporal DET teacher (refiner-v3, docs/refiner_v3/STEP2_E2E.md; decided by the DET teacher run's OWN config.json
+  temporal cfg, no ck_e2e2 key): load_ck rebuilds the temporal branch (a PRIVILEGED run is refused), the target builder
+  adds the teacher's CLEAN causal object rows of the train object pack (e2e_data2.KDObjRows: kd_obj_in_0 /
+  kd_obj_mask_0 / kd_frame_valid_0 / kd_obj_ok_0) and TeacherPair2.run feeds exactly OBJ_INPUT_KEYS to the DET
+  teacher's TemporalBranch.scene + hook (= CKNet.forward(..., objs=) of train_ck2 / infer_val_v3, fp16 autocast on CUDA
+  as their evaluations); kd_obj_ok_0 False -> the DET teacher's ok False -> KD off for the token.  The MAP teacher and
+  the student (CK2, no temporal branch) are unchanged; a non-temporal DET teacher runs the old code path bit for bit.
 BEV-KD arm (bev_kd.enabled; ck/bev_kd_arm.py): + adapter_weight * sum_t L_t(GradScale(bev_embed, lam_t / adapter_weight))
   over bev_kd.teachers (arm: [det, map], user 2026-10-08 ~20:40 KST), one RatioController per teacher (lam_t * |dL_t/dBEV|
   ~ ratio x |g_plan|, measured per teacher on the v2 'gnorm/plan' micro-batches, all-reduced); returned inside the CK
@@ -77,10 +84,10 @@ from .online import N_ROWS, _sanitize_traj, bev_sgrid, label_supply_warning, stu
 # SPEC s1-3 names).
 from . import cands2 as C2  # noqa: E402
 from .cands2 import online_variants, v0_from_status  # noqa: E402,F401
-from .e2e_data2 import (EP_TARGET_DEFAULT, G_K, GROUP_VAR, K16, N_NEAR_MID, NV, SRC_FALLBACK,  # noqa: E402,F401
-                        SRC_NAMES, SRC_NODATA, SRC_OLDER, SRC_PREV, STREAM_LAB, STREAM_NOW, STREAM_WU,
-                        TEACHER_DET_RUN, TEACHER_MAP_RUN, VAR_SAMPLING, VNAMES, CandRecorder2, draw_cols, sample_cols,
-                        type_balanced_cols, uniform_cols)
+from .e2e_data2 import (EP_TARGET_DEFAULT, G_K, GROUP_VAR, K16, KD_OBJ_INPUT, KD_OBJ_KEYS, KD_OBJ_OK,  # noqa: E402,F401
+                        N_NEAR_MID, NV, SRC_FALLBACK, SRC_NAMES, SRC_NODATA, SRC_OLDER, SRC_PREV, STREAM_LAB,
+                        STREAM_NOW, STREAM_WU, TEACHER_DET_RUN, TEACHER_MAP_RUN, VAR_SAMPLING, VNAMES, CandRecorder2,
+                        draw_cols, sample_cols, teacher_temporal, type_balanced_cols, uniform_cols)
 from .ep_target import EP_TARGETS  # noqa: E402
 from .kd_calib import calib_path  # noqa: E402
 
@@ -416,6 +423,18 @@ class CKE2E2Config:
                 arm = json.loads(cj.read_text()).get("arm")
                 if arm != want:
                     raise ValueError(f"ck_e2e2.{key} {run}: config.json arm {arm!r}, expected {want!r}")
+                # refiner-v3 temporal teacher (its own config.json; off for every CK2 run): DET only, never privileged
+                tc = teacher_temporal(run)
+                if tc.on:
+                    if key != "teacher_det_run":
+                        raise ValueError(f"ck_e2e2.{key} {run}: temporal branch on a MAP teacher is not supported")
+                    if tc.privileged:
+                        raise ValueError(f"ck_e2e2.{key} {run}: PRIVILEGED temporal run (forecaster {tc.forecaster!r}, "
+                                         f"source {tc.source!r}) can never be a KD teacher")
+                    try:
+                        tc.validate(want)
+                    except (ValueError, NotImplementedError) as e:
+                        raise ValueError(f"ck_e2e2.{key} {run}: temporal cfg: {e}") from None
         # the warm-up variant label files must be the same variant definition (speeds, lats, combine, s_on_frac,
         # names, accel extension)
         if (Path(self.warmup["var_dir"]) / "build.json").is_file():
@@ -491,6 +510,77 @@ def lateral_decode(cand: torch.Tensor, w_lat: torch.Tensor, v0: torch.Tensor, sl
 
 
 # ----------------------------------------------------------------------------------------------- teachers
+def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optional[Dict[str, torch.Tensor]] = None
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The KD teacher ops under the caller's autocast / no_grad: trunk.scene once, trunk.candidates on `cand`, score
+    -> (score logits [B,K,5] f32, w_lat [B,K,6]).  A temporal teacher (net.temporal, refiner-v3) additionally runs
+    TemporalBranch.scene(objs) once and binds its hook to this candidate set -- the order and ops of
+    CKNet.forward(bev, cand, status, decode=False, objs=objs) (train_ck2.forward / infer_val_v3).  objs must be given
+    iff the teacher has a temporal branch (ValueError otherwise: a silently dropped branch / stray input)."""
+    B, K = cand.shape[:2]
+    temporal = getattr(net, "temporal", None)
+    if temporal is None and objs is not None:
+        raise ValueError("teacher_forward: objs given to a teacher without a temporal branch")
+    if temporal is not None and objs is None:
+        raise ValueError("teacher_forward: this teacher has a temporal branch: its causal object rows are required")
+    feat, mem = net.trunk.scene(bev, B)
+    tf = None if temporal is None else temporal.hook(temporal.scene(objs), B, K)
+    o = net.trunk.candidates(feat, mem, cand, *ego, tfeat=tf)
+    return net.score(o, B, K), o["w_lat"]
+
+
+def kd_objs_of(targets, device=None) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """(objs = {obj_in, obj_mask, frame_valid} -- exactly ck.temporal.config.OBJ_INPUT_KEYS --, obj_ok [B]) of the DET
+    teacher from the e2e targets (e2e_data2.KDObjRows keys).  KeyError when the target builder did not emit them."""
+    from .temporal.config import OBJ_INPUT_KEYS
+    miss = [k for k in KD_OBJ_KEYS + (KD_OBJ_OK,) if k not in targets]
+    if miss:
+        raise KeyError(f"temporal DET teacher: targets lack {miss} (CK2E2ETargetBuilder without the teacher's object "
+                       f"rows?)")
+    objs = {KD_OBJ_INPUT[k]: (targets[k] if device is None else targets[k].to(device)) for k in KD_OBJ_KEYS}
+    assert tuple(objs) == tuple(OBJ_INPUT_KEYS), (tuple(objs), OBJ_INPUT_KEYS)
+    ok = targets[KD_OBJ_OK].reshape(-1).bool()
+    return objs, (ok if device is None else ok.to(device))
+
+
+def _tensor_sha16(sd: Dict[str, torch.Tensor]) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for k in sorted(sd):
+        v = sd[k].detach().cpu().contiguous()
+        h.update(k.encode())
+        h.update(str(v.dtype).encode())
+        h.update(str(tuple(v.shape)).encode())
+        h.update(v.numpy().tobytes() if v.dtype != torch.bfloat16 else v.float().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def temporal_teacher_info(net) -> Optional[Dict[str, Any]]:
+    """Record of a teacher's temporal branch (None when off): cfg dict, sha16 of the loaded branch / forecaster state
+    (the checkpoint's weights actually used) and of the cfg.fc_init file (pre-trained forecaster), ca_b."""
+    t = getattr(net, "temporal", None)
+    if t is None:
+        return None
+    tc = net.temporal_cfg
+    rec: Dict[str, Any] = {"cfg": tc.to_dict(), "branch_state_sha16": _tensor_sha16(t.state_dict())}
+    if t.forecaster is not None:
+        rec["forecaster_state_sha16"] = _tensor_sha16(t.forecaster.state_dict())
+    if getattr(t, "ca_b", None) is not None:
+        rec["ca_b"] = [[float(x) for x in r] for r in t.ca_b.detach().cpu().tolist()]
+    if tc.fc_init:
+        p = Path(tc.fc_init)
+        if p.is_file():
+            import hashlib
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for b in iter(lambda: f.read(1 << 22), b""):
+                    h.update(b)
+            rec["fc_init"] = {"path": str(p), "sha16": h.hexdigest()[:16]}
+        else:
+            rec["fc_init"] = {"path": str(p), "missing": True}
+    return rec
+
+
 class TeacherPair2:
     """Frozen CK2 DET (arm T) + MAP (arm M) teachers (ck.model.load_ck of tools/ck/train_ck2 runs), run online on the
     student's candidates.  Plain python object (not an nn.Module attribute of the agent: not in the state_dict / DDP /
@@ -501,7 +591,11 @@ class TeacherPair2:
     calib (ck_e2e2.kd_calib when enabled; None = no calibration, the old path): {'det': file | None, 'map': file |
     None} of tools/ck/e2e2/fit_kd_calib.py; each file must match its loaded teacher (kd_calib.check_calib: arm, run,
     which, ckpt sha16, ep_target, and every KD key of kd_keys this teacher is a source of fitted) or construction
-    fails.  run() then uses z' = a_k z + b_k (per key) as the teacher's score logits."""
+    fails.  run() then uses z' = a_k z + b_k (per key) as the teacher's score logits.
+    Temporal DET teacher (refiner-v3): load_ck rebuilds it from its config.json (refuses a PRIVILEGED run: the
+    PermissionError is re-raised naming the teacher); a temporal MAP teacher is refused.  run(..., objs_det=,
+    obj_ok_det=) is then required (teacher_forward; kd_obj_ok False -> ok False for the token); self.temporal_info
+    records the cfg and the forecaster / branch state sha16 (None for a CK2 teacher)."""
 
     def __init__(self, det_run: str, map_run: str, which: str = "last", device="cpu", amp: bool = True,
                  require_done: bool = True, ep_target: Optional[str] = None,
@@ -535,7 +629,12 @@ class TeacherPair2:
                     raise ValueError(f"teacher {name} {run}: ep_target {got!r} (config.json; missing = 'official') "
                                      f"!= the student's ck_e2e2.ep_target {want!r} (label BCE and EP KD would "
                                      f"disagree)")
-            net, cfg = load_ck(run, which, device="cpu")
+            try:
+                net, cfg = load_ck(run, which, device="cpu")       # refuses a PRIVILEGED (temporal oracle / gt) run
+            except PermissionError as e:
+                raise PermissionError(f"teacher {name} {run}: {e} -- never a KD teacher") from None
+            if getattr(net, "temporal", None) is not None and name != "det":
+                raise ValueError(f"teacher {name} {run}: temporal branch on a MAP teacher is not supported")
             lw = net.trunk.lon_head[-1]
             if bool(lw.weight.detach().abs().max() > 0) or bool(lw.bias.detach().abs().max() > 0):
                 raise ValueError(f"teacher {name} {run}: trunk.lon_head last layer is not all zero (not a CK2 run)")
@@ -548,6 +647,9 @@ class TeacherPair2:
         self.ep_target = eps                 # each teacher run's EP target (config.json)
         self.ckpt = {k: getattr(n, "init_report", {}).get("ckpt_sha16") for k, n in (("det", self.det),
                                                                                     ("map", self.map))}
+        # refiner-v3: the DET teacher's temporal branch (None = CK2 teacher, the old path)
+        self.det_temporal = getattr(self.det, "temporal", None) is not None
+        self.temporal_info = temporal_teacher_info(self.det)
         # KD calibration (Platt on the logits, per teacher and key); None = off (old path, nothing applied)
         self.calib: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None
         self.calib_info: Dict[str, Any] = {}
@@ -585,30 +687,40 @@ class TeacherPair2:
         return self
 
     @torch.no_grad()
-    def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None) -> Dict[str, torch.Tensor]:
+    def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None, objs_det=None,
+            obj_ok_det=None) -> Dict[str, torch.Tensor]:
         """bev_* [B, 256, 50, 100] (f16 cache), ok_* [B], cand [B, K, 8, 3] (finite), status [B, 8], cand_ok [B, K]
         -> kd_score_prob f32 [B,K,5] (combine_teacher: nc/ttc DET, dac MAP, ep/comfort mean), kd_e_lat f32 [B,K,6]
         = 0.5 (e_DET + e_MAP) (decode z_lon = 0, slope 0), kd_ok bool [B,K] = DET ok & MAP ok (per token) & finite
         logits / offsets of both & cand_ok; e_det / e_map [B,K,6], p_det / p_map [B,K,5] (logging).
         With calibration (self.calib) each teacher's logits are a_k z + b_k BEFORE the sigmoid / combination (p_det /
-        p_map are then the calibrated probabilities); the lateral outputs are unchanged."""
+        p_map are then the calibrated probabilities); the lateral outputs are unchanged.
+        Temporal DET teacher only (self.det_temporal): objs_det = {obj_in [B,3,96,17], obj_mask [B,3,96], frame_valid
+        [B,3]} (kd_objs_of: exactly OBJ_INPUT_KEYS) and obj_ok_det [B] are required; DET ok = ok_det & obj_ok_det.
+        A CK2 DET teacher: both must be None (the old path, bit for bit)."""
         from ..refiner.e2e import ego_inputs
         from .kd import combine_teacher
 
         dev = self.device
         cand = cand.detach().float().to(dev)
         B, K = cand.shape[:2]
+        if self.det_temporal:
+            if objs_det is None or obj_ok_det is None:
+                raise ValueError("TeacherPair2.run: the DET teacher has a temporal branch: objs_det and obj_ok_det "
+                                 "(its causal object rows, kd_objs_of(targets)) are required")
+            objs_det = {k: v.to(dev) for k, v in objs_det.items()}
+            ok_det = ok_det.reshape(-1).bool().to(dev) & obj_ok_det.reshape(-1).bool().to(dev)
+        elif objs_det is not None or obj_ok_det is not None:
+            raise ValueError("TeacherPair2.run: object rows given but the DET teacher has no temporal branch")
         ego = ego_inputs(status.detach().float().to(dev))
         v0 = ego[0]
         ac = torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=self.amp and dev.type == "cuda")
         logits, ws = [], []
-        for net, bev in ((self.det, bev_det), (self.map, bev_map)):
+        for net, bev, objs in ((self.det, bev_det, objs_det), (self.map, bev_map, None)):
             with ac:
-                feat, mem = net.trunk.scene(bev.to(dev).float(), B)
-                o = net.trunk.candidates(feat, mem, cand, *ego)
-                s = net.score(o, B, K)
+                s, w = teacher_forward(net, bev.to(dev).float(), cand, ego, objs)
             logits.append(s.float())
-            ws.append(o["w_lat"].float())
+            ws.append(w.float())
         if self.calib is not None:            # KD calibration: Platt on the logits, per teacher and key
             for i, name in enumerate(("det", "map")):
                 ab = self.calib.get(name)
@@ -780,6 +892,11 @@ class CKE2E2:
                 print("[ck_e2e2] KD calibration: " + "; ".join(
                     f"{t} {i['path']} (sha16 {i['sha16']}, ckpt {i['ckpt_sha16']}, keys {i['fitted_keys']})"
                     for t, i in self._teachers.calib_info.items()), flush=True)
+            if self._teachers.temporal_info is not None:
+                ti = self._teachers.temporal_info
+                print(f"[ck_e2e2] temporal DET teacher {c.teacher_det_run}: forecaster {ti['cfg']['forecaster']} "
+                      f"(fc_train {ti['cfg']['fc_train']}), branch sha16 {ti['branch_state_sha16']}, forecaster sha16 "
+                      f"{ti.get('forecaster_state_sha16')}, fc_init {ti.get('fc_init')}", flush=True)
         return self._teachers.to(device)
 
     def labels(self):
@@ -989,8 +1106,12 @@ class CKE2E2:
         # ---- teachers (online, every phase) on the step's KD candidates
         tt = time.time()
         tp = self.teachers(dev)
+        tkw: Dict[str, Any] = {}
+        if tp.det_temporal:                             # refiner-v3 temporal DET teacher: its causal object rows
+            objs_det, obj_ok_det = kd_objs_of(targets, dev)
+            tkw = {"objs_det": objs_det, "obj_ok_det": obj_ok_det}
         T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
-                   cand_ok=S["cand_ok"])
+                   cand_ok=S["cand_ok"], **tkw)
         t_teacher = time.time() - tt
 
         # ---- student forward (one pass over KD candidates + label set)
@@ -1113,6 +1234,8 @@ class CKE2E2:
             logs["ck2/lat_disagree"] = float(((T["e_det"] - T["e_map"]).abs().mean(-1).nan_to_num(0.0)
                                               * mf).sum()) / den
             logs["ck2/n_cand"] = float(Kc + (0 if S["extra"] is None else S["extra"].shape[1]))
+            if tkw:                                     # temporal DET teacher only (CK2 teachers: logs unchanged)
+                logs["ck2/kd_obj_ok_frac"] = float(tkw["obj_ok_det"].float().mean())
         self.cum["sur_nonfinite"] += int(nonfin)
         logs["ck2/variants_ms"] = 1e3 * t_var
         logs["ck2/teacher_ms"] = 1e3 * t_teacher

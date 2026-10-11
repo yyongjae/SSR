@@ -212,7 +212,7 @@ The changes in `decide_step1.py` (`v3_decide_2`):
 
 | gate | rule |
 |---|---|
-| G1 | Unchanged. The output records that one seed per arm leaves seed noise out of the CI. If \|Δ − 0.20\| ≤ 0.15 it sets `second_seed_required` and adds a note. |
+| G1 | Unchanged. The output records that one seed per arm leaves seed noise out of the CI. ~~If \|Δ − 0.20\| ≤ 0.15 it sets `second_seed_required` and adds a note.~~ → **2026-10-11 tooling fix F1(§5.1)로 대체:** seed ablation 없음(사용자 결정), 단일 seed로 결정 확정, 경고 필드 `near_threshold`만 남김. |
 | G1, also reported (not gating) | the same Δ on the full-history subset and split by past-frame cache source (current vs `_future`-named); a descriptive variant that takes only NC / TTC from the arm and freezes DAC / EP / C from ck2T |
 | G2, G3 | Absolute thresholds as before. Also reported: the (a), (b), (c) values and the paired (a)−(b), (a)−(c) deltas with log-cluster CIs. For AUC this is a new weighted-AUC bootstrap on the same multinomial log weights as `log_bootstrap`; the test checks it against brute force. |
 | G4 | Non-inferiority: pref(a) − pref(c) ≥ −0.01 and CI lower bound ≥ −0.03. (a)−(b) is reported. |
@@ -221,7 +221,7 @@ Further changes:
 - The frozen-DAC token order (`lead_remedy/infer/ck2T/tokens.parquet`) is asserted to equal the packed order (R3.9).
 - The full-history and cache-source subsets now come from the K96 val pack.
 
-Tests: `test_v3_decide::test_auc_boot_matches_roc_auc_and_brute_force`, `::test_decide_d4_reports_and_second_seed_flag`, `::test_g4_noninferiority_edges`. The updated real self-compare still gives PDMS 90.814 and 1,583 hazard pairs, with every delta 0.
+Tests: `test_v3_decide::test_auc_boot_matches_roc_auc_and_brute_force`, `::test_decide_d4_reports_and_second_seed_flag` (F1 이후 `::test_decide_d4_reports_and_band_flag`), `::test_g4_noninferiority_edges`. The updated real self-compare still gives PDMS 90.814 and 1,583 hazard pairs, with every delta 0.
 
 ### 2.5 Smaller fixes
 
@@ -239,7 +239,7 @@ Tests: `test_v3_decide::test_auc_boot_matches_roc_auc_and_brute_force`, `::test_
 | R2.5 forecast loss normalised per GPU | not changed | With D3, Step 1 has no forecast loss under DDP: a is frozen, and pre-training is one process. It matters only for the optional `joint` mode; use one world size there. |
 | R2.6 KD / e2e cannot use a temporal teacher | not changed | Step-2 work; it fails loudly (`_temporal_required`). |
 | R2.8 speed variants are not shared | not changed | A design choice (SPEC finding 7: per-candidate stations) that needs the user's confirmation. |
-| R3.2 one seed | rule only | D4: no extra run without approval. G1 near the threshold sets `second_seed_required`. The per-epoch checkpoints `ckpt_ep7` / `ckpt_ep8` exist for a descriptive check (`STEP1_RUN.md` §5). |
+| R3.2 one seed | rule only | D4: no extra run without approval. ~~G1 near the threshold sets `second_seed_required`.~~ **2026-10-11 사용자 결정: seed ablation은 하지 않음.** 결정은 단일 seed로 확정이고, G1이 임계값 ±0.15 안이며 G2–G4가 통과하면 `near_threshold` 경고(낮은 신뢰도)만 기록합니다(§5.1). The per-epoch checkpoints `ckpt_ep7` / `ckpt_ep8` exist for a descriptive check (`STEP1_RUN.md` §5). |
 | R3.5 6 modes vs 1 | not changed | Inherent to "learned vs analytic"; documented. |
 | R3.10 class-mapping contract, v2det history | not built | Step-2 work. The CA scales and ROI are already tied to a source. |
 | R3.11 arm (c) code era | not changed | A c′ rerun at v3 code costs about 2.8 h of GPU and needs approval. The fresh dump (D8) reproduces exactly, and G4 is non-inferiority against it. |
@@ -283,3 +283,225 @@ Tests: `test_v3_decide::test_auc_boot_matches_roc_auc_and_brute_force`, `::test_
   Every val split was finite. ck2T10 itself had 3 skipped steps by step 100.
 - **Arm (c) dump** (D8): `D3/infer/ck2T10`, 156 s on GPU 0. Check: pdms_ck_noim 0.9032467603683472, equal to ck2T10's `val_metrics.jsonl` (|Δ| = 0, n_sel 18,179).
 - **GPU time used:** about 9 min in total, as separate jobs of at most 156 s, on GPUs 0 and 1 only. GPUs 2–7 were never touched.
+
+## 5. 2026-10-11 tooling fixes
+
+작성 2026-10-12 00:30 KST, tooling fixer. 적대적 검증(코드 근거 + CPU 실험)으로 확인된 결함 4개(F1–F4)를 고쳤습니다. 커밋 없음, 학습 없음, GPU 사용 없음. 실행 중인 arm (b) 학습과 `SSR-ck2` 워크트리는 건드리지 않았습니다.
+
+**현재 Step-1 산출물에 대한 영향: 넷 다 없음** [실측, 검증 보고]. decide는 아직 실행되지 않았고, arm (a)/(b) infer 폴더도 아직 없습니다. arm (c) 덤프, K96 pack 3개, `v3fc_pre_learned6`은 각 결함의 발동 조건을 거치지 않았습니다. 수정은 이후 실행(arm a/b infer, decide, 재개, 재빌드)부터 적용됩니다.
+
+| id | 파일 | 결함 | 수정 |
+|---|---|---|---|
+| F1 | decide_step1.py | "second seed 필요" 조건에서도 `decision: GO`, `go: true`로 기록됨 | seed ablation 없음(사용자 결정) → 단일 seed로 결정 확정, `near_threshold` 경고 |
+| F2 | infer_val_v3.py, decide_step1.py | 입력이 바뀌어도 done 행을 재사용하고 meta만 새 입력으로 덮어씀 | `cache_key.json` + 거부, decide에서 ckpt 재해시와 cache key 검사, arm (c) legacy 경로 |
+| F3 | pretrain_forecaster.py | `--batch` / `n_train`을 바꿔 재개하면 sample을 건너뛰거나 중복 학습함 | step geometry를 config와 ckpt에 기록, 다르면 재개 거부 |
+| F4 | build_obj_pack.py | 중단된 빌드를 입력이 바뀐 뒤 재개하면 옛 chunk와 새 chunk가 섞임 | part_key에 입력 fingerprint 포함 |
+
+### 5.1 F1: 단일 seed로 결정 확정 (사용자 결정 2026-10-11)
+
+**결함.** |Δ − 0.20| ≤ 0.15이면 `G1.second_seed_required`를 켜고 "before the decision is final" note를 남기면서도, 결론 필드는 `decision: "GO"`, `go: true`였습니다. 그래서 잠정 결론이 확정처럼 보였습니다. 두 seed를 합치는 규칙도 사전등록돼 있지 않았습니다.
+
+**결정.** seed ablation은 하지 않습니다(사용자 결정 2026-10-11). 그러므로 결정은 seed 1개로 확정합니다.
+
+**수정** (`VERSION v3_decide_3`):
+- 삭제: `second_seed_required`, `GO_RULE.G1.second_seed_band`, "second seed … before the decision is final" note, stdout의 `SECOND SEED REQUIRED`.
+- `GO_RULE.G1.near_threshold_band = 0.15`. `gates.G1.within_band`는 G2–G4와 무관한 원래 구간 판정입니다.
+- 최상위 `near_threshold`: |Δ − 0.20| ≤ 0.15 **이고** G2–G4가 모두 통과할 때만 `"single seed; delta within 0.15 of the threshold -> low confidence"`, 그 외에는 `null`입니다. G2–G4 중 하나라도 fail이면 G1과 상관없이 NO-GO이므로 경고할 이유가 없습니다.
+- 최상위 `seed_policy = "single seed (user decision 2026-10-11)"`, `final = valid_for_decision`.
+- decision 텍스트는 `GO` / `NO-GO` / `INVALID (would be …)` 그대로입니다. stdout 첫 줄은 `decision: GO  [final; single seed (user decision 2026-10-11)]`이고, 경고가 있으면 다음 줄에 `WARNING near_threshold: …`가 찍힙니다. INVALID는 final이 아닙니다.
+
+**테스트.** `test_v3_decide::test_single_seed_decision_final_and_near_threshold`가 G2–G4를 통과하도록 설계한 world에서 다음을 확인합니다:
+
+| Δ (설계값) | G2 | 기대 결론 | near_threshold |
+|---|---|---|---|
+| +0.30 | pass | GO (final) | 경고 |
+| +1.00 | pass | GO (final) | 없음 |
+| +0.10 | pass | NO-GO (final) | 경고 |
+| +0.30 | fail | NO-GO (final) | 없음 |
+
+`--no-arm-check`(INVALID)이면 `final: false`입니다. 이 밖에 `::test_decide_d4_reports_and_band_flag`(구 `…_second_seed_flag`)와 `::test_preregistered_constants`도 갱신했습니다.
+
+### 5.2 F2: infer cache key, decide의 ckpt / cache 검사, legacy 경로
+
+**결함.**
+- `infer_val_v3.py`는 `--out`에 이미 done인 행과 memmap이 있으면 그대로 재사용했습니다. ckpt, which, cand, variants, object pack, ca_scales, 코드가 같은지는 확인하지 않았습니다. 그러면서 `infer_meta.json`은 새 입력으로 덮어써서, 옛 점수에 새 메타가 붙었습니다.
+- variants가 바뀐 경우는 logit16 check로도 잡히지 않았습니다. 80개 variant는 16개 후보와 따로 점수가 매겨지기 때문입니다.
+- decide는 `ckpt_sha16`을 기록만 하고 비교하지 않았습니다.
+- `STEP1_RUN.md` §5의 "`--out`을 안 주면 last 덤프를 덮어쓴다"는 틀린 설명이었습니다. 실제로는 last 점수를 그대로 둔 채 meta만 ep7로 바꿨고, check도 ok로 나왔습니다 [실측: 검증 실험].
+
+**수정 (infer).** `<out>/cache_key.json`을 행 계산 전에 씁니다. `version v3_infer_cache_1`이고 내용은 다음과 같습니다:
+- run (resolved), which, ckpt 파일명, `ckpt_sha256`(모델 로드 전에 해시);
+- packed `tokens.parquet` / `ok.npy` / `cand.npy` / `status.npy`의 sha256과 variants sha256;
+- temporal cfg, privileged, 정밀도(`fp16 autocast` / `fp32 (cpu)`);
+- `data` = 이 추론의 provenance data(val pack build.json sha, ca_scales sha, fc_init sha);
+- `code` = forward 코드 sha256: `infer_val_v3.py`에서 시작한 **정적 import closure**입니다. ast로 module 수준과 함수 안의 `import` / `from .. import`를 모두 따라가고, 상대 import를 풀고, 부모 package를 포함하며, 범위는 repo의 `navsim/`, `tools/`입니다. 현재 40개 파일이고 model, temporal branch / forecast / raster, refiner, CKDataset, obj_pack, ckutil, 이 스크립트가 들어갑니다. 파일별 sha16도 함께 기록합니다.
+  - 처음에는 `ck/**` 전체를 glob했습니다. 그런데 전체 테스트 중 다른 세션이 `online2.py`를 고치자 같은 키 재실행이 거부됐습니다 [실측, 아래 §5.5]. 그래서 실제로 import되는 코드만 보도록 바꿨습니다. e2e student 코드(`online2.py`, `e2e_data2.py`)와 `train_ck2.py`는 키에 들어가지 않습니다.
+  - 정적 분석이므로, 그 프로세스가 다른 모듈을 import했는지와 무관하게 키가 같습니다.
+
+검사와 기록:
+- `--out`에 done 행이 있는데 `cache_key.json`이 없거나(F2 이전 덤프) 키가 다르면, 아무것도 쓰지 않고 SystemExit합니다. 메시지에 다른 필드 이름이 나오고 새 `--out`을 쓰라고 안내합니다. 키가 같으면 이어서 계산합니다.
+- `infer_meta.json`에 `cache_key`를 기록하고, `ckpt`는 절대경로로 씁니다. `sessions`는 키가 같을 때만 이어 붙입니다.
+- 한계: BEV feature 파일 자체는 해시하지 않습니다. 공용 teacher dump이고 read-only입니다.
+
+**수정 (decide `check_arm_meta`).**
+- `infer_meta.ckpt`를 다시 해시해 `ckpt_sha16`과 비교합니다. 파일이 없거나 sha가 다르면 거부합니다.
+- `cache_key`가 필수입니다. infer_meta의 키와 폴더의 `cache_key.json`이 같아야 하고, ckpt / which / temporal이 meta와 맞아야 하며, cand / variants sha가 현재 파일과 같아야 합니다.
+
+**Legacy 경로** (F2 이전 덤프, 대표적으로 arm (c) `D3/infer/ck2T10`; 이 덤프는 다시 쓰지 않습니다). 키가 없는 덤프는 다음을 모두 만족할 때만 받아들입니다:
+- 세션이 정확히 1개이고 그 세션의 n이 n_done, n_rows와 같습니다. 즉 모든 행을 한 세션에서 계산했으므로 다른 입력으로 계산된 행이 섞일 수 없습니다.
+- 위의 ckpt / cand / variants 검사를 통과합니다.
+
+받아들인 legacy 덤프는 step1.json에 `inputs.<arm>.cache = {mode: "legacy", legacy_rule, …}`, `legacy_dumps`, note로 표시됩니다.
+
+**실측.**
+- ck2T10 덤프는 legacy 조건을 만족합니다: sessions [18179], ckpt sha16 7d42718ef99ca6c4 = 현재 파일, cand / variants sha 일치 (`::test_real_arm_c_legacy_dump_accepted`).
+- 실제 decide를 arm check와 함께 dry run했습니다(`--a/--b/--c D3/infer/ck2T10`). 거부된 것은 a와 b뿐이고 이유는 "must be temporal on"이었습니다. c는 legacy로 통과했습니다.
+- `--no-arm-check` dry run(`/tmp/v3fix_decide_dry/step1_dry.json`): PDMS 90.919, lead TTC AUC .8369, lead fail 6.17 %, a-1.0 pref .6526으로 STEP1_RUN의 arm (c) 기준값과 같습니다. 결과는 `INVALID (would be NO-GO)`, `final: false`, `legacy_dumps [a, b, c]`(NOT checked)입니다.
+- temporal 경로는 CPU에서 확인했습니다(`smoke_gpu01_a`, 4행, `/tmp`): cache_key가 생성되고(data: packs / ca_scales / fc_init, code 40 files), 같은 키로 다시 실행하면 sessions [4, 0], decide cache / ckpt 문제 0입니다. check는 CPU fp32 vs GPU fp16이라 not ok인데, 기존과 같고 예상된 결과입니다.
+
+**테스트.** `test_v3_tooling_fixes::test_key_diff_and_check_cache`, `::test_cache_key_fields`, `::test_real_infer_cache_reuse_and_refusals`. 마지막 테스트는 ck2T 8행을 CPU로 계산한 뒤 다음을 확인합니다:
+- 같은 키로 재실행하면 기존 행을 재사용합니다.
+- 같은 `--out`에 `--which ep28`를 주면 거부되고, 출력 파일 바이트가 그대로입니다.
+- `cache_key.json`을 지우면 거부됩니다.
+
+`test_v3_decide::test_check_arm_meta_ckpt_and_cache_key`, `::test_check_arm_meta_legacy_dump`, `::test_check_arm_meta_rules`(갱신)도 같이 고쳤습니다.
+
+### 5.3 F3: forecaster pre-training 재개 검사
+
+**결함.** 재개 위치를 sample이 아니라 step 수로 저장하고, 새 `--batch`로 계산한 `steps_per_epoch`로 해석했습니다. 그 결과:
+- batch를 키우면 sample이 누락되고, 줄이면 같은 순서·같은 augmentation으로 중복 학습됩니다. 그런데도 `done.json`은 정상 완료처럼 보입니다.
+- `--limit-tokens`로 `n_train`을 바꿔도 같은 문제가 생깁니다.
+- `config.json`은 첫 실행 때만 써서 옛 batch가 그대로 남습니다.
+
+**수정.**
+- `config.json`에 최상위 `batch`를 추가하고, `ckpt_last.pt`에 `batch` / `n_train` / `steps_per_epoch` / `total_steps`를 저장합니다.
+- `--resume`이면 n_modes / seed / epochs / aug와 위 4개 값을 config.json 및 ckpt(기록돼 있을 때)와 비교합니다. F3 이전 config는 `args.batch`로 비교합니다. 다르면 SystemExit합니다.
+- batch를 바꿔 이어 학습하는 기능은 지원하지 않습니다. LR schedule도 step 단위라서, 위치를 다시 계산하기보다 거부하는 편이 단순하고 안전합니다.
+
+**테스트** (CPU, 실제 K96 train pack 40행, batch 8, 3 epoch; `::test_pretrain_resume_geometry`, `::test_resume_mismatch_unit`):
+- epoch 0 ckpt 직후에 kill하고 같은 설정으로 재개하면, 남은 epoch마다 모든 sample을 1회씩 학습하고 최종 forecaster 가중치가 중단 없는 실행과 **bitwise 동일**합니다.
+- `--batch 16`, `--limit-tokens 32`, `--max-steps`로 재개하면 모두 거부됩니다.
+- 옛 결함도 재현했습니다. 수정 전 코드(커밋 aa7a7b2)는 같은 상태에서 `--batch 16`으로 재개하면 epoch 1의 sample 일부만 학습하고, `done.json`에 `epochs_done 3`을 쓰고 조용히 끝납니다.
+
+기존 `v3fc_pre_learned6`은 재개한 적이 없어 영향이 없습니다. 그 config(F3 이전 형식)도 같은 인자로 재개하면 통과합니다.
+
+**부작용 (중요).** `pretrain_forecaster.py`는 `provenance.TRAIN_CODE`에 들어 있습니다. 그래서 이 수정만으로 training-code sha가 **eb1bb78f96af8e99 → 3aeff8960e5d2200**으로 바뀝니다. 원본 파일로 sha를 다시 계산하면 eb1bb78f96af8e99로 돌아오는 것을 확인했습니다 [실측].
+
+**이 수정과 무관한 동시 변경 [실측].** 다른 세션이 2026-10-12 00:18 KST부터 같은 워크트리의 `navsim/agents/para_ssr/ck/e2e_data2.py`, `online2.py`를 고치고 있습니다(Step-2 temporal DET teacher, `docs/refiner_v3/STEP2_E2E.md` 참조). 둘 다 TRAIN_CODE에 들어 있습니다. 00:19 KST 기준 sha는 3d7a862f30c5ce3b이고, pretrain만 원본으로 돌려도 4ec95ac6674bc12e입니다. 세 파일을 모두 HEAD로 돌려야 eb1bb78f96af8e99가 됩니다. 이 두 파일은 건드리지 않았습니다.
+
+- 지금 학습 중인 arm (b)가 끝나기 전(≈ 02:15 KST)에 죽어서 `run_step1.sh b`로 재개하면, train_ck2의 D5 재개 검사가 "code.train.sha256 differs"로 거부합니다. 이 경우 아래 절차를 따릅니다(2026-10-12 리뷰 후속으로 수정, §6 finding 3; 이전 판의 `git stash push -- <files>` / `git stash pop` 절차는 **폐기**: stash 스택은 다른 워크트리·세션과 공유되므로 `pop`이 남의 항목을 적용할 수 있고, 다른 세션의 작업 중 파일을 빼앗으며, `git diff --stat`은 sha에 포함되는 untracked `.py`를 보여주지 않습니다).
+  1. **sha를 직접 확인합니다.** `cd /workspace/yongjae/SSR-v3 && PYTHONPATH=/workspace/yongjae/SSR-v3 /venv/ssr/bin/python -B -c "from tools.ck.v3 import provenance as PV; print(PV.train_code()['sha256'][:16])"` 출력이 b의 `config.json` 기록값 **eb1bb78f96af8e99**여야 재개됩니다(2026-10-12 00:46 KST 현재 2386cecba71b2ce2). 어떤 파일이 다른지는 `PV.train_code()['files']`를 b의 `config.json` `provenance.code.train`과 비교해 봅니다.
+  2. **F3 파일만 되돌립니다.** `cp tools/ck/v3/pretrain_forecaster.py /tmp/pretrain_forecaster.f3.py && git show HEAD:tools/ck/v3/pretrain_forecaster.py > tools/ck/v3/pretrain_forecaster.py` (HEAD 판 = `/tmp/pretrain_forecaster.orig.py`, sha256 `1aaaa0ca…`).
+  3. **다른 세션의 파일(`e2e_data2.py`, `online2.py` 등)은 여기서 되돌리지 않습니다.** 사용자나 그 세션에 잠시 HEAD 판으로 돌려 달라고 요청하고, 1번 sha가 eb1bb78f96af8e99가 될 때까지 기다립니다.
+  4. `V3_USER_APPROVED=1 bash tools/ck/v3/run_step1.sh b`로 재개합니다.
+  5. `D3/train/v3T10_b_ca.launch.log`에 `resumed …` 줄이 나오고 `train_log.jsonl`에 새 step 기록이 생긴 뒤(두 rank 모두 provenance 검사를 통과한 뒤) `cp /tmp/pretrain_forecaster.f3.py tools/ck/v3/pretrain_forecaster.py`로 F3 수정본을 복원하고, 다른 세션에도 복원해도 된다고 알립니다.
+  6. stash가 꼭 필요하면 `git stash push -u -m <고유-tag> -- <files>` 후 `git stash list --format='%H %gs'`로 자기 항목의 sha를 잡아 `git stash apply <sha>`로 복원하고, tag로 다시 찾아 drop합니다. bare `git stash pop`은 쓰지 않습니다.
+- 앞으로 새로 학습하는 arm(예: d)은 a / b와 code sha가 달라 decide provenance 검사에 걸립니다.
+- a, b, c로 decide하는 데는 영향이 없습니다. decide는 각 run의 config.json에 기록된 학습 시 provenance만 비교합니다(a = b = eb1bb78f96af8e99).
+
+### 5.4 F4: object pack 빌드 재개 키
+
+**결함.** chunk 재사용 키(part_key)에는 layout(version, K_OBJ, D_OBJ, threshold, targets)만 들어 있었습니다. 그래서 GT 내용, BEVFusion cache나 frames parquet, `MATCH_GATE_M`, `FC_T`, `N_FRAMES`, 코드가 바뀐 뒤 중단된 빌드를 재개하면 옛 chunk와 새 chunk가 섞였고, build.json에는 새 provenance만 기록됐습니다.
+
+**수정.**
+- provenance를 chunk를 만들기 **전에** 계산합니다. build.json에도 이 값이 기록됩니다.
+- 입력 fingerprint = sha256(provenance에서 git_head / git_note를 뺀 것, `MATCH_GATE_M`, `FC_T`, `N_FRAMES`, GT 파일별 manifest `D3/gt_objects/_manifests/<split>.json`의 sha256)입니다.
+- 이 fingerprint를 part_key의 `inputs`에 넣고 worker init에도 넘깁니다. assembly 단계에서도 모든 part의 키를 다시 검사합니다.
+- build.json에 `inputs_sha256`과 `inputs`를 기록합니다.
+- 기존 complete pack(K96 3개, fingerprint 없음)은 그대로 로드됩니다. ObjPack은 이 필드를 읽지 않습니다.
+- 한계: GT 파일 내용은 manifest와 index sha로만 감지합니다. manifest를 다시 만들지 않고 GT를 바꾸면 잡지 못합니다.
+
+**테스트** (`/tmp`, navtrain_val 32행, chunk 16; `::test_build_resume_rebuilds_on_changed_gate`, `::test_part_key_includes_fingerprint`, `::test_existing_complete_pack_loads_unchanged`):
+- 입력이 그대로인 재개: "0 to build", 결과 바이트 동일.
+- gate를 2.0에서 0.5로 바꾼 재개: "2 to build". 결과는 처음부터 gate 0.5로 만든 pack과 바이트가 같고, gate 2.0 결과와는 target이 다릅니다. 즉 수정 전이었다면 섞인 pack이 됐을 상황입니다.
+
+### 5.5 검증과 남은 일
+
+**실행 결과** [실측; CPU only, `CUDA_VISIBLE_DEVICES=`, `OMP_NUM_THREADS=1`, `python -B`; 임시 파일은 `/tmp`, 기존 테스트가 쓰는 `D3/test_tmp`만 예외]:
+- **전체 v3 테스트(`tests/test_v3_*.py`): 146 passed, 0 failed, 0 skipped, 8 min 9 s.**
+  - 파일별 개수: arms 6, decide 27(+4), integration_off 1, loss_metrics 21, model_patch 5, objects 15, review_fixes 11, temporal_model 34, temporal_real 3, tooling_fixes 9(신규), train 14.
+  - 다른 세션이 00:31 KST에 만든 `test_v3_e2e_teacher.py`는 실행 시작 뒤에 생겨서 포함되지 않았습니다.
+- **첫 전체 실행: 144 passed, 1 failed.** 실패한 것은 `test_real_infer_cache_reuse_and_refusals`였습니다.
+  - 두 infer 호출 사이에 다른 세션이 `navsim/agents/para_ssr/ck/online2.py`를 고쳤고, 같은 키여야 할 재실행이 `code.files.…online2.py` 차이로 거부됐습니다.
+  - 즉 cache key는 설계대로 작동했지만, 범위가 넓어서 무관한 코드 변경에도 거부했습니다. 그래서 forward 코드를 정적 import closure로 좁혔고(§5.2), 그 뒤 위의 146 passed를 얻었습니다.
+- **decide known-answer 테스트**(전체 실행에 포함):
+  - `test_real_ck2T_selfcompare`: PDMS 90.814, 1,605 lead, 1,583 hazard pairs, 모든 Δ 0.
+  - `test_reference_equality_with_lib`, `test_auc_boot_matches_roc_auc_and_brute_force`, `test_g4_noninferiority_edges`.
+- **decide dry run** (a/b infer 폴더가 아직 없어 arm (c) 덤프로만, 출력은 `/tmp/v3fix_decide_dry/`):
+  - arm check를 켜면 a / b만 "must be temporal on"으로 거부되고, c는 legacy로 통과합니다.
+  - `--no-arm-check`이면 arm (c) 기준값(90.919 / .8369 / 6.17 % / .6526)이 그대로 나오고, `INVALID (would be NO-GO)`, `final false`, `legacy_dumps [a, b, c]`(NOT checked)입니다.
+- 수정 전 원본 4개는 `/tmp/*.orig.py`에 있습니다(diff용).
+
+**main session이 할 일.** a / b infer 명령은 STEP1_RUN §4 그대로 쓰면 됩니다. 기본 출력 폴더가 아직 없으므로 처음부터 계산됩니다. 그다음 decide를 실행합니다. arm (c)는 legacy로 받아들여지고 step1.json에 표시됩니다.
+- 하지 않은 것:
+  - arm (a) / (b) infer와 decide 본 실행: main session이 할 일입니다.
+  - BEV feature 해시(F2 한계).
+  - GT 파일 내용 전체 해시(F4 한계).
+  - 2-seed 결합 규칙: 사용자 결정으로 필요 없어졌습니다.
+
+
+## 6. 2026-10-12 F1–F4 리뷰 후속 수정
+
+작성 2026-10-12 01:15 KST, tooling fixer. F1–F4 수정에 대한 리뷰(차단 결함 0, medium 1, low 5)를 반영했습니다. 커밋 없음, 학습 없음, GPU 사용 없음. 실행 중인 arm (b) 학습, `tools/ck/train_ck2.py`, `navsim/**`, `tools/ck/data/**`, `SSR-ck2` 워크트리는 건드리지 않았습니다. 바꾼 파일: `tools/ck/v3/decide_step1.py`, `tools/ck/v3/infer_val_v3.py`, `tests/test_v3_decide.py`, `tests/test_v3_tooling_fixes.py`, 이 문서, `STEP1_RUN.md`, `SPEC.md` §12.1. 둘 다 TRAIN_CODE가 아니므로 training-code sha는 바뀌지 않습니다.
+
+| # | 등급 | 내용 | 조치 |
+|---|---|---|---|
+| 1 | medium | decide가 arm 간 forward 코드를 비교하지 않음 | **수정**: `code_check` |
+| 2 | low | 사전등록이 아닌 bootstrap(`--n-boot 200`)도 `final: true` | **수정**: INVALID, final 아님 |
+| 3 | low (문서) | arm (b) 재개 절차의 `git stash push/pop`이 위험 | **수정**: §5.3 절차 교체 |
+| 4 | low | 기본 `--out`이 `--which`를 무시 | **수정**: last가 아니면 `<run>_<which>` |
+| 5 | low | 같은 키 재개 시 `fc_metrics.json`이 첫 세션 행만 반영 | **수정**: 합계 저장·합산 + decide note |
+| 6 | low | ckpt를 모델 로드 전에만 해시 | **수정**: 로드 전후 sha 비교 |
+| (추가) | – | 학습 중인 run의 `ckpt_last`를 infer할 수 있음 | **수정**: `done.json` 필수 (infer, decide) |
+
+### 6.1 Finding 1: arm 간 forward 코드 검사 (medium)
+
+**결함.** cache key에 `code.sha256`과 파일별 sha가 기록되지만 arm 사이에서 비교하지 않았습니다. 다른 세션이 같은 워크트리의 `navsim/agents/para_ssr/ck/`를 고치는 중이라, a와 b infer 사이에 `model.py`, `temporal/*`, `tools/ck/data/*`가 바뀌면 두 arm이 다른 코드로 채점돼도 경고가 없었습니다.
+
+**수정** (`decide_step1.code_check`, `VERSION v3_decide_4`):
+- cache key가 있는 모든 arm(a, b, d, 그리고 c도 키가 있으면)은 `cache_key.code.sha256`과 `cache_key.amp`가 기준 arm(a, b, d, c 순으로 첫 keyed arm)과 같아야 합니다. 다르면 **오류**이고 `code.files`에서 다른 파일(한쪽에만 있는 파일 포함)을 나열합니다. `run()`은 arm check 단계에서 SystemExit합니다.
+- legacy arm(c `D3/infer/ck2T10`)은 기록된 `code_sha256`(MODEL_FILES 7개; F2가 바꾼 `infer_val_v3.py`는 제외)과 `amp`를 기준 arm의 코드와 비교해 **경고**만 냅니다. legacy 덤프는 전체 closure를 기록하지 않았기 때문입니다.
+- 결과는 `step1.json`의 `code_check`(`ref`, arm별 sha, `legacy_compared`, errors, warnings)와 stdout `forward code:` 줄에 나옵니다. `decide()`는 `code_check`가 없거나 오류가 있으면 INVALID입니다.
+- 실측: 현재 forward 코드 sha **3475c5a4ffc2a8e2**(40개 파일, HEAD와 다른 것은 `infer_val_v3.py`뿐). legacy c의 MODEL_FILES 7개는 현재 코드와 모두 같습니다(differ `[]`).
+
+### 6.2 Finding 2: 사전등록 bootstrap이 아니면 INVALID
+
+`run()`이 `preregistered = (n_boot == 2000 and seed == 0)`을 `decide()`에 넘깁니다. 아니면 `valid_for_decision: false`, `final: false`, `go: false`, `decision: "INVALID (would be …)"`, `preregistered_bootstrap: false`, note가 붙습니다. 합성 테스트는 `decide()`를 직접 부르므로(작은 n_boot) 영향이 없습니다. CLI는 `[warn] … diagnostic (INVALID, never final)`을 찍습니다.
+
+### 6.3 Finding 3: arm (b) 재개 절차 (문서)
+
+§5.3과 `STEP1_RUN.md` "Still open"의 `git stash push -- <files>` / `git stash pop` 절차를 폐기하고, sha 직접 확인(eb1bb78f96af8e99) → F3 파일만 `git show HEAD:…`로 되돌림 → 다른 세션 파일은 그 세션과 조율 → 재개 → `resumed` 줄과 새 step 기록 확인 후 복원, 으로 바꿨습니다(§5.3). arm (b)가 정상 종료하면 필요 없는 절차입니다.
+
+### 6.4 Finding 4: `--which`별 기본 출력 폴더
+
+`--out`이 없으면 `which == last`일 때 `D3/infer/<run>`, 아니면 `D3/infer/<run>_<which>`입니다(`infer_val_v3.default_out_name`). 예전에는 ep7 infer를 먼저 하면 기본 폴더를 차지해 last infer가 (안전하게) 거부되어 막혔습니다.
+
+### 6.5 Finding 5: forecast metrics 합산
+
+- `fc_metrics.json`에 `ForecastMetrics`의 가산 합계(`sums.arm`, `sums.ca_reference`)를 함께 저장합니다.
+- 같은 cache key로 재개하면 이전 합계에 이번 세션 합계를 더해 다시 씁니다(`n_rows` 누적, `n_sessions_merged`). 키가 다른 폴더는 F2에서 이미 거부되므로 섞이지 않습니다. 합계가 없는 옛 파일은 이번 세션 값으로 바꾸고 로그를 남깁니다.
+- decide는 `fc_metrics.n_rows != infer_meta.n_done`이면 note를 남깁니다(forecast metrics는 서술용이고 gate가 아님). 세션이 행 계산 중 죽은 경우 등을 표시합니다.
+
+### 6.6 Finding 6: 로드 전후 ckpt sha 비교, 학습 완료 검사
+
+- `infer`는 키에 쓸 sha256을 모델 로드 전에 계산하고, `load_ck`가 파일을 읽은 뒤 계산한 `net.init_report["ckpt_sha16"]`과 비교합니다. 다르면(로드 중 파일 교체) 아무것도 쓰지 않고 SystemExit합니다.
+- (추가) `--which last`는 `<run>/done.json`이 있어야 합니다. 학습 중인 run의 `ckpt_last`는 중간 가중치이고 eval 직후라면 reproduce check까지 통과할 수 있기 때문입니다. `--allow-unfinished`는 점검용이며 `infer_meta.run_done`에 기록됩니다. decide도 meta의 `run`에 `done.json`이 없으면 그 arm을 거부합니다. ck2T, ck2T10, v3T10_a_learned에는 있고, v3T10_b_ca는 학습 종료 후 생깁니다.
+
+### 6.7 테스트
+
+신규·확장 (`tests/test_v3_decide.py`, `tests/test_v3_tooling_fixes.py`):
+- `test_v3_decide::test_code_check_between_arms`: 같은 코드 통과, 다른 파일·한쪽에만 있는 파일·amp 차이·d·keyed c → 오류(파일명 포함), legacy c 차이 → 경고만, 기준 arm 순서.
+- `::test_decide_code_check_preregistered_and_fc_coverage`: GO 세계에서 code_check 없음/오류 → `INVALID (would be GO)`, 경고만 → GO final, `preregistered=False` → INVALID·final 아님, fc 행 수 note.
+- `::test_check_arm_meta_requires_finished_run`, `::test_real_arm_c_legacy_dump_accepted`(확장: 실제 c 덤프 vs 현재 closure 비교, 7개 파일 일치).
+- `test_v3_tooling_fixes::test_default_out_name`, `::test_infer_refuses_unfinished_run_and_changed_ckpt`, `::test_merge_fc_sums`.
+- `::test_real_temporal_fc_merge_and_decide_code_check`(실제 v3T10_a_learned, CPU): 4행 + 4행 두 세션의 forecast 합계 = 한 번에 8행(rel 1e-4), sessions [4, 4]. 이어서 ck2T10 배열을 /tmp에 복사한 전체 크기 a / b 대역 폴더(이 infer의 meta와 cache key, b는 forecaster ca, check.ok 지정)와 실제 legacy c로 **arm check를 켠** `decide_step1.run`: valid, final, `NO-GO`(a = b = c 점수), `legacy_dumps ['c']`, code check 오류 없음(a = b sha, legacy c 7개 파일 일치, CPU 대역이라 amp 경고), fc note. `n_boot 50` → `INVALID (would be NO-GO)`. b의 코드 sha와 `model.py`만 바꾸면 `forward code differs … model.py`로 거부되고 출력 파일이 생기지 않습니다.
+
+**실행 결과** [실측; CPU only, `CUDA_VISIBLE_DEVICES=`, `OMP_NUM_THREADS=1`, `python -B`; 임시 파일은 `/tmp`, 로그 `/tmp/v3fix_rev2/pytest_all.log`]:
+- **전체 `tests/test_v3_*.py`(다른 세션의 e2e 3개 파일 포함): 165 passed, 0 failed, 0 skipped, 7 min 59 s** (2026-10-12 00:55–01:03 KST).
+  - 파일별: arms 6, decide 30(+3), e2e_cpu_dryrun 1, e2e_launch 4, e2e_teacher 7, integration_off 1, loss_metrics 21, model_patch 5, objects 15, review_fixes 11, temporal_model 34, temporal_real 3, tooling_fixes 13(+4), train 14.
+  - decide known-answer 테스트 포함: `test_real_ck2T_selfcompare`(PDMS 90.814, 1,605 lead, 1,583 hazard pairs), `test_reference_equality_with_lib`, `test_auc_boot_matches_roc_auc_and_brute_force`, `test_g4_noninferiority_edges`; OFF bit-identity `test_off_bitwise_identical_to_8ae8b1d`.
+- 실행 후 상태: forward 코드 sha 3475c5a4ffc2a8e2(40개 파일), training-code sha 2386cecba71b2ce2(이번 수정으로 바뀌지 않음; 다른 세션 파일 + F3 때문). arm (b)는 01:03 KST에 epoch 6 / step 34,200 / 53,190으로 정상 진행 중.
+
+### 6.8 main session이 할 일 (arm (b) `done.json` 생긴 뒤)
+
+`STEP1_RUN.md` §4 명령 그대로입니다: (0) a, b의 `done.json` 확인, (1) forward 코드 sha 출력(3475c5a4ffc2a8e2 예상; 다르면 어떤 파일이 바뀌었는지 확인), (2) GPU 0에서 a → b infer를 연달아 기본 `--out`으로, (3) decide를 사전등록 기본값(`--n-boot`/`--seed` 생략)으로. decide가 `forward code differs`로 거부하면 두 infer 사이에 forward 코드가 바뀐 것이므로, 코드가 고정된 상태에서 a와 b를 새 `--out`으로 다시 돌립니다. smoke는 `/tmp`에만 합니다.

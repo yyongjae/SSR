@@ -25,9 +25,15 @@ the analytic CA reference with D3/ca_scales.json): navtrain_val (BEVFusion in-sa
 out-of-sample, GT from D3/gt_objects/navtest; review causality finding 2), and a fixed log-stratified subset of
 navtrain_train (in-sample scenes).  overfit_index = (minADE_learned / minADE_CA)_val / (..)_train_subset; > 1.10 is
 flagged (the critic of arm a would see better-than-deployable forecasts during training).
-Outputs (--out): config.json (args, aug, provenance: code / pack / ca_scales shas), train_log.jsonl,
-val_metrics.jsonl, ckpt_last.pt (resume), forecaster.pt ({'forecaster': state_dict, 'n_modes', 'seed', ...}),
-done.json.  GPU: only GPU 0 or 1 (CUDA_VISIBLE_DEVICES exactly '0' or '1'); CPU for tests.
+Outputs (--out): config.json (args, aug, batch / n_train / steps_per_epoch / total_steps, provenance: code / pack /
+ca_scales shas), train_log.jsonl, val_metrics.jsonl, ckpt_last.pt (resume; also carries batch / n_train /
+steps_per_epoch / total_steps), forecaster.pt ({'forecaster': state_dict, 'n_modes', 'seed', ...}), done.json.
+GPU: only GPU 0 or 1 (CUDA_VISIBLE_DEVICES exactly '0' or '1'); CPU for tests.
+Resume (--resume, tooling fix F3 2026-10-11): the resume position is a STEP count, mapped onto epochs with
+steps_per_epoch = ceil(n_train / batch), and the LR schedule is a function of total_steps.  A resume is therefore
+refused (SystemExit) unless batch, n_train (--limit-tokens / train pack), steps_per_epoch and total_steps (--epochs,
+--max-steps) equal those of config.json and of ckpt_last.pt (when it records them), besides n_modes / seed / epochs /
+aug / packs.  Before this fix another --batch silently skipped (larger batch) or repeated (smaller batch) samples.
 """
 from __future__ import annotations
 
@@ -58,6 +64,23 @@ AUG_SEED_OFFSET = 7919
 VERSION = "v3_fc_pretrain_1"
 OVERFIT_FLAG = 1.10
 KEYS = ("obj_in", "obj_mask", "frame_valid", "fc_xyh", "fc_state")
+# the resume position (a step count) and the LR schedule are only meaningful under the same step geometry (F3)
+RESUME_KEYS = ("n_modes", "seed", "epochs", "aug", "batch", "n_train", "steps_per_epoch", "total_steps")
+GEOMETRY_KEYS = ("batch", "n_train", "steps_per_epoch", "total_steps")
+
+
+def resume_mismatch(old_conf: Dict, conf: Dict, ck: Optional[Dict] = None) -> List[str]:
+    """Differences that make a resume unsound: config.json (old_conf; configs written before F3 carry the batch only
+    in args) vs this call, and the checkpoint's own step geometry (when it records it) vs this call."""
+    bad = []
+    for k in RESUME_KEYS:
+        ov = old_conf.get(k, (old_conf.get("args") or {}).get(k) if k == "batch" else None)
+        if ov != conf[k]:
+            bad.append(f"{k}={conf[k]!r} but config.json has {ov!r}")
+    for k in GEOMETRY_KEYS:
+        if ck is not None and k in ck and ck[k] != conf[k]:
+            bad.append(f"{k}={conf[k]!r} but ckpt_last.pt has {ck[k]!r}")
+    return bad
 
 
 def kst() -> str:
@@ -228,7 +251,8 @@ def main(argv=None):
     conf = dict(version=VERSION, args=vars(a), n_modes=cfg.n_modes, seed=int(a.seed), epochs=int(a.epochs),
                 aug=dict(p_frame_drop=cfg.p_frame_drop, p_obj_drop=cfg.p_obj_drop, v_noise=cfg.v_noise,
                          aug_seed=aug_seed, stream="objaug"),
-                temporal=cfg.to_dict(), n_train=len(train), steps_per_epoch=steps_per_epoch, total_steps=total,
+                temporal=cfg.to_dict(), batch=int(a.batch), n_train=len(train), steps_per_epoch=steps_per_epoch,
+                total_steps=total,
                 param_count=int(sum(p.numel() for p in model.parameters())),
                 provenance=PV.run_provenance(cfg, splits=[a.train_split] + [s for s, _ in evals if not
                                                                             s.endswith("_insample")]),
@@ -239,12 +263,14 @@ def main(argv=None):
         if not a.resume:
             raise SystemExit(f"{last} exists: pass --resume (or use a new --out)")
         old = U.read_json(out / "config.json") or {}
-        for k in ("n_modes", "seed", "epochs", "aug"):
-            if old.get(k) != conf[k]:
-                raise SystemExit(f"resume with {k}={conf[k]!r} but config.json has {old.get(k)!r}")
+        ck = torch.load(last, map_location="cpu", weights_only=False)
+        bad = resume_mismatch(old, conf, ck)
+        if bad:
+            raise SystemExit(f"{out}: refusing to resume: {'; '.join(bad)} (the resume position is a step count and "
+                             f"the LR schedule depends on total_steps: rerun with the recorded settings or use a new "
+                             f"--out)")
         if ((old.get("provenance") or {}).get("data") or {}).get("packs") != conf["provenance"]["data"]["packs"]:
             raise SystemExit("resume with other object packs than config.json records")
-        ck = torch.load(last, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["forecaster"])
         opt.load_state_dict(ck["optim"])
         sched.load_state_dict(ck["sched"])
@@ -311,7 +337,8 @@ def main(argv=None):
                                    flag=bool(rv / rt > OVERFIT_FLAG)))
         epoch_next = epoch + 1 if finished else epoch
         torch.save(dict(forecaster=model.state_dict(), optim=opt.state_dict(), sched=sched.state_dict(),
-                        epoch=epoch_next, step=step, n_modes=cfg.n_modes, seed=int(a.seed)), str(last) + ".tmp")
+                        epoch=epoch_next, step=step, n_modes=cfg.n_modes, seed=int(a.seed),
+                        **{k: conf[k] for k in GEOMETRY_KEYS}), str(last) + ".tmp")
         os.replace(str(last) + ".tmp", last)
         epoch = epoch_next
     fpath = out / "forecaster.pt"

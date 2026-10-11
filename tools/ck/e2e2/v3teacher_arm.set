@@ -1,0 +1,10 @@
+# refiner-v3 DET-teacher arm of the CK2 e2e (user 2026-10-11 night: once the teacher refiners (det, map) are done, start
+# the full e2e training with KD into the e2e model): ck_e2e2 key=value lines applied on top of ck_e2e2.yaml with
+#   RUN=ck2e2e_v3T CK2_E2E_APPROVED=1 E2E_CK_SET=<this file> bash tools/ck/e2e2/train_e2e2.sh start --gpus 0,1   (ARM=main)
+# Identical to ck2e2e_main (same yaml, recipe, seed, schedule, no BEV KD, MAP teacher ck2M10 + its calibration) except the
+# DET teacher: the v3 temporal teacher v3T10_a_learned (causal BEVFusion detection history + frozen pre-trained learned
+# forecaster + path-time raster; its own config.json temporal cfg is what turns the KD object inputs on) and that
+# teacher's KD calibration file (fit after the teacher finished: docs/refiner_v3/STEP2_E2E.md step 1).
+# The student stays CK2 (no temporal branch).  Do not add other keys here: the run must isolate the teacher change.
+teacher_det_run=/home/external-user/ssd/yongjae_refiner/ck/v3/train/v3T10_a_learned
+kd_calib.det=/home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/v3T10_a_learned__last.json

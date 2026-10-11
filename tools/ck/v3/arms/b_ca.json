@@ -1,0 +1,28 @@
+{
+ "version": "v3_arm_1",
+ "arm": "b",
+ "name": "v3T10_b_ca",
+ "role": "decision control: analytic constant-acceleration forecaster (SPEC 3.6, fixed Laplace scales, M = 1) in the SAME branch; isolates the learned forecaster",
+ "recipe": "recipe_ck2T10.json",
+ "privileged": false,
+ "requires_user_approval": true,
+ "gates": [
+  "G1"
+ ],
+ "temporal": {
+  "on": true,
+  "source": "bevfusion",
+  "forecaster": "ca",
+  "n_modes": 1,
+  "lambda_fc": 1.0,
+  "fc_backprop": false,
+  "p_frame_drop": 0.1,
+  "p_obj_drop": 0.05,
+  "v_noise": 0.3,
+  "pack_root": "/home/external-user/ssd/yongjae_refiner/ck/v3/objpack_k96",
+  "ca_scales": "/home/external-user/ssd/yongjae_refiner/ck/v3/ca_scales.json",
+  "version": "v3_temporal_1",
+  "fc_init": "",
+  "fc_train": "frozen"
+ }
+}

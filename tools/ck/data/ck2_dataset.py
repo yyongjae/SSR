@@ -14,6 +14,14 @@ CK2Dataset(split, bev in {'T', 'M', 'none'}, n_var=32, var_name='var_separate_sa
              navtrain_val cache), none: no BEV key (tests / label-only use).  Unreadable BEV -> zeros + bev_ok False.
   gt         GTLoader surrogate GT (ref_* keys), training only.
   epoch      sampler epoch (set_epoch(e) before building the epoch's DataLoader; workers fork the current value).
+  objects    refiner-v3 temporal branch (docs/refiner_v3/SPEC.md 5.2; default None = the CK2 code path, no new keys,
+             no RNG draw): {"cfg": TemporalCfg.to_dict() (on), "aug": bool, "targets": bool}.  __getitem__ (never
+             labels_item) adds the object pack row (tools/ck/data/obj_pack.ObjPack of (cfg.source, split) under
+             cfg.pack_root): obj_in f32 [3, 64, 17], obj_mask bool [3, 64], frame_valid bool [3], obj_ok bool
+             (+ fc_xyh f32 [64, 10, 3], fc_state i8 [64, 10] targets); aug -> obj_pack.augment_objects(token, epoch,
+             seed, cfg) on stream token_rng(token, epoch, seed, 'objaug') (training only); forecaster 'oracle_gt' ->
+             priv_fc_xyh / priv_fc_state (copies of the targets: PRIVILEGED inputs of the oracle arm).  Only
+             OBJ_INPUT_KEYS (+ PRIV_INPUT_KEYS for the oracle) may reach the model (MODEL_INPUT_KEYS_TEMPORAL).
   ep_target  'official' (default: y / var_y EP = the official label column, old behaviour bit-identical) | 'decoupled'
              (EP = clip(raw_progress / max(pdm_progress_eff, raw_progress), 0, 1) if max > 5 m else 1, i.e. official EP
              without the NC * DAC * DDC factor; user 2026-10-08): navsim.agents.para_ssr.ck.ep_target.ck_targets turns
@@ -34,6 +42,7 @@ Per item (row r, token t, epoch e)
 Item keys
   model inputs (MODEL_INPUT_KEYS; nothing else may reach the network)
     bev f16 [256, 50, 100] (+ bev_ok), cand f32 [K, 8, 3] (raw anchors), status f32 [8], var_traj f32 [V, 8, 3]
+    (+ obj_in, obj_mask, frame_valid with objects: MODEL_INPUT_KEYS_TEMPORAL)
   labels (CK_KEYS order nc, dac, ep, ttc, comfort; EP per ep_target; ok = label ok & all 5 targets finite)
     y f32 [K, 5], y_ok bool [K], y_pdms f32 [K] (official); var_y f32 [V, 5], var_ok bool [V], var_pdms f32 [V]
   training-time metadata (GT- / label-derived: never model inputs)
@@ -69,6 +78,65 @@ VAR_NAME = "var_separate_sampler16"
 RAW_LABELS = "raw256"
 MODEL_INPUT_KEYS = ("bev", "cand", "status", "var_traj")
 VAR_STREAM = "var"
+OBJ_INPUT_KEYS = ("obj_in", "obj_mask", "frame_valid")                # == ck.temporal.config.OBJ_INPUT_KEYS
+MODEL_INPUT_KEYS_TEMPORAL = MODEL_INPUT_KEYS + OBJ_INPUT_KEYS
+OBJ_BAD_MAX = 0.005                     # > 0.5 % of a dataset's tokens without objects (obj_ok False) -> refuse
+
+
+class ObjectRows:
+    """refiner-v3 object-pack adapter shared by CK2Dataset and CKDataset (`objects` kwarg, SPEC 5.2).
+
+    spec = {"cfg": TemporalCfg dict (must be on), "aug": bool, "targets": bool}; tokens = the dataset's packed token
+    order, rows = its packed rows.  The pack (cfg.source, split) under cfg.pack_root must cover every row in the same
+    token order.  item(row, token, epoch, seed) -> dict of pack arrays (augmented when aug, + privileged copies of the
+    targets for the oracle forecaster)."""
+
+    SPEC_KEYS = ("cfg", "aug", "targets")
+
+    def __init__(self, split: str, spec: Dict, tokens: np.ndarray, rows: np.ndarray):
+        from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+        from navsim.agents.para_ssr.ck.temporal.config import OBJ_INPUT_KEYS as _OK
+        from tools.ck.data.obj_pack import ObjPack
+        assert tuple(_OK) == OBJ_INPUT_KEYS, (_OK, OBJ_INPUT_KEYS)
+        if not isinstance(spec, dict) or set(spec) - set(self.SPEC_KEYS) or "cfg" not in spec:
+            raise ValueError(f"objects must be a dict with keys {self.SPEC_KEYS}, got {spec!r}")
+        self.cfg = TemporalCfg.from_dict(spec["cfg"])
+        if not self.cfg.on:
+            raise ValueError("objects given with a temporal cfg that is off (pass objects=None for the CK2 path)")
+        self.aug = bool(spec.get("aug", False))
+        self.targets = bool(spec.get("targets", False))
+        self.oracle = self.cfg.forecaster == "oracle_gt"
+        if self.oracle and not self.targets:
+            raise ValueError("oracle_gt forecaster: objects need targets (its privileged inputs are the GT futures)")
+        self.split = str(split)
+        self.pack = ObjPack(self.split, source=self.cfg.source, root=self.cfg.pack_root, targets=self.targets)
+        rows = np.asarray(rows, np.int64)
+        if len(rows) and int(rows.max()) >= self.pack.n:
+            raise ValueError(f"object pack {self.pack.dir} has {self.pack.n} rows; the dataset needs row "
+                             f"{int(rows.max())}")
+        tok = np.asarray(tokens).astype(str)
+        if not np.array_equal(self.pack.tokens, tok[: self.pack.n]):
+            raise ValueError(f"object pack {self.pack.dir}: token order differs from the dataset's packed order")
+        ok = np.asarray(np.load(self.pack.dir / "obj_ok.npy", mmap_mode="r"), bool)
+        self.n_obj_bad = int((~ok[rows]).sum()) if len(rows) else 0
+        self.frac_obj_bad = float(self.n_obj_bad / max(len(rows), 1))
+
+    def describe(self) -> Dict:
+        return {"cfg": self.cfg.to_dict(), "aug": self.aug, "targets": self.targets, "pack": str(self.pack.dir),
+                "pack_n": int(self.pack.n), "pack_kst_end": self.pack.build.get("kst_end"),
+                "n_obj_bad": self.n_obj_bad, "frac_obj_bad": self.frac_obj_bad}
+
+    def item(self, row: int, token: str, epoch: int, seed: int) -> Dict:
+        from tools.ck.data.obj_pack import augment_objects
+        if self.pack.token(row) != token:
+            raise ValueError(f"object pack row {row}: token {self.pack.token(row)} != {token}")
+        it = self.pack.item(row)
+        if self.aug:
+            it = augment_objects(it, token, int(epoch), int(seed), self.cfg)
+        if self.oracle:
+            it["priv_fc_xyh"] = it["fc_xyh"].copy()
+            it["priv_fc_state"] = it["fc_state"].copy()
+        return it
 
 
 def ck2_dir(root=None, ck2_root=None) -> Path:
@@ -83,7 +151,7 @@ class CK2Dataset(torch.utils.data.Dataset):
     def __init__(self, split: str, bev: str = "T", n_var: int = 32, var_name: str = VAR_NAME, gt: bool = False,
                  epoch: int = 0, seed: int = 0, sampler_seed: int = 0, rows: Optional[np.ndarray] = None,
                  limit: int = 0, root=None, ck2_root=None, anchors: Optional[np.ndarray] = None,
-                 ep_target: str = "official"):
+                 ep_target: str = "official", objects: Optional[Dict] = None):
         assert bev in ("T", "M", "none"), bev
         self.split, self.bev, self.n_var = split, bev, int(n_var)
         self.ep_target = check_ep_target(ep_target)
@@ -137,6 +205,7 @@ class CK2Dataset(torch.utils.data.Dataset):
         if rows is not None and not keep[r].all():
             raise ValueError(f"{int((~keep[r]).sum())} requested rows lack GT / raw256 labels / variants")
         self.rows = r[: int(limit)] if limit else r
+        self.objects = None if objects is None else ObjectRows(split, objects, self.tokens, self.rows)
 
     # ------------------------------------------------------------------------------------------- lazy per process
     def _arr(self, name: str) -> np.ndarray:
@@ -160,7 +229,7 @@ class CK2Dataset(torch.utils.data.Dataset):
                 "ep_target": self.ep_target,
                 "K": self.K, "n_var": self.n_var, "seed": self.seed, "sampler": self.sampler.config(),
                 "raw_labels": str(self._paths["raw_labels"]), "var_dir": str(self.var_dir) if self.var_dir else None,
-                "var_meta": self.var_meta}
+                "var_meta": self.var_meta, **({"objects": self.objects.describe()} if self.objects else {})}
 
     def _bev_cache(self):
         if self._cache is None:
@@ -257,6 +326,8 @@ class CK2Dataset(torch.utils.data.Dataset):
                 self._arr("status")
                 self._gtl = GTLoader(CM.DATA_ROOT)
             it.update(self._gtl.load(it["token"]))
+        if self.objects is not None:
+            it.update(self.objects.item(it["row"], it["token"], self.epoch, self.seed))
         return it
 
 

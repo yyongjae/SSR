@@ -1,0 +1,32 @@
+{
+ "version": "v3_arm_1",
+ "arm": "a",
+ "name": "v3T10_a_learned",
+ "role": "decision arm: learned forecaster (LearnedForecaster, 6 modes) in the temporal branch, PRE-TRAINED by stage \"pre\" (pre_forecaster.json, tools/ck/v3/pretrain_forecaster.py) and FROZEN during critic training (review fix D3: (a) and (b) both use a fixed forecaster)",
+ "recipe": "recipe_ck2T10.json",
+ "privileged": false,
+ "requires_user_approval": true,
+ "gates": [
+  "G1",
+  "G2",
+  "G3",
+  "G4"
+ ],
+ "temporal": {
+  "on": true,
+  "source": "bevfusion",
+  "forecaster": "learned",
+  "n_modes": 6,
+  "lambda_fc": 1.0,
+  "fc_backprop": false,
+  "p_frame_drop": 0.1,
+  "p_obj_drop": 0.05,
+  "v_noise": 0.3,
+  "pack_root": "/home/external-user/ssd/yongjae_refiner/ck/v3/objpack_k96",
+  "ca_scales": "/home/external-user/ssd/yongjae_refiner/ck/v3/ca_scales.json",
+  "version": "v3_temporal_1",
+  "fc_init": "/home/external-user/ssd/yongjae_refiner/ck/v3/train/v3fc_pre_learned6/forecaster.pt",
+  "fc_train": "frozen"
+ },
+ "requires_stage": "pre"
+}

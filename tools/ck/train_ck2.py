@@ -76,6 +76,17 @@ Outputs --out-root/<run>/ (default CK_DATA/ck2/train): config.json, norm.npz | n
   train_log.jsonl, val_metrics.jsonl, done.json.  ckpt files hold {'model' (CKNet state dict, no 'module.' prefix),
   'cfg', ...}: model.load_ck(run, 'last' | 'best' | 'ep<e>') and model.build_ck(init_from=run) load them.
   Epoch-end evaluation is crash-safe as in train_ck (eval_pending marker in ckpt_last.pt, missing splits redone).
+
+refiner-v3 temporal branch (docs/refiner_v3/SPEC.md 5.3; --temporal 0 = default = the CK2 trainer unchanged):
+  --temporal 1 --t-forecaster {learned, ca, oracle_gt} [--t-modes (default 6 learned / 1 ca, oracle_gt)] adds
+  ck.temporal.TemporalBranch to CKNet (arm T only).  Datasets get objects = {cfg, aug (train only), targets} (object
+  pack D3/objpack/<source>/<split>, tools/ck/data/obj_pack.py); the model sees only OBJ_INPUT_KEYS (+ the oracle's
+  PRIVILEGED priv_fc_*).  Loss += lambda_fc * temporal.loss.forecast_loss (learned arm only; WTA Laplace NLL + mode
+  CE on the GT future targets, masked).  Optimiser: one AdamW, param groups critic / forecaster ('temporal.forecaster.'),
+  each clipped to --clip; a step with a non-finite grad norm in either group is skipped; grad_norm_fc logged.
+  config.json: temporal (TemporalCfg dict, resume guard), privileged, param_count_temporal_shared /
+  param_count_forecaster.  PRIVILEGED runs (oracle_gt) must be named *_PRIV and tag every val_metrics row.
+  Val rows of a learned run add the forecast metrics fc_nll / fc_minade / fc_minfde (+ fc_* detail).
 """
 from __future__ import annotations
 
@@ -110,11 +121,26 @@ NORM_FILE = TC.NORM_FILE
 TRAIN_EVAL_NAME = TC.TRAIN_EVAL_NAME
 RAW_SUFFIX = "_raw"
 FROZEN_MODULES = ("trunk.lon_head", "trunk.gate_head")
-SUM_KEYS = ("n_gt", "n_bev_bad", "n_anc_ok", "n_var_ok")
+SUM_KEYS = ("n_gt", "n_bev_bad", "n_anc_ok", "n_var_ok", "fc_n_obj", "n_obj_bad")   # fc_*/n_obj: temporal only
 DEFAULT_BEST = {"T": "navtrain_val:pdms_a_b1:max", "M": "none"}
 SUR_GROUPS = ("all", "near", "near_mid")
 SUR_GROUP_MAX = {"all": None, "near": 0, "near_mid": 1}       # anchor_sampler GROUP_NEAR 0 / GROUP_MID 1 / GROUP_STRAT 2
 FAIL_KEYS = ("nc", "dac", "ttc", "comfort")
+FC_PREFIX = "temporal.forecaster."                           # parameters of the learned forecaster (own param group)
+
+
+def run_provenance(a, tcfg) -> Dict:
+    """review fix D5: code / data provenance of this run (tools/ck/v3/provenance.py); decide_step1 compares it."""
+    from tools.ck.v3 import provenance as PV
+    splits = [a.split] + ([a.val_split] if a.val_split and a.val_split != "none" else [])
+    return PV.run_provenance(tcfg, splits=splits)
+
+
+def temporal_cfg_of(a):
+    """TemporalCfg of resolved args (absent attribute = off, e.g. args built by older tests)."""
+    from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+    t = getattr(a, "temporal_cfg", None)
+    return t if t is not None else TemporalCfg()
 
 
 def C():
@@ -180,7 +206,62 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dist-timeout-min", type=float, default=60.0)
     ap.add_argument("--resume", action="store_true", help="continue from ckpt_last.pt if present")
     ap.add_argument("--restart", action="store_true", help="wipe the run dir outputs and start over")
+    # refiner-v3 temporal branch (SPEC 5.3); every default = off / the TemporalCfg default
+    from navsim.agents.para_ssr.ck.temporal import config as TCF
+    d = TCF.TemporalCfg()
+    ap.add_argument("--temporal", dest="temporal_on", type=int, choices=(0, 1), default=0,
+                    help="1 = add the temporal branch (arm T only; refiner-v3 Step 1)")
+    ap.add_argument("--t-source", choices=TCF.SOURCES, default=d.source, help="object source (Step 1: bevfusion)")
+    ap.add_argument("--t-forecaster", choices=TCF.FORECASTERS, default=d.forecaster)
+    ap.add_argument("--t-modes", type=int, default=None, help="forecast modes (default 6 learned, 1 ca / oracle_gt)")
+    ap.add_argument("--t-lambda-fc", type=float, default=d.lambda_fc, help="forecast loss weight (learned arm)")
+    ap.add_argument("--t-fc-backprop", type=int, choices=(0, 1), default=int(d.fc_backprop),
+                    help="1 = the critic loss also reaches the forecaster (untested option; default 0)")
+    ap.add_argument("--t-frame-drop", type=float, default=d.p_frame_drop, help="train aug: past-frame drop prob")
+    ap.add_argument("--t-obj-drop", type=float, default=d.p_obj_drop, help="train aug: object-slot drop prob")
+    ap.add_argument("--t-vnoise", type=float, default=d.v_noise, help="train aug: velocity noise sigma (m/s)")
+    ap.add_argument("--t-pack-root", default=d.pack_root, help="object pack root (<root>/<source>/<split>)")
+    ap.add_argument("--t-ca-scales", default=d.ca_scales, help="CA Laplace scales json (arms ca / oracle_gt)")
+    ap.add_argument("--t-fc-init", default=d.fc_init,
+                    help="learned arm: pre-trained forecaster (tools/ck/v3/pretrain_forecaster.py <out>/forecaster.pt)")
+    ap.add_argument("--t-fc-train", choices=TCF.FC_TRAIN, default=d.fc_train,
+                    help="learned arm: frozen (default; needs --t-fc-init) | joint (forecast loss trains it)")
     return ap
+
+
+def resolve_temporal(a):
+    """-> TemporalCfg from the --temporal / --t-* flags (off unless --temporal 1), validated against --arm."""
+    from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+    if not int(getattr(a, "temporal_on", 0) or 0):
+        return TemporalCfg()
+    n_modes = a.t_modes if a.t_modes is not None else (6 if a.t_forecaster == "learned" else 1)
+    try:
+        fc_init = str(getattr(a, "t_fc_init", "") or "")
+        fc_train = str(getattr(a, "t_fc_train", "frozen") or "frozen")
+        if a.t_forecaster != "learned" and not fc_init:
+            fc_train = "frozen"                         # ca / oracle_gt: fixed forecasters by construction
+        t = TemporalCfg(on=True, source=a.t_source, forecaster=a.t_forecaster, n_modes=int(n_modes),
+                        lambda_fc=float(a.t_lambda_fc), fc_backprop=bool(a.t_fc_backprop),
+                        p_frame_drop=float(a.t_frame_drop), p_obj_drop=float(a.t_obj_drop),
+                        v_noise=float(a.t_vnoise), pack_root=str(a.t_pack_root), ca_scales=str(a.t_ca_scales),
+                        fc_init=fc_init, fc_train=fc_train)
+        t.validate(a.arm)
+        t.check_trainable()
+    except (ValueError, NotImplementedError) as e:
+        raise SystemExit(f"--temporal: {e}") from None
+    if t.fc_init:
+        fi = Path(t.fc_init)
+        if not fi.is_file():
+            raise SystemExit(f"--t-fc-init {fi}: missing (tools/ck/v3/pretrain_forecaster.py writes <out>/forecaster.pt)")
+        meta = torch.load(fi, map_location="cpu", weights_only=False)
+        if int(meta.get("n_modes", -1)) != int(t.n_modes):
+            raise SystemExit(f"--t-fc-init {fi}: pre-trained with n_modes {meta.get('n_modes')} != --t-modes {t.n_modes}")
+    if t.privileged and not str(a.run).endswith("_PRIV"):
+        raise SystemExit(f"PRIVILEGED temporal run (forecaster {t.forecaster}, source {t.source}): the run name must "
+                         f"end in '_PRIV', got {a.run!r}")
+    if t.forecaster != "learned" and not Path(t.ca_scales).is_file():
+        raise SystemExit(f"--t-ca-scales {t.ca_scales}: missing (CA Laplace scales, tools/ck/v3/fit_ca_scales.py)")
+    return t
 
 
 def resolve_args(a):
@@ -212,6 +293,7 @@ def resolve_args(a):
     if a.workers > 16:
         raise SystemExit("--workers <= 16 per rank")
     parse_best(a.best_metric)
+    a.temporal_cfg = resolve_temporal(a)
     return a
 
 
@@ -328,6 +410,28 @@ class DistEpochBatches(torch.utils.data.Sampler):
 
 
 # ----------------------------------------------------------------------------------------------- data
+def objects_spec(a, split: str, train: bool) -> Optional[Dict]:
+    """Dataset `objects` kwarg of the temporal branch (None when off): train -> aug + targets; evals -> no aug,
+    targets when the split's pack has them (navtest has none; the oracle needs them everywhere)."""
+    t = temporal_cfg_of(a)
+    if not t.on:
+        return None
+    if train:
+        return {"cfg": t.to_dict(), "aug": True, "targets": True}
+    from tools.ck.data.obj_pack import ObjPack
+    has = ObjPack(split, source=t.source, root=t.pack_root, targets=False).has_targets
+    return {"cfg": t.to_dict(), "aug": False, "targets": bool(has)}
+
+
+def check_obj_bad(name: str, ds) -> None:
+    """SPEC 5.3 fail loudly: more than 0.5 % of a dataset's tokens without objects (obj_ok False) -> SystemExit."""
+    from tools.ck.data.ck2_dataset import OBJ_BAD_MAX
+    o = getattr(ds, "objects", None)
+    if o is not None and o.frac_obj_bad > OBJ_BAD_MAX:
+        raise SystemExit(f"{name}: {o.n_obj_bad} of {len(ds)} tokens ({100 * o.frac_obj_bad:.2f} %) have no object "
+                         f"rows (obj_ok False) in {o.pack.dir}: more than {100 * OBJ_BAD_MAX:.1f} %")
+
+
 def build_datasets(a) -> Dict:
     """-> {'train': CK2Dataset, 'evals': [(name, kind in {'r34', 'raw'}, dataset)]}."""
     from tools.ck.data.ck2_dataset import CK2Dataset
@@ -335,15 +439,21 @@ def build_datasets(a) -> Dict:
 
     ep = getattr(a, "ep_target", "official")
     ck2 = dict(var_name=a.var_name, seed=a.seed, sampler_seed=a.sampler_seed, ep_target=ep)
-    train = CK2Dataset(a.split, bev=a.arm, n_var=a.n_var, gt=True, limit=a.limit_tokens or 0, **ck2)
+    on = temporal_cfg_of(a).on
+
+    def ob(split, train=False):                    # the objects kwarg only when the branch is on (OFF: no kwarg)
+        return {"objects": objects_spec(a, split, train)} if on else {}
+
+    train = CK2Dataset(a.split, bev=a.arm, n_var=a.n_var, gt=True, limit=a.limit_tokens or 0, **ck2,
+                       **ob(a.split, True))
     evals = []
     if a.val_split and a.val_split != "none":
         evals.append((a.val_split, "r34", CKDataset(a.val_split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
-                                                    limit=a.val_limit or 0, ep_target=ep)))
+                                                    limit=a.val_limit or 0, ep_target=ep, **ob(a.val_split))))
         if a.val_raw:
             evals.append((a.val_split + RAW_SUFFIX, "raw",
                           CK2Dataset(a.val_split, bev=a.arm, n_var=a.eval_n_var, gt=False, epoch=0,
-                                     limit=a.val_limit or 0, **ck2)))
+                                     limit=a.val_limit or 0, **ck2, **ob(a.val_split))))
     if a.train_eval_rows:
         tdf = TC.packed_tokens(a.split)
         if tdf is not None:
@@ -352,9 +462,13 @@ def build_datasets(a) -> Dict:
             rows = pool[U.log_stratified_rows(tdf["log"].values[pool], n_eval, seed=0)]
             name = TRAIN_EVAL_NAME.format(a.split)
             evals.append((name, "r34", CKDataset(a.split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
-                                                 rows=rows, ep_target=ep)))
+                                                 rows=rows, ep_target=ep, **ob(a.split))))
             evals.append((name + RAW_SUFFIX, "raw", CK2Dataset(a.split, bev=a.arm, n_var=a.eval_n_var, gt=False,
-                                                               epoch=0, rows=rows, **ck2)))
+                                                               epoch=0, rows=rows, **ck2, **ob(a.split))))
+    if on:
+        check_obj_bad(a.split, train)
+        for name, _, ds in evals:
+            check_obj_bad(name, ds)
     return {"train": train, "evals": evals}
 
 
@@ -392,6 +506,42 @@ def trainable(net) -> List[torch.nn.Parameter]:
     return [p for p in net.parameters() if p.requires_grad]
 
 
+def save_eval_logits(path: Path, R: Dict, pend: Dict) -> None:
+    """Atomic npz of a temporal run's r34 eval: score_logit [N, K, 5] float32, packed rows [N], epoch, step."""
+    tmp = path.with_name(f".{path.stem}.tmp{os.getpid()}.npz")
+    np.savez(tmp, logit=np.asarray(R["logit"], np.float32), rows=np.asarray(R["rows"], np.int64),
+             epoch=np.int64(pend["epoch"]), step=np.int64(pend["step"]))
+    os.replace(tmp, path)
+
+
+def load_pretrained_forecaster(net, tcfg) -> Dict:
+    """Learned arm: load cfg.fc_init (pre-training stage output) into net.temporal.forecaster (strict) and, when
+    fc_train is 'frozen' (default), freeze it (requires_grad False: no optimiser group, DDP ignores it)."""
+    fcm = net.temporal.forecaster
+    rep = {"fc_init": tcfg.fc_init or None, "fc_train": tcfg.fc_train}
+    if tcfg.fc_init:
+        meta = torch.load(tcfg.fc_init, map_location="cpu", weights_only=False)
+        fcm.load_state_dict(meta["forecaster"], strict=True)
+        rep.update(sha16=U.sha256_file(tcfg.fc_init), n_modes=meta.get("n_modes"), seed=meta.get("seed"),
+                   step=meta.get("step"), version=meta.get("version"))
+    if tcfg.fc_frozen:
+        for p in fcm.parameters():
+            p.requires_grad_(False)
+    rep["n_trainable"] = int(sum(p.numel() for p in fcm.parameters() if p.requires_grad))
+    return rep
+
+
+def param_groups(net) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+    """(critic, forecaster) trainable parameters; forecaster = names under 'temporal.forecaster.' (learned arm),
+    critic = every other trainable parameter in net.parameters() order.  OFF / CA / oracle: forecaster empty and
+    critic == trainable(net)."""
+    crit, fc = [], []
+    for n, p in net.named_parameters():
+        if p.requires_grad:
+            (fc if n.startswith(FC_PREFIX) else crit).append(p)
+    return crit, fc
+
+
 def setup_model(a, run: Path, train_ds, D: Dist, norm_override=None):
     """-> (CKNet with frozen lon / gate heads, init report).  Rank 0 writes the norm file; every rank builds the net
     from it (DDP then broadcasts rank 0's parameters, incl. the score prior)."""
@@ -413,9 +563,13 @@ def setup_model(a, run: Path, train_ds, D: Dist, norm_override=None):
     D.barrier()
     mean, std, _ = load_norm(dst)
     init = None if a.init_from in (None, "", "none") else a.init_from
-    net = build_ck(a.arm, seed=a.seed, norm=(mean, std), init_from=init, lead_aux=False)
+    tcfg = temporal_cfg_of(a)
+    kw = {"temporal": tcfg} if tcfg.on else {}                     # OFF: the CK2 call, unchanged
+    net = build_ck(a.arm, seed=a.seed, norm=(mean, std), init_from=init, lead_aux=False, **kw)
     rep = getattr(net, "init_report", None)
     rep = dict(rep) if isinstance(rep, dict) else {"report": str(rep)}
+    if tcfg.on and tcfg.forecaster == "learned":
+        rep["forecaster"] = load_pretrained_forecaster(net, tcfg)
     if a.score_prior and rep.get("kind") != "ck" and D.is0:
         prior = ck2_label_prior(train_ds, a.prior_rows) if hasattr(train_ds, "labels_item") else None
         if prior is not None:
@@ -442,11 +596,17 @@ def mask_bev_ok(batch: Dict) -> Dict:
     return b
 
 
-def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool) -> Dict:
-    """CKNet forward on the model inputs only (bev, cand, status, var_traj); no decode (done with z_lon = 0)."""
+def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool, tcfg=None) -> Dict:
+    """CKNet forward on the model inputs only (bev, cand, status, var_traj; + OBJ_INPUT_KEYS (+ the oracle's
+    PRIV_INPUT_KEYS) when the temporal branch is on); no decode (done with z_lon = 0)."""
     extra = batch["var_traj"].float() if with_var and "var_traj" in batch else None
+    kw = {}
+    if tcfg is not None and tcfg.on:
+        from navsim.agents.para_ssr.ck.temporal.branch import objs_from_batch
+        kw["objs"] = objs_from_batch(batch, tcfg, dev)
     with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_amp):
-        return net(batch.get("bev"), batch["cand"].float(), batch["status"].float(), extra=extra, decode=False)
+        return net(batch.get("bev"), batch["cand"].float(), batch["status"].float(), extra=extra, decode=False,
+                   **kw)
 
 
 def lateral_decode(cand: torch.Tensor, w_lat: torch.Tensor, v0: torch.Tensor, slope: float) -> Dict:
@@ -524,6 +684,20 @@ def compute_loss(out: Dict, corr: Dict, batch: Dict, a) -> Tuple[torch.Tensor, D
     st["e_abs"] = float(corr["e_lat"].detach()[..., 2:].abs().mean())
     st["w_lat_abs"] = float(out["w_lat"].detach().float().abs().mean())
     st["z_lon_absmax"] = float(out["z_lon"].detach().float().abs().max())
+    if "t_stats" in out:                                    # temporal branch on (absent when off: stats unchanged)
+        st["loss_ck"] = float(loss.detach())
+        st["t_n_obj"] = float(out["t_stats"]["n_obj"])
+        if "obj_ok" in batch:
+            st["n_obj_bad"] = float((~batch["obj_ok"].bool()).sum())
+        st["t_n_valid"] = float(out["t_stats"].get("n_valid", 0))
+        if "fc" in out:                                     # learned forecaster
+            from navsim.agents.para_ssr.ck.temporal.loss import add_forecast_loss, forecast_loss
+            if temporal_cfg_of(a).fc_frozen:                # pre-trained + frozen: monitor only, no loss term
+                with torch.no_grad():
+                    _, s_fc = forecast_loss(out["fc"], batch["fc_xyh"], batch["fc_state"], batch["obj_mask"][:, 0])
+                st.update(s_fc)
+            else:                                           # joint: + lambda_fc * forecast loss
+                loss = add_forecast_loss(loss, st, out, batch, temporal_cfg_of(a).lambda_fc)
     st["loss"] = float(loss.detach())
     return loss, st
 
@@ -533,6 +707,9 @@ def dummy_backward(out: Dict) -> None:
     graph (zero-weighted outputs), so the reducer stays in step; the gradients are discarded."""
     terms = [out[k].float().nan_to_num(0.0, 0.0, 0.0).sum() * 0.0 for k in ("score_logit", "extra_score_logit",
                                                                             "w_lat") if k in out]
+    if out.get("fc") is not None and out["fc"].mu.requires_grad:   # learned forecaster outputs (not frozen)
+        from navsim.agents.para_ssr.ck.temporal.loss import forecast_touch
+        terms.append(forecast_touch(out["fc"]).nan_to_num(0.0, 0.0, 0.0))
     if terms:
         torch.stack(terms).sum().backward()
 
@@ -672,29 +849,46 @@ def run_eval(net, ds, kind: str, a, dev, use_amp: bool, D: Dist, collate_fn=None
     keep = (("prob", "y", "y_ok", "y_pdms", "v2_final", "v2_im") if kind == "r34" else
             ("prob", "y", "y_ok", "y_pdms", "anc_group", "anc_idx", "var_prob", "var_y", "var_ok", "var_pdms",
              "var_v", "var_anchor"))
-    acc: Dict[str, list] = {k: [] for k in keep + ("e_abs",)}
+    tcfg = temporal_cfg_of(a)
+    save_logit = tcfg.on and kind == "r34"          # review fix D6: per-token logits for the infer reproduce check
+    acc: Dict[str, list] = {k: [] for k in keep + ("e_abs",) + (("logit", "rows") if save_logit else ())}
     bad, ntok = 0, 0
     slope = C().LON_ST_SLOPE["eval"]
+    fcm, obj_bad = None, 0
+    if tcfg.on and tcfg.forecaster == "learned":
+        from navsim.agents.para_ssr.ck.temporal.metrics import ForecastMetrics
+        fcm = ForecastMetrics()
     if len(shard):
         for batch in dl:
             batch = mask_bev_ok(TC.to_dev(batch, dev))
             bad += TC.n_bev_bad(batch)
             ntok += int(batch["cand"].shape[0])
             with_var = kind == "raw" and "var_traj" in batch
-            out = forward(net, batch, use_amp, dev, with_var)
+            out = forward(net, batch, use_amp, dev, with_var, tcfg)
+            if tcfg.on and "obj_ok" in batch:
+                obj_bad += int((~batch["obj_ok"].bool()).sum())
+            if fcm is not None and out.get("fc") is not None and "fc_xyh" in batch:
+                fcm.update(out["fc"], batch["fc_xyh"], batch["fc_state"], batch["obj_mask"][:, 0])
             corr = lateral_decode(batch["cand"], out["w_lat"], out["ego"][0], slope)
             acc["prob"].append(torch.sigmoid(out["score_logit"].float()).cpu().numpy())
+            if save_logit:
+                acc["logit"].append(out["score_logit"].float().cpu().numpy())
+                acc["rows"].append(batch["rows"].cpu().numpy() if "rows" in batch else
+                                   np.full(int(batch["cand"].shape[0]), -1, np.int64))
             acc["e_abs"].append(corr["e_lat"][..., 2:].abs().mean(-1).float().cpu().numpy().reshape(-1))
             if with_var:
                 acc["var_prob"].append(torch.sigmoid(out["extra_score_logit"].float()).cpu().numpy())
             for k in keep:
-                if k in ("prob", "var_prob"):
+                if k in ("prob", "var_prob", "logit", "rows"):
                     continue
                 if k in batch:
                     acc[k].append(batch[k].cpu().numpy())
     net.train()
     mine = {k: (np.concatenate(v) if v else None) for k, v in acc.items()}
     mine["_bad"], mine["_ntok"] = bad, ntok
+    if tcfg.on:
+        mine["_obj_bad"] = obj_bad
+        mine["_fc"] = fcm.to_tensor().numpy() if fcm is not None else None
     parts = D.all_gather(mine)
     R: Dict[str, np.ndarray] = {}
     for k in acc:
@@ -703,6 +897,11 @@ def run_eval(net, ds, kind: str, a, dev, use_amp: bool, D: Dist, collate_fn=None
             R[k] = np.concatenate(arrs)
     R["n_bev_bad"] = np.asarray(sum(int(p["_bad"]) for p in parts))
     R["n_tok"] = np.asarray(sum(int(p["_ntok"]) for p in parts))
+    if tcfg.on:
+        R["n_obj_bad"] = np.asarray(sum(int(p["_obj_bad"]) for p in parts))
+        fcs = [p["_fc"] for p in parts if p.get("_fc") is not None]
+        if fcs:
+            R["fc_sums"] = np.sum(np.stack(fcs), 0)
     return R
 
 
@@ -712,6 +911,11 @@ def eval_metrics(kind: str, R: Dict[str, np.ndarray], var_names=None) -> Dict[st
     m = r34_metrics(R) if kind == "r34" else raw_metrics(R, var_names)
     m["n_tokens"] = int(R["n_tok"])
     m["n_bev_bad"] = int(R["n_bev_bad"])
+    if "n_obj_bad" in R:                                     # temporal branch on
+        m["n_obj_bad"] = int(R["n_obj_bad"])
+    if "fc_sums" in R:                                       # learned forecaster with targets: SPEC 5.3 fc metrics
+        from navsim.agents.para_ssr.ck.temporal.metrics import ForecastMetrics
+        m.update(ForecastMetrics.from_tensor(torch.as_tensor(R["fc_sums"])).result("fc_"))
     return m
 
 
@@ -768,13 +972,17 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
     collate_fn = collate_fn or collate()
     train_ds = datasets["train"]
     evals = datasets["evals"]
+    tcfg = temporal_cfg_of(a)
     net, init_rep = setup_model(a, run, train_ds, D, norm_override)
     net = net.to(dev)
     params = trainable(net)
+    p_crit, p_fc = param_groups(net)
+    pc = net.param_counts() if hasattr(net, "param_counts") else {}
     use_amp = bool(a.amp) and dev.type == "cuda"
     ck_root = U.ck_data()
     var_names = (getattr(train_ds, "var_meta", None) or {}).get("names")
-    cfg = dict(vars(a), arm=a.arm, seed=a.seed, trainer="train_ck2", git_head=U.git_head(), run_dir=str(run),
+    targs = {k: v for k, v in vars(a).items() if k != "temporal_cfg"}
+    cfg = dict(targs, arm=a.arm, seed=a.seed, trainer="train_ck2", git_head=U.git_head(), run_dir=str(run),
                device_resolved=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), world_size=D.world,
                tokens_per_rank=b_local, global_batch=a.tokens_per_batch,
                lr_note="lr is not rescaled with the batch; global batches are world-size independent",
@@ -786,7 +994,11 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                lon_head="removed (zeroed + frozen; decode with z_lon = 0)", kd="off", score_weighting="none",
                ep_target_rule=(EP_RULE if a.ep_target == "decoupled" else "official EP label column"),
                score_hidden=256, lead_aux=0, param_count=int(sum(p.numel() for p in net.parameters())),
-               param_count_trainable=int(sum(p.numel() for p in params)))
+               param_count_trainable=int(sum(p.numel() for p in params)),
+               temporal=tcfg.to_dict(), privileged=int(tcfg.privileged),
+               param_count_temporal_shared=int(pc.get("temporal_shared", 0)),
+               param_count_forecaster=int(pc.get("forecaster", 0)),
+               provenance=run_provenance(a, tcfg))
     old = U.read_json(run / "config.json")
     if old is not None and a.resume:
         old_default = {"sur_groups": "all", "score_keys": list(Cn.CK_KEYS), "ep_target": "official"}
@@ -795,6 +1007,20 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
             ov = old.get(k, old_default.get(k))
             if ov != cfg.get(k):
                 raise SystemExit(f"{run}: resume with {k}={cfg.get(k)!r} but config.json has {ov!r}")
+        from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+        ot = TemporalCfg.from_dict(old.get("temporal")).normalised().to_dict()   # old config without the key = off
+        if ot != tcfg.normalised().to_dict():
+            raise SystemExit(f"{run}: resume with temporal={cfg['temporal']!r} but config.json has {ot!r}")
+        if tcfg.on and old.get("provenance"):      # review fix D5: a resumed arm must keep its code and data
+            from tools.ck.v3 import provenance as PV
+            cmp = PV.compare({"config.json": old["provenance"], "now": cfg["provenance"]})
+            if cmp["errors"]:
+                raise SystemExit(f"{run}: resume with other code / data than config.json records: {cmp['errors']}")
+    if tcfg.on and (old is None or a.restart):            # D5: refuse a fresh run on inconsistent data
+        from tools.ck.v3 import provenance as PV
+        bad = PV.check_self(cfg["provenance"])
+        if bad:
+            raise SystemExit(f"{run}: provenance check failed: {bad}")
     if D.is0 and (old is None or a.restart):
         U.write_json(run / "config.json", cfg)
     steps_per_epoch = len(TC.EpochBatches(len(train_ds), a.tokens_per_batch, a.seed, 0))
@@ -803,7 +1029,10 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
     total = steps_per_epoch * a.epochs
     if a.max_steps:
         total = min(total, a.max_steps)
-    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=a.wd)
+    if p_fc:                                     # learned forecaster: own param group (clipped separately)
+        opt = torch.optim.AdamW([{"params": p_crit}, {"params": p_fc}], lr=a.lr, weight_decay=a.wd)
+    else:                                        # OFF / CA / oracle: the CK2 optimiser (p_crit == params)
+        opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=a.wd)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, TC.lr_lambda(min(a.warmup_steps, max(1, total // 10))
                                                                 if a.max_steps else a.warmup_steps, total))
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -861,7 +1090,11 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                     continue
                 R = run_eval(net, ds, kind, a, dev, use_amp, D, collate_fn)
                 m = eval_metrics(kind, R, var_names)
+                if D.is0 and "logit" in R:          # temporal r34 evals: logits of this eval (infer check, D6)
+                    save_eval_logits(run / f"eval_r34_{name}_last.npz", R, pend)
                 TC.check_bev_bad(int(m.get("n_bev_bad", 0)), int(m.get("n_tokens", 0)), f"eval {name}", force=True)
+                if tcfg.privileged:
+                    m["privileged"] = 1
                 if D.is0:
                     U.log_jsonl(valp, dict(epoch=pend["epoch"], step=pend["step"], split=name, kind=kind,
                                            partial_epoch=bool(pend["partial"]), **m))
@@ -902,7 +1135,7 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
         bi = bstart
         for batch in dl:
             batch = TC.to_dev(batch, dev)
-            out = forward(model, batch, use_amp, dev, with_var)
+            out = forward(model, batch, use_amp, dev, with_var, tcfg)
             corr = lateral_decode(batch["cand"], out["w_lat"], out["ego"][0], slope)
             loss, st = compute_loss(out, corr, batch, a)
             opt.zero_grad(set_to_none=True)
@@ -915,8 +1148,13 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
             else:
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
-                gn = torch.nn.utils.clip_grad_norm_(params, a.clip if a.clip > 0 else float("inf"))
+                clip = a.clip if a.clip > 0 else float("inf")
+                gn = torch.nn.utils.clip_grad_norm_(p_crit if p_fc else params, clip)
                 st["grad_norm"] = float(gn)
+                if p_fc:                                # forecaster group: own norm, own clip
+                    gn_fc = torch.nn.utils.clip_grad_norm_(p_fc, clip)
+                    st["grad_norm_fc"] = float(gn_fc)
+                    gn = gn + gn_fc                     # non-finite in either group -> skip the step
                 if not math.isfinite(float(gn)):
                     n_skip["grad"] += 1
                     st["skipped"] = 1.0

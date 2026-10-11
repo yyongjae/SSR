@@ -1,0 +1,187 @@
+--- a/navsim/agents/para_ssr/ck/model.py
++++ b/navsim/agents/para_ssr/ck/model.py
+@@ -29,7 +29,7 @@
+ import json
+ import os
+ from pathlib import Path
+-from typing import Dict, Optional, Sequence, Tuple, Union
++from typing import Callable, Dict, Optional, Sequence, Tuple, Union
+ 
+ import numpy as np
+ import torch
+@@ -43,6 +43,7 @@
+ from ..refiner.refiner_net import ADAPTER_SEED_OFFSET, RefinerNet, draft_features
+ from .constants import CK_KEYS, NORM_FILE, SCORE_SEED_OFFSET
+ from .correct import correct
++from .temporal.config import TemporalCfg
+ 
+ ARMS = ("T", "M", "S", "none")
+ N_KEYS = len(CK_KEYS)
+@@ -71,8 +72,11 @@
+         return feat, mem
+ 
+     def candidates(self, feat: torch.Tensor, mem: torch.Tensor, tau: torch.Tensor, v0: torch.Tensor,
+-                   a0: torch.Tensor, eds: torch.Tensor, cmd: torch.Tensor) -> Dict[str, torch.Tensor]:
+-        """tau [T, K, 8, 3] -> h [T*K, 2d] (not detached), z_lon / w_lat [T, K, 6], gate_logit [T, K], ud, geom."""
++                   a0: torch.Tensor, eds: torch.Tensor, cmd: torch.Tensor,
++                   tfeat: Optional[Callable] = None) -> Dict[str, torch.Tensor]:
++        """tau [T, K, 8, 3] -> h [T*K, 2d] (not detached), z_lon / w_lat [T, K, 6], gate_logit [T, K], ud, geom.
++        tfeat (refiner-v3 temporal branch, TemporalBranch.hook): (geom, flat) -> (st_add [B, 48, d], ud_add [B, d]),
++        added to the 48 station tokens and the draft token; None = the CK2 path (required None when off)."""
+         T, K = tau.shape[:2]
+         B = T * K
+         with torch.autocast(device_type=tau.device.type, enabled=False):
+@@ -83,7 +87,15 @@
+         X = corridor_tensor(feat, geom, T, K)                                         # [B, 70, 48, 17]
+         Hc = self.enc(X)                                                              # [B, 128, 48, 17]
+         st = self.station(Hc.permute(0, 2, 1, 3).reshape(B, N_ST, -1))               # [B, 48, d]
+-        x = torch.cat([self.draft_mlp(ud.to(st.dtype))[:, None], st], 1)              # [B, 49, d]
++        if tfeat is None:
++            if getattr(self, "_temporal_required", False):
++                raise RuntimeError("CKTrunk.candidates: this CK net has a temporal branch; call it through "
++                                   "CKNet.forward(..., objs=...) (direct trunk use would silently drop it)")
++            x = torch.cat([self.draft_mlp(ud.to(st.dtype))[:, None], st], 1)          # [B, 49, d]
++        else:
++            st_add, ud_add = tfeat(geom, flat)
++            x = torch.cat([(self.draft_mlp(ud.to(st.dtype)) + ud_add.to(st.dtype))[:, None],
++                           st + st_add.to(st.dtype)], 1)                              # [B, 49, d]
+         for layer in self.layers:
+             x = layer(x, mem, T, K)
+         x = self.norm_out(x)
+@@ -123,7 +135,8 @@
+     """CK head (module docstring).  CKNet(arm in {'T', 'M', 'S'}, seed, norm=(mean, std) for T / M)."""
+ 
+     def __init__(self, arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+-                 score_hidden: int = 256, lead_aux: bool = False):
++                 score_hidden: int = 256, lead_aux: bool = False, temporal: Optional[TemporalCfg] = None,
++                 ca_b: Optional[torch.Tensor] = None):
+         super().__init__()
+         self.arm = arm
+         self.seed = int(seed)
+@@ -135,6 +148,15 @@
+             self.score_head = nn.Sequential(nn.Linear(d2, score_hidden), nn.GELU(), nn.Linear(score_hidden, N_KEYS))
+             self.lead_head = (nn.Sequential(nn.Linear(d2, 128), nn.GELU(), nn.Linear(128, 1)) if lead_aux else None)
+         self.init_report: Dict = {}
++        # refiner-v3 temporal branch (docs/refiner_v3/SPEC.md 4.5): built AFTER every CK2 module, own seeded RNG
++        self.temporal_cfg = temporal if temporal is not None else TemporalCfg()
++        if self.temporal_cfg.on:
++            self.temporal_cfg.validate(arm)
++            from .temporal.branch import TemporalBranch
++            self.temporal = TemporalBranch(self.temporal_cfg, self.trunk.d_model, seed, ca_b=ca_b)
++            self.trunk._temporal_required = True                       # plain attribute, not state
++        else:
++            self.temporal = None
+ 
+     # ------------------------------------------------------------------------------------------ helpers
+     def param_counts(self) -> Dict[str, int]:
+@@ -142,6 +164,10 @@
+         c["score_head"] = sum(p.numel() for p in self.score_head.parameters())
+         c["lead_head"] = 0 if self.lead_head is None else sum(p.numel() for p in self.lead_head.parameters())
+         c["total"] = c["total"] + c["score_head"] + c["lead_head"]
++        if self.temporal is not None:                                   # keys only when on (OFF dict unchanged)
++            tc = self.temporal.param_counts()
++            c.update(tc)
++            c["total"] = c["total"] + tc["temporal_shared"] + tc["forecaster"]
+         return c
+ 
+     @torch.no_grad()
+@@ -156,30 +182,41 @@
+     # ------------------------------------------------------------------------------------------ forward
+     def forward(self, bev: Optional[torch.Tensor], cand: torch.Tensor, status: torch.Tensor,
+                 extra: Optional[torch.Tensor] = None, decode: bool = True, slope: float = 0.0,
+-                rescore_corr: bool = False) -> Dict:
++                rescore_corr: bool = False, objs: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
+         T, K = cand.shape[:2]
+         if status.shape[0] != T:
+             raise ValueError(f"status {tuple(status.shape)} vs cand {tuple(cand.shape)}")
++        if self.temporal is None and objs is not None:
++            raise ValueError("objs given to a CK net without a temporal branch")
++        if self.temporal is not None and objs is None:
++            raise ValueError("this CK net has a temporal branch: forward(..., objs=...) is required")
+         ego = ego_inputs(status)
+         v0, a0, eds, cmd = ego
+         cand = cand.float()
+         feat, mem = self.trunk.scene(bev, T)
+-        o = self.trunk.candidates(feat, mem, cand, v0, a0, eds, cmd)
++        ctx = self.temporal.scene(objs) if self.temporal is not None else None
++        tf = (lambda Kc: None) if ctx is None else (lambda Kc: self.temporal.hook(ctx, T, Kc))
++        o = self.trunk.candidates(feat, mem, cand, v0, a0, eds, cmd, tfeat=tf(K))
+         out = {"score_logit": self.score(o, T, K), "z_lon": o["z_lon"].float(), "w_lat": o["w_lat"].float(),
+                "gate_logit": o["gate_logit"].float(), "ego": ego}
+         if decode or rescore_corr:
+             out["corr"] = correct(cand, out["z_lon"], out["w_lat"], v0, slope)
+         if rescore_corr:
+             ct = out["corr"]["traj"].detach()
+-            out["corr_score_logit"] = self.score(self.trunk.candidates(feat, mem, ct, v0, a0, eds, cmd), T, K)
++            out["corr_score_logit"] = self.score(self.trunk.candidates(feat, mem, ct, v0, a0, eds, cmd, tfeat=tf(K)),
++                                                 T, K)
+         if extra is not None:
+             if extra.shape[0] != T:
+                 raise ValueError(f"extra {tuple(extra.shape)} vs cand {tuple(cand.shape)}")
+             K2 = extra.shape[1]
+             out["extra_score_logit"] = self.score(
+-                self.trunk.candidates(feat, mem, extra.float(), v0, a0, eds, cmd), T, K2)
++                self.trunk.candidates(feat, mem, extra.float(), v0, a0, eds, cmd, tfeat=tf(K2)), T, K2)
+         if self.lead_head is not None:
+             out["lead_logit"] = self.lead_head(o["h"].reshape(T, K, -1).mean(1)).float()[:, 0]
++        if ctx is not None:
++            if ctx.fc_raw is not None:
++                out["fc"] = ctx.fc_raw                                      # learned forecast (forecast loss)
++            out["t_stats"] = {"n_obj": ctx.n_obj}
+         return out
+ 
+ 
+@@ -215,7 +252,8 @@
+ 
+ 
+ def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+-             init_from: Optional[Union[str, Path]] = None, lead_aux: bool = False, score_hidden: int = 256) -> CKNet:
++             init_from: Optional[Union[str, Path]] = None, lead_aux: bool = False, score_hidden: int = 256,
++             temporal: Optional[TemporalCfg] = None) -> CKNet:
+     """CKNet, optionally initialised from
+       * a v1 stage-T run dir (config.json + ckpt_best.pt (else ckpt_last.pt) with RefinerNet keys): loaded into
+         net.trunk; the source arm must equal the target arm, except target 'S', for which every adapter.* key is
+@@ -229,9 +267,12 @@
+         src = Path(init_from)
+         cfg = json.loads((src / "config.json").read_text()) if (src / "config.json").is_file() else {}
+         src_arm = cfg.get("arm")
++        tsrc = TemporalCfg.from_dict(cfg.get("temporal"))
++        if tsrc != (temporal if temporal is not None else TemporalCfg()):
++            raise ValueError(f"init_from {src}: temporal cfg {tsrc.to_dict()} differs from the target's")
+         if norm is None and arm in NORM_FILE and src_arm == arm and (src / NORM_FILE[arm]).is_file():
+             norm = load_arm_norm(src, arm)
+-    net = CKNet(arm, seed, norm, score_hidden=score_hidden, lead_aux=lead_aux)
++    net = CKNet(arm, seed, norm, score_hidden=score_hidden, lead_aux=lead_aux, temporal=temporal)
+     if init_from is None:
+         net.init_report = report
+         return net
+@@ -278,16 +319,25 @@
+     os.replace(tmp, path)
+ 
+ 
+-def load_ck(run_dir: Union[str, Path], which: str = "last", device="cpu") -> Tuple[CKNet, Dict]:
+-    """Rebuild a CK run (config.json: arm, seed, optional lead_aux / score_hidden; norm.npz (T) / norm_map.npz (M))
+-    and load ckpt_<which>.pt['model'] strictly (which = 'last', 'ep<e>' or a .pt path) -> (net.eval(), cfg)."""
++def load_ck(run_dir: Union[str, Path], which: str = "last", device="cpu",
++            allow_privileged: bool = False) -> Tuple[CKNet, Dict]:
++    """Rebuild a CK run (config.json: arm, seed, optional lead_aux / score_hidden / temporal; norm.npz (T) /
++    norm_map.npz (M)) and load ckpt_<which>.pt['model'] strictly (which = 'last', 'ep<e>' or a .pt path) ->
++    (net.eval(), cfg).  A PRIVILEGED run (temporal oracle / gt source) raises PermissionError unless
++    allow_privileged (single choke point for KD teachers, navtest / e2e evals, fit_kd_calib)."""
+     run_dir = Path(run_dir)
+     cfg = json.loads((run_dir / "config.json").read_text())
+     arm = cfg["arm"]
++    tcfg = TemporalCfg.from_dict(cfg.get("temporal"))
++    if tcfg.privileged and not allow_privileged:
++        raise PermissionError(f"CK run {run_dir} is PRIVILEGED (temporal forecaster {tcfg.forecaster!r}, source "
++                              f"{tcfg.source!r}): analysis only, pass allow_privileged=True")
+     # the checkpoint carries the adapter's z-score buffers, so a missing norm file is not fatal
+     norm = load_arm_norm(run_dir, arm) if arm in NORM_FILE and (run_dir / NORM_FILE[arm]).is_file() else None
+     net = CKNet(arm, int(cfg.get("seed", 0)), norm,
+-                score_hidden=int(cfg.get("score_hidden", 256)), lead_aux=bool(int(cfg.get("lead_aux", 0) or 0)))
++                score_hidden=int(cfg.get("score_hidden", 256)), lead_aux=bool(int(cfg.get("lead_aux", 0) or 0)),
++                temporal=tcfg, ca_b=(torch.ones(2, 10) if tcfg.on and tcfg.forecaster != "learned" else None))
++    # (ca_b placeholder: the checkpoint's persistent buffer overwrites it in the strict load below)
+     p = _ckpt_path(run_dir, which)
+     net.load_state_dict(_torch_load(p)["model"], strict=True)
+     net.init_report = {"source": str(run_dir), "kind": "ck", "ckpt": str(p), "ckpt_sha16": _sha16(p)}

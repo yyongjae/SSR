@@ -1,0 +1,22 @@
+{
+ "version": "v3_arm_1",
+ "name": "ck2T10",
+ "doc": "ck2T10 training recipe (SPEC section 5.4) shared by every Step-1 arm; the arms add only --out-root, --run-name and the temporal flags. world 2 (GPUs 0,1), 8 tokens per rank, as ck2T10.",
+ "source_config": "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10/config.json",
+ "source_config_sha16": "5023a0167b7a1ef2",
+ "source_launch": "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/run_ck2T10.sh",
+ "world_size": 2,
+ "cuda_visible": "0,1",
+ "tokens_per_rank": 8,
+ "cli": ["--arm", "T", "--epochs", "10", "--tokens-per-batch", "16", "--lr", "6e-4", "--sur-groups", "near_mid",
+         "--eval-every", "2", "--best-metric", "none", "--score-keys", "nc,ttc,ep,comfort", "--n-var", "80",
+         "--var-name", "var_separate_sampler16_accstraight", "--seed", "0", "--sampler-seed", "0",
+         "--norm-from", "compute", "--warmup-steps", "500", "--wd", "0.01", "--clip", "1.0", "--workers", "8",
+         "--ep-target", "official"],
+ "trailing": ["--resume"],
+ "expect_from_source_config": ["arm", "epochs", "lr", "wd", "warmup_steps", "tokens_per_batch", "n_var", "var_name",
+                               "sampler_seed", "workers", "amp", "clip", "seed", "init_from", "norm_from",
+                               "lambda_score", "lambda_sur", "score_keys", "sur_groups", "score_prior", "prior_rows",
+                               "train_eval_rows", "val_raw", "eval_n_var", "eval_every", "best_metric", "max_steps",
+                               "limit_tokens", "val_limit", "eval_batch", "split", "val_split"]
+}

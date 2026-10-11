@@ -18,6 +18,10 @@ CKDataset(split, bev in {'S','T','M','none'}, k=16, labels='cand', gt=False, kd_
   corr_aug  corr_traj [K,8,3] (kd_dir/kd_corr_traj.npy), y_corr [K,5] / y_corr_ok [K] (labels/<split>/kd_corr),
             kd_score_prob_corr [K,5] (kd_dir)
   lead      lead_has, lead_d1 (f32; NaN = censored) from <root>/lead/<split>.parquet (fallback CK_DATA/lead)
+  objects   refiner-v3 temporal branch (default None = the CK2 path, no new keys): {"cfg": TemporalCfg dict (on),
+            "aug": False, "targets": bool} -> obj_in / obj_mask / frame_valid / obj_ok (+ fc_xyh / fc_state, + the
+            oracle's priv_fc_*) from the object pack (ck2_dataset.ObjectRows).  Evaluation only: aug must be False
+            (CKDataset has no epoch / seed; training augmentation lives in CK2Dataset).
 Item keys: token (str), row (int), bev f16 [256,50,100] + bev_ok, cand f32 [K,8,3], status f32 [8], v2_final f32 [K],
   v2_im f32 [K], v2_sim f32 [K,5] (CK_KEYS), gt_traj f32 [8,3] (always; NaN if unavailable), y f32 [K,5] (CK_KEYS),
   y_ok bool [K], y_pdms f32 [K], + the optional groups above.
@@ -50,7 +54,8 @@ PDMS_IDX = CM.LABEL_COLS.index("pdms")
 class CKDataset(torch.utils.data.Dataset):
     def __init__(self, split: str, bev: str = "S", k: int = CM.K_CAND, labels: Optional[str] = "cand",
                  gt: bool = False, kd_dir: Optional[str] = None, corr_aug: bool = False, lead: bool = False,
-                 rows: Optional[np.ndarray] = None, limit: int = 0, root=None, ep_target: str = "official"):
+                 rows: Optional[np.ndarray] = None, limit: int = 0, root=None, ep_target: str = "official",
+                 objects: Optional[Dict] = None):
         assert bev in ("S", "T", "M", "none"), bev
         self.split, self.bev, self.k = split, bev, int(k)
         self.ep_target = check_ep_target(ep_target)
@@ -109,6 +114,12 @@ class CKDataset(torch.utils.data.Dataset):
         self._pid = None
         r = np.flatnonzero(ok) if rows is None else np.asarray(rows, np.int64)
         self.rows = r[: int(limit)] if limit else r
+        self.objects = None
+        if objects is not None:
+            from tools.ck.data.ck2_dataset import ObjectRows
+            if bool(objects.get("aug", False)) if isinstance(objects, dict) else False:
+                raise ValueError("CKDataset objects: aug must be False (evaluation dataset; train with CK2Dataset)")
+            self.objects = ObjectRows(split, objects, self.tokens, self.rows)
 
     # ------------------------------------------------------------------------------------------- lazy per process
     def _arr(self, name: str) -> np.ndarray:
@@ -187,6 +198,8 @@ class CKDataset(torch.utils.data.Dataset):
                 self._arr("cand")       # resets per-process state if forked
                 self._gtl = GTLoader(CM.DATA_ROOT)
             it.update(self._gtl.load(tok))
+        if self.objects is not None:
+            it.update(self.objects.item(r, tok, 0, 0))
         return it
 
 

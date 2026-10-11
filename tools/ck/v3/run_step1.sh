@@ -36,6 +36,7 @@ else
   case "$CVD" in 0,1|4,5) ;; *) echo "refusing: V3_GPUS='$CVD' (0,1 or 4,5)"; exit 2 ;; esac
 fi
 GPUS=${CVD//,/ }
+G45=0; [ "$CVD" = 4,5 ] && G45=1           # tools/ck/ckutil.gpu_guard_ddp: CK_ALLOW_GPU45=1 admits exactly 4,5
 for g in $GPUS; do
   used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g" | tr -d ' ')
   [ "$used" -lt 1024 ] || { echo "refusing: GPU $g uses ${used} MiB (needs < 1024)"; exit 3; }
@@ -85,8 +86,8 @@ if [ "$ARM" = pre ]; then
 else
   echo "[run_step1] train_ck2.py $ARGS"
   # shellcheck disable=SC2086
-  setsid nohup env CUDA_VISIBLE_DEVICES="$CVD" PYTHONPATH="$V3" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
-    nice -n 10 /venv/ssr/bin/torchrun --standalone --nproc_per_node=2 tools/ck/train_ck2.py $ARGS \
+  setsid nohup env CUDA_VISIBLE_DEVICES="$CVD" CK_ALLOW_GPU45="$G45" PYTHONPATH="$V3" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    PYTHONDONTWRITEBYTECODE=1 nice -n 10 /venv/ssr/bin/torchrun --standalone --nproc_per_node=2 tools/ck/train_ck2.py $ARGS \
     > "$D3/train/$NAME.launch.log" 2>&1 < /dev/null &
 fi
 PID=$!

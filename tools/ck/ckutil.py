@@ -4,7 +4,8 @@ pin()          : navsim pinned to the SSR-ck worktree (contract env.navsim_pin);
 ck_data()      : CK data root (core constants.CK_DATA; env CK_DATA_ROOT overrides it for smoke / tests ONLY when the
                  core constants do not already honour it -- see resolve note in ck_data()).
 gpu_guard()    : refuse any physical GPU outside 0-3 (CUDA_VISIBLE_DEVICES must be one of 0,1,2,3 when CUDA is used).
-gpu_guard_ddp(): train_ck2 (DDP): 1..2 distinct GPUs of 0-3, one process per visible GPU.
+gpu_guard_ddp(): train_ck2 (DDP): 1..2 distinct GPUs of 0-3, one process per visible GPU.  CK_ALLOW_GPU45=1 also allows
+                 exactly the pair 4,5 (user 2026-10-12: GPUs 4,5 only for short jobs and only when idle).
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from typing import Dict, Optional
 
 CK_REPO = str(Path(__file__).resolve().parents[2])   # repo root of this worktree
 ALLOWED_GPUS = ("0", "1", "2", "3")
+EXTRA_DDP_PAIR = ("4", "5")          # gpu_guard_ddp with CK_ALLOW_GPU45=1 only (module docstring)
 
 
 def pin() -> None:
@@ -56,7 +58,9 @@ def gpu_guard_ddp(device: str, world_size: int, max_gpus: int = 2) -> None:
         return
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     ids = [x.strip() for x in vis.split(",") if x.strip()]
-    if not (1 <= len(ids) <= max_gpus) or len(set(ids)) != len(ids) or any(i not in ALLOWED_GPUS for i in ids):
+    if os.environ.get("CK_ALLOW_GPU45") == "1" and tuple(ids) == EXTRA_DDP_PAIR:
+        pass
+    elif not (1 <= len(ids) <= max_gpus) or len(set(ids)) != len(ids) or any(i not in ALLOWED_GPUS for i in ids):
         raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK2 jobs run on 1..{max_gpus} distinct GPUs of {ALLOWED_GPUS}")
     if len(ids) != int(world_size):
         raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r} has {len(ids)} GPU(s) but WORLD_SIZE={world_size}: "

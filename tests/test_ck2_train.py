@@ -607,6 +607,20 @@ def test_gpu_guard_ddp(monkeypatch):
             with pytest.raises(SystemExit):
                 U.gpu_guard_ddp("cuda", w)
     U.gpu_guard_ddp("cpu", 2)
+    # CK_ALLOW_GPU45=1 (user 2026-10-12): exactly the pair 4,5 in addition; nothing else changes
+    monkeypatch.setenv("CK_ALLOW_GPU45", "1")
+    for vis, w, ok in (("4,5", 2, True), ("4", 1, False), ("5,4", 2, False), ("4,6", 2, False), ("6,7", 2, False),
+                       ("0,1", 2, True), ("4,5", 1, False)):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", vis)
+        if ok:
+            U.gpu_guard_ddp("cuda", w)
+        else:
+            with pytest.raises(SystemExit):
+                U.gpu_guard_ddp("cuda", w)
+    monkeypatch.delenv("CK_ALLOW_GPU45")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5")
+    with pytest.raises(SystemExit):
+        U.gpu_guard_ddp("cuda", 2)
 
 
 # ----------------------------------------------------------------------------------------------- end to end (CPU)

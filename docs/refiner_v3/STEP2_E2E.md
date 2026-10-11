@@ -182,3 +182,17 @@ ck2e2e_main 대비 diff = 50행 `teacher_det_run`, 67행 `kd_calib.det` 2줄뿐;
 teacher_det_run / kd_calib / io_dir / _ck_sets; teachers.json `forecaster_equals_fc_init: true`, `warnings: []`,
 `kd_objects.same_as_teacher_training: true` (pack `d004c23d…`). 실제 kd_calib / e2e 디렉터리에는 아무것도 쓰지 않음.
 
+
+## 7. 실행 기록 (2026-10-12, main session)
+
+- KD calibration `ck2/kd_calib/v3T10_a_learned__last.json` (sha16 c8c5723d9d40a678): nc a .9548 b +1.2032, ep a .6804
+  b +.6064, ttc a .7766 b +1.2937; n_tokens_obj_ok 16384/16384. sanity fwd_score_maxdiff 0.0039 = fp16 1-ULP (fp32 2.8e-5).
+- GPU smoke `e2e_smoke/v3T_1012_0235` (G1M, GPUs 0,1, 3 ep × 300 mb): **pass True**, 10/10 check
+  (temporal_teacher_recorded, kd_objects_same_as_teacher_training, kd_obj_ok_frac_logged_ge_0999 포함).
+- 코드 snapshot: `ck2/e2e/code_snapshot_e2e_v3T_20261012_0247.tar.gz` (git archive HEAD e184002, sha256 2ae1c3c8…).
+- **launch 02:47 KST** `RUN=ck2e2e_v3T CK2_E2E_APPROVED=1 E2E_CK_SET=…/v3teacher_arm.set train_e2e2.sh start --gpus 0,1`
+  (wandb online). overrides = dry run과 동일 (diff 0); ck2e2e_main 대비 차이 = teacher_det_run, kd_calib.det, run 경로뿐.
+  teachers.json det ckpt sha16 43cda8bc5210fe67, ep_target official, kd_objects pack d004c23d… same_as_teacher_training true.
+- 속도: epoch 0 1.43 it/s × 10,639 step → epoch ≈ 2.1 h, 30 epoch ≈ 62 h (예상 종료 10/14 오후–저녁 KST).
+- 학습 중 online2.py / e2e_data2.py / model.py / temporal/** 수정 금지.
+- Step 1 판정은 STEP1_RESULT.md (진단상 NO-GO; 이 run은 user 지시로 GO 여부와 무관하게 진행).

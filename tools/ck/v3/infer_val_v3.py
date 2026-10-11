@@ -46,9 +46,15 @@ Check (stage check, also run at the end of a full inference; review fix D6: REPO
 never an exit; decide_step1.py requires check.ok):
   temporal runs  the trainer saved the r34 logits of its last navtrain_val eval (eval_r34_navtrain_val_last.npz,
                  same weights as ckpt_last).  Per token and logit: |dlogit| = |infer - train|; picks = argmax
-                 ck_final(sigmoid, im = 1, noim weights) per token.  ok iff the 99.9 % quantile of |dlogit| <= 2e-4
-                 and at most 0.1 % of the picks flip (CUDA scatter_add order, another batch composition and fp16
-                 make bit equality impossible; measured scale 1e-7..1e-4 [실측 review_correctness E1]).
+                 ck_final(sigmoid, im = 1, noim weights) per token.  ok iff the 99.9 % quantile of |dlogit| <= 2^-5,
+                 at most 0.1 % of the picks flip and pdms_ck_noim reproduces the val_metrics row (|diff| <= 1e-4,
+                 n_sel equal).  CUDA scatter_add order, another batch composition and fp16 make bit equality
+                 impossible.  Tolerance (fix 2026-10-12 KST, user-approved after Step 1): the logits are fp16 autocast
+                 outputs (every saved value is fp16-representable, |logit| < 32, fp16 spacing 2^-6 there), so the
+                 tolerance is 2 fp16 ULP of that range = 2^-5 = 0.03125.  The first tolerance 2e-4 came from fp32-scale
+                 CPU checks [review_correctness E1] and refused arm a (q99.9 0.0039 = 2^-8, max 0.0156, 2 / 18,179
+                 flipped picks, pdms exact) [실측 2026-10-12]; arm b max 0.027.  Different weights (arm a infer vs
+                 arm b training logits) differ by median 0.535, q99.9 11.6 [실측], so 2^-5 still separates them.
   temporal-off   (arm c) no saved logits: pdms_ck_noim recomputed from prob16 + cand labels vs the run's last
                  navtrain_val r34 val_metrics row; ok iff |diff| <= 1e-4 and n_sel equal ('exact' = |diff| <= 1e-6).
 Rows whose object pack row has obj_ok False are scored like any other (outputs are finite for empty object sets)
@@ -89,7 +95,8 @@ K80 = K16 * NVAR
 KST = 9 * 3600
 CHECK_TOL = 1e-6                 # 'exact' (reported)
 CHECK_PDMS_TOL = 1e-4            # temporal-off tolerance
-CHECK_DLOGIT = 2e-4              # temporal runs: 99.9 % quantile of |dlogit|
+CHECK_DLOGIT = 2.0 ** -5         # temporal runs: 99.9 % quantile of |dlogit| (2 fp16 ULP at |logit| < 32; docstring)
+CHECK_DLOGIT_V1 = 2e-4           # first tolerance (fp32 scale), still reported as frac_dlogit_gt_v1
 CHECK_DLOGIT_Q = 0.999
 CHECK_FLIP_MAX = 0.001           # at most 0.1 % flipped picks
 MODEL_FILES = ("navsim/agents/para_ssr/ck/model.py", "navsim/agents/para_ssr/ck/temporal/branch.py",
@@ -332,6 +339,7 @@ def logit_check(run: Path, logit16: np.ndarray, done: np.ndarray, ref_step: Opti
     out.update(n_rows=int(fin.sum()), n_logits=int(d.size), max_abs_dlogit=float(d.max()) if d.size else None,
                q999_abs_dlogit=float(np.quantile(d, CHECK_DLOGIT_Q)) if d.size else None,
                frac_dlogit_gt_tol=float((d > CHECK_DLOGIT).mean()) if d.size else None,
+               frac_dlogit_gt_v1=float((d > CHECK_DLOGIT_V1).mean()) if d.size else None,
                n_picks=int(lab_ok.sum()), n_flipped=int((pi != pt).sum()),
                frac_flipped=float((pi != pt).mean()) if lab_ok.any() else None,
                tol={"dlogit": CHECK_DLOGIT, "quantile": CHECK_DLOGIT_Q, "flip_max": CHECK_FLIP_MAX})
@@ -372,8 +380,9 @@ def reproduce_check(run: Path, prob16: np.ndarray, done: np.ndarray, logit16: Op
     lc = logit_check(run, logit16, done, out.get("ref_step")) if logit16 is not None else None
     if lc is not None:
         out["logit_check"] = lc
-        out["rule"] = "per-token logits (temporal run): q99.9 |dlogit| <= 2e-4 and <= 0.1 % flipped picks"
-        out["ok"] = bool(lc["ok"])
+        out["rule"] = ("per-token logits (temporal run): q99.9 |dlogit| <= 2^-5 (fp16), <= 0.1 % flipped picks and "
+                       "pdms_ck_noim |diff| <= 1e-4 with n_sel equal")
+        out["ok"] = bool(lc["ok"] and out.get("pdms_ok") is True)
     elif "pdms_ok" in out:
         out["rule"] = "pdms_ck_noim |diff| <= 1e-4 and n_sel equal (no saved logits)"
         out["ok"] = bool(out["pdms_ok"])
@@ -561,6 +570,40 @@ def infer(a) -> Dict:
     return meta
 
 
+def recheck(a) -> Dict:
+    """Recompute the reproduce check of a finished dump (--out, required) with the current tolerance, from its saved
+    prob16 / score_logit16 / done arrays; the run's checkpoint must still hash to the dump's cache key (the check is
+    about those weights).  Rewrites infer_meta.json: check = new, check_history += [old check, KST, rule]."""
+    from tools.ck import ckutil as U
+    if not a.out:
+        raise SystemExit("--recheck needs --out <dump dir>")
+    out = Path(a.out)
+    meta = U.read_json(out / "infer_meta.json", None)
+    if not meta:
+        raise SystemExit(f"{out}/infer_meta.json missing")
+    run = Path(meta["run"])
+    if Path(os.path.abspath(a.run)) != run:
+        raise SystemExit(f"--run {a.run} != the dump's run {run}")
+    key = meta.get("cache_key") or {}
+    ck_file = Path(meta["ckpt"])
+    if not key.get("ckpt_sha256") or sha(ck_file, 64) != key["ckpt_sha256"]:
+        raise SystemExit(f"{ck_file} no longer hashes to the dump's cache key: the check would compare other weights")
+    if int(meta.get("limit") or 0):
+        raise SystemExit("dump made with --limit: no check to recompute")
+    on = bool((meta.get("temporal") or {}).get("on"))
+    D = np.load(out / "done.npy").astype(bool)
+    new = reproduce_check(run, np.asarray(np.load(out / "prob16.npy")), D,
+                          np.asarray(np.load(out / "score_logit16.npy")) if on else None)
+    new["recheck"] = {"at": kst(), "infer_val_v3_sha16": sha(__file__)}
+    meta["check_history"] = (meta.get("check_history") or []) + [
+        {"check": meta.get("check"), "replaced": kst(), "by_rule": new.get("rule")}]
+    meta["check"] = new
+    U.write_json(out / "infer_meta.json", meta)
+    log(f"[recheck] {out}: ok {new.get('ok')} ({new.get('rule')}); previous ok "
+        f"{(meta['check_history'][-1]['check'] or {}).get('ok')}")
+    return new
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", required=True)
@@ -573,9 +616,15 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--limit", type=int, default=0, help="first N packed rows only (CPU checks); skips the check")
+    ap.add_argument("--recheck", action="store_true",
+                    help="recompute infer_meta.json['check'] from the saved arrays of --out (no model, no GPU); the "
+                         "old check is kept in check_history")
     a = ap.parse_args(argv)
     if a.workers > 16:
         raise SystemExit("--workers <= 16")
+    if a.recheck:
+        recheck(a)
+        return
     infer(a)
 
 

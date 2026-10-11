@@ -298,5 +298,15 @@ def test_infer_logit_check_tolerance(tmp_path):
     L2 = L.copy()
     L2[rows[:40]] += 0.5                                                  # 10 % of the tokens far off
     c2 = IV.logit_check(tmp_path, L2, done, 100)
-    assert not c2["ok"] and c2["q999_abs_dlogit"] > 2e-4
+    assert not c2["ok"] and c2["q999_abs_dlogit"] > IV.CHECK_DLOGIT
     assert IV.logit_check(tmp_path / "none", L, done, 100) is None
+    # fix 2026-10-12: fp16-scale differences (1 % of the logits off by up to 2^-6, as arm a) pass; v1 still reported
+    L3 = L.copy()
+    m = rng.random((n, 16, 5)) < 0.01
+    L3[rows] = np.where(m, tl + rng.choice([-1, 1], tl.shape) * 2.0 ** -6, tl)
+    c3 = IV.logit_check(tmp_path, L3, done, 100)
+    assert c3["ok"] and c3["q999_abs_dlogit"] > IV.CHECK_DLOGIT_V1 and c3["frac_dlogit_gt_v1"] > 0
+    # other weights: a fresh draw of logits (differences O(1)) fails
+    L4 = L.copy()
+    L4[rows] = rng.normal(0, 3, tl.shape)
+    assert IV.logit_check(tmp_path, L4, done, 100)["ok"] is False

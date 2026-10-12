@@ -63,3 +63,35 @@
 1. ~~무결성 허용치 수정~~ → 완료 (§2), 공식 NO-GO.
 2. b − c ≈ 0 진단: user 승인 (06:47 KST), CPU 전용으로 진행 중 → `D3/diag_bc/`.
 3. arm d (oracle forecaster, PRIV): 2번 결과를 보고 결정 (GPU 학습이라 user 승인 필요).
+
+## 6. arm d (oracle forecaster, PRIVILEGED) 결과 — 2026-10-12 12:12 KST
+
+판정 규칙은 결과 전에 등록했다(`ARM_D_PREREG.md`, 커밋 `88be625`, 09:19 KST). 결과는 12:12 KST에 나왔다.
+- 학습: GPU 4·5, 08:02 → 12:08 KST (4.1 h).
+- 추론: GPU 4, 207 s. 재현 검사 exact (pdms absdiff 0).
+- 출력: `D3/decide/with_d/step1_with_d_no-arm-check.{json,log}`. d − c는 `D3/decide/with_d/dc_contrast/d_as_a.json`(d를 arm a 자리에 넣고 `--no-arm-check`).
+- 공식 모드(`step1_with_d_check.log`)는 provenance D5에서 거부됐다. 예상한 대로다.
+  - 원인: train-code sha 차이 (d 393ab2f8 vs a·b eb1bb78f)
+  - 차이 나는 파일: online2.py, e2e_data2.py(e2e 전용), ckutil.py(GPU guard), pretrain_forecaster.py(d는 실행하지 않음)
+  - teacher 학습 경로는 같다.
+
+| | 판정 PDMS | ncttc_only | lead-decel TTC AUC | lead NC/TTC fail |
+|---|---|---|---|---|
+| d (oracle) | **91.600** | **91.528** | **.925** | **3.74 %** |
+| a (learned) | 91.088 | 91.119 | .830 | 6.85 % |
+| b (CA) | 90.922 | 91.000 | .844 | 6.73 % |
+| c (ck2T10) | 90.919 | 90.888 | .837 | 6.17 % |
+
+| Δ (paired log bootstrap) | ncttc_only | 판정 PDMS |
+|---|---|---|
+| **d − b (주 지표)** | **+0.529 [+0.340, +0.713]** | +0.678 [+0.435, +0.890] |
+| d − a | +0.409 [+0.220, +0.614] | +0.512 [+0.288, +0.718] |
+| d − c | +0.640 [+0.444, +0.853] | +0.681 [+0.415, +0.931] |
+
+- lead-decel 기준 d − c: TTC AUC +0.088 [+0.060, +0.112], 실패율 −2.43 pp [−4.02, −0.86].
+
+**사전 등록 판정: d − b = +0.529 ≥ +0.30 → 파이프라인은 강한 예보 신호를 회수한다. 다음 레버는 forecaster 품질이다.**
+- d − c +0.640은 CPU emulation 기대 +0.71 [+0.52, +0.92]의 약 90%다. 즉 raster/gap → CNN → 주입 → critic 경로는 정보가 있으면 쓴다.
+- b·a가 c에 비해 작게 오른 것은 파이프라인 문제가 아니다. CA와 learned 예보가 t0 BEV 위에 더해 주는 정보가 작기 때문이다(진단 `D3/diag_bc/`).
+- d는 PRIVILEGED(GT 미래 입력)다. 분석 상한일 뿐이고, plug-in 결과나 KD teacher로는 쓰지 않는다.
+- 단일 seed다.

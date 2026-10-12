@@ -144,3 +144,31 @@ CUDA_VISIBLE_DEVICES=6,7 nohup bash scripts/training/run_bev_selector_v7_distill
 ```bash
 tail -f /workspace/byounggun/SSR/work_dirs/v7_train.log
 ```
+
+---
+
+## 6. 최종 NAVSIM 평가 결과 (30 Epoch 완료, 12,146개 시나리오)
+
+- **평가 일시**: 2026-10-11
+- **평가 체크포인트**: `/workspace/byounggun/SSR/work_dirs/paradrive_distill_bev_selector_v7/lightning_logs/version_1/checkpoints/epoch=29-step=19950.ckpt`
+- **평가 하드웨어**: NVIDIA RTX 4090 (GPUs 6, 7 병렬 샤드)
+- **결과 파일**: `/workspace/byounggun/SSR/work_dirs/eval/paradrive_distill_bev_selector_v7/merged.csv`
+
+### 6.1 최종 성능 비교표
+
+| 평가 지표 | Baseline (R34 Plan-Only) | v6 Distill (R34 Plan-Only) | **v7 Distill (R34 Plan-Only)** | v6 대비 변화 |
+| :--- | :---: | :---: | :---: | :---: |
+| **PDM Score (PDMS)** | ~0.8485 | 0.8647 | **0.8671** | **+0.0024 (+0.24%p)** |
+| **Drivable Area (DAC)** | 0.9380 | 0.9466 | **0.9508** | **+0.0042 (+0.42%p) 🚀** |
+| **Ego Progress (EP)** | 0.7950 | 0.8016 | **0.8027** | **+0.0011 (+0.11%p)** |
+| **Comfort** | 0.9998 | 0.9999 | **1.0000** | **+0.0001 (만점)** |
+| **Driving Dir (DDC)** | 1.0000 | 1.0000 | **1.0000** | **1.0000 (만점)** |
+| **Time-to-Collision (TTC)** | 0.9480 | 0.9498 | **0.9492** | -0.0006 |
+| **No Collision (NC)** | 0.9820 | 0.9856 | **0.9826** | -0.0030 |
+
+### 6.2 분석 및 결론
+1. **DAC의 괄목할 만한 상승 (0.9466 → 0.9508)**:
+   - v6의 최대 병목이었던 도로 경계 이탈이 **Soft Gaussian Spatial Distance Bias** ($\sigma=4.0\text{ m}$)와 **ReSMap 3.0x 손실 스케일링**에 의해 대폭 개선되었습니다.
+2. **순수 Plan-Only(ResNet-34) 한계치 도달**:
+   - 보조 태스크 헤드가 전혀 없는 순수 경량 추론 구조에서 0.8671을 달성하여, 미증류 베이스라인 대비 **+1.86%p**의 압도적인 개선을 보였습니다.
+

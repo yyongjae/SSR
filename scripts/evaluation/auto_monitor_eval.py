@@ -59,6 +59,16 @@ def find_matching_pids(pattern: str) -> list[int]:
         return []
 
 
+def get_latest_ckpt_dir(exp_dir: Path) -> Path:
+    version_dirs = sorted(
+        exp_dir.glob("lightning_logs/version_*"),
+        key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else 0,
+    )
+    if version_dirs:
+        return version_dirs[-1] / "checkpoints"
+    return exp_dir / "lightning_logs/version_0/checkpoints"
+
+
 def check_checkpoint(ckpt_dir: Path) -> Optional[Path]:
     """Find epoch 29 checkpoint or last.ckpt with epoch >= 29."""
     if not ckpt_dir.is_dir():
@@ -199,29 +209,10 @@ def main() -> None:
     args = parser.parse_args()
 
     jobs = {
-        "tmux21_plan_only": {
-            "name": "para_ssr_plan_only",
-            "pattern": "run_training.py.*para_ssr_plan_only",
-            "initial_pids": [840256, 840650],
-            "ckpt_dir": WORK_DIRS / "para_ssr_plan_only/lightning_logs/version_0/checkpoints",
-            "gpus": "4,5",
-            "arch": "resnet50.tv_in1k",
-            "extra_args": [
-                "agent.config.use_task_interaction=false",
-                "agent.config.use_det_motion_head=false",
-                "agent.config.use_map_head=false",
-                "agent.config.plan_anchor=false",
-                "agent.config.plan_anchor_file=null",
-                "agent.config.plan_score_file=null",
-            ],
-            "status": "training",
-            "result": None,
-        },
-        "tmux19_bev_selector_v6": {
-            "name": "paradrive_distill_bev_selector_v6",
-            "pattern": "run_training.py.*paradrive_distill_bev_selector_v6",
-            "initial_pids": [893377, 894151],
-            "ckpt_dir": WORK_DIRS / "paradrive_distill_bev_selector_v6/lightning_logs/version_0/checkpoints",
+        "tmux19_bev_selector_v7": {
+            "name": "paradrive_distill_bev_selector_v7",
+            "pattern": "run_training.py.*paradrive_distill_bev_selector_v7",
+            "exp_dir": WORK_DIRS / "paradrive_distill_bev_selector_v7",
             "gpus": "6,7",
             "arch": "resnet34.tv_in1k",
             "extra_args": [
@@ -239,8 +230,7 @@ def main() -> None:
 
     log("=" * 72)
     log("Auto-monitor & Eval started.")
-    log(f"Monitoring tmux 21 (para_ssr_plan_only) -> will eval on GPUs 4,5")
-    log(f"Monitoring tmux 19 (paradrive_distill_bev_selector_v6) -> will eval on GPUs 6,7")
+    log(f"Monitoring tmux 19 (paradrive_distill_bev_selector_v7) -> will eval on GPUs 6,7 upon completion")
     log(f"Report destination: {REPORT_FILE}")
     log("=" * 72)
 
@@ -255,18 +245,18 @@ def main() -> None:
                 continue
 
             all_done = False
-            ckpt_dir = job["ckpt_dir"]
+            exp_dir = job["exp_dir"]
+            ckpt_dir = get_latest_ckpt_dir(exp_dir)
             final_ckpt = check_checkpoint(ckpt_dir)
 
             # Check running processes
-            alive_pids = [pid for pid in job["initial_pids"] if is_pid_alive(pid)]
             pattern_pids = find_matching_pids(job["pattern"])
-            is_alive = bool(alive_pids or pattern_pids)
+            is_alive = bool(pattern_pids)
 
             # Log heartbeat every 10 iterations (~10 mins)
             if loop_count % 10 == 0:
                 cur_ep = get_latest_epoch(ckpt_dir)
-                log(f"[Status {job['name']}] alive={is_alive} (pids={alive_pids or pattern_pids}), latest_checkpoint_epoch={cur_ep}, target=29")
+                log(f"[Status {job['name']}] alive={is_alive} (pids={pattern_pids}), latest_checkpoint_epoch={cur_ep}, target=29")
 
             if not is_alive:
                 # Give a grace period for filesystem sync

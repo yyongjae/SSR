@@ -422,7 +422,11 @@ class ParaSSRModel(nn.Module):
             ego_status=ego_status,
             det_out=det_out,
             map_out=map_out,
-            return_bev_attn=bool(getattr(cfg, "distill_selector", False)),
+            return_bev_attn=bool(
+                getattr(cfg, "distill_selector", False)
+                or getattr(cfg, "distill_selector_v6", False)
+                or getattr(cfg, "distill_selector_v7", False)
+            ),
         )
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
@@ -431,6 +435,8 @@ class ParaSSRModel(nn.Module):
                 planned["ego_fut_preds"], features["command"]
             ),
         }
+        if "bev_pos" in planned and planned["bev_pos"] is not None:
+            predictions["bev_pos"] = planned["bev_pos"]
         if "plan_bev_attn" in planned:
             predictions["plan_bev_attn"] = planned["plan_bev_attn"]
         if "trajectory_offset" in planned:

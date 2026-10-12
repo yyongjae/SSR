@@ -407,6 +407,7 @@ class ParaSSRModel(nn.Module):
                 getattr(cfg, "distill_selector", False)
                 or getattr(cfg, "distill_selector_v6", False)
                 or getattr(cfg, "distill_selector_v7", False)
+                or getattr(cfg, "distill_selector_v8", False)
             ),
         )
         if not self.use_task_interaction:
@@ -426,6 +427,7 @@ class ParaSSRModel(nn.Module):
                 getattr(cfg, "distill_selector", False)
                 or getattr(cfg, "distill_selector_v6", False)
                 or getattr(cfg, "distill_selector_v7", False)
+                or getattr(cfg, "distill_selector_v8", False)
             ),
         )
         predictions: Dict[str, torch.Tensor] = {

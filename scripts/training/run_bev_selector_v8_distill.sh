@@ -3,9 +3,10 @@
 # BEV Selector v8 Distillation Launch Script
 #
 # Methodology (docs/bev_selector_v8.md):
-# - Student: Pure Plan-Only (No Det/Map auxiliary heads, no task interaction)
+# - Student: km/para-ssr-v2 Multi-Task (Aux Det+Motion + Map + Task Interaction + 256 Anchors)
 # - Backbone: ResNet-34 (timm/resnet34.tv_in1k)
 # - Planner: 256 K-Means Trajectory Anchors + WTA Offset + Simulation Rewards
+# - Balancer: Closed-loop GradBalancer across Student tasks (plan: 0.4, det: 0.3, map: 0.3)
 # - Bug Fixes:
 #     * Student Proj Optimizer Registration (student_proj trainable, shared QKV probes frozen)
 #     * Distill Loss Scale Fix (0.5 * bank_loss, loss_distill_tok moved to telemetry, 3x bug eliminated)
@@ -132,7 +133,7 @@ if [[ "${WANDB}" != "0" ]]; then
       "wandb.project=${WANDB_PROJECT}"
       "wandb.group=${WANDB_GROUP}"
       "wandb.name=${run_name}"
-      "wandb.tags=[bev-selector,r34,v8,hybrid-anchors,multi-scale-bias,plan-only]"
+      "wandb.tags=[bev-selector,r34,v8,aux-tasks,interaction,hybrid-anchors,multi-scale-bias]"
     )
   else
     echo "Notice: No WANDB_API_KEY found. Running with W&B disabled."
@@ -147,7 +148,7 @@ echo " Visible GPUs    : ${CUDA_VISIBLE_DEVICES} (${NUM_GPUS} GPUs)"
 echo " Feature Cache   : ${DISTILL_FEATURE_ROOT}"
 echo " Global Batch    : ${GLOBAL_BATCH} (Batch ${BATCH_SIZE} x GPUs ${NUM_GPUS} x Acc ${ACCUMULATE})"
 echo " Max Epochs      : ${MAX_EPOCHS}"
-echo " Student Arch    : ResNet-34 (Plan-Only, No Aux Heads, 256 Anchors)"
+echo " Student Arch    : ResNet-34 (Aux Det/Motion + Map + Task Interaction + 256 Anchors)"
 echo " Distill Target  : BEVFusion (NC) + ReSMap 3.0x (DAC) with Multi-Scale Spatial Bias & Attn KD"
 echo "======================================================================"
 

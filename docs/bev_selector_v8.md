@@ -6,7 +6,7 @@
 **작성일**: 2026-10-12  
 **실행 대상**: GPU 6, 7  
 **학생 백본**: ResNet-34 (`resnet34.tv_in1k`)  
-**학생 아키텍처**: Pure Plan-Only (No Det/Map aux heads, No task interaction, 256 Anchor Planner)  
+**학생 아키텍처**: `km/para-ssr-v2` Multi-Task (Aux Det/Motion + Map + Task Interaction + 256 Anchor Planner + GradBalancer)  
 
 ---
 

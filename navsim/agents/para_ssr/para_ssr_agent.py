@@ -499,12 +499,17 @@ class ParaSSRAgent(AbstractAgent):
                     command = status_feature[:, :self._config.num_navi_cmd]
 
             distill_kwargs = {}
-            if getattr(self._distill, "selector_v6", False) or getattr(self._distill, "selector_v7", False):
+            if (
+                getattr(self._distill, "selector_v6", False)
+                or getattr(self._distill, "selector_v7", False)
+                or getattr(self._distill, "selector_v8", False)
+            ):
                 distill_kwargs = {
                     "trajectory_anchors": predictions.get("trajectory_anchors"),
                     "command": command,
                     "ego_status": status,
                     "bev_pos": predictions.get("bev_pos"),
+                    "sim_reward": targets.get("sim_reward"),
                 }
             elif getattr(self._distill, "selector_mode", False):
                 distill_kwargs = {
@@ -696,6 +701,23 @@ class ParaSSRAgent(AbstractAgent):
                 backbone_params.append(param)
             else:
                 other_params.append(param)
+
+        # Stage-2 planning distillation: add student_proj adapter to optimizer,
+        # while freezing Q/K/V/MLP projections to prevent degenerate collapse (q_proj -> 0).
+        if self._distill is not None and getattr(self._distill, "anchor_distill", None) is not None:
+            anchor_distill = self._distill.anchor_distill
+            for mod_name in (
+                "anchor_mlp", "cmd_mlp", "status_mlp", "query_norm",
+                "q_proj", "k_proj", "v_proj", "out_proj", "attn_det", "attn_map",
+            ):
+                mod = getattr(anchor_distill, mod_name, None)
+                if mod is not None:
+                    mod.requires_grad_(False)
+
+            if getattr(anchor_distill, "student_proj", None) is not None:
+                for param in anchor_distill.student_proj.parameters():
+                    if param.requires_grad:
+                        other_params.append(param)
 
         groups = [
             {"params": other_params, "lr": self._lr, "lr_scale": 1.0},

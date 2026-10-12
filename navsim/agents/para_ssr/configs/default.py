@@ -384,6 +384,15 @@ class ParaSSRConfig:
     distill_attn_loss_scale: float = 5.0
     distill_resmap_scale: float = 3.0
 
+    # v8: Hybrid Anchor Weighting & Multi-Scale Spatial Distance Bias Distillation
+    distill_selector_v8: bool = False
+    distill_spatial_sigmas: Tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
+    distill_lambda_gt: float = 0.6
+    distill_lambda_cov: float = 0.2
+    distill_lambda_risk: float = 0.2
+    distill_tau_gt: float = 5.0
+    distill_tau_risk: float = 8.0
+
     # Stage 1: train one adapter + the unchanged planning decoder from the
     # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.
     teacher_adapter_branch: str = "bevfusion"

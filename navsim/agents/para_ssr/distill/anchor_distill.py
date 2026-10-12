@@ -34,10 +34,16 @@ class TrajectoryAnchorDistillation(nn.Module):
         attn_loss_scale: float = 5.0,
         resmap_scale: float = 3.0,
         spatial_sigma: float = 4.0,
+        spatial_sigmas: Optional[Sequence[float]] = None,
+        lambda_gt: float = 0.6,
+        lambda_cov: float = 0.2,
+        lambda_risk: float = 0.2,
+        tau_gt: float = 5.0,
+        tau_risk: float = 8.0,
         loss_type: str = "hybrid",
         use_proj: bool = True,
         mode: str = "cross_attn",
-        version: str = "v7",
+        version: str = "v8",
         trajectory_anchors_file: Optional[str] = "/workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy",
     ) -> None:
         super().__init__()
@@ -53,6 +59,15 @@ class TrajectoryAnchorDistillation(nn.Module):
         self.attn_loss_scale = float(attn_loss_scale)
         self.resmap_scale = float(resmap_scale)
         self.spatial_sigma = float(spatial_sigma)
+        if spatial_sigmas is not None:
+            self.spatial_sigmas = tuple(float(s) for s in spatial_sigmas)
+        else:
+            self.spatial_sigmas = (2.0, 4.0, 8.0, 16.0)
+        self.lambda_gt = float(lambda_gt)
+        self.lambda_cov = float(lambda_cov)
+        self.lambda_risk = float(lambda_risk)
+        self.tau_gt = float(tau_gt)
+        self.tau_risk = float(tau_risk)
         self.loss_type = str(loss_type).lower()
         self.use_proj = bool(use_proj)
         self.mode = str(mode).lower()
@@ -68,13 +83,12 @@ class TrajectoryAnchorDistillation(nn.Module):
         self.status_mlp = nn.Linear(4, self.channels)
         self.query_norm = nn.LayerNorm(self.channels)
 
-
         # Cross-Attention interaction decoders:
         # Bank 0: Obstacle interaction (BEVFusion)
         # Bank 1: Road Boundary / Map interaction (ReSMap)
         if self.mode == "cross_attn":
-            if self.version == "v7":
-                # v7: Explicit Q, K, V projections for asymmetric teacher-guided alignment
+            if self.version in ("v7", "v8"):
+                # v7/v8: Explicit Q, K, V projections for asymmetric teacher-guided alignment
                 self.q_proj = nn.Linear(self.channels, self.channels)
                 self.k_proj = nn.ModuleList([
                     nn.Linear(self.channels, self.channels) for _ in range(2)
@@ -115,7 +129,7 @@ class TrajectoryAnchorDistillation(nn.Module):
             self.spatial_bias = None
 
     def _build_spatial_bias(self, anchors: torch.Tensor) -> torch.Tensor:
-        """Compute Gaussian spatial distance bias [K, HW] for 256 anchors."""
+        """Compute Gaussian spatial distance bias [K, HW] (v7) or [H, K, HW] (v8) for 256 anchors."""
         device = anchors.device
         r = torch.arange(self.bev_h, dtype=torch.float32, device=device)
         c = torch.arange(self.bev_w, dtype=torch.float32, device=device)
@@ -133,8 +147,18 @@ class TrajectoryAnchorDistillation(nn.Module):
 
         dists = torch.norm(wp_pts.unsqueeze(2) - grid_pts.unsqueeze(0).unsqueeze(0), dim=-1)  # [K, T, HW]
         min_dist = dists.min(dim=1).values  # [K, HW]
-        spatial_bias = -0.5 * (min_dist / max(self.spatial_sigma, 1e-4)) ** 2
-        return spatial_bias  # [K, HW]
+
+        if self.version == "v8":
+            sigmas = list(self.spatial_sigmas)
+            if len(sigmas) != self.num_heads:
+                sigmas = [sigmas[i % len(sigmas)] for i in range(self.num_heads)]
+            biases = []
+            for s in sigmas:
+                biases.append(-0.5 * (min_dist / max(float(s), 1e-4)) ** 2)
+            spatial_bias = torch.stack(biases, dim=0)  # [H, K, HW]
+        else:
+            spatial_bias = -0.5 * (min_dist / max(self.spatial_sigma, 1e-4)) ** 2  # [K, HW]
+        return spatial_bias
 
     def _build_anchor_queries(
         self,
@@ -166,8 +190,9 @@ class TrajectoryAnchorDistillation(nn.Module):
         self,
         anchors: torch.Tensor,
         gt_trajectory: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute Softmax + Winner importance weights for 256 anchors."""
+        sim_reward: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute Softmax + Uniform Coverage + Risk importance weights for 256 anchors."""
         bs = gt_trajectory.size(0)
         k = anchors.size(0)
         flat_anchors = anchors[..., :2].reshape(1, k, -1).to(device=gt_trajectory.device, dtype=gt_trajectory.dtype)
@@ -177,20 +202,46 @@ class TrajectoryAnchorDistillation(nn.Module):
         dist = torch.norm(flat_anchors - flat_gt, dim=-1)  # [B, K]
         winner = dist.argmin(dim=-1)  # [B]
 
-        # Softmax over distance with sharpened tau
-        w = F.softmax(-dist / self.tau, dim=-1)
+        if self.version == "v8":
+            # 1. Relaxed GT softmax: tau_gt ~ 5.0 (spreads across ~20-50 candidate anchors)
+            w_gt = F.softmax(-dist / max(self.tau_gt, 1e-4), dim=-1)  # [B, K]
 
-        # Winner anchor boost
-        if self.winner_boost > 0.0:
-            boost = torch.zeros_like(w).scatter_add(
-                1, winner.unsqueeze(1),
-                torch.full((bs, 1), self.winner_boost, device=w.device, dtype=w.dtype)
-            )
-            w = w + boost
+            # 2. Uniform coverage across all 256 anchors
+            w_cov = torch.full((bs, k), 1.0 / k, device=dist.device, dtype=dist.dtype)
 
-        # Normalize weights so sum is 1.0 per sample
-        w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        return w, winner
+            # 3. Hard negative / Risk exploration term r_k
+            if sim_reward is not None and sim_reward.dim() >= 3 and sim_reward.size(-1) == k:
+                # sim_reward: [B, 5, K], channel 0=NC, channel 1=DAC
+                nc = sim_reward[:, 0, :].to(device=dist.device, dtype=dist.dtype)
+                dac = sim_reward[:, 1, :].to(device=dist.device, dtype=dist.dtype)
+                safety = (nc * dac).clamp(0.0, 1.0)
+                risk_factor = 1.0 - safety  # collision or DAC violation
+                risk_proximity = F.softmax(-dist / max(self.tau_risk, 1e-4), dim=-1)
+                r_k = risk_proximity * risk_factor
+                r_k = r_k / r_k.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            else:
+                # Borderline distance-banded risk
+                risk_proximity = F.softmax(-dist / max(self.tau_risk, 1e-4), dim=-1)
+                r_k = risk_proximity * (1.0 - w_gt)
+                r_k = r_k / r_k.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+            # Hybrid Weighting
+            w = self.lambda_gt * w_gt + self.lambda_cov * w_cov + self.lambda_risk * r_k
+            w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        else:
+            # v7 legacy: sharpened softmax + winner boost
+            w = F.softmax(-dist / self.tau, dim=-1)
+            if self.winner_boost > 0.0:
+                boost = torch.zeros_like(w).scatter_add(
+                    1, winner.unsqueeze(1),
+                    torch.full((bs, 1), self.winner_boost, device=w.device, dtype=w.dtype)
+                )
+                w = w + boost
+            w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        entropy = -(w * torch.log(w.clamp_min(1e-12))).sum(dim=-1)
+        n_eff = torch.exp(entropy).mean()
+        return w, winner, n_eff
 
     def _feature_pair_loss(
         self,
@@ -244,6 +295,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         command: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
         bev_pos: Optional[torch.Tensor] = None,
+        sim_reward: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Compute trajectory-anchor interaction distillation loss.
 
@@ -255,6 +307,7 @@ class TrajectoryAnchorDistillation(nn.Module):
             command: [B, 4] (optional)
             ego_status: [B, 4] (optional)
             bev_pos: [B, HW, C] (optional 2D positional encoding)
+            sim_reward: [B, 5, K] (optional PDM simulation scores)
         """
         if len(teacher_by_bank) != 2:
             raise ValueError(f"TrajectoryAnchorDistillation expects 2 teachers, got {len(teacher_by_bank)}")
@@ -265,15 +318,21 @@ class TrajectoryAnchorDistillation(nn.Module):
         k = trajectory_anchors.size(0)
         hw = student_bev.size(1)
 
+        losses: Dict[str, torch.Tensor] = {}
+        metrics: Dict[str, torch.Tensor] = {}
+
         # Compute importance weights
         if gt_trajectory is not None and gt_trajectory.numel() > 0:
-            weights, winner = self._compute_anchor_weights(trajectory_anchors, gt_trajectory)
+            weights, winner, n_eff = self._compute_anchor_weights(
+                trajectory_anchors, gt_trajectory, sim_reward=sim_reward,
+            )
         else:
             weights = torch.full((bs, k), 1.0 / k, device=device, dtype=dtype)
             winner = torch.zeros((bs,), device=device, dtype=torch.long)
+            n_eff = torch.tensor(float(k), device=device, dtype=dtype)
 
-        losses: Dict[str, torch.Tensor] = {}
-        metrics: Dict[str, torch.Tensor] = {}
+        metrics["distill/effective_anchors"] = n_eff.detach()
+
         names = ("bevfusion", "resmap")
         total_distill_terms = []
 
@@ -287,9 +346,9 @@ class TrajectoryAnchorDistillation(nn.Module):
             if bev_pos is None:
                 raise ValueError("bev_pos must be provided by planner_head for TrajectoryAnchorDistillation")
 
-            if self.version == "v7":
+            if self.version in ("v7", "v8"):
                 # -------------------------------------------------------------
-                # v7: Asymmetric Teacher-Guided Alignment with Spatial Bias
+                # v7/v8: Asymmetric Teacher-Guided Alignment with Multi-Scale Spatial Bias
                 # -------------------------------------------------------------
                 q_proj = self.q_proj(q).view(bs, k, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, K, D]
 
@@ -297,7 +356,11 @@ class TrajectoryAnchorDistillation(nn.Module):
                 if not hasattr(self, "spatial_bias") or self.spatial_bias is None:
                     spatial_bias = self._build_spatial_bias(trajectory_anchors)
                     self.register_buffer("spatial_bias", spatial_bias)
-                bias = self.spatial_bias.to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(1)  # [1, 1, K, HW]
+
+                if self.spatial_bias.dim() == 2:
+                    bias = self.spatial_bias.to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(1)  # [1, 1, K, HW]
+                else:
+                    bias = self.spatial_bias.to(device=device, dtype=dtype).unsqueeze(0)              # [1, H, K, HW]
 
                 scale = 1.0 / (self.head_dim ** 0.5)
 
@@ -338,8 +401,9 @@ class TrajectoryAnchorDistillation(nn.Module):
                     domain_scale = self.resmap_scale if name == "resmap" else 1.0
                     bank_loss = domain_scale * (self.loss_scale * feat_loss + self.attn_loss_scale * attn_loss)
 
-                    losses[f"loss_distill_{name}"] = bank_loss
-                    losses[f"loss_attn_{name}"] = (domain_scale * self.attn_loss_scale * attn_loss).detach()
+                    # Fix: Each bank contributes 0.5 * bank_loss so sum equals (det + map) / 2
+                    losses[f"loss_distill_{name}"] = 0.5 * bank_loss
+                    metrics[f"loss_attn_{name}"] = (domain_scale * self.attn_loss_scale * attn_loss).detach()
                     total_distill_terms.append(bank_loss)
                     metrics[f"distill_cos/{name}"] = bank_cos.detach()
 
@@ -366,7 +430,7 @@ class TrajectoryAnchorDistillation(nn.Module):
                     bank_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t, weights)
                     scaled_loss = self.loss_scale * bank_loss
 
-                    losses[f"loss_distill_{name}"] = scaled_loss
+                    losses[f"loss_distill_{name}"] = 0.5 * scaled_loss
                     total_distill_terms.append(scaled_loss)
                     metrics[f"distill_cos/{name}"] = bank_cos.detach()
 
@@ -399,9 +463,10 @@ class TrajectoryAnchorDistillation(nn.Module):
                 domain_scale = self.resmap_scale if name == "resmap" else 1.0
                 scaled_loss = domain_scale * self.loss_scale * bank_loss
 
-                losses[f"loss_distill_{name}"] = scaled_loss
+                losses[f"loss_distill_{name}"] = 0.5 * scaled_loss
                 total_distill_terms.append(scaled_loss)
                 metrics[f"distill_cos/{name}"] = bank_cos.detach()
 
-        losses["loss_distill_tok"] = torch.stack(total_distill_terms).mean()
+        # Fix: loss_distill_tok is purely for telemetry/W&B logging, NOT returned in losses to avoid 3x double counting
+        metrics["loss_distill_tok"] = torch.stack(total_distill_terms).mean().detach()
         return losses, metrics

@@ -18,7 +18,9 @@ NEW_CONFIG_KEYS = {"temporal", "privileged", "param_count_temporal_shared", "par
                    "t_source", "t_forecaster", "t_modes", "t_lambda_fc", "t_fc_backprop", "t_frame_drop",
                    "t_obj_drop", "t_vnoise", "t_pack_root", "t_ca_scales",
                    # review fixes D3 / D5: pre-trained forecaster flags and the run provenance record
-                   "t_fc_init", "t_fc_train", "provenance"}
+                   "t_fc_init", "t_fc_train", "provenance",
+                   # refiner-fix B1: train_ck2 --corridor-version (default 1 = the 8ae8b1d corridor, arrays identical)
+                   "corridor_version"}
 EQUAL_FACTS = ("param_counts", "sd_keys", "ck2T10_param_count", "ck2T10_config_param_count", "ck2T10_trainable",
                "data_hashes", "data_keys", "ck2_describe", "train1_step_keys", "train3_step_keys",
                "train1_optim_groups", "train3_optim_groups", "train1_val_keys", "train3_val_keys",

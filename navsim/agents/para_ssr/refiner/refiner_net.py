@@ -134,7 +134,10 @@ def _mlp(d_in: int, d_hid: int, d_out: int, zero_last: bool = False) -> nn.Seque
 
 class RefinerNet(nn.Module):
     """Stage-T refiner (see module docstring).  arm in {'T', 'none', 'M', 'TM'}; norm_mean / norm_std [256] =
-    BEVFusion stats (arms T, TM); map_norm_mean / map_norm_std [256] = ReSMap stats (arms M, TM)."""
+    BEVFusion stats (arms T, TM); map_norm_mean / map_norm_std [256] = ReSMap stats (arms M, TM).
+    corridor_version (plain attribute, not state; refiner-fix B1): corridor.corridor_geometry version, default 1."""
+
+    corridor_version = 1
 
     def __init__(self, arm: str = "T", norm_mean=None, norm_std=None, d_model: int = 192, n_heads: int = 6,
                  d_ffn: int = 768, n_layers: int = 4, dropout: float = 0.0, seed: int = 0, map_norm_mean=None,
@@ -185,7 +188,7 @@ class RefinerNet(nn.Module):
         # geometry and draft features in float32, outside autocast (DraftPath solves, exact grid coordinates)
         with torch.autocast(device_type=dev.type, enabled=False):
             flat = tau0.reshape(B, N_POSE, 3).float()
-            geom = corridor_geometry(flat)
+            geom = corridor_geometry(flat, version=self.corridor_version)
             rep = lambda x: x.reshape(T, *x.shape[1:]).repeat_interleave(K, 0)
             ud = draft_features(flat, rep(v0.float()), rep(a0.float()), rep(eds.float()), rep(cmd), geom)
         feat = self.adapter(bev, n_tokens=T)                                          # [T, 64, 50, 100]

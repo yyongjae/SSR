@@ -36,7 +36,7 @@ import torch
 import torch.nn as nn
 
 from ..refiner.adapters import BEV_H, BEV_W, load_norm
-from ..refiner.corridor import N_ST, corridor_geometry, corridor_tensor, global_tokens
+from ..refiner.corridor import CORRIDOR_VERSIONS, N_ST, corridor_geometry, corridor_tensor, global_tokens
 from ..refiner.decoder import N_FREE
 from ..refiner.e2e import AdapterS, ego_inputs
 from ..refiner.geometry import N_POSE
@@ -81,7 +81,7 @@ class CKTrunk(RefinerNet):
         B = T * K
         with torch.autocast(device_type=tau.device.type, enabled=False):
             flat = tau.reshape(B, N_POSE, 3).float()
-            geom = corridor_geometry(flat)
+            geom = corridor_geometry(flat, version=self.corridor_version)
             rep = lambda x: x.reshape(T, *x.shape[1:]).repeat_interleave(K, 0)
             ud = draft_features(flat, rep(v0.float()), rep(a0.float()), rep(eds.float()), rep(cmd), geom)
         X = corridor_tensor(feat, geom, T, K)                                         # [B, 70, 48, 17]
@@ -136,12 +136,17 @@ class CKNet(nn.Module):
 
     def __init__(self, arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                  score_hidden: int = 256, lead_aux: bool = False, temporal: Optional[TemporalCfg] = None,
-                 ca_b: Optional[torch.Tensor] = None):
+                 ca_b: Optional[torch.Tensor] = None, corridor_version: int = 1):
         super().__init__()
         self.arm = arm
         self.seed = int(seed)
         self.lead_aux = bool(lead_aux)
         self.trunk = build_trunk(arm, seed, norm)
+        # refiner-fix B1: corridor geometry version (plain attribute, not state; config.json 'corridor_version')
+        if int(corridor_version) not in CORRIDOR_VERSIONS:
+            raise ValueError(f"corridor_version {corridor_version!r} not in {CORRIDOR_VERSIONS}")
+        self.corridor_version = int(corridor_version)
+        self.trunk.corridor_version = self.corridor_version
         d2 = 2 * self.trunk.d_model
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(seed + SCORE_SEED_OFFSET)
@@ -253,7 +258,7 @@ def _torch_load(p: Path) -> Dict:
 
 def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarray]] = None,
              init_from: Optional[Union[str, Path]] = None, lead_aux: bool = False, score_hidden: int = 256,
-             temporal: Optional[TemporalCfg] = None) -> CKNet:
+             temporal: Optional[TemporalCfg] = None, corridor_version: int = 1) -> CKNet:
     """CKNet, optionally initialised from
       * a v1 stage-T run dir (config.json + ckpt_best.pt (else ckpt_last.pt) with RefinerNet keys): loaded into
         net.trunk; the source arm must equal the target arm, except target 'S', for which every adapter.* key is
@@ -261,6 +266,8 @@ def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarra
         run's norm.npz / norm_map.npz is used (the checkpoint carries the same buffers anyway);
       * a CK run dir (ckpt_last.pt whose 'model' keys start with 'trunk.'): full CKNet state, strict.
     For T / M from a v1 or CK run the checkpoint's adapter z-score buffers take precedence over `norm`.
+    corridor_version (refiner-fix B1) is the TARGET's corridor geometry; it is not part of the state dict, so a run
+    may be initialised from a run of another corridor version (fine-tuning across the fix is allowed, not checked).
     net.init_report = {source, kind, ckpt, ckpt_sha16, source_arm, n_loaded, skipped, missing, unexpected}."""
     report: Dict = {"source": None}
     if init_from is not None:
@@ -272,7 +279,8 @@ def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarra
             raise ValueError(f"init_from {src}: temporal cfg {tsrc.to_dict()} differs from the target's")
         if norm is None and arm in NORM_FILE and src_arm == arm and (src / NORM_FILE[arm]).is_file():
             norm = load_arm_norm(src, arm)
-    net = CKNet(arm, seed, norm, score_hidden=score_hidden, lead_aux=lead_aux, temporal=temporal)
+    net = CKNet(arm, seed, norm, score_hidden=score_hidden, lead_aux=lead_aux, temporal=temporal,
+                corridor_version=corridor_version)
     if init_from is None:
         net.init_report = report
         return net
@@ -321,7 +329,8 @@ def save_ck(path: Union[str, Path], net: CKNet, cfg: Dict, **extra) -> None:
 
 def load_ck(run_dir: Union[str, Path], which: str = "last", device="cpu",
             allow_privileged: bool = False) -> Tuple[CKNet, Dict]:
-    """Rebuild a CK run (config.json: arm, seed, optional lead_aux / score_hidden / temporal; norm.npz (T) /
+    """Rebuild a CK run (config.json: arm, seed, optional lead_aux / score_hidden / temporal / corridor_version
+    (absent = 1, every run before refiner-fix); norm.npz (T) /
     norm_map.npz (M)) and load ckpt_<which>.pt['model'] strictly (which = 'last', 'ep<e>' or a .pt path) ->
     (net.eval(), cfg).  A PRIVILEGED run (temporal oracle / gt source) raises PermissionError unless
     allow_privileged (single choke point for KD teachers, navtest / e2e evals, fit_kd_calib)."""
@@ -336,7 +345,8 @@ def load_ck(run_dir: Union[str, Path], which: str = "last", device="cpu",
     norm = load_arm_norm(run_dir, arm) if arm in NORM_FILE and (run_dir / NORM_FILE[arm]).is_file() else None
     net = CKNet(arm, int(cfg.get("seed", 0)), norm,
                 score_hidden=int(cfg.get("score_hidden", 256)), lead_aux=bool(int(cfg.get("lead_aux", 0) or 0)),
-                temporal=tcfg, ca_b=(torch.ones(2, 10) if tcfg.on and tcfg.forecaster != "learned" else None))
+                temporal=tcfg, ca_b=(torch.ones(2, 10) if tcfg.on and tcfg.forecaster != "learned" else None),
+                corridor_version=1 if cfg.get("corridor_version") is None else int(cfg["corridor_version"]))
     # (ca_b placeholder: the checkpoint's persistent buffer overwrites it in the strict load below)
     p = _ckpt_path(run_dir, which)
     net.load_state_dict(_torch_load(p)["model"], strict=True)

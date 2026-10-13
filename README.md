@@ -50,6 +50,12 @@ CUDA_VISIBLE_DEVICES=0 python tools/test.py projects/configs/SSR/SSR_e2e.py /pat
 *After refactoring, the released checkpoint exhibits minor difference with results reported in the paper.
 
 Log and Checkpoint : [Google Drive](https://drive.google.com/drive/folders/1YFG5JsJ6yuLNl0y1yceV8UxMFyh5138a)
+
+Planning distillation from frozen BEVDepth/HDMapNet or BEVFusion/MapTRv2
+teachers is documented in [docs/PLANNING_DISTILLATION.md](docs/PLANNING_DISTILLATION.md).
+The Korean research hypothesis, method, experiment matrix, and success criteria
+are in [docs/PLANNING_DISTILLATION_EXPERIMENT_PLAN_KR.md](docs/PLANNING_DISTILLATION_EXPERIMENT_PLAN_KR.md).
+
 ### UniAD-style metric protocal
 | Method | L2<sub>MAX</sub> (m) 1s | L2<sub>MAX</sub> (m) 2s | L2<sub>MAX</sub> (m) 3s | L2<sub>MAX</sub> (m) Avg. | CR<sub>MAX</sub> (%) 1s | CR<sub>MAX</sub> (%) 2s | CR<sub>MAX</sub> (%) 3s | CR<sub>MAX</sub> (%) Avg. | 
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |

@@ -34,6 +34,30 @@ def _record(token: str = "token_a", identity: str = "a" * 64):
     }
 
 
+def test_aux_agent_config_drops_training_plan_scores(tmp_path):
+    config_path = tmp_path / "training.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "agent:",
+                "  checkpoint_path: null",
+                "  config:",
+                "    test_aux_heads: false",
+                "    backbone_pretrained: true",
+                "    plan_anchor: true",
+                "    plan_score_file: /tmp/pdm_score_256",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    loaded = runner._load_training_agent_config(config_path, tmp_path / "model.ckpt")
+    assert loaded.config.test_aux_heads is True
+    assert loaded.config.backbone_pretrained is False
+    assert loaded.config.plan_anchor is True
+    assert loaded.config.plan_score_file is None
+
+
 def test_record_schema_fixes_top100_and_twenty_raw_points():
     record = _record()
     runner._validate_record(record, "token_a", "a" * 64)

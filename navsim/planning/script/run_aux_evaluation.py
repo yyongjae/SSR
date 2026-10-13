@@ -641,6 +641,11 @@ def _load_training_agent_config(
         agent_config.config.plan_map_weight = 0.0
     if agent_config.config.get("plan_anchor", False):
         agent_config.config.plan_score_file = None  # labels are training-only
+    # aux_distill BEV distillation is training-only as well: built, it would open
+    # the teacher caches and add scene_token to the targets.  The loader skips
+    # its '_distill.' checkpoint keys when it is not built.
+    if "use_distill" in agent_config.config:
+        agent_config.config.use_distill = False
     return agent_config
 
 

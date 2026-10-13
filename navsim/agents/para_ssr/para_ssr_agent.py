@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -358,6 +359,12 @@ class ParaSSRAgent(AbstractAgent):
                 from .ck.bev_kd_arm import build_bev_kd_arm
 
                 self.ck_bev_kd = build_bev_kd_arm(ck2)       # nn.Module: state_dict / DDP / own optimiser group
+        # BEV planning distillation merged from aux_distill (distill/, docs/bev_selector_v8.md): built only when
+        # config.use_distill (default off: nothing imported, built or loaded).  A registered submodule `_distill`
+        # (state_dict prefix '_distill.'); deliberately NO class attribute of that name (it would hide the registered
+        # module), so read it with getattr(self, "_distill", None).
+        if getattr(config, "use_distill", False):
+            self._distill = self._build_distill(config)
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
@@ -635,6 +642,121 @@ class ParaSSRAgent(AbstractAgent):
     def name(self) -> str:
         return self.__class__.__name__
 
+    # ------------------------------------------------------------------ #
+    # aux_distill BEV planning distillation (fusion_v1 port)
+    # ------------------------------------------------------------------ #
+    _DISTILL_PREFIX = "_distill."
+
+    @staticmethod
+    def _build_distill(config):
+        """PlanningDistillation of the trajectory-anchor path (v6 / v7 / v8) on this kyungmin-v2 core.
+
+        Differences to aux_distill, none of which changes the distillation math:
+        - the frozen random probe (anchor / cmd / status MLPs, query LN, q/k/v/out projections) is drawn under
+          torch.random.fork_rng(seed=distill_probe_seed), so switching the distillation on leaves the v2 / refiner
+          init and the global RNG stream (data order) of the distillation-off run unchanged;
+        - everything but student_proj is frozen HERE, before Lightning's DDP wrap (aux_distill froze the probe inside
+          get_optimizers, after the wrap, which only works with ddp_find_unused_parameters_true);
+        - the spatial bias is built from config.plan_anchor_file (the planner's own anchors) and is not saved in
+          checkpoints (it is a function of that file).
+        """
+        if not any(bool(getattr(config, k, False))
+                   for k in ("distill_selector_v6", "distill_selector_v7", "distill_selector_v8")):
+            raise NotImplementedError(
+                "use_distill on this core supports only the trajectory-anchor path (distill_selector_v6/v7/v8); the "
+                "stage-1 adapter / corridor / register-selector paths need aux_distill's own v2 port")
+        anchor_file = getattr(config, "plan_anchor_file", None)
+        if not getattr(config, "plan_anchor", False) or not anchor_file or not os.path.isfile(str(anchor_file)):
+            raise ValueError("use_distill (trajectory-anchor path) needs the anchor planner: plan_anchor true and an "
+                             f"existing plan_anchor_file (got plan_anchor={getattr(config, 'plan_anchor', None)}, "
+                             f"plan_anchor_file={anchor_file})")
+        from .distill.distillation import build_planning_distillation
+
+        # CPU generator only: torch.manual_seed would also re-seed the (queued) CUDA generators
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(int(getattr(config, "distill_probe_seed", 0)))
+            module = build_planning_distillation(config)
+        trainable = "anchor_distill.student_proj."
+        for name, param in module.named_parameters():
+            param.requires_grad_(name.startswith(trainable))
+        return module
+
+    def distill_parameters(self) -> List[torch.nn.Parameter]:
+        distill = getattr(self, "_distill", None)
+        if distill is None:
+            return []
+        return [p for p in distill.parameters() if p.requires_grad]
+
+    def _distill_loss(self, distill, features, targets, predictions, logs):
+        """aux_distill's compute_loss block (v6 / v7 / v8 anchor path), added after the v2 balancer and the refiner
+        terms.  bev_pos is recomputed from the planner's LearnedPositionalEncoding exactly as plan_from_bev does
+        (same parameters, not detached: the distillation gradient reaches the shared positional embedding as in
+        aux_distill, where the planner returned the same tensor)."""
+        cfg = self._config
+        if "scene_token" not in targets:
+            raise ValueError("planning distillation needs targets['scene_token'] (ParaSSRTargetBuilder emits it when "
+                             "use_distill is on; regenerate a target cache built with use_distill off)")
+        status = features.get("ego_status")
+        status_feature = features.get("status_feature")
+        command = features.get("command")
+        n_cmd = int(cfg.num_navi_cmd)
+        if status is None and status_feature is not None and status_feature.shape[-1] > n_cmd:
+            status = status_feature[:, n_cmd:]
+            if command is None:
+                command = status_feature[:, :n_cmd]
+        bev = predictions["bev_embed"]
+        head = self.para_ssr_model.pts_bbox_head
+        mask = bev.new_zeros((bev.shape[0], head.bev_h, head.bev_w))
+        bev_pos = head.positional_encoding(mask).to(bev.dtype).flatten(2).transpose(1, 2)
+        losses, metrics = distill(
+            bev,
+            targets["scene_token"],
+            trajectories=targets.get("trajectory"),
+            trajectory_anchors=predictions.get("trajectory_anchors"),
+            command=command,
+            ego_status=status,
+            bev_pos=bev_pos,
+            sim_reward=targets.get("sim_reward"),
+        )
+        weight = float(cfg.distill_loss_weight)
+        total = None
+        out = {}
+        for name, value in losses.items():
+            total = weight * value if total is None else total + weight * value
+            out[name] = value.detach()
+        out.update({k: v.detach() for k, v in metrics.items()})
+        if total is None:
+            total = bev.new_zeros(())
+        else:
+            self._log_distill_bev_grad(bev, total, out)
+        return total, out
+
+    def _log_distill_bev_grad(self, bev: torch.Tensor, distill_loss: torch.Tensor, logs: Dict) -> None:
+        """||d L_distill / d bev_embed|| on the gnorm/plan cadence (aux_distill telemetry; same micro-batches on every
+        rank).  Logged as gnorm/distill_v8: gnorm/distill is the readout-KD slot of ParaSSRLoss."""
+        interval = int(getattr(self._config, "grad_norm_log_interval", 0) or 0)
+        if interval <= 0 or not self.training or not distill_loss.requires_grad or not bev.requires_grad:
+            return
+        if (int(getattr(self._loss, "iteration", 1)) - 1) % interval != 0:
+            return
+        grad = torch.autograd.grad(distill_loss, bev, retain_graph=True, allow_unused=True)[0]
+        norm = 0.0 if grad is None else float(grad.detach().norm())
+        from .modules.grad_balance import all_reduce_mean
+
+        reduced = all_reduce_mean({"distill_v8": norm}, bev.device)
+        logs["gnorm/distill_v8"] = bev.new_tensor(float(reduced["distill_v8"]))
+
+    def filter_datasets_to_teacher_cache(self, train_data, val_data) -> None:
+        """Keep only training tokens present in every teacher store (run_training hook); no-op when distillation is
+        off.  The distillation is a training-only term here, so validation keeps all its tokens (aux_distill also
+        filtered val, which emptied it: the ReSMap cache covers navtrain train_logs only)."""
+        distill = getattr(self, "_distill", None)
+        if distill is None:
+            return
+        from .distill.teacher_store import restrict_dataset_to_stores
+
+        restrict_dataset_to_stores(train_data, list(distill.stores.values()), name="train")
+
     def initialize(self) -> None:
         """Load an exact PARA-SSR agent checkpoint.
 
@@ -677,16 +799,19 @@ class ParaSSRAgent(AbstractAgent):
         # it is training-only, so a KD checkpoint must evaluate without it and
         # a KD fine-tune must start from a checkpoint that never had it.
         kd_prefix = "_loss.distiller."
+        # Same for the aux_distill BEV distillation module (training-only): a distillation checkpoint evaluates with
+        # use_distill off, and a distillation run may start from a checkpoint that never had it.
+        train_only = (kd_prefix, self._DISTILL_PREFIX)
         own = self.state_dict()
         state_dict = {
-            k: v for k, v in state_dict.items() if not k.startswith(kd_prefix) or k in own
+            k: v for k, v in state_dict.items() if not k.startswith(train_only) or k in own
         }
         # v1 -> v2 init: the anchor planner replaces the single-trajectory regressor.
         v1_regressor = "para_ssr_model.pts_bbox_head.ego_fut_decoder."
         if not any(k.startswith(v1_regressor) for k in own):
             state_dict = {k: v for k, v in state_dict.items() if not k.startswith(v1_regressor)}
         result = self.load_state_dict(state_dict, strict=False)
-        missing = [k for k in result.missing_keys if not k.startswith(kd_prefix)]
+        missing = [k for k in result.missing_keys if not k.startswith(train_only)]
         # The v2 anchor planner may be initialised from a v1 checkpoint: its new
         # modules start fresh, but only when the checkpoint has NONE of them (a
         # partial match is a different vocabulary/architecture, not an upgrade).
@@ -813,6 +938,15 @@ class ParaSSRAgent(AbstractAgent):
             loss = loss + ck_loss
             logs.update(ck_logs)
             logs["loss"] = loss.detach()
+        distill = getattr(self, "_distill", None)
+        if distill is not None and self.training:
+            # aux_distill BEV distillation, added after the balancer and the refiner terms (their telemetry and
+            # v2_loss are those of the distillation-off run)
+            d_loss, d_logs = self._distill_loss(distill, features, targets, predictions, logs)
+            logs["loss_pre_distill"] = logs["loss"]
+            loss = loss + d_loss
+            logs.update(d_logs)
+            logs["loss"] = loss.detach()
         self.latest_logs = logs
         return loss
 
@@ -902,6 +1036,11 @@ class ParaSSRAgent(AbstractAgent):
                         "weight_decay": bk["weight_decay"],
                     }
                 )
+        distill_params = self.distill_parameters()
+        if distill_params:
+            # aux_distill trains student_proj with the base group (lr, lr_scale 1, weight_decay): same AdamW math in a
+            # group of its own, so the distillation-off group layout is unchanged
+            groups.append({"params": distill_params, "lr": self._lr, "lr_scale": 1.0})
         optimizer_cls = getattr(torch.optim, cfg.optimizer_type)
         optimizer = optimizer_cls(groups, lr=self._lr, weight_decay=cfg.weight_decay)
 

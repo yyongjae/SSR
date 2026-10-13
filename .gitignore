@@ -7,7 +7,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
-
+.env
 # 가상환경 / 에디터
 .venv/
 venv/

@@ -57,7 +57,7 @@ else
 fi
 export DISTILL_FEATURE_ROOT
 
-EXPERIMENT="${EXPERIMENT:-paradrive_distill_bev_selector_v8}"
+EXPERIMENT="${EXPERIMENT:-paradrive_distill_bev_selector_v8_fix}"
 MAX_EPOCHS="${MAX_EPOCHS:-30}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 LR="${LR:-1e-4}"
@@ -157,6 +157,7 @@ exec "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
   agent.lr="${LR}" \
   agent.config.max_epochs="${MAX_EPOCHS}" \
   agent.config.distill_feature_root="${DISTILL_FEATURE_ROOT}" \
+  agent.config.plan_heading_from_xy=true \
   experiment_name="${EXPERIMENT}" \
   scene_filter=navtrain \
   split=trainval \

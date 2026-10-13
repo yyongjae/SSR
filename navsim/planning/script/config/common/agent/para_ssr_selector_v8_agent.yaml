@@ -29,6 +29,7 @@ config:
   plan_anchor: true
   plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
   plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+  plan_heading_from_xy: true
 
   # Task Gradient Balancing (Closed-loop balancer across Plan, Det, Map)
   grad_balance_target:

@@ -155,6 +155,7 @@ exec "${PYTHON}" "${REPO}/navsim/planning/script/run_training.py" \
   agent.config.plan_anchor=true \
   agent.config.plan_anchor_file=/workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy \
   agent.config.plan_score_file=/workspace/byounggun/SSR/data/planning_vb/pdm_score_256 \
+  agent.config.plan_heading_from_xy=true \
   'agent.config.plan_reward_weights=[0.1,0.5,0.5,1.0]' \
   'agent.config.grad_balance_target={plan:0.4,det:0.3,map:0.3}' \
   agent.config.grad_balance_warmup_iters=10600 \

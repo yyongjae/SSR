@@ -62,7 +62,7 @@ config:
   plan_reward_weights: [0.1, 0.5, 0.5, 1.0]
   plan_topk: 6
   plan_kinematic: false
-  plan_heading_from_xy: false
+  plan_heading_from_xy: true
   plan_rescore_refined: false
   plan_offset_loss_weight: 1.0
   plan_im_reward_weight: 1.0

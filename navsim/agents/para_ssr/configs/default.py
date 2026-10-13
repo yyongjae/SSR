@@ -186,7 +186,7 @@ class ParaSSRConfig:
     plan_reward_weights: Tuple[float, float, float, float] = (0.1, 0.5, 0.5, 1.0)
     plan_topk: int = 6
     plan_kinematic: bool = False
-    plan_heading_from_xy: bool = False
+    plan_heading_from_xy: bool = True
     plan_rescore_refined: bool = False
     plan_offset_loss_weight: float = 1.0
     plan_im_reward_weight: float = 1.0

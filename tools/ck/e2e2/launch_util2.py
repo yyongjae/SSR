@@ -282,6 +282,16 @@ def parse_gpus2(s: str, ngpu: Optional[int] = None) -> List[str]:
     return g
 
 
+def gpu_check2(gpus: Sequence[str], max_used_mib: int = 1024, used: Optional[Dict[str, int]] = None) -> Dict[str, int]:
+    """= launch_util.gpu_check (every GPU <= max_used_mib) on a list already validated by parse_gpus2.  LU.gpu_check
+    re-validates against GPUs 0-3 only and so refused 4,5 under CK_ALLOW_GPU45=1 whatever their memory use."""
+    used = LU.nvidia_smi_used() if used is None else used
+    busy = {g: used.get(g) for g in gpus if used.get(g) is None or used[g] > max_used_mib}
+    if busy:
+        raise LaunchError(f"GPU busy or unknown (MiB used > {max_used_mib}): {busy}")
+    return {g: used[g] for g in gpus}
+
+
 def counters2(ngpu: int) -> Dict[str, int]:
     """Per-GPU-count trainer / balancer counters: the global batch (128) and every per-rank micro-batch counter keep
     their meaning in samples / optimizer steps (2 GPUs: the user values; 4 GPUs: the old 4-GPU recipe)."""
@@ -756,7 +766,7 @@ def main(argv=None) -> int:
             print(json.dumps(rec, indent=1, default=str))
         elif a.cmd == "gpu-check":
             g2 = parse_gpus2(a.gpus)
-            print(",".join(g2) if a.list_only else json.dumps(LU.gpu_check(g2, a.max_used_mib)))
+            print(",".join(g2) if a.list_only else json.dumps(gpu_check2(g2, a.max_used_mib)))
         elif a.cmd == "labeler-health":
             ok, why = labeler_health2(a.run_dir, a.state, a.stall_s)
             print(why)

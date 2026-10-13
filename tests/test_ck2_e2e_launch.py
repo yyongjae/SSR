@@ -299,6 +299,13 @@ def test_gpus_4_5_only_with_the_flag_and_as_a_pair(tmp_path, monkeypatch):
             L2.parse_gpus2(bad)
     ov, _, _ = _ov(tmp_path, gpus=("2", "3", "4", "5"))
     assert _get(ov, "trainer.params.devices") == "4" and _get(ov, "trainer.params.accumulate_grad_batches") == "8"
+    # the busy check accepts the flagged list too (LU.gpu_check re-validated against 0-3 and refused 4,5)
+    idle = {str(i): 1 for i in range(8)}
+    assert L2.gpu_check2(L2.parse_gpus2("2,3,4,5"), used=idle) == {"2": 1, "3": 1, "4": 1, "5": 1}
+    with pytest.raises(L2.LaunchError, match="busy"):
+        L2.gpu_check2(L2.parse_gpus2("2,3,4,5"), used=dict(idle, **{"4": 12000}))
+    monkeypatch.setattr(L2.LU, "nvidia_smi_used", lambda: idle)
+    assert L2.main(["gpu-check", "--gpus", "2,3,4,5"]) == 0
 
 
 def _sh(env_extra, *args, timeout=600):
@@ -349,6 +356,14 @@ def test_train_e2e2_dry_run(tmp_path):
               "++agent.config.use_distill=true", "++agent.config.distill_teacher_source=targets"):
         assert o in r.stdout.splitlines(), o
     assert _sh(dict(base, CK2_E2E_APPROVED="1"), "start", "--gpus", "0,1,2").returncode == 3
+    # labeler workers: 16 x ngpu capped at the labeler's MAX_WORKERS (48); 64 made labeler2 die at start on 4 GPUs
+    from tools.ck.e2e import labeler as L1
+    expr = 'ng=$1; lw=${LABELER_WORKERS:-$((16 * ng))}; [ "$lw" -gt 48 ] && lw=48; echo $lw'
+    got = {ng: subprocess.run(["bash", "-c", expr, "_", str(ng)], capture_output=True, text=True,
+                              env={k: v for k, v in os.environ.items() if k != "LABELER_WORKERS"}).stdout.strip()
+           for ng in (2, 4)}
+    assert got == {2: "32", 4: "48"} and L1.MAX_WORKERS == 48
+    assert expr.split("; echo")[0].split("ng=$1; ")[1] in SH.read_text()
 
 
 def test_hydra_compose_full_override_list(tmp_path):

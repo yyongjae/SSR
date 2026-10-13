@@ -29,11 +29,11 @@
 #   KD keys fitted); a missing file is REFUSED with the command to run after the teacher has finished:
 #     CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=$REPO /venv/ssr/bin/python tools/ck/e2e2/fit_kd_calib.py --run <teacher run>
 #       --which last      (-> .../ck/ck2/kd_calib/<run>__last.json; recorded with its sha16 in launch/teachers.json)
-# -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (16 x ngpu workers, --world-size ngpu, --max-epoch
+# -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (min(16 x ngpu, 48) workers, --world-size ngpu, --max-epoch
 #   MAX_EPOCHS-2, --exit-when-done --train-pid-file) -> watchdog (restart a dead / hung labeler while training lives).
 # ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
 #   after the arm file.  Never pkill / pgrep -f: processes are found through the pid files only.
-# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu: 32 / 64), LABELER_POLL (30),
+# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu, at most 48: 32 / 48), LABELER_POLL (30),
 #   LABELER_MAX_EPOCH (MAX_EPOCHS-2), E2E_NO_LABELER=1, E2E_WANDB=online|offline|disable, E2E_EXTRA=<Hydra override file>,
 #   E2E_SMOKE=1, E2E_WAIT_TIMEOUT, E2E_DRY_RUN=1, WATCHDOG_EVERY (120), LABELER_MAX_RESTARTS (20), LABELER_STALL_S (1200),
 #   E2E_NO_WATCHDOG=1, E2E_NO_DEEP_TEACHER_CHECK=1 (tests: skip loading the teacher ckpts).
@@ -106,17 +106,18 @@ start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   if [ "${E2E_NO_LABELER:-0}" = 1 ]; then log "labeler disabled (E2E_NO_LABELER=1)"; return 0; fi
   if p=$(alive "$LB/labeler.pid" labeler2); then log "labeler alive (pid $p): kept"; return 0; fi
   need_gpus
-  local ng me; ng=$(awk -F, '{print NF}' <<< "$GPUS"); me=${LABELER_MAX_EPOCH:-$(( ${MAX_EPOCHS:-30} - 2 ))}
+  local ng me lw; ng=$(awk -F, '{print NF}' <<< "$GPUS"); me=${LABELER_MAX_EPOCH:-$(( ${MAX_EPOCHS:-30} - 2 ))}
+  lw=${LABELER_WORKERS:-$((16 * ng))}; [ "$lw" -gt 48 ] && lw=48      # labeler MAX_WORKERS = 48 (tools/ck/e2e/labeler.py)
   [ "$me" -lt 0 ] && me=0
   mkdir -p "$LB"; rm -f "$LB/labeler.exit" "$LB/labeler.pid"
-  local LCMD=("$PY" "$REPO/tools/ck/e2e2/labeler2.py" --io-dir "$IO" --world-size "$ng" --workers "${LABELER_WORKERS:-$((16 * ng))}"
+  local LCMD=("$PY" "$REPO/tools/ck/e2e2/labeler2.py" --io-dir "$IO" --world-size "$ng" --workers "$lw"
               --poll "${LABELER_POLL:-30}" --max-epoch "$me" --exit-when-done --train-pid-file "$L/train.pid")
   [ "${1:-}" = retry ] && LCMD+=(--retry-errors)
   echo "${LCMD[*]}" > "$LB/labeler.cmd"
   setsid nohup bash -c "$WRAP" _ "$LB" labeler env PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 "${LCMD[@]}" \
     < /dev/null > /dev/null 2>&1 &
   for _ in $(seq 30); do [ -s "$LB/labeler.pid" ] && break; sleep 0.2; done
-  log "labeler2 started pid $(cat "$LB/labeler.pid" 2>/dev/null) W=${LABELER_WORKERS:-$((16 * ng))} world $ng max-epoch $me -> $LB/labeler.log"
+  log "labeler2 started pid $(cat "$LB/labeler.pid" 2>/dev/null) W=$lw world $ng max-epoch $me -> $LB/labeler.log"
 }
 
 start_watchdog() {

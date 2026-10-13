@@ -246,3 +246,12 @@ def test_filter_keeps_val_and_drops_uncached_train_tokens(pair):
     train, val = Toks([good, "ffffffffffffffff"]), Toks(["ffffffffffffffff"])
     on.filter_datasets_to_teacher_cache(train, val)
     assert train.tokens == [good] and val.tokens == ["ffffffffffffffff"]
+
+
+def test_default_resmap_store_is_transpose_only(pair, batch):
+    """fusion_v1 default (distill_branches.resmap.flip_w False): the ReSMap store equals the refiner's
+    GT-validated kd_bev_1; BEVFusion keeps its W flip."""
+    _, _, on, _ = pair
+    assert on._distill.stores["resmap"].flip_w is False and on._distill.stores["bevfusion"].flip_w is True
+    rm = on._distill.stores["resmap"].load_batch(list(batch["tokens"]), torch.device("cpu"), torch.float32)
+    assert torch.equal(rm, batch["targets"]["kd_bev_1"].float())

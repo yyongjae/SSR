@@ -420,6 +420,11 @@ class ParaSSRConfig:
                 "cache_name": "resmap",
                 "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
                 "loss_weight": 1.0,
+                # fusion_v1: transpose only.  ReSMap's lateral index 0 is y_left = +32 m, i.e.
+                # already student column 0; aux_distill's default flip_w=True mirrored the map
+                # teacher left/right (GT check, 187 navtrain tokens: road IoU 0.965 transpose-only
+                # vs 0.360 with the flip, better on 187/187; = refiner/resmap_cache.py, kd_bev_1).
+                "flip_w": False,
             },
         }
     )

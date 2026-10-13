@@ -60,7 +60,8 @@ E2E_ROOT = f"{CK_DATA}/ck2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/ck2/e2e_smoke"
 IO_SUB = "ck_e2e2"
 NGPU = 2                          # user: 2 GPUs per run (devices 2)
-NGPU_ALLOWED = (2, 4)             # user 2026-10-13: 4 GPUs (0-3) for the fusion_v1 run
+NGPU_ALLOWED = (2, 4)             # user 2026-10-13: 4 GPUs for the fusion_v1 run
+EXTRA_GPUS = ("4", "5")           # only with CK_ALLOW_GPU45=1 (user 2026-10-13: fusion_v1 on 2,3,4,5; never 6, 7)
 ACCUMULATE = 16                   # user: 2 x 4 x 16 = 128
 BALANCE_WARMUP = 10600            # user
 BALANCE_INTERVAL = 200            # user
@@ -262,8 +263,18 @@ def kd_calib_check(c, teachers: Dict[str, Any]) -> Dict[str, Any]:
 
 # ----------------------------------------------------------------------------------------------- overrides
 def parse_gpus2(s: str, ngpu: Optional[int] = None) -> List[str]:
-    """2 or 4 GPUs of 0-3 (or exactly ngpu when given)."""
-    g = LU.parse_gpus(s)
+    """2 or 4 GPUs of 0-3 (or exactly ngpu when given).  CK_ALLOW_GPU45=1 (user 2026-10-13: the fusion_v1 run on
+    GPUs 2,3,4,5) also admits GPUs 4 and 5, only together; 6 and 7 are never allowed."""
+    if os.environ.get("CK_ALLOW_GPU45") == "1":
+        g = [x.strip() for x in str(s).split(",") if x.strip()]
+        pool = tuple(LU.ALLOWED_GPUS) + EXTRA_GPUS
+        bad = [x for x in g if x not in pool]
+        if not g or bad or len(set(g)) != len(g):
+            raise LaunchError(f"GPU list {s!r}: distinct GPUs of {','.join(pool)} (CK_ALLOW_GPU45=1)")
+        if ("4" in g) != ("5" in g):
+            raise LaunchError(f"GPU list {s!r}: GPUs 4 and 5 only as a pair (CK_ALLOW_GPU45=1)")
+    else:
+        g = LU.parse_gpus(s)
     ok = (len(g) == ngpu) if ngpu is not None else (len(g) in NGPU_ALLOWED)
     if not ok:
         want = ngpu if ngpu is not None else " or ".join(map(str, NGPU_ALLOWED))

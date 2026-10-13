@@ -286,6 +286,21 @@ def test_four_gpus_keep_the_schedule_in_samples(tmp_path):
             _ov(tmp_path, gpus=g)
 
 
+def test_gpus_4_5_only_with_the_flag_and_as_a_pair(tmp_path, monkeypatch):
+    """CK_ALLOW_GPU45=1 (user 2026-10-13, fusion_v1 on 2,3,4,5) admits GPUs 4 and 5 together; never 6 / 7."""
+    monkeypatch.delenv("CK_ALLOW_GPU45", raising=False)
+    with pytest.raises(L2.LaunchError):
+        L2.parse_gpus2("2,3,4,5")
+    monkeypatch.setenv("CK_ALLOW_GPU45", "1")
+    assert L2.parse_gpus2("2,3,4,5") == ["2", "3", "4", "5"] and L2.parse_gpus2("4,5") == ["4", "5"]
+    assert L2.parse_gpus2("0,1") == ["0", "1"]
+    for bad in ("2,3,4", "2,3,4,6", "4,6", "6,7", "2,3,4,4", "0,1,2", "0,1,2,3,4,5"):
+        with pytest.raises(L2.LaunchError):
+            L2.parse_gpus2(bad)
+    ov, _, _ = _ov(tmp_path, gpus=("2", "3", "4", "5"))
+    assert _get(ov, "trainer.params.devices") == "4" and _get(ov, "trainer.params.accumulate_grad_batches") == "8"
+
+
 def _sh(env_extra, *args, timeout=600):
     env = dict(os.environ, PYTHONPATH=str(REPO), OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", CUDA_VISIBLE_DEVICES="",
                E2E_WANDB="disable", **env_extra)

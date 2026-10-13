@@ -255,3 +255,64 @@ def test_default_resmap_store_is_transpose_only(pair, batch):
     assert on._distill.stores["resmap"].flip_w is False and on._distill.stores["bevfusion"].flip_w is True
     rm = on._distill.stores["resmap"].load_batch(list(batch["tokens"]), torch.device("cpu"), torch.float32)
     assert torch.equal(rm, batch["targets"]["kd_bev_1"].float())
+
+
+# ----------------------------------------------------------------------------------------------- fusion arm
+def _ck2_cfg(tmp):
+    from test_ck2_e2e_agent import ck2_cfg
+
+    return ck2_cfg(tmp)
+
+
+def _fusion_step(agent, batch, ok0=None, seed: int = 11):
+    agent.train()
+    agent.zero_grad(set_to_none=True)
+    f = {k: v.clone() for k, v in batch["features"].items()}
+    t = {k: v.clone() for k, v in batch["targets"].items()}
+    t["scene_token"] = list(batch["tokens"])
+    if ok0 is not None:
+        t["kd_ok_0"] = torch.tensor(ok0)
+    torch.manual_seed(seed)
+    pred = agent.forward(f)
+    loss = agent.compute_loss(f, t, pred)
+    loss.backward()
+    return loss.detach(), dict(agent.latest_logs)
+
+
+SMOKE_T = D / "ck2/smoke/smoke_ck2T_ddp2"
+
+
+@pytest.mark.skipif(not (SMOKE_T / "done.json").is_file(), reason="CK2 smoke teachers absent")
+def test_targets_source_equals_store_source_on_the_ck2_arm(batch, tmp_path):
+    """refiner e2e main arm + v8: teachers from the CK2 targets give exactly the store-fed loss (the default
+    resmap orientation is the same transpose-only map) and gradients."""
+    store, _ = build(ck_e2e2=_ck2_cfg(tmp_path / "s"), **V8)
+    tgt, _ = build(ck_e2e2=_ck2_cfg(tmp_path / "t"), distill_teacher_source="targets", **V8)
+    l_s, lg_s = _fusion_step(store, batch)
+    l_t, lg_t = _fusion_step(tgt, batch)
+    for k in ("loss_distill_bevfusion", "loss_distill_resmap", "distill/effective_anchors"):
+        assert torch.equal(lg_s[k], lg_t[k]), k
+    assert torch.equal(l_s, l_t)
+    gs = dict(store.named_parameters())
+    for n, p in tgt.named_parameters():
+        if p.grad is not None:
+            assert torch.equal(p.grad, gs[n].grad), n
+    assert float(lg_t["distill/teacher_ok_frac"]) == 1.0
+
+
+@pytest.mark.skipif(not (SMOKE_T / "done.json").is_file(), reason="CK2 smoke teachers absent")
+def test_targets_source_leaves_out_tokens_without_teacher(batch, tmp_path):
+    agent, _ = build(ck_e2e2=_ck2_cfg(tmp_path / "a"), distill_teacher_source="targets", **V8)
+    _, lg = _fusion_step(agent, batch, ok0=[True, False])
+    assert float(lg["distill/teacher_ok_frac"]) == 0.5 and torch.isfinite(lg["loss_distill_resmap"])
+    _, lg = _fusion_step(agent, batch, ok0=[False, False])
+    assert float(lg["distill/teacher_ok_frac"]) == 0.0 and "loss_distill_resmap" not in lg
+    for p in agent.distill_parameters():       # plain DDP: still a (zero) gradient
+        assert p.grad is not None and float(p.grad.abs().sum()) == 0.0
+
+
+def test_targets_source_needs_the_ck2_arm():
+    with pytest.raises(ValueError, match="needs ck_e2e2"):
+        build(distill_teacher_source="targets", **V8)
+    with pytest.raises(ValueError, match="distill_teacher_source"):
+        build(distill_teacher_source="disk", **V8)

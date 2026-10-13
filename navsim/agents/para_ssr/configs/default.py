@@ -440,6 +440,13 @@ class ParaSSRConfig:
     # distillation on changes neither the v2 / refiner init nor the global RNG
     # stream (data order).  aux_distill drew the probe from the global RNG.
     distill_probe_seed: int = 0
+    # Where the anchor path gets its two teacher BEVs (bevfusion, resmap):
+    #   "store"   aux_distill's TeacherFeatureStore, read in the training process from
+    #             distill_feature_root by targets['scene_token'];
+    #   "targets" the refiner e2e targets kd_bev_0 (DET = BEVFusion) / kd_bev_1 (MAP = ReSMap,
+    #             transpose only), loaded by the ck_e2e2 dataloader workers for the CK2 teachers
+    #             anyway (no extra I/O); tokens with kd_ok False are left out of the term.
+    distill_teacher_source: str = "store"
     # Legacy v1-v5 knobs (inert on the anchor path; kept because the
     # aux_distill agent yamls set them).
     use_corridor_mask: bool = True

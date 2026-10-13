@@ -583,14 +583,21 @@ class PlanningDistillation(nn.Module):
         trajectory_anchors: Optional[torch.Tensor] = None,
         bev_pos: Optional[torch.Tensor] = None,
         sim_reward: Optional[torch.Tensor] = None,
+        teacher_tokens: Optional[Sequence[torch.Tensor]] = None,
     ):
-        """``student_bev`` is ``[B, bev_h*bev_w, C]``; returns (losses, metrics)."""
+        """``student_bev`` is ``[B, bev_h*bev_w, C]``; returns (losses, metrics).
+
+        ``teacher_tokens`` (fusion_v1, anchor path only): the two teacher BEVs (bevfusion,
+        resmap) already on the student grid as ``[B, bev_h*bev_w, C]``; the stores are not read.
+        """
         if self.selector_v6 or self.selector_v7 or self.selector_v8:
             return self._anchor_forward(
                 student_bev, tokens, trajectory_anchors, trajectories,
                 command=command, ego_status=ego_status, bev_pos=bev_pos,
-                sim_reward=sim_reward,
+                sim_reward=sim_reward, teacher_tokens=teacher_tokens,
             )
+        if teacher_tokens is not None:
+            raise ValueError("teacher_tokens is only supported on the trajectory-anchor path")
         if self.selector_mode:
             return self._selector_forward(
                 student_bev, tokens, plan_attn, command, ego_status,
@@ -731,6 +738,7 @@ class PlanningDistillation(nn.Module):
         ego_status: Optional[torch.Tensor] = None,
         bev_pos: Optional[torch.Tensor] = None,
         sim_reward: Optional[torch.Tensor] = None,
+        teacher_tokens: Optional[Sequence[torch.Tensor]] = None,
     ):
         if self.anchor_distill is None:
             raise RuntimeError("trajectory anchor distillation was not constructed")
@@ -739,6 +747,17 @@ class PlanningDistillation(nn.Module):
             # needs the planner's own anchors (plan_anchor on).
             raise ValueError("trajectory anchor distillation needs predictions['trajectory_anchors'] "
                              "(plan_anchor on)")
+        if teacher_tokens is not None:
+            teachers = [t.to(device=student_bev.device, dtype=student_bev.dtype)
+                        for t in teacher_tokens]
+            if len(teachers) != 2 or any(t.shape != student_bev.shape for t in teachers):
+                raise ValueError("teacher_tokens must be (bevfusion, resmap), each shaped like "
+                                 f"student_bev {tuple(student_bev.shape)}")
+            return self.anchor_distill(
+                student_bev, teachers, trajectory_anchors,
+                gt_trajectory=gt_trajectory, command=command, ego_status=ego_status,
+                bev_pos=bev_pos, sim_reward=sim_reward,
+            )
         teachers = []
         for name in ("bevfusion", "resmap"):
             teacher_map = self.stores[name].load_batch(

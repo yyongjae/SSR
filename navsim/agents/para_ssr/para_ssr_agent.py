@@ -364,6 +364,12 @@ class ParaSSRAgent(AbstractAgent):
         # (state_dict prefix '_distill.'); deliberately NO class attribute of that name (it would hide the registered
         # module), so read it with getattr(self, "_distill", None).
         if getattr(config, "use_distill", False):
+            source = str(getattr(config, "distill_teacher_source", "store"))
+            if source not in ("store", "targets"):
+                raise ValueError(f"distill_teacher_source must be 'store' or 'targets', got {source!r}")
+            if source == "targets" and self._ck_e2e2 is None:
+                raise ValueError("distill_teacher_source='targets' needs ck_e2e2 (its target builder loads "
+                                 "kd_bev_0 / kd_bev_1)")
             self._distill = self._build_distill(config)
 
         if resume_from_checkpoint and checkpoint_path:
@@ -708,19 +714,36 @@ class ParaSSRAgent(AbstractAgent):
         head = self.para_ssr_model.pts_bbox_head
         mask = bev.new_zeros((bev.shape[0], head.bev_h, head.bev_w))
         bev_pos = head.positional_encoding(mask).to(bev.dtype).flatten(2).transpose(1, 2)
+        inputs = dict(student_bev=bev, tokens=list(targets["scene_token"]), trajectories=targets.get("trajectory"),
+                      command=command, ego_status=status, bev_pos=bev_pos, sim_reward=targets.get("sim_reward"))
+        out = {}
+        if str(getattr(cfg, "distill_teacher_source", "store")) == "targets":
+            # fusion_v1: the CK2 targets (S grid, f16): kd_bev_0 = DET / BEVFusion, kd_bev_1 = MAP / ReSMap
+            from .ck.bev_kd import sgrid_to_tokens
+
+            ok = targets["kd_ok_0"].bool() & targets["kd_ok_1"].bool()
+            inputs["teacher_tokens"] = (sgrid_to_tokens(targets["kd_bev_0"]).float(),
+                                        sgrid_to_tokens(targets["kd_bev_1"]).float())
+            out["distill/teacher_ok_frac"] = ok.float().mean().detach()
+            if not bool(ok.all()):
+                if not bool(ok.any()):
+                    # every trainable distillation parameter still gets a (zero) gradient: plain DDP
+                    total = 0.0 * sum(p.sum() for p in self.distill_parameters())
+                    self._log_distill_bev_grad(bev, total, out)
+                    return total, out
+                idx = ok.nonzero(as_tuple=True)[0]
+                inputs = {k: (None if v is None else
+                              [v[i] for i in idx.tolist()] if k == "tokens" else
+                              tuple(t[idx] for t in v) if k == "teacher_tokens" else v[idx])
+                          for k, v in inputs.items()}
         losses, metrics = distill(
-            bev,
-            targets["scene_token"],
-            trajectories=targets.get("trajectory"),
+            inputs.pop("student_bev"),
+            inputs.pop("tokens"),
             trajectory_anchors=predictions.get("trajectory_anchors"),
-            command=command,
-            ego_status=status,
-            bev_pos=bev_pos,
-            sim_reward=targets.get("sim_reward"),
+            **inputs,
         )
         weight = float(cfg.distill_loss_weight)
         total = None
-        out = {}
         for name, value in losses.items():
             total = weight * value if total is None else total + weight * value
             out[name] = value.detach()
@@ -751,8 +774,8 @@ class ParaSSRAgent(AbstractAgent):
         off.  The distillation is a training-only term here, so validation keeps all its tokens (aux_distill also
         filtered val, which emptied it: the ReSMap cache covers navtrain train_logs only)."""
         distill = getattr(self, "_distill", None)
-        if distill is None:
-            return
+        if distill is None or str(getattr(self._config, "distill_teacher_source", "store")) == "targets":
+            return       # the 'targets' source masks a missing teacher per token (kd_ok) instead
         from .distill.teacher_store import restrict_dataset_to_stores
 
         restrict_dataset_to_stores(train_data, list(distill.stores.values()), name="train")

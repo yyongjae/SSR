@@ -304,6 +304,9 @@ class TeacherFeatureStore:
             raw = raw.transpose(0, 2, 1)
         if self.flip_w:
             raw = raw[:, :, ::-1].copy()
+        else:
+            # fusion_v1: own the memory (a transposed memmap row is a read-only view)
+            raw = np.array(raw)
         return raw
 
     def load_batch(

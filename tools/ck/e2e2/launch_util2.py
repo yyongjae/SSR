@@ -8,14 +8,17 @@ helpers, W&B mode); this file adds the CK2 recipe, the ck_e2e2 dict, the teacher
                              [--teacher-check strict|smoke] --out R/launch/overrides.txt
   launch_util2.py teacher-check --det RUN --map RUN [--mode strict|smoke] [--ep-target decoupled|official] [--out F.json]
                                 [--kd-calib-det F.json] [--kd-calib-map F.json]            exit 3 when not usable
-  launch_util2.py gpu-check  --gpus 0,1 [--max-used-mib 1024] [--list-only]               exactly 2 GPUs of 0-3
+  launch_util2.py gpu-check  --gpus 0,1 [--max-used-mib 1024] [--list-only]               2 or 4 GPUs of 0-3
   launch_util2.py labeler-health --run-dir R --state F [--stall-s 1200]                   exit 5 when the labeler hangs
   launch_util2.py status     --run-dir R [--json]
   launch_util2.py smoke-check2 --run-dir R --out F [--ngpu 2] [--onpolicy-epochs 2] [--gen-epochs 1]   GPU smoke summary
   (find-last / wandb-mode: tools/ck/e2e/launch_util.py)
 
 Recipe (user): v2 r34 source on 2 GPUs = the old 4-GPU recipe with devices 2, batch 4 / GPU, accumulate_grad_batches 16
-(global 128), grad_balance_warmup_iters 10600, grad_balance_interval 200, grad_norm_log_interval 200; experiment_name
+(global 128), grad_balance_warmup_iters 10600, grad_balance_interval 200, grad_norm_log_interval 200.  4 GPUs (0-3, user
+2026-10-13, fusion_v1) = the old 4-GPU counters: devices 4, accumulate 8 (global 128), 5300 / 100 / 100, and the
+ck_e2e2 per-rank micro-batch counters halved (MB_COUNTERS: lat_kd.start_mb, label_refresh_every_mb, grad_share_every,
+bev_kd.start_mb), so every schedule keeps its meaning in samples / optimizer steps; experiment_name
 <run> (prefixed 'ck2e2e_' unless it already starts with 'ck2e2e'), W&B project para-ssr-v2, name <run>, group ck2e2e, tags [ck2e2e, main | bevkd].  plan_score_file stays the
 WoTE pdm_score_256 (user: v2 keeps its labels).  Then '++agent.config.ck_e2e2.<leaf>=<value>' for every leaf of
 ck_e2e2.yaml (+ --ck-set / --ck-set-file lines) and output_dir=<R>/train/.
@@ -57,11 +60,15 @@ E2E_ROOT = f"{CK_DATA}/ck2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/ck2/e2e_smoke"
 IO_SUB = "ck_e2e2"
 NGPU = 2                          # user: 2 GPUs per run (devices 2)
+NGPU_ALLOWED = (2, 4)             # user 2026-10-13: 4 GPUs (0-3) for the fusion_v1 run
 ACCUMULATE = 16                   # user: 2 x 4 x 16 = 128
 BALANCE_WARMUP = 10600            # user
 BALANCE_INTERVAL = 200            # user
 GRAD_NORM_LOG = 200               # user
 TOKENS_PER_MB = 4
+GLOBAL_BATCH = NGPU * TOKENS_PER_MB * ACCUMULATE            # 128
+# ck_e2e2 leaves counted in per-rank micro-batches (the 2-GPU values doubled the 4-GPU run's, ck_e2e2.yaml)
+MB_COUNTERS = ("lat_kd.start_mb", "label_refresh_every_mb", "grad_share_every", "bev_kd.start_mb")
 WANDB_PROJECT = "para-ssr-v2"
 WANDB_GROUP = "ck2e2e"
 GSHARE_WARN = 0.5
@@ -254,23 +261,55 @@ def kd_calib_check(c, teachers: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------------------------------- overrides
-def parse_gpus2(s: str, ngpu: int = NGPU) -> List[str]:
+def parse_gpus2(s: str, ngpu: Optional[int] = None) -> List[str]:
+    """2 or 4 GPUs of 0-3 (or exactly ngpu when given)."""
     g = LU.parse_gpus(s)
-    if len(g) != ngpu:
-        raise LaunchError(f"CK2 e2e runs on exactly {ngpu} GPUs of 0-3 (devices {ngpu}, user recipe), got {s!r}")
+    ok = (len(g) == ngpu) if ngpu is not None else (len(g) in NGPU_ALLOWED)
+    if not ok:
+        want = ngpu if ngpu is not None else " or ".join(map(str, NGPU_ALLOWED))
+        raise LaunchError(f"CK2 e2e runs on {want} GPUs of 0-3 (user recipe), got {s!r}")
     return g
+
+
+def counters2(ngpu: int) -> Dict[str, int]:
+    """Per-GPU-count trainer / balancer counters: the global batch (128) and every per-rank micro-batch counter keep
+    their meaning in samples / optimizer steps (2 GPUs: the user values; 4 GPUs: the old 4-GPU recipe)."""
+    if ngpu not in NGPU_ALLOWED:
+        raise LaunchError(f"unsupported GPU count {ngpu} (allowed {NGPU_ALLOWED})")
+    acc = GLOBAL_BATCH // (TOKENS_PER_MB * ngpu)
+    if acc * TOKENS_PER_MB * ngpu != GLOBAL_BATCH:
+        raise LaunchError(f"global batch {GLOBAL_BATCH} is not divisible over {ngpu} GPUs")
+    return {"accumulate": acc, "balance_warmup": BALANCE_WARMUP * NGPU // ngpu,
+            "balance_interval": BALANCE_INTERVAL * NGPU // ngpu, "grad_norm_log": GRAD_NORM_LOG * NGPU // ngpu}
+
+
+def scale_mb_counters(ck: Dict[str, Any], ngpu: int) -> Dict[str, Any]:
+    """ck_e2e2 yaml defaults counted in per-rank micro-batches, rescaled from the 2-GPU values to ngpu ranks (applied
+    BEFORE --ck-set lines, which stay absolute)."""
+    if ngpu == NGPU:
+        return ck
+    out = json.loads(json.dumps(ck))
+    for dotted in MB_COUNTERS:
+        node, *path = dotted.split(".")
+        parent, key = (out, node) if not path else (out[node], path[0])
+        v = parent[key]
+        if not isinstance(v, int) or (v * NGPU) % ngpu:
+            raise LaunchError(f"ck_e2e2.{dotted}={v!r} does not rescale to {ngpu} GPUs")
+        parent[key] = v * NGPU // ngpu
+    return out
 
 
 def recipe2(run: str, run_dir: str, ngpu: int, workers: int, max_epochs: int, wandb: str, arm: str = "main"
             ) -> List[str]:
-    """launch_util.recipe (v2 r34 source) with the CK2 2-GPU counters / names (SPEC s7-2)."""
+    """launch_util.recipe (v2 r34 source) with the CK2 counters for ngpu GPUs (counters2) / names (SPEC s7-2)."""
+    c = counters2(ngpu)
     rep = {
         "+trainer.params.devices": f"+trainer.params.devices={ngpu}",
         "trainer.params.strategy": "trainer.params.strategy=ddp",
-        "trainer.params.accumulate_grad_batches": f"trainer.params.accumulate_grad_batches={ACCUMULATE}",
-        "agent.config.grad_balance_warmup_iters": f"agent.config.grad_balance_warmup_iters={BALANCE_WARMUP}",
-        "agent.config.grad_balance_interval": f"agent.config.grad_balance_interval={BALANCE_INTERVAL}",
-        "agent.config.grad_norm_log_interval": f"agent.config.grad_norm_log_interval={GRAD_NORM_LOG}",
+        "trainer.params.accumulate_grad_batches": f"trainer.params.accumulate_grad_batches={c['accumulate']}",
+        "agent.config.grad_balance_warmup_iters": f"agent.config.grad_balance_warmup_iters={c['balance_warmup']}",
+        "agent.config.grad_balance_interval": f"agent.config.grad_balance_interval={c['balance_interval']}",
+        "agent.config.grad_norm_log_interval": f"agent.config.grad_norm_log_interval={c['grad_norm_log']}",
         "experiment_name": f"experiment_name={run if run.startswith('ck2e2e') else 'ck2e2e_' + run}",
     }
     out, seen = [], set()
@@ -285,7 +324,8 @@ def recipe2(run: str, run_dir: str, ngpu: int, workers: int, max_epochs: int, wa
     if missing:
         raise LaunchError(f"launch_util.recipe no longer has {sorted(missing)}")
     if wandb != "disable":
-        out += [f"wandb.project={WANDB_PROJECT}", f"wandb.group={WANDB_GROUP}", f"wandb.tags=[ck2e2e,{arm}]"]
+        tags = f"[ck2e2e,{arm}]" if ngpu == NGPU else f"[ck2e2e,{arm},gpu{ngpu}]"
+        out += [f"wandb.project={WANDB_PROJECT}", f"wandb.group={WANDB_GROUP}", f"wandb.tags={tags}"]
     return out
 
 
@@ -300,7 +340,7 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
         raise LaunchError(f"run dir must be absolute: {run_dir}")
     gpus = parse_gpus2(",".join(gpus))
     run = Path(run_dir).name
-    ck = load_ck2_yaml(ck_yaml)
+    ck = scale_mb_counters(load_ck2_yaml(ck_yaml), len(gpus))
     ck["io_dir"] = f"{run_dir}/{IO_SUB}"
     ck = LU.apply_sets(ck, ck_sets)
     check_paths(ck)

@@ -18,7 +18,8 @@
 #   labeler/   labeler.log / .pid / .pgid / .exit / .cmd, watchdog.pid / .log / .restarts / .state
 #   launch/    train.log / .pid / .pgid / .exit, overrides.txt, ck_e2e2_effective.json, teachers.json,
 #              nvidia_smi_start.txt, launch.log
-# start guards: --gpus = exactly 2 GPUs of 0-3 (user recipe devices 2), nvidia-smi <= 1 GiB used on each,
+# start guards: --gpus = 2 or 4 GPUs of 0-3 (user recipe devices 2; 4 = fusion_v1, launch_util2.counters2 halves the
+#   per-rank counters), nvidia-smi <= 1 GiB used on each,
 #   CK2_E2E_APPROVED=1 (main runs) or E2E_SMOKE=1 (only below .../ck/ck2/e2e_smoke/), both CK2 teachers finished
 #   (done.json, trainer train_ck2, arm T / M, lon head zero, config.json ep_target == ck_e2e2.ep_target -- default
 #   teachers ck2T10dep / ck2M10dep with --ep-target decoupled, user 2026-10-08; launch/teachers.json records the ckpt
@@ -28,11 +29,11 @@
 #   KD keys fitted); a missing file is REFUSED with the command to run after the teacher has finished:
 #     CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=$REPO /venv/ssr/bin/python tools/ck/e2e2/fit_kd_calib.py --run <teacher run>
 #       --which last      (-> .../ck/ck2/kd_calib/<run>__last.json; recorded with its sha16 in launch/teachers.json)
-# -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (32 workers, --world-size 2, --max-epoch
+# -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (16 x ngpu workers, --world-size ngpu, --max-epoch
 #   MAX_EPOCHS-2, --exit-when-done --train-pid-file) -> watchdog (restart a dead / hung labeler while training lives).
 # ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
 #   after the arm file.  Never pkill / pgrep -f: processes are found through the pid files only.
-# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (32), LABELER_POLL (30),
+# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu: 32 / 64), LABELER_POLL (30),
 #   LABELER_MAX_EPOCH (MAX_EPOCHS-2), E2E_NO_LABELER=1, E2E_WANDB=online|offline|disable, E2E_EXTRA=<Hydra override file>,
 #   E2E_SMOKE=1, E2E_WAIT_TIMEOUT, E2E_DRY_RUN=1, WATCHDOG_EVERY (120), LABELER_MAX_RESTARTS (20), LABELER_STALL_S (1200),
 #   E2E_NO_WATCHDOG=1, E2E_NO_DEEP_TEACHER_CHECK=1 (tests: skip loading the teacher ckpts).
@@ -96,7 +97,7 @@ grp_kill() {  # grp_kill <pgid_file> <pid_file> <needle> <name>: TERM the group,
   log "$4 still alive after 60 s: KILL"
   if [ -n "$pg" ]; then kill -KILL -- "-$pg" 2>/dev/null || kill -KILL "$pid"; else kill -KILL "$pid"; fi
 }
-need_gpus() { [ -n "$GPUS" ] || die "--gpus <2 GPUs of 0-3> is required (e.g. --gpus 0,1)"; }
+need_gpus() { [ -n "$GPUS" ] || die "--gpus <2 or 4 GPUs of 0-3> is required (e.g. --gpus 0,1 or 0,1,2,3)"; }
 
 case "$R" in *=*) die "run dir $R contains '='";; esac
 case "$ARM" in main|bevkd) ;; *) die "ARM must be main | bevkd (got $ARM)";; esac
@@ -108,14 +109,14 @@ start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   local ng me; ng=$(awk -F, '{print NF}' <<< "$GPUS"); me=${LABELER_MAX_EPOCH:-$(( ${MAX_EPOCHS:-30} - 2 ))}
   [ "$me" -lt 0 ] && me=0
   mkdir -p "$LB"; rm -f "$LB/labeler.exit" "$LB/labeler.pid"
-  local LCMD=("$PY" "$REPO/tools/ck/e2e2/labeler2.py" --io-dir "$IO" --world-size "$ng" --workers "${LABELER_WORKERS:-32}"
+  local LCMD=("$PY" "$REPO/tools/ck/e2e2/labeler2.py" --io-dir "$IO" --world-size "$ng" --workers "${LABELER_WORKERS:-$((16 * ng))}"
               --poll "${LABELER_POLL:-30}" --max-epoch "$me" --exit-when-done --train-pid-file "$L/train.pid")
   [ "${1:-}" = retry ] && LCMD+=(--retry-errors)
   echo "${LCMD[*]}" > "$LB/labeler.cmd"
   setsid nohup bash -c "$WRAP" _ "$LB" labeler env PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 "${LCMD[@]}" \
     < /dev/null > /dev/null 2>&1 &
   for _ in $(seq 30); do [ -s "$LB/labeler.pid" ] && break; sleep 0.2; done
-  log "labeler2 started pid $(cat "$LB/labeler.pid" 2>/dev/null) W=${LABELER_WORKERS:-32} world $ng max-epoch $me -> $LB/labeler.log"
+  log "labeler2 started pid $(cat "$LB/labeler.pid" 2>/dev/null) W=${LABELER_WORKERS:-$((16 * ng))} world $ng max-epoch $me -> $LB/labeler.log"
 }
 
 start_watchdog() {
@@ -167,7 +168,7 @@ stop_watchdog() {
 
 do_start() {
   need_gpus
-  "$PY" "$LU2" gpu-check --gpus "$GPUS" --list-only > /dev/null || die "GPU list $GPUS (exactly 2 of 0-3)"
+  "$PY" "$LU2" gpu-check --gpus "$GPUS" --list-only > /dev/null || die "GPU list $GPUS (2 or 4 of 0-3)"
   local TMODE=strict
   if [ "${E2E_SMOKE:-0}" = 1 ]; then
     case "$R/" in "$SMOKE_PREFIX"*) ;; *) die "E2E_SMOKE=1 only below $SMOKE_PREFIX (got $R)";; esac

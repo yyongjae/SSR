@@ -8,6 +8,7 @@ CKE2E2Config, and a train_e2e2.sh dry run (E2E_DRY_RUN=1: prints the overrides, 
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -261,6 +262,30 @@ def test_labeler_health_and_status(tmp_path):
     assert s["train"]["alive"] is False and s["generations_done"] == [] and isinstance(s["warnings"], list)
 
 
+def test_four_gpus_keep_the_schedule_in_samples(tmp_path):
+    """user 2026-10-13 (fusion_v1): 4 GPUs of 0-3 = devices 4, accumulate 8 (global batch 128 as on 2 GPUs) and every
+    per-rank micro-batch counter halved (= the old 4-GPU values); an explicit --ck-set stays absolute."""
+    ov, ck, _ = _ov(tmp_path, gpus=("0", "1", "2", "3"), wandb="online")
+    assert _get(ov, "trainer.params.devices") == "4" and _get(ov, "trainer.params.accumulate_grad_batches") == "8"
+    assert _get(ov, "agent.config.grad_balance_warmup_iters") == "5300"
+    assert _get(ov, "agent.config.grad_balance_interval") == "100"
+    assert _get(ov, "agent.config.grad_norm_log_interval") == "100"
+    c = "agent.config.ck_e2e2."
+    for k, v in {"lat_kd.start_mb": "500", "label_refresh_every_mb": "500", "grad_share_every": "50",
+                 "bev_kd.start_mb": "5300"}.items():
+        assert _get(ov, c + k) == v, k
+    assert ck["lat_kd"]["start_mb"] == 500 and ck["grad_share_every"] == 50 and ck["bev_kd"]["start_mb"] == 5300
+    assert _get(ov, "wandb.tags") == "[ck2e2e,main,gpu4]"
+    ov2, _, _ = _ov(tmp_path, ["grad_share_every=7"], gpus=("0", "1", "2", "3"))
+    assert _get(ov2, c + "grad_share_every") == "7"
+    c2, c4 = L2.counters2(2), L2.counters2(4)
+    assert 2 * L2.TOKENS_PER_MB * c2["accumulate"] == 4 * L2.TOKENS_PER_MB * c4["accumulate"] == 128
+    assert math.ceil(L2.LU.mb_per_epoch(4) / c4["accumulate"]) == math.ceil(L2.LU.mb_per_epoch(2) / c2["accumulate"])
+    for g in (("0", "1", "2"), ("0", "1", "2", "4"), ("0", "1", "2", "3", "3")):
+        with pytest.raises(L2.LaunchError):
+            _ov(tmp_path, gpus=g)
+
+
 def _sh(env_extra, *args, timeout=600):
     env = dict(os.environ, PYTHONPATH=str(REPO), OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", CUDA_VISIBLE_DEVICES="",
                E2E_WANDB="disable", **env_extra)
@@ -300,6 +325,15 @@ def test_train_e2e2_dry_run(tmp_path):
         assert r.returncode == 3 and ("done.json" in r.stderr or "no config.json" in r.stderr), r.stderr[-1000:]
     # E2E_SMOKE only below the smoke prefix
     assert _sh(dict(base, E2E_SMOKE="1"), "start", "--gpus", "0,1").returncode == 3
+    # 4 GPUs (fusion_v1): the fusion arm overrides on top of the 4-GPU counters
+    extra = REPO / "tools/ck/e2e2/fusion_v8_arm.extra"
+    r = _sh(dict(base, CK2_E2E_APPROVED="1", RUN="dry_fusion4", E2E_EXTRA=str(extra)), "start", "--gpus", "0,1,2,3")
+    assert r.returncode == 0, r.stderr[-2000:]
+    for o in ("+trainer.params.devices=4", "trainer.params.accumulate_grad_batches=8",
+              "agent.config.grad_balance_warmup_iters=5300", "++agent.config.ck_e2e2.grad_share_every=50",
+              "++agent.config.use_distill=true", "++agent.config.distill_teacher_source=targets"):
+        assert o in r.stdout.splitlines(), o
+    assert _sh(dict(base, CK2_E2E_APPROVED="1"), "start", "--gpus", "0,1,2").returncode == 3
 
 
 def test_hydra_compose_full_override_list(tmp_path):

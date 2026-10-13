@@ -123,15 +123,36 @@ class TrajectoryAnchorDistillation(nn.Module):
         if trajectory_anchors_file is not None and os.path.exists(trajectory_anchors_file):
             import numpy as np
             anchors_np = np.load(trajectory_anchors_file)
-            bias = self._build_spatial_bias(torch.tensor(anchors_np, dtype=torch.float32))
-            # fusion_v1: not persistent -- a pure function of the anchors file (20.5 MB per checkpoint otherwise)
+            anchors_t = torch.tensor(anchors_np, dtype=torch.float32)
+            bias = self._build_spatial_bias(anchors_t)
+            # fusion_v1: not persistent -- a pure function of the anchors (20.5 MB per checkpoint otherwise);
+            # bias_anchors records which anchors built it (sync_spatial_bias)
             self.register_buffer("spatial_bias", bias, persistent=False)
+            self.register_buffer("bias_anchors", anchors_t.clone(), persistent=False)
         elif trajectory_anchors_file is not None and str(version) in ("v7", "v8"):
             # fusion_v1: a missing file used to leave a plain attribute and fail at the
             # first forward (register_buffer KeyError); fail at construction instead.
             raise FileNotFoundError(f"trajectory anchors file not found: {trajectory_anchors_file}")
         else:
             self.register_buffer("spatial_bias", None)
+        if not hasattr(self, "bias_anchors"):
+            self.register_buffer("bias_anchors", None)
+
+    @torch.no_grad()
+    def sync_spatial_bias(self, anchors: torch.Tensor) -> bool:
+        """fusion_v1: keep the spatial bias a function of the planner's own anchors.  A checkpoint restore replaces the
+        planner's anchor buffer but not this non-persistent bias, so a changed anchor set would silently disagree.
+        Rebuilt in place (same shape, so DDP's buffer list stays valid).  Returns True when it was rebuilt."""
+        if self.spatial_bias is None or self.bias_anchors is None:
+            return False
+        a = anchors.detach().to(device=self.bias_anchors.device, dtype=self.bias_anchors.dtype)
+        if a.shape != self.bias_anchors.shape:
+            raise ValueError(f"planner anchors {tuple(a.shape)} != spatial-bias anchors {tuple(self.bias_anchors.shape)}")
+        if torch.equal(a, self.bias_anchors):
+            return False
+        self.spatial_bias.copy_(self._build_spatial_bias(a).to(self.spatial_bias))
+        self.bias_anchors.copy_(a)
+        return True
 
     def _build_spatial_bias(self, anchors: torch.Tensor) -> torch.Tensor:
         """Compute Gaussian spatial distance bias [K, HW] (v7) or [H, K, HW] (v8) for 256 anchors."""

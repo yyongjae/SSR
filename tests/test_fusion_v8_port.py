@@ -302,13 +302,45 @@ def test_targets_source_equals_store_source_on_the_ck2_arm(batch, tmp_path):
 
 @pytest.mark.skipif(not (SMOKE_T / "done.json").is_file(), reason="CK2 smoke teachers absent")
 def test_targets_source_leaves_out_tokens_without_teacher(batch, tmp_path):
+    """A token without teacher BEV contributes 0 and every kept token keeps its full-batch weight 1/B (ranks with
+    different coverage weigh the same under DDP); with no teacher at all the term is 0 but the log keys are the same
+    as in a full step (sync_dist logging) and student_proj still gets a (zero) gradient (plain DDP)."""
     agent, _ = build(ck_e2e2=_ck2_cfg(tmp_path / "a"), distill_teacher_source="targets", **V8)
+    _, full = _fusion_step(agent, batch)
     _, lg = _fusion_step(agent, batch, ok0=[True, False])
     assert float(lg["distill/teacher_ok_frac"]) == 0.5 and torch.isfinite(lg["loss_distill_resmap"])
+    added = lg["loss"] - lg["loss_pre_distill"]
+    assert torch.allclose(added, 0.5 * (lg["loss_distill_bevfusion"] + lg["loss_distill_resmap"]), rtol=1e-5, atol=1e-5)
     _, lg = _fusion_step(agent, batch, ok0=[False, False])
-    assert float(lg["distill/teacher_ok_frac"]) == 0.0 and "loss_distill_resmap" not in lg
-    for p in agent.distill_parameters():       # plain DDP: still a (zero) gradient
+    assert float(lg["distill/teacher_ok_frac"]) == 0.0
+    dkeys = lambda d: {k for k in d if ("distill" in k or k.startswith("loss_attn")) and not k.startswith("gnorm/")}
+    assert dkeys(lg) == dkeys(full) and len(dkeys(full)) >= 9    # the distillation keys (gnorm/* follow the cadence)
+    assert float(lg["loss_distill_resmap"]) == 0.0 and torch.equal(lg["loss"], lg["loss_pre_distill"])
+    for p in agent.distill_parameters():
         assert p.grad is not None and float(p.grad.abs().sum()) == 0.0
+
+
+def test_spatial_bias_follows_the_planner_anchors(pair, batch):
+    """The bias is rebuilt from the planner's anchor buffer when it differs from the anchors that built it (e.g. a
+    checkpoint restore of a run whose anchor file changed); unchanged anchors leave it untouched."""
+    _, _, on, _ = pair
+    ad = on._distill.anchor_distill
+    buf = on.para_ssr_model.pts_bbox_head.anchor_planner.trajectory_anchors
+    assert torch.equal(ad.bias_anchors, buf)
+    before, bias_id = ad.spatial_bias.clone(), ad.spatial_bias.data_ptr()
+    assert ad.sync_spatial_bias(buf) is False and torch.equal(ad.spatial_bias, before)
+    with torch.no_grad():
+        buf[:, :, 1] += 1.0                                  # shift every anchor 1 m to the left
+    try:
+        on.zero_grad(set_to_none=True)
+        train_step(on, batch, scene_token=True, seed=3)
+        assert torch.equal(ad.bias_anchors, buf) and ad.spatial_bias.data_ptr() == bias_id    # rebuilt in place
+        assert torch.equal(ad.spatial_bias, ad._build_spatial_bias(buf.clone()))
+        assert not torch.equal(ad.spatial_bias, before)
+    finally:
+        with torch.no_grad():
+            buf[:, :, 1] -= 1.0
+        ad.sync_spatial_bias(buf)
 
 
 def test_targets_source_needs_the_ck2_arm():

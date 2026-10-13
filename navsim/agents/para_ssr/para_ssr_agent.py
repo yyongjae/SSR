@@ -717,6 +717,12 @@ class ParaSSRAgent(AbstractAgent):
         inputs = dict(student_bev=bev, tokens=list(targets["scene_token"]), trajectories=targets.get("trajectory"),
                       command=command, ego_status=status, bev_pos=bev_pos, sim_reward=targets.get("sim_reward"))
         out = {}
+        anchors = predictions.get("trajectory_anchors")
+        ad = getattr(distill, "anchor_distill", None)
+        if ad is not None and anchors is not None and ad.sync_spatial_bias(anchors):
+            logger.warning("distillation spatial bias rebuilt from the planner's anchors (they differ from the ones "
+                           "it was built from, e.g. after a checkpoint restore)")
+        frac, dead = 1.0, False
         if str(getattr(cfg, "distill_teacher_source", "store")) == "targets":
             # fusion_v1: the CK2 targets (S grid, f16): kd_bev_0 = DET / BEVFusion, kd_bev_1 = MAP / ReSMap
             from .ck.bev_kd import sgrid_to_tokens
@@ -725,13 +731,18 @@ class ParaSSRAgent(AbstractAgent):
             inputs["teacher_tokens"] = (sgrid_to_tokens(targets["kd_bev_0"]).float(),
                                         sgrid_to_tokens(targets["kd_bev_1"]).float())
             out["distill/teacher_ok_frac"] = ok.float().mean().detach()
-            if not bool(ok.all()):
-                if not bool(ok.any()):
-                    # every trainable distillation parameter still gets a (zero) gradient: plain DDP
-                    total = 0.0 * sum(p.sum() for p in self.distill_parameters())
-                    self._log_distill_bev_grad(bev, total, out)
-                    return total, out
+            if not bool(ok.any()):
+                # no teacher at all on this rank: run the term on the student's own (detached) BEV with weight 0, so
+                # every rank logs the same keys (sync_dist logging) and every trainable distillation parameter gets
+                # a (zero) gradient (plain DDP)
+                dead = True
+                inputs["teacher_tokens"] = (bev.detach(), bev.detach())
+            elif not bool(ok.all()):
+                # left-out tokens contribute 0 and every kept token keeps the per-sample weight 1 / B it has in a
+                # full micro-batch (the term is a batch mean), so ranks with different teacher coverage weigh the
+                # same under DDP's gradient average
                 idx = ok.nonzero(as_tuple=True)[0]
+                frac = float(idx.numel()) / float(ok.numel())
                 inputs = {k: (None if v is None else
                               [v[i] for i in idx.tolist()] if k == "tokens" else
                               tuple(t[idx] for t in v) if k == "teacher_tokens" else v[idx])
@@ -739,15 +750,16 @@ class ParaSSRAgent(AbstractAgent):
         losses, metrics = distill(
             inputs.pop("student_bev"),
             inputs.pop("tokens"),
-            trajectory_anchors=predictions.get("trajectory_anchors"),
+            trajectory_anchors=anchors,
             **inputs,
         )
-        weight = float(cfg.distill_loss_weight)
+        weight = float(cfg.distill_loss_weight) * (0.0 if dead else frac)
+        keep = 0.0 if dead else 1.0
         total = None
         for name, value in losses.items():
             total = weight * value if total is None else total + weight * value
-            out[name] = value.detach()
-        out.update({k: v.detach() for k, v in metrics.items()})
+            out[name] = value.detach() * keep           # per kept token (0 when no teacher)
+        out.update({k: v.detach() * keep for k, v in metrics.items()})
         if total is None:
             total = bev.new_zeros(())
         else:

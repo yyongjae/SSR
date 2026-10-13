@@ -52,13 +52,18 @@ class TeacherFeatureStore:
             "cache_val_100x100",
         ),
         feature_key: str = BEV_FEATURE_KEY,
-        flip_w: bool = True,
+        flip_w: Optional[bool] = None,
     ) -> None:
         self.root = os.path.abspath(os.path.expanduser(root))
         self.teacher = str(teacher)
         self.cache_subdirs = tuple(cache_subdirs)
         self.feature_key = str(feature_key)
-        self.flip_w = bool(flip_w)
+        if flip_w is None:
+            # BEVFusion requires flip_w=True due to mmdet3d LiDAR coordinate (Right->Left columns).
+            # ReSMap sharded cache already has columns aligned Left->Right with student, so flip_w must be False.
+            self.flip_w = False if (self.teacher == "resmap" or self.is_sharded()) else True
+        else:
+            self.flip_w = bool(flip_w)
         self._manifests: Optional[Dict[str, dict]] = None
         self._meta: Optional[dict] = None
         self._index: Optional[Dict[str, list]] = None

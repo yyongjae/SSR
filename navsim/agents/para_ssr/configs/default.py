@@ -298,11 +298,13 @@ class ParaSSRConfig:
                 "cache_name": "bevfusion",
                 "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
                 "loss_weight": 1.0,
+                "flip_w": True,
             },
             "resmap": {
                 "cache_name": "resmap",
                 "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
                 "loss_weight": 1.0,
+                "flip_w": False,
             },
         }
     )

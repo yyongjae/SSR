@@ -10,6 +10,12 @@ With task interaction disabled, the same layers use only BEV -> FFN and the
 planner neither constructs interaction parameters nor consumes task memories.
 All modes inject current ego velocity/acceleration into the planning query and
 normalize the final residual stream before trajectory regression.
+
+Task-memory layout (report/41) is a config choice that adds no parameters:
+``plan_det_memory_mode`` keeps one token per object (``mean`` over motion
+modes, the original) or one per (object, mode) (``mode_tokens``), and
+``plan_map_memory_segments`` splits each map element's points into S
+contiguous segments (1 is the original per-element mean).
 """
 from __future__ import annotations
 
@@ -20,6 +26,37 @@ import torch.nn as nn
 
 from .anchor_planner import AnchorPlanner
 from .transformer_blocks import LearnedPositionalEncoding
+
+PLAN_DET_MEMORY_MODES = ("mean", "mode_tokens")
+
+
+def validate_plan_memory_options(
+    plan_det_memory_mode: str,
+    plan_map_memory_segments: int,
+    num_map_points: Optional[int] = None,
+) -> None:
+    """Reject invalid task-memory layouts with the offending field named.
+
+    ``num_map_points`` (P) is checked only when given: the constructor has no
+    P, so divisibility is verified at config validation and again against the
+    real tensor when the memories are built.
+    """
+    if plan_det_memory_mode not in PLAN_DET_MEMORY_MODES:
+        raise ValueError(
+            f"plan_det_memory_mode must be one of {PLAN_DET_MEMORY_MODES}, "
+            f"got {plan_det_memory_mode!r}"
+        )
+    segments = plan_map_memory_segments
+    if isinstance(segments, bool) or not isinstance(segments, int) or segments < 1:
+        raise ValueError(
+            f"plan_map_memory_segments must be a positive integer, got {segments!r}"
+        )
+    if num_map_points is not None:
+        if segments > num_map_points or num_map_points % segments != 0:
+            raise ValueError(
+                "plan_map_memory_segments must divide the points per map element "
+                f"(1 <= S <= P, P % S == 0), got S={segments} and P={num_map_points}"
+            )
 
 
 class PlanTaskMemoryLayer(nn.Module):
@@ -134,8 +171,11 @@ class ParaSSRPlannerHead(nn.Module):
         plan_kinematic: bool = False,
         plan_heading_from_xy: bool = False,
         plan_rescore_refined: bool = False,
+        plan_det_memory_mode: str = "mean",
+        plan_map_memory_segments: int = 1,
     ):
         super().__init__()
+        validate_plan_memory_options(plan_det_memory_mode, plan_map_memory_segments)
         if use_stl:
             raise ValueError("PARA-SSR task-memory planner requires use_stl=False")
         if plan_num_layers != 3:
@@ -154,6 +194,9 @@ class ParaSSRPlannerHead(nn.Module):
         self.traj_dims = traj_dims
         self.use_stl = False
         self.use_task_interaction = use_task_interaction
+        # Memory layout only; no parameter, buffer or state-dict key depends on it.
+        self.plan_det_memory_mode = plan_det_memory_mode
+        self.plan_map_memory_segments = plan_map_memory_segments
 
         self.transformer = transformer
         self.positional_encoding = LearnedPositionalEncoding(embed_dims // 2, bev_h, bev_w)
@@ -287,6 +330,13 @@ class ParaSSRPlannerHead(nn.Module):
         Map points are already in [0, 1] and enter their coordinate MLP as-is.
         Both heads use sigmoid focal classification without a background logit;
         the maximum sigmoid score is their foreground confidence.
+
+        Token layouts (memory, position and confidence always share one order):
+        objects are ``[B,Q,C]`` (``mean``) or ``[B,Q*M,C]`` with token
+        ``q*M + m`` (``mode_tokens``); map elements are ``[B,V*S,C]`` with
+        token ``v*S + s`` where segment ``s`` holds points ``[s*L, (s+1)*L)``.
+        Hidden content keeps its gradient into the decoders; XY and scores are
+        detached before their metadata encoders.
         """
         if not self.use_task_interaction:
             raise ValueError("task memories are unavailable when use_task_interaction=False")
@@ -299,24 +349,74 @@ class ParaSSRPlannerHead(nn.Module):
             raise ValueError("detection and motion hidden states must share batch and object dimensions")
         if det_hidden.shape[0] != map_point_hidden.shape[0]:
             raise ValueError("detection and map hidden states must share the batch dimension")
-        det_memory = self.det_memory_norm(
-            self.det_projection(det_hidden) + self.motion_projection(motion_hidden.mean(dim=2))
-        )
-        map_memory = self.map_memory_norm(self.map_projection(map_point_hidden.mean(dim=2)))
+        bs, num_objects, num_modes = motion_hidden.shape[:3]
+        _, num_elements, num_points = map_point_hidden.shape[:3]
+        if num_modes < 1 or num_elements < 1 or num_points < 1:
+            raise ValueError(
+                "motion modes, map elements and points per element must all be positive, got "
+                f"M={num_modes}, V={num_elements}, P={num_points}"
+            )
+        segments = self.plan_map_memory_segments
+        validate_plan_memory_options(self.plan_det_memory_mode, segments, num_points)
+
         det_xy = det_out["all_bbox_preds"][-1, ..., :2].detach()
+        det_score = det_out["all_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
+        map_xy = map_out["all_map_pts_preds"][-1].detach()
+        map_score = map_out["all_map_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
+        if det_xy.shape != (bs, num_objects, 2) or det_score.shape != (bs, num_objects, 1):
+            raise ValueError(
+                "detection metadata must match the [B,Q] object latents, got bbox XY "
+                f"{tuple(det_xy.shape)} and scores {tuple(det_score.shape)} for B={bs}, Q={num_objects}"
+            )
+        if map_xy.shape != (bs, num_elements, num_points, 2) or map_score.shape != (bs, num_elements, 1):
+            raise ValueError(
+                "map metadata must match the [B,V,P] point latents, got points "
+                f"{tuple(map_xy.shape)} and scores {tuple(map_score.shape)} for "
+                f"B={bs}, V={num_elements}, P={num_points}"
+            )
         xy_origin = det_xy.new_tensor(self.pc_range[:2])
         xy_extent = det_xy.new_tensor((self.real_w, self.real_h))
         det_xy = (det_xy - xy_origin) / xy_extent
-        map_xy = map_out["all_map_pts_preds"][-1].detach()
-        det_score = det_out["all_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
-        map_score = map_out["all_map_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
+
+        # ---- objects: [B,Q,C] (mean over modes) or [B,Q*M,C] (one token per mode)
+        det_position = self.det_position_encoder(det_xy)
+        det_confidence = self.det_confidence_encoder(det_score)
+        if self.plan_det_memory_mode == "mean":
+            det_memory = self.det_memory_norm(
+                self.det_projection(det_hidden) + self.motion_projection(motion_hidden.mean(dim=2))
+            )
+        else:  # mode_tokens
+            det_content = self.det_projection(det_hidden).unsqueeze(2)       # [B,Q,1,C]
+            motion_content = self.motion_projection(motion_hidden)            # [B,Q,M,C]
+            det_memory = self.det_memory_norm(det_content + motion_content).flatten(1, 2)
+            det_position = det_position.unsqueeze(2).expand(-1, -1, num_modes, -1).flatten(1, 2)
+            det_confidence = det_confidence.unsqueeze(2).expand(-1, -1, num_modes, -1).flatten(1, 2)
+
+        # ---- map elements: [B,V,C] (S=1, original) or [B,V*S,C] (S segments of L points)
+        map_confidence = self.map_confidence_encoder(map_score)
+        if segments == 1:
+            map_memory = self.map_memory_norm(self.map_projection(map_point_hidden.mean(dim=2)))
+            map_position = self.map_position_encoder(map_xy).mean(dim=2)
+        else:
+            points_per_segment = num_points // segments
+            segment_hidden = map_point_hidden.reshape(
+                bs, num_elements, segments, points_per_segment, -1
+            ).mean(dim=3)                                                     # [B,V,S,C_map]
+            map_memory = self.map_memory_norm(self.map_projection(segment_hidden)).flatten(1, 2)
+            # Embed every point first, then average inside the segment: the
+            # encoder is non-linear, so encoder(mean(XY)) would differ.
+            point_position = self.map_position_encoder(map_xy)                # [B,V,P,C]
+            map_position = point_position.reshape(
+                bs, num_elements, segments, points_per_segment, -1
+            ).mean(dim=3).flatten(1, 2)
+            map_confidence = map_confidence.unsqueeze(2).expand(-1, -1, segments, -1).flatten(1, 2)
         return {
             "det_memory": det_memory,
-            "det_position": self.det_position_encoder(det_xy),
-            "det_confidence": self.det_confidence_encoder(det_score),
+            "det_position": det_position,
+            "det_confidence": det_confidence,
             "map_memory": map_memory,
-            "map_position": self.map_position_encoder(map_xy).mean(dim=2),
-            "map_confidence": self.map_confidence_encoder(map_score),
+            "map_position": map_position,
+            "map_confidence": map_confidence,
         }
 
     def plan_from_bev(

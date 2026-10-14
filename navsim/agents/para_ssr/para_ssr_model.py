@@ -206,6 +206,8 @@ class ParaSSRModel(nn.Module):
             plan_kinematic=bool(getattr(cfg, "plan_kinematic", False)),
             plan_heading_from_xy=bool(getattr(cfg, "plan_heading_from_xy", False)),
             plan_rescore_refined=bool(getattr(cfg, "plan_rescore_refined", False)),
+            plan_det_memory_mode=getattr(cfg, "plan_det_memory_mode", "mean"),
+            plan_map_memory_segments=getattr(cfg, "plan_map_memory_segments", 1),
         )
         self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
 

@@ -59,6 +59,12 @@ config:
   use_stl: false
   use_task_interaction: true
   plan_num_layers: 3
+  # Planner task-memory layout (report/41); defaults reproduce the original memories.
+  # plan_det_memory_mode: mean | mode_tokens (one token per object x motion mode)
+  # plan_map_memory_segments: contiguous point segments per map element (must divide
+  # map_num_pts_per_vec); 1 = original per-element mean, 4 = first improvement run.
+  plan_det_memory_mode: mean
+  plan_map_memory_segments: 1
 
   # --- heads --------------------------------------------------------------
   use_det_motion_head: true

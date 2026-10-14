@@ -95,6 +95,14 @@ def test_default_config_contract_is_valid():
         ({"lidar_encoder": "pillar", "bev_h": 100, "lidar_pillar_size": (0.16, 0.16)}, "same factor"),
         ({"lidar_encoder": "pillar", "lidar_backbone_layers": (3, 5)}, "per backbone stage"),
         ({"lidar_attn_points": 0}, "lidar_attn_points"),
+        # planner task-memory layout (report/41)
+        ({"plan_det_memory_mode": "weighted"}, "plan_det_memory_mode"),
+        ({"plan_map_memory_segments": True}, "plan_map_memory_segments"),
+        ({"plan_map_memory_segments": 0}, "plan_map_memory_segments"),
+        ({"plan_map_memory_segments": -1}, "plan_map_memory_segments"),
+        ({"plan_map_memory_segments": 4.0}, "plan_map_memory_segments"),
+        ({"plan_map_memory_segments": 3}, "plan_map_memory_segments"),    # 20 % 3 != 0
+        ({"plan_map_memory_segments": 40}, "plan_map_memory_segments"),   # S > P
     ],
 )
 def test_invalid_config_contract_fails_fast(override, message):
@@ -125,3 +133,16 @@ def test_non_navsim_sampling_interval_fails_fast():
     sampling = TrajectorySampling(time_horizon=2.0, interval_length=0.25)
     with pytest.raises(ValueError, match="0.5 second"):
         ParaSSRAgent._validate_config(_config(), sampling)
+
+
+def test_memory_options_default_when_absent_and_accept_the_planned_combinations():
+    # Namespaces/configs from before report/41 carry no memory fields: original behaviour.
+    ParaSSRAgent._validate_config(_config(), _sampling())
+    for mode, segments in (("mean", 1), ("mode_tokens", 1), ("mean", 4), ("mode_tokens", 4), ("mean", 20)):
+        ParaSSRAgent._validate_config(
+            _config(plan_det_memory_mode=mode, plan_map_memory_segments=segments), _sampling()
+        )
+    # Without interaction, only the value format is checked.
+    ParaSSRAgent._validate_config(
+        _config(use_task_interaction=False, plan_map_memory_segments=3), _sampling()
+    )

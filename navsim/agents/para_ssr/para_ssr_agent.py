@@ -44,6 +44,7 @@ from .modules.lidar_encoder import (
     pillar_downsample_ratio,
     sparse_grid,
 )
+from .modules.planner_head import validate_plan_memory_options
 from .para_ssr_model import ParaSSRModel
 from .para_ssr_targets import (
     DET_NAME_TO_INDEX,
@@ -490,6 +491,15 @@ class ParaSSRAgent(AbstractAgent):
                 "map_dir_interval must satisfy 1 <= interval < points/vector, "
                 f"got {config.map_dir_interval} and {config.map_num_pts_per_vec}"
             )
+        # Planner task-memory layout (report/41).  Older configs/namespaces
+        # without the fields keep the original pooled memories.  The format is
+        # always checked; the point divisibility only matters when the planner
+        # actually builds the memories.
+        validate_plan_memory_options(
+            getattr(config, "plan_det_memory_mode", "mean"),
+            getattr(config, "plan_map_memory_segments", 1),
+            int(config.map_num_pts_per_vec) if getattr(config, "use_task_interaction", True) else None,
+        )
         # ---- Stage E student refiner (exp-refine) ----
         refiner_mode = getattr(config, "refiner_mode", "off")
         if refiner_mode not in ("off", "E1", "E2"):

@@ -159,6 +159,15 @@ class ParaSSRConfig:
     use_stl: bool = False
     use_task_interaction: bool = True
     plan_num_layers: int = 3
+    # Planner task-memory layout (report/41).  Both default to the original
+    # pooled memories so existing checkpoints and results are reproduced.
+    #   plan_det_memory_mode: "mean" pools the motion modes into one token per
+    #     object; "mode_tokens" keeps one token per (object, mode), Q*M tokens.
+    #   plan_map_memory_segments: S contiguous point segments per map element,
+    #     V*S tokens; 1 is the original per-element mean, must divide
+    #     map_num_pts_per_vec.  Neither option adds parameters.
+    plan_det_memory_mode: str = "mean"    # mean | mode_tokens
+    plan_map_memory_segments: int = 1    # 1 is the original behaviour; first experiment uses 4
     num_scenes: int = 16
     num_reg_fcs: int = 2
     latent_num_layers: int = 3

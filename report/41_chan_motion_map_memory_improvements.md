@@ -260,6 +260,8 @@ bash scripts/training/train_para_ssr.sh \
   agent.config.plan_map_memory_segments=4
 ```
 
+W&B 기록 (2026-10-14 추가): `train_para_ssr.sh`는 기본으로 W&B를 켠다 (`WANDB=0`으로 끔, 로그인은 `~/.netrc`, entity는 개인 공간 `chandsgdfkdsjvl`로 고정, project `para-ssr`; 팀 `Robust_Ex`에는 올라가지 않음). 각 run은 `wandb.name=${EXPERIMENT}`로 올라가고, run config에 `agent`·`dataloader`·`trainer` 설정이 그대로 들어가며, 태그에 `backbone:<arch>`·`det_mem:<mode>`·`map_seg:<S>`가 자동으로 붙는다. 네 조합은 대시보드에서 이 태그 또는 `agent.config.plan_det_memory_mode`/`plan_map_memory_segments`로 필터한다. 조합마다 `EXPERIMENT` 이름을 다르게 주고, 같은 비교군은 `WANDB_GROUP`을 공유한다. 구현은 `navsim/planning/training/wandb_logging.py`, 테스트는 `tests/test_wandb_logging.py`.
+
 v2 실험은 기존 anchor config·파일·reward target을 그대로 사용해 네 조합을 비교한다. v1 PDMS 결과와 v2 EPDMS 결과를 같은 기준으로 섞지 않는다.
 
 [eval_para_ssr.sh](../scripts/evaluation/eval_para_ssr.sh)는 현재 기본 PDM 평가 진입점이다. 이를 실행했다고 EPDMS를 계산한 것으로 간주하지 않는다. EPDMS 성능 실험에는 실제 사용하는 공식 평가 버전·진입점·metric cache·traffic policy·구성 지표를 확인하고 네 조합에 동일하게 적용한다. 평가 옵션이 checkpoint 학습 옵션과 일치해야 한다.

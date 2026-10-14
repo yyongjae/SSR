@@ -147,12 +147,80 @@ def build_wandb_logger(
         return None
 
 
+# Config subtrees that distinguish one run from another.  They are uploaded as
+# the W&B run config so runs can be filtered/grouped by e.g.
+# ``agent.config.plan_det_memory_mode`` without reading the Hydra output dir.
+HPARAM_KEYS: Sequence[str] = ("agent", "dataloader", "trainer", "scene_filter", "split")
+
+
+def _to_plain(node: Any) -> Any:
+    """``OmegaConf`` node -> plain Python; falls back to unresolved on bad interpolations."""
+    from omegaconf import OmegaConf
+
+    if not OmegaConf.is_config(node):
+        return node
+    try:
+        return OmegaConf.to_container(node, resolve=True)
+    except Exception:  # noqa: BLE001 - e.g. ${oc.env:...} unset in this process
+        return OmegaConf.to_container(node, resolve=False)
+
+
+def hparams_from_cfg(cfg) -> Dict[str, Any]:
+    """Pick the Hydra subtrees worth storing as the W&B run config."""
+    out: Dict[str, Any] = {}
+    name = cfg.get("experiment_name", None)
+    if name is not None:
+        out["experiment_name"] = str(name)
+    for key in HPARAM_KEYS:
+        node = cfg.get(key, None)
+        if node is not None:
+            out[key] = _to_plain(node)
+    return out
+
+
+def auto_tags_from_cfg(cfg) -> List[str]:
+    """Tags derived from the agent config so ablation runs are tellable apart.
+
+    Covers the knobs the current experiments vary: image backbone, the two
+    planner memory options from report 41, and the v2 anchor planner.
+    """
+    agent = cfg.get("agent", None)
+    agent_cfg = agent.get("config", None) if agent is not None else None
+    if agent_cfg is None:
+        return []
+    tags: List[str] = []
+    arch = agent_cfg.get("image_architecture", None)
+    if arch:
+        tags.append(f"backbone:{arch}")
+    mode = agent_cfg.get("plan_det_memory_mode", None)
+    if mode:
+        tags.append(f"det_mem:{mode}")
+    segments = agent_cfg.get("plan_map_memory_segments", None)
+    if segments is not None:
+        tags.append(f"map_seg:{segments}")
+    if agent_cfg.get("plan_anchor", False):
+        tags.append("v2-anchor")
+    return tags
+
+
+def _merge_tags(*groups: Optional[Sequence[str]]) -> Optional[List[str]]:
+    merged: List[str] = []
+    for group in groups:
+        for tag in group or ():
+            tag = str(tag)
+            if tag and tag not in merged:
+                merged.append(tag)
+    return merged or None
+
+
 def build_loggers(cfg) -> List[Logger]:
     """TensorBoard always; W&B when ``cfg.wandb.enable`` is set.
 
     The TensorBoard logger reproduces Lightning's own default layout
     (``<output_dir>/lightning_logs/version_N``) so enabling W&B does not move
-    any existing event files.
+    any existing event files.  The W&B run additionally receives the Hydra
+    config subtrees in :data:`HPARAM_KEYS` as its run config and the tags from
+    :func:`auto_tags_from_cfg` on top of ``cfg.wandb.tags``.
     """
     output_dir = str(cfg.output_dir)
     loggers: List[Logger] = [TensorBoardLogger(save_dir=output_dir, name="lightning_logs")]
@@ -166,11 +234,12 @@ def build_loggers(cfg) -> List[Logger]:
         project=wandb_cfg.get("project", "para-ssr"),
         name=wandb_cfg.get("name", None) or str(cfg.experiment_name),
         group=wandb_cfg.get("group", None),
-        tags=wandb_cfg.get("tags", None),
+        tags=_merge_tags(wandb_cfg.get("tags", None), auto_tags_from_cfg(cfg)),
         entity=wandb_cfg.get("entity", None),
         mode=wandb_cfg.get("mode", "online"),
         exclude=wandb_cfg.get("exclude", DEFAULT_EXCLUDE),
         non_fatal=wandb_cfg.get("non_fatal", True),
+        config=hparams_from_cfg(cfg),
     )
     if wandb_logger is not None:
         loggers.append(wandb_logger)

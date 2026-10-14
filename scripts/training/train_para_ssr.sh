@@ -60,11 +60,14 @@ RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 
 # Weights & Biases. Runs alongside TensorBoard and is fail-open: an SDK or
 # service failure disables telemetry instead of killing a DDP rank.
-# TensorBoard is always on. Opt in with WANDB=1; for offline W&B also set
-# WANDB_MODE=offline (sync later).
-WANDB="${WANDB:-0}"
+# TensorBoard is always on. W&B is ON by default (entity/login from ~/.netrc);
+# WANDB=0 turns it off explicitly. For offline W&B set WANDB_MODE=offline and
+# `wandb sync` later. Run config + auto tags (backbone, det_mem, map_seg) are
+# attached in navsim/planning/training/wandb_logging.py.
+WANDB="${WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-para-ssr}"
 WANDB_GROUP="${WANDB_GROUP:-para-navsim}"
+WANDB_ENTITY="${WANDB_ENTITY:-chandsgdfkdsjvl}"   # personal W&B space, not the Robust_Ex team
 WANDB_MODE_ARG="${WANDB_MODE:-online}"
 
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
@@ -75,12 +78,13 @@ if [[ "${GLOBAL_BATCH}" -ne 128 ]]; then
   echo "warning: effective global batch is ${GLOBAL_BATCH}, not the configured recipe value 128" >&2
 fi
 
-WANDB_ARGS=()
+WANDB_ARGS=("wandb.enable=false")
 if [[ "${WANDB}" != "0" ]]; then
-  WANDB_ARGS+=(
+  WANDB_ARGS=(
     "wandb.enable=true"
     "wandb.project=${WANDB_PROJECT}"
     "wandb.group=${WANDB_GROUP}"
+    "wandb.entity=${WANDB_ENTITY}"
     "wandb.mode=${WANDB_MODE_ARG}"
     "wandb.name=${EXPERIMENT}"
     "wandb.tags=[para-ssr,navsim,no-ffp,aux,global${GLOBAL_BATCH},${MAX_EPOCHS}ep]"

@@ -80,9 +80,12 @@ class ParaSSRConfig:
     ffn_channels: int = 512
     num_feature_levels: int = 1
 
-    # The tag matters: bare timm ``resnet50`` resolves to its A1 recipe, while
-    # original SSR uses torchvision://resnet50 (0676ba61 / tv_in1k).
-    image_architecture: str = "resnet50.tv_in1k"
+    # NAVSIM-standard ResNet-34 (TransFuser / WoTE / DiffusionDrive), torchvision
+    # weights.  The ``.tv_in1k`` tag matters: a bare timm ``resnet34``/``resnet50``
+    # resolves to timm's A1 recipe.  Original SSR used torchvision resnet50
+    # (``resnet50.tv_in1k``); the channel width is read from timm feature_info,
+    # so either tag works without further changes.
+    image_architecture: str = "resnet34.tv_in1k"
     # Training starts from ImageNet weights.  Checkpoint evaluation overrides
     # this to False: the strict checkpoint load immediately replaces every
     # parameter, so asking timm to download/cache a second copy is unnecessary

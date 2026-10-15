@@ -778,12 +778,22 @@ def compute_loss(out: Dict, corr: Dict, batch: Dict, a) -> Tuple[torch.Tensor, D
     return loss, st
 
 
+def _all_ck_keys():
+    from navsim.agents.para_ssr.ck.constants import CK_KEYS
+    return list(CK_KEYS)
+
+
 def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
     """refiner v4 terms (absent outputs / batch keys -> unchanged loss and stats):
       + lambda_pref * Huber(log1p P_ref) (out 'pref_logp', batch 'pref' [T] m, NaN = no target);
       + lambda_station * censored station BCE (hazard readout 'haz' / 'extra_haz', batch 'anc_tidx' [T, K, 3] /
-        'var_tidx' [T, V, 3], same masks as the score BCE)."""
+        'var_tidx' [T, V, 3], same masks as the score BCE);
+      + lambda_ev * evidence aux (evidence readout: occupancy BCE / drivable-margin Huber).
+    Specialist teachers (--score-keys, user 2026-10-08): the station terms are restricted to the hazard keys in
+    score_keys (DET nc,ttc,ep,comfort -> nc, ttc; MAP dac,ep -> dac), the occupancy aux needs nc or ttc and the margin
+    aux dac (review 79 D(c))."""
     from navsim.agents.para_ssr.ck.v4 import losses as V4L
+    keys = set(getattr(a, "score_keys", None) or _all_ck_keys())
     if "pref_logp" in out:
         tgt, ok = None, batch["bev_ok"].bool().reshape(-1) if "bev_ok" in batch else None
         if "pref" in batch:
@@ -804,17 +814,19 @@ def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
             ref["ref_gt_ok"] = ref["ref_gt_ok"].bool() & batch["bev_ok"].bool().reshape(-1)
         l_occ, l_m, s_ev = V4L.evidence_aux(out["haz"], ref)
         st.update(s_ev)
-        loss = loss + float(a.lambda_ev) * (l_occ + l_m)
+        w_occ = 1.0 if keys & {"nc", "ttc"} else 0.0
+        w_m = 1.0 if "dac" in keys else 0.0
+        loss = loss + float(a.lambda_ev) * (w_occ * l_occ + w_m * l_m)
     if "haz" in out and "a_nc" in out["haz"] and float(getattr(a, "lambda_station", 0.0) or 0.0) > 0 \
             and "anc_tidx" in batch:
         sets = [(out["haz"], batch["anc_tidx"], batch["y"], batch["y_ok"])]
         if "extra_haz" in out and "var_tidx" in batch:
             sets.append((out["extra_haz"], batch["var_tidx"], batch["var_y"], batch["var_ok"]))
         haz = {k: torch.cat([s[0][k] for s in sets], 1) for k in sets[0][0]}
-        tidx = torch.cat([s[1].to(haz["t_arr"].device).long() for s in sets], 1)
+        tidx = torch.cat([s[1].to(haz["haz_mask"].device).long() for s in sets], 1)
         y5 = torch.cat([s[2].float() for s in sets], 1)
         ok = torch.cat([s[3].bool() for s in sets], 1)
-        l_st, s_st = V4L.station_bce(haz, tidx, y5, ok)
+        l_st, s_st = V4L.station_bce(haz, tidx, y5, ok, keys=keys)
         st.update(s_st)
         with torch.no_grad():
             st.update(V4L.localisation_hit({k: v.detach() for k, v in haz.items()}, tidx, y5, ok))

@@ -617,6 +617,15 @@ def _keep_parent(cand_s: torch.Tensor, parent: torch.Tensor, good: torch.Tensor)
     return torch.where(g[..., None, None], parent.float(), cand_s.float())
 
 
+def infer_pool(traj96: torch.Tensor, top16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The 96 pool as CKE2E2.infer scores it (also tools/ck/e2e2/eval_e2e2.stage_infer_check): traj96 [B, 96, 8, 3]
+    (c = k * 6 + v, may hold NaN), top16 [B, 16, 8, 3] (the identities, traj96[:, ::6]) -> (candidates with
+    non-finite ones replaced by v2's trajectory top16[:, 0], finite mask [B, 96], each candidate's parent draft
+    [B, 96, 8, 3] (its rank's identity; a replaced candidate is its own parent))."""
+    cand, fin = _sanitize_traj(traj96, top16[:, 0])
+    return cand, fin, _keep_parent(cand, top16.float().repeat_interleave(NV, 1), fin)
+
+
 # ----------------------------------------------------------------------------------------------- teachers
 def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optional[Dict[str, torch.Tensor]] = None,
                     parents: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1271,8 +1280,12 @@ class CKE2E2:
         from .v4.corrector import awr_loss, credit, critic_select_score
         E, nG = S["E"], int(S["n_G"])
         feat, mem, ego, pref = out["scene"]
-        logp = student.corrector_logp(feat, mem, ego, E["E_src_traj"].float(), E["E_src_par"].float(),
-                                      E["E_u"].float(), pref=pref)
+        # fp32 outside the loss's autocast: the scene features come from student_forward2 (fp16 under amp), the
+        # re-score runs here after that scope has closed (review 79 F8)
+        feat, mem = feat.float(), mem.float()
+        with torch.autocast(device_type=feat.device.type, enabled=False):
+            logp = student.corrector_logp(feat, mem, ego, E["E_src_traj"].float(), E["E_src_par"].float(),
+                                          E["E_u"].float(), pref=None if pref is None else pref.float())
         s_all = critic_select_score(s_lab.detach())
         KE = E["E_ok"].shape[1]
         R_all = torch.cat([E["G_pdms"].float(), E["E_pdms"].float()], 1)
@@ -1303,8 +1316,7 @@ class CKE2E2:
         status = features["status_feature"].float().to(dev)
         v0 = ego_inputs(status)[0]
         V = C2.online_variants(top["cand"], v0_from_status(status), self.cfg.variants)
-        cand, fin = _sanitize_traj(V["traj96"], top["cand"][:, 0])
-        par = _keep_parent(cand, top["cand"].float().repeat_interleave(NV, 1), fin)      # c = k * 6 + v -> parent k
+        cand, fin, par = infer_pool(V["traj96"], top["cand"])                 # c = k * 6 + v -> parent k
         ce = None
         with torch.autocast(device_type=dev.type, enabled=False):
             if getattr(student, "corrector", None) is not None:

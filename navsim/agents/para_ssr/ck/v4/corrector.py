@@ -98,10 +98,16 @@ def credit(s_all: torch.Tensor, R_all: torch.Tensor, ok_all: torch.Tensor, edit_
     R = torch.where(ok_all, R_all.float(), torch.zeros_like(R_all.float()))
     p = torch.softmax(s, -1)
     f_all = (p * R).sum(-1, keepdim=True)                                          # [B, 1]
-    pe = torch.gather(p, 1, edit_cols)
     Re = torch.gather(R, 1, edit_cols)
-    # f(S \\ i): renormalise without i
-    f_wo = (f_all - pe * Re) / (1.0 - pe).clamp(min=1e-6)
+    # f(S \\ i): the softmax recomputed without column i (exact; the renormalisation (f - p_i R_i) / (1 - p_i)
+    # cancels catastrophically in float32 when p_i rounds to 1, review 79 F3)
+    K = edit_cols.shape[1]
+    drop = torch.zeros(s.shape[0], K, s.shape[1], dtype=torch.bool, device=s.device)
+    drop.scatter_(2, edit_cols[..., None], True)
+    s_wo = s[:, None, :].expand(-1, K, -1).masked_fill(drop, float("-inf"))
+    any_left = torch.isfinite(s_wo).any(-1)
+    p_wo = torch.softmax(torch.where(any_left[..., None], s_wo, torch.zeros_like(s_wo)), -1)
+    f_wo = torch.where(any_left, (p_wo * R[:, None, :]).sum(-1), torch.zeros_like(Re))
     a_sel = f_all - f_wo
     if R_src is not None:
         a_loc = Re - R_src.float()

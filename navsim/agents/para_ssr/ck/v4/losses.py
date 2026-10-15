@@ -1,15 +1,18 @@
 """refiner v4 losses (BCE-family only; no ranking / margin terms).
 
-station_bce  censored station BCE of the hazard readout (report 70 P1 M7, 72 I1), per key k in (nc, ttc, dac):
-  inputs  a [B, K, 48] station hazard logits, t [B, K, 48] the candidate's arrival time at the parent's stations,
-          m [B, K, 48] stations read (t <= horizon), tidx [B, K] first-failure time index of the official scorer
-          (n = 0..40 -> tau = 0.1 n s on the 41-state LQR grid; -1 no event; -2 unknown / not available), y [B, K] the
-          key's official label (fail iff y < 1), ok [B, K] candidate ok.
-  targets failing candidate (y < 1, tidx >= 0): station j* = the read station whose arrival time is closest to tau
-          -> positive; stations reached before tau - before_s -> negative; j* +- 1 and later stations ignored
-          (censored: after a failure the trajectory is not evaluated by the metric any more);
+station_bce  censored station BCE of the hazard readout (report 70 P1 M7, 72 I1), per key k in (nc, ttc, dac) (or the
+  `keys` subset: a specialist teacher only gets the station terms of its own score keys):
+  inputs  a [B, K, 48] station hazard logits, t_in / t_out [B, K, 48] the candidate's time interval in the parent's
+          station bins (entry, min(leave, horizon)), m [B, K, 48] stations read, tidx [B, K] first-failure time index
+          of the official scorer (n = 0..40 -> tau = 0.1 n s on the 41-state LQR grid; -1 no event; -2 unknown / not
+          available), y [B, K] the key's official label (fail iff y < 1), ok [B, K] candidate ok.
+  targets failing candidate (y < 1, tidx >= 0): station j* = the read station whose interval contains tau (else the
+          nearest interval) -> positive (a stopped / slow candidate's failure lands on the bin it dwells in);
+          stations left before tau - before_s -> negative; j* +- 1 and later stations ignored (censored: after a
+          failure the trajectory is not evaluated by the metric any more);
           passing candidate (y >= 1, tidx == -1): every read station negative;
           tidx == -2, y / tidx inconsistent, or no read station: no station term.
+  (haz dicts without t_in / t_out, e.g. older callers: t_in = t_out = t_arr, the bin-centre arrival time.)
   value   mean BCE over the weighted (candidate, station) entries of each key, then the mean over the keys present.
   TTC note: the scorer's TTC index is the ego time of the flagged step (the contact may be up to 0.9 s later), so the
   TTC positive marks where the ego is when the infraction is flagged.
@@ -29,39 +32,56 @@ TIDX_DT = 0.1                             # s per index (official scorer, 41-sta
 HAZ_KEYS = (("nc", "a_nc"), ("ttc", "a_ttc"), ("dac", "a_dac"))
 
 
-def station_targets(t: torch.Tensor, m: torch.Tensor, tidx: torch.Tensor, y: torch.Tensor, ok: torch.Tensor,
-                    before_s: float = 0.25) -> Tuple[torch.Tensor, torch.Tensor]:
+def _jstar(t_in: torch.Tensor, t_out: torch.Tensor, m: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+    """[.., 48] intervals, m read, tau [..] -> index of the read interval [t_in, t_out) containing tau, else the nearest
+    interval (distance to it; ties -> the lower index; zero-length intervals t_in == t_out = the old nearest arrival
+    time) [..]."""
+    tt = tau[..., None]
+    dist = (t_in - tt).clamp(min=0) + (tt - t_out).clamp(min=0)
+    dist = torch.where((t_in <= tt) & (tt < t_out), torch.full_like(dist, -1.0), dist)
+    return torch.where(m, dist, torch.full_like(dist, 1e6)).argmin(-1)
+
+
+def _intervals(haz: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    if "t_in" in haz and "t_out" in haz:
+        return haz["t_in"].float(), haz["t_out"].float()
+    t = haz["t_arr"].float()
+    return t, t
+
+
+def station_targets(t_in: torch.Tensor, t_out: torch.Tensor, m: torch.Tensor, tidx: torch.Tensor, y: torch.Tensor,
+                    ok: torch.Tensor, before_s: float = 0.25) -> Tuple[torch.Tensor, torch.Tensor]:
     """-> (target [B, K, 48] in {0, 1}, weight [B, K, 48] in {0, 1}) for one key (module docstring)."""
     m = m.bool() & ok.bool()[..., None]
     ti = tidx.long()
     fail = (y < 1.0) & (ti >= 0)
     pas = (y >= 1.0) & (ti == -1)
-    tau = ti.clamp(min=0).to(t.dtype) * TIDX_DT
-    big = torch.full_like(t, 1e6)
-    dist = torch.where(m, (t - tau[..., None]).abs(), big)
-    jstar = dist.argmin(-1)                                                       # [B, K]
+    tau = ti.clamp(min=0).to(t_in.dtype) * TIDX_DT
+    jstar = _jstar(t_in, t_out, m, tau)                                           # [B, K]
     has = torch.gather(m, -1, jstar[..., None])[..., 0]
-    j = torch.arange(t.shape[-1], device=t.device).view(1, 1, -1)
+    j = torch.arange(t_in.shape[-1], device=t_in.device).view(1, 1, -1)
     pos = (j == jstar[..., None]) & (fail & has)[..., None]
     near = ((j - jstar[..., None]).abs() <= 1) & ~pos
-    neg_f = m & (t < (tau - before_s)[..., None]) & ~near & (fail & has)[..., None]
+    neg_f = m & (t_out < (tau - before_s)[..., None]) & ~near & (fail & has)[..., None]
     neg_p = m & pas[..., None]
-    target = pos.to(t.dtype)
-    weight = (pos | neg_f | neg_p).to(t.dtype)
+    target = pos.to(t_in.dtype)
+    weight = (pos | neg_f | neg_p).to(t_in.dtype)
     return target, weight
 
 
 def station_bce(haz: Dict[str, torch.Tensor], tidx: torch.Tensor, y5: torch.Tensor, ok: torch.Tensor,
-                before_s: float = 0.25) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """haz = score_set / forward 'haz' dict ([B, K, 48] a_nc, a_ttc, a_dac, haz_mask, t_arr); tidx [B, K, 3] int
-    (TIDX_COLS order); y5 [B, K, 5] CK targets (CK_KEYS order); ok [B, K] -> (loss, stats).  0 (graph-connected) when
-    no key has a station term."""
-    t = haz["t_arr"].float()
+                before_s: float = 0.25, keys=None) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """haz = score_set / forward 'haz' dict ([B, K, 48] a_nc, a_ttc, a_dac, haz_mask, t_in, t_out (or t_arr)); tidx
+    [B, K, 3] int (TIDX_COLS order); y5 [B, K, 5] CK targets (CK_KEYS order); ok [B, K]; keys: the hazard keys to
+    supervise (None = nc, ttc, dac) -> (loss, stats).  0 (graph-connected) when no key has a station term."""
+    t_in, t_out = _intervals(haz)
     m = haz["haz_mask"].bool()
     terms, st = [], {}
     for c, (key, ak) in enumerate(HAZ_KEYS):
+        if keys is not None and key not in keys:
+            continue
         a = haz[ak].float()
-        tg, w = station_targets(t, m, tidx[..., c], y5[..., CK_KEYS.index(key)].float(), ok, before_s)
+        tg, w = station_targets(t_in, t_out, m, tidx[..., c], y5[..., CK_KEYS.index(key)].float(), ok, before_s)
         n = w.sum()
         st[f"st_n_{key}"] = float(n.detach())
         st[f"st_npos_{key}"] = float((tg * w).sum().detach())
@@ -80,7 +100,7 @@ def localisation_hit(haz: Dict[str, torch.Tensor], tidx: torch.Tensor, y5: torch
                      ok: torch.Tensor) -> Dict[str, float]:
     """Diagnostic (report 70 P1 (i)): for failing candidates, fraction whose argmax hazard station is the labelled
     failure station (|j - j*| <= 1) per key; the chance level is 3 / (number of read stations)."""
-    t = haz["t_arr"].float()
+    t_in, t_out = _intervals(haz)
     m = haz["haz_mask"].bool() & ok.bool()[..., None]
     out = {}
     for c, (key, ak) in enumerate(HAZ_KEYS):
@@ -89,8 +109,8 @@ def localisation_hit(haz: Dict[str, torch.Tensor], tidx: torch.Tensor, y5: torch
         if not bool(fail.any()):
             continue
         tau = ti.clamp(min=0).float() * TIDX_DT
-        jstar = torch.where(m, (t - tau[..., None]).abs(), torch.full_like(t, 1e6)).argmin(-1)
-        a = torch.where(m, haz[ak].float(), torch.full_like(t, -1e9))
+        jstar = _jstar(t_in, t_out, m, tau)
+        a = torch.where(m, haz[ak].float(), torch.full_like(t_in, -1e9))
         jhat = a.argmax(-1)
         hit = ((jhat - jstar).abs() <= 1) & fail
         out[f"loc_hit_{key}"] = float(hit.sum()) / float(fail.sum())

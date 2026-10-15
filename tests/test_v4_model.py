@@ -131,7 +131,8 @@ def test_noisy_or_and_time_embed():
     p = torch.sigmoid(-a)[m].prod()
     assert abs(float(torch.sigmoid(noisy_or_logit(a, m))) - float(p)) < 1e-6
     big = noisy_or_logit(torch.full((1, 48), -30.0), torch.zeros(1, 48, dtype=torch.bool))
-    assert float(big) > 10                                             # nothing read -> pass ~ 1, finite
+    assert float(big) > 10 and math.isfinite(float(big))              # empty mask: finite (the readout never passes
+    # one: read_mask always reads station 0, test_near_stop_reads_and_learns)
     e = time_embed(torch.tensor([0.0, 2.0, 20.0]), 3)
     assert e.shape == (3, 7) and float(e[2, 0]) == 2.0                 # clamped to 8 s
 
@@ -143,7 +144,7 @@ def test_station_targets():
     tidx = torch.tensor([[20, -1, -2]])                                  # fail at 2.0 s / pass / unknown
     y = torch.tensor([[0.0, 1.0, 0.0]])
     ok = torch.ones(1, 3, dtype=torch.bool)
-    tg, w = V4L.station_targets(t.expand(1, 3, 48), m, tidx, y, ok)
+    tg, w = V4L.station_targets(t.expand(1, 3, 48), t.expand(1, 3, 48), m, tidx, y, ok)   # zero-length = old rule
     assert float(tg[0, 0, 20]) == 1 and float(w[0, 0, 20]) == 1 and float(tg[0, 0].sum()) == 1
     assert float(w[0, 0, 19]) == 0 and float(w[0, 0, 21]) == 0 and float(w[0, 0, 30]) == 0      # near / censored
     assert float(w[0, 0, :18].sum()) == 18 and float(w[0, 0, 18]) == 0                        # before tau - 0.25 s
@@ -157,6 +158,23 @@ def test_station_targets():
     assert abs(float(l) - math.log(2)) < 1e-5 and st["st_npos_nc"] == 1.0
     assert float(pref_loss(torch.tensor([math.log1p(10.0)]), torch.tensor([10.0]))) < 1e-9
     assert float(pref_loss(torch.tensor([1.0]), torch.tensor([float("nan")]))) == 0.0
+    # station intervals: a candidate stopped in bin 0 (only station 0 read, dwells 0..4 s) failing at 3.5 s -> its
+    # positive is station 0; a slow one with bins [0, 1.5) [1.5, 3) [3, 4] failing at 3.5 s -> station 2 positive,
+    # station 0 negative (left before tau - 0.25 s), station 1 ignored (j* - 1)
+    inf = float("inf")
+    t_in = torch.full((1, 2, 48), inf)
+    t_out = torch.full((1, 2, 48), inf)
+    t_in[0, 0, 0], t_out[0, 0, 0] = 0.0, 4.0
+    t_in[0, 1, :3], t_out[0, 1, :3] = torch.tensor([0.0, 1.5, 3.0]), torch.tensor([1.5, 3.0, 4.0])
+    mm = torch.isfinite(t_in)
+    tg, w = V4L.station_targets(t_in, t_out, mm, torch.tensor([[35, 35]]), torch.tensor([[0.0, 0.0]]),
+                                torch.ones(1, 2, dtype=torch.bool))
+    assert float(tg[0, 0, 0]) == 1 and float(w[0, 0].sum()) == 1
+    assert float(tg[0, 1, 2]) == 1 and w[0, 1, :3].tolist() == [1.0, 0.0, 1.0] and float(w[0, 1].sum()) == 2
+    # boundary: tau on a bin edge belongs to the later bin ([t_in, t_out)); tau = 4.0 s to the last one
+    tg, _ = V4L.station_targets(t_in, t_out, mm, torch.tensor([[40, 15]]), torch.tensor([[0.0, 0.0]]),
+                                torch.ones(1, 2, dtype=torch.bool))
+    assert float(tg[0, 0, 0]) == 1 and float(tg[0, 1, 1]) == 1
 
 
 # ----------------------------------------------------------------------------------------------- hazard net
@@ -290,7 +308,7 @@ def test_evidence_forward_backward_and_aux(data):
     o = net(data["bev"], data["traj96"], data["status"], decode=False, cand_parent=data["par96"])
     h = o["haz"]
     assert o["score_logit"].shape == (T, 96, 5) and torch.isfinite(o["score_logit"]).all()
-    assert h["occ_logit"].shape == (T, 96, 48, 17, 8) and h["margin"].shape == (T, 96, 48, 17)
+    assert h["occ_logit"].shape == (T, 96, 48, 17, 10) and h["margin"].shape == (T, 96, 48, 17)   # bins to 5.0 s
     assert h["pts"].shape == (T, 96, 48, 17, 2) and int(h["is_self"].sum()) == T * 16
     p = torch.sigmoid(o["score_logit"])
     assert float(p[..., 0].min()) > 0.5                          # sparse occupancy prior -> NC mostly passes
@@ -338,11 +356,13 @@ def test_corrector_identity_credit_awr(data):
     lp = net.corrector_logp(feat, mem, ego, src, torch.gather(data["par96"], 1, ce["src_idx"][..., None, None]
                                                               .expand(T, 4, 8, 3)), ce2["u"], pref=pref)
     assert torch.allclose(lp, ce2["logp"], atol=1e-4)
-    # credit: an edit that is picked and better than its source gets A > 0; a picked trap A < 0
+    # credit: an edit that is picked and better than its source gets A > 0; a picked trap A < 0 (exact
+    # leave-one-out values: f(S \\ edit) is the softmax over the two others = 0.35 / 0.7)
     s_all = torch.tensor([[0.0, 0.0, 5.0], [0.0, 0.0, 5.0]])
     R_all = torch.tensor([[0.5, 0.2, 1.0], [0.5, 0.9, 0.0]])
     ok = torch.ones(2, 3, dtype=torch.bool)
     c = CR.credit(s_all, R_all, ok, torch.tensor([[2], [2]]), torch.tensor([[0], [0]]))
+    assert abs(float(c["A_sel"][0, 0]) - 0.65) < 1e-6 and abs(float(c["A_sel"][1, 0]) + 0.7) < 1e-6
     assert float(c["A"][0, 0]) > 0 and float(c["A"][1, 0]) < 0 and abs(float(c["A_loc"][0, 0]) - 0.5) < 1e-6
     # AWR: weights favour positive advantages; gradient reaches mu / log_sig
     l = CR.awr_loss(ce2["logp"], torch.randn(T, 4) * 0.1, torch.ones(T, 4, dtype=torch.bool))

@@ -3,13 +3,16 @@
 Scene quantities (learned, candidate-free; predicted on the PARENT's station grid by small per-cell MLPs on the corridor
 conv features Hc [B, 128, 48, 17] and the station tokens x' [B, 48, d]):
   O [B, 48, 17, M] occupancy logits: another object covers the grid point (station j, lateral offset i) at time bin m
-                   (t_m = 0.5 (m + 1) s, M = ev_tbins <= 8);
+                   (t_m = 0.5 (m + 1) s, M = ev_tbins <= 10; 10 bins reach 5.0 s, past the official TTC's 4.9 s);
   D [B, 48, 17]    drivable margin [m]: signed distance of the grid point to the official DAC boundary (+ inside).
 Candidate quantities (geometry, no parameters; ck/v4/sibling.on_parent knots on the parent's grid):
   knots k = 1..8 (t = 0.5 k s): arc length s_k, lateral offset d_k, speed v_k = (s_k - s_{k-1}) / 0.5.
   Ego box (geometry.HALF_LEN 2.588, HALF_WID 1.1485, centre RA2C 1.461 m ahead of the rear axle) approximated in the
   parent's path frame (heading relative to the path ignored): 9 footprint points (3 along x 3 across), 4 corners.
-Evidence (the official rules, differentiable).  Points of one footprint (and the TTC deltas of one knot) see the SAME
+Evidence (official-rule-shaped differentiable approximations, NOT the scorer: no at-fault / stopped-ego / static-object
+logic for NC, the raw 8 poses instead of the 41 LQR-tracked states, the footprint in the parent's path frame without
+the heading relative to the path, the TTC projection along the parent path instead of straight along the ego heading,
+no TTC delta 0; tests/test_v4_model.py lists what is checked).  Points of one footprint (and the TTC deltas of one knot) see the SAME
 objects, so they are combined with a soft maximum of their logits (smax: tau logsumexp(z / tau), tau 0.5 -- "the
 footprint overlaps something"), and the knots with a noisy-OR (log P_pass = sum_k log(1 - p_k)):
   NC   log P = sum_k logsigmoid(-smax_{9 points} O(point, t_k))              (bilinear in (j, i), bin of t_k)
@@ -20,7 +23,8 @@ footprint overlaps something"), and the knots with a noisy-OR (log P_pass = sum_
   in the scorer, but the parent grid cannot say more; the residual can learn the out-of-grid share.
 Score: logit_k = logit(P_k) + residual_k([log P_nc, log P_ttc, log P_dac, min corner margin, g_c]) (zero-initialised
   MLP, ev_resid), EP / comfort heads as the hazard readout, lateral head on [g_c, margin-weighted station features].
-Outputs also O, D (aux losses: evidence_aux in ck/v4/losses.py) and per-candidate reasons (argmax point / time)."""
+Outputs also O, D (aux losses: evidence_aux in ck/v4/losses.py) and the per-key log evidence lp_nc / lp_ttc / lp_dac and
+the minimum corner margin (the per-candidate reason; the argmax point / time is not returned yet)."""
 from __future__ import annotations
 
 import math
@@ -36,7 +40,7 @@ from ...refiner.decoder import N_FREE
 from ...refiner.geometry import HALF_LEN, HALF_WID, RA2C
 from ..constants import CK_KEYS
 from .config import V4Cfg
-from .readout import EP_MIN_DIST, HC_CH, I_C, I_DAC, I_EP, I_NC, I_TTC, LAT_STEP, _mlp, lateral_read
+from .readout import EP_MIN_DIST, HC_CH, I_C, I_DAC, I_EP, I_NC, I_TTC, LAT_STEP, _mlp, lateral_read, read_mask
 
 TTC_DELTAS = (0.3, 0.6, 0.9)
 T_BIN = 0.5
@@ -95,13 +99,14 @@ class EvidenceReadout(nn.Module):
         self.cfg = cfg
         d = d_model
         M = int(cfg.ev_tbins)
-        self.occ_head = _mlp(HC_CH + d, 128, M)
-        self.marg_head = _mlp(HC_CH + d, 128, 1)
+        he = int(cfg.ev_hidden)
+        self.occ_head = _mlp(HC_CH + d, he, M)
+        self.marg_head = _mlp(HC_CH + d, he, 1)
         self.log_eps = nn.Parameter(torch.tensor(math.log(float(cfg.ev_eps))))
-        self.resid = _mlp(4 + d, 128, 3, zero_last=True) if cfg.ev_resid else None
+        self.resid = _mlp(4 + d, he, 3, zero_last=True) if cfg.ev_resid else None
         self.ep_head = _mlp(3 * d + 3, int(cfg.ep_hidden), 1)
-        self.comfort_head = _mlp(d, 128, 1)
-        self.lat_head = _mlp(2 * d + HC_CH, 256, N_FREE, zero_last=True)
+        self.comfort_head = _mlp(d, int(cfg.comfort_hidden), 1)
+        self.lat_head = _mlp(2 * d + HC_CH, int(cfg.lat_hidden), N_FREE, zero_last=True)
 
     @torch.no_grad()
     def set_prior(self, prior: Sequence[float]) -> None:
@@ -123,11 +128,12 @@ class EvidenceReadout(nn.Module):
         return self.occ_head(z).float(), self.marg_head(z)[..., 0].float()
 
     def forward(self, xs: torch.Tensor, xd: torch.Tensor, Hc: torch.Tensor, g: torch.Tensor, s_st: torch.Tensor,
-                s_k: torch.Tensor, d_k: torch.Tensor, d_st: torch.Tensor, t_st: torch.Tensor, S8: torch.Tensor,
-                pref: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                s_k: torch.Tensor, d_k: torch.Tensor, d_st: torch.Tensor, t_in: torch.Tensor, t_leave: torch.Tensor,
+                S8: torch.Tensor, pref: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """xs [B, 48, d], xd [B, d], Hc [B, 128, 48, 17] (parent pass), g [B, d] (candidate draft embedding),
-        s_st [B, 48] parent station arc lengths, s_k / d_k [B, 9] candidate knots on the parent's grid, d_st / t_st
-        [B, 48] candidate lateral offset / arrival time at the stations, S8 [B], pref [B] log1p P_ref | None."""
+        s_st [B, 48] parent station arc lengths, s_k / d_k [B, 9] candidate knots on the parent's grid, d_st [B, 48]
+        candidate lateral offset at the stations, t_in / t_leave [B, 48] entry / leave time of the station bins
+        (stations read as the hazard readout: readout.read_mask), S8 [B], pref [B] log1p P_ref | None."""
         B = xs.shape[0]
         dt = xs.dtype
         O, D = self.scene(xs, Hc)
@@ -186,7 +192,10 @@ class EvidenceReadout(nn.Module):
             logit[:, I_TTC] = logit[:, I_TTC] + r[:, 1]
             logit[:, I_DAC] = logit[:, I_DAC] + r[:, 2]
         # EP / comfort (as the hazard readout)
-        m = (t_st <= float(self.cfg.horizon)) & torch.isfinite(t_st)
+        H = float(self.cfg.horizon)
+        m = read_mask(t_in, H)
+        t_out = torch.where(m, torch.minimum(t_leave.float(), torch.full_like(t_leave.float(), H)),
+                            torch.zeros_like(t_leave.float()))
         mf = m.to(dt)[..., None]
         xs_mean = (xs * mf).sum(1) / mf.sum(1).clamp(min=1.0)
         S = S8.float().clamp(min=0.0)
@@ -206,5 +215,5 @@ class EvidenceReadout(nn.Module):
         w = torch.where(m.any(-1, keepdim=True), w, torch.zeros_like(w)).to(dt)
         f = lateral_read(Hc, d_st).to(dt)
         w_lat = self.lat_head(torch.cat([g, (w[..., None] * xs).sum(1), (w[..., None] * f).sum(1)], -1)).float()
-        return {"score_logit": logit, "w_lat": w_lat, "occ_logit": O, "margin": D, "mask": m,
+        return {"score_logit": logit, "w_lat": w_lat, "occ_logit": O, "margin": D, "mask": m, "t_out": t_out,
                 "lp_nc": lp_nc, "lp_ttc": lp_ttc, "lp_dac": lp_dac, "min_margin": min_marg}

@@ -7,11 +7,17 @@ readout
             * scene reading per PARENT path: corridor (48 stations x 17 lateral offsets) + 4 layers on the parent's
               draft (time_free: the parent's own arrival-time / speed geo channels are zeroed, so the station
               features describe the scene along the path, not a schedule);
-            * every candidate c reads its parent's stations at its OWN arrival time t_c(j), speed v_c(j) and lateral
-              offset d_c(j) (sibling.on_parent: Frenet projection of c's poses on the parent's station frame);
-            * per-key station hazard a_k(j) = MLP_k(x'_j, Hc(j, d_c(j)), phi(t_c(j)), v_c(j)) for NC / TTC, and
-              MLP_dac(x'_j, Hc(j, d_c(j)), d_c(j)) for DAC (no time);
-            * noisy-OR over the stations reached within `horizon`: log P_pass,k = sum_j m_c(j) log sigmoid(-a_k(j))
+            * every candidate c reads its parent's stations over the time it spends in each station's bin
+              [s_j - ds / 2, s_j + ds / 2): entry time t_in,c(j), dwell w_c(j) = min(t_leave, horizon) - t_in, speed
+              v_c(j) and lateral offset d_c(j) (sibling.on_parent: Frenet projection of c's poses on the parent's
+              station frame).  A station is read when the candidate enters its bin within `horizon`, so station 0 is
+              always read (no candidate reads nothing; a stopped candidate reads the bin it stops in with a long
+              dwell);
+            * per-key station hazard a_k(j) = MLP_k(x'_j, Hc(j, d_c(j)), phi(t_in,c(j)), w_c(j), v_c(j), e_c) for
+              NC / TTC, and MLP_dac(x'_j, Hc(j, d_c(j)), d_c(j), e_c) for DAC (no time); e_c = the candidate's
+              feasibility from the ego state (v0, planned first-segment speed change, stopping deceleration
+              v0^2 / 2 S_8: plans the LQR tracker cannot follow overshoot them);
+            * noisy-OR over the read stations: log P_pass,k = sum_j m_c(j) log sigmoid(-a_k(j))
               (0 learned parameters; the metric is 'fails if it fails anywhere');
             * EP head on [g_c, parent draft token, masked station mean, log1p S_8, log1p P_ref, S_8 / max(P_ref, S_8,
               5 m)] (P_ref detached), comfort head on the candidate's kinematics only (g_c = draft_mlp(u_d,c)),
@@ -22,15 +28,21 @@ readout
   'evidence' v4 report 77 Q4-2 (evidence-decomposed critic): the same parent pass; the readout first predicts SCENE
             quantities on the parent's station grid -- occupancy logits O[j, i, m] (other objects at station j, lateral
             offset i, time bin m = 0.5 (m + 1) s) and the drivable margin D[j, i] (signed distance to the DAC boundary,
-            m) -- then turns them into per-candidate evidence with the official rules: NC = noisy-OR of O over the ego
-            footprint (9 points) at the candidate's knots, TTC = the same over the footprint projected v * {0.3, 0.6,
+            m) -- then turns them into per-candidate evidence with official-rule-shaped approximations (evidence.py
+            docstring lists the differences): NC = noisy-OR of O over the ego footprint (9 points) at the candidate's
+            knots, TTC = the same over the footprint projected v * {0.3, 0.6,
             0.9} s ahead at t + delta, DAC = noisy-OR of sigmoid(-D / eps) over the 4 corners; + a zero-initialised
             residual MLP per key (what the rules do not explain); EP / comfort / lateral heads as 'hazard' (the
             lateral weights from the margin along the path).  Outputs O / D for the auxiliary losses (GT objects /
             the official drivable SDF on the parent grid points) and as the per-candidate 'reason'.
-pref_head   one learned query over the 200 scene tokens + ego (v0, a0, command) -> log1p(P_ref) per token, P_ref =
-            labels 'pdm_progress_eff' (token constant).  Used by the hazard EP head (detached); its own loss is
-            lambda_pref * Huber (callers).
+pref_head   one learned query over the 200 scene tokens (attention pooling) + ego (v0, a0, command) -> log1p(P_ref)
+            per token, P_ref = labels 'pdm_progress_eff' (token constant).  Used by the hazard EP head (detached); its
+            own loss is lambda_pref * Huber (callers).
+Head sizes (haz_hidden, ep_hidden, comfort_hidden, lat_hidden, pref_kdim, pref_hidden, ev_hidden): the defaults give
+the hazard + P_ref (and the evidence + P_ref) critic the trainable parameter count of the CK2 critic it replaces (CK2 as trained: 3,391,755 = the shared trunk
+3,191,808 + score head 99,845 + lateral head 100,102; the new heads together take the 199,947 of the two replaced
+heads, tests/test_v4_model.py::test_param_budget), so a v4 vs CK2 comparison is not a capacity comparison (report 74,
+review 79 F7).
 """
 from __future__ import annotations
 
@@ -39,7 +51,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 READOUTS = ("mean", "hazard", "evidence")
-CONFIG_VERSION = "v4_1"
+CONFIG_VERSION = "v4_2"          # v4_2: interval station reads + feasibility, matched head sizes, 10 ev bins
 
 
 @dataclass(frozen=True)
@@ -50,10 +62,16 @@ class V4Cfg:
     lat_haz: bool = True               # hazard: hazard-localised lateral head (False: lateral head on [g_c, mean x'])
     horizon: float = 4.0               # [s] stations first reached later than this are not read (label horizon)
     n_freq: int = 4                    # time embedding: t/4, sin / cos(2 pi m t / 8), m = 1..n_freq
-    haz_hidden: int = 128
-    ep_hidden: int = 256
+    haz_hidden: int = 48
+    ep_hidden: int = 96
+    comfort_hidden: int = 32
+    lat_hidden: int = 128
+    pref_kdim: int = 64
+    pref_hidden: int = 52
+    ev_hidden: int = 56                # evidence: hidden width of the occupancy / margin / residual MLPs
     prior_n_eff: float = 24.0          # set_score_prior: per-station hazard prior = 1 - p^(1 / n_eff)
-    ev_tbins: int = 8                  # evidence: occupancy time bins t = 0.5 (m + 1) s, m = 0..ev_tbins-1
+    ev_tbins: int = 10                 # evidence: occupancy time bins t = 0.5 (m + 1) s, m = 0..ev_tbins-1 (10: to
+                                       # 5.0 s, the official TTC reads object states up to 4.9 s)
     ev_eps: float = 0.3                # evidence: initial margin temperature [m] of p_out = sigmoid(-D / eps)
     ev_resid: bool = True              # evidence: zero-initialised residual MLP per key
     corrector: bool = False            # learned corrector A on the critic's top-corr_k (needs a parent-pass readout)
@@ -86,13 +104,13 @@ class V4Cfg:
             raise ValueError("v4.corrector needs readout 'hazard' or 'evidence' (its context is the parent pass)")
         if not (1 <= int(self.corr_k) <= 32):
             raise ValueError(f"v4.corr_k {self.corr_k} must be in [1, 32]")
-        if not (1 <= int(self.ev_tbins) <= 8) or not (0.01 <= float(self.ev_eps) <= 5.0):
-            raise ValueError(f"v4: ev_tbins {self.ev_tbins} must be in [1, 8], ev_eps {self.ev_eps} in [0.01, 5]")
+        if not (1 <= int(self.ev_tbins) <= 10) or not (0.01 <= float(self.ev_eps) <= 5.0):
+            raise ValueError(f"v4: ev_tbins {self.ev_tbins} must be in [1, 10], ev_eps {self.ev_eps} in [0.01, 5]")
         if not (0.5 <= float(self.horizon) <= 8.0):
             raise ValueError(f"v4.horizon {self.horizon} outside [0.5, 8] s")
-        if int(self.n_freq) < 0 or int(self.haz_hidden) < 8 or int(self.ep_hidden) < 8:
-            raise ValueError(f"v4: bad sizes n_freq {self.n_freq} haz_hidden {self.haz_hidden} "
-                             f"ep_hidden {self.ep_hidden}")
+        sizes = ("haz_hidden", "ep_hidden", "comfort_hidden", "lat_hidden", "pref_kdim", "pref_hidden", "ev_hidden")
+        if int(self.n_freq) < 0 or any(int(getattr(self, k)) < 8 for k in sizes):
+            raise ValueError(f"v4: bad sizes n_freq {self.n_freq} " + " ".join(f"{k} {getattr(self, k)}" for k in sizes))
         if float(self.prior_n_eff) < 1.0:
             raise ValueError(f"v4.prior_n_eff {self.prior_n_eff} < 1")
         if self.version != CONFIG_VERSION:

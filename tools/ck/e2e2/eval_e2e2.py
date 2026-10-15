@@ -543,7 +543,7 @@ def stage_label(P: Paths, a) -> None:
 def stage_infer_check(P: Paths, a, tol_logit: float = 3e-2, tol_traj: float = 2e-3) -> Dict:
     import torch
     from navsim.agents.para_ssr.ck.model import load_ck
-    from navsim.agents.para_ssr.ck.online2 import lateral_decode, student_forward2
+    from navsim.agents.para_ssr.ck.online2 import infer_pool, lateral_decode, student_forward2
     from navsim.agents.para_ssr.refiner.e2e import ego_inputs
     f = P.infer / "check_bev.npz"
     if not f.is_file():
@@ -564,13 +564,32 @@ def stage_infer_check(P: Paths, a, tol_logit: float = 3e-2, tol_traj: float = 2e
     else:
         dev = torch.device("cpu")
     net, cfg = load_ck(P.ck_run, "last", str(dev))
-    cand = torch.from_numpy(np.load(P.packed / "cand96.npy", mmap_mode="r")[rows].astype(np.float32)).to(dev)
+    raw = torch.from_numpy(np.load(P.packed / "cand96.npy", mmap_mode="r")[rows].astype(np.float32)).to(dev)
     status = torch.from_numpy(np.load(P.packed / "status.npy", mmap_mode="r")[rows].astype(np.float32)).to(dev)
+    # the pool exactly as CKE2E2.infer scores it: sanitised candidates + each candidate's parent (refiner v4 parent-pass
+    # readouts read the scene on the parent's corridor; the mean readout ignores the parents)
+    cand, fin, par = infer_pool(raw, raw[:, ::6])
+    bev_t = torch.from_numpy(bev).to(dev)
     with torch.no_grad():
-        o = student_forward2(net, torch.from_numpy(bev).to(dev), cand, status)
+        if getattr(net, "corrector", None) is not None:
+            # refiner v4 corrector A: the same ops as CKE2E2.infer (score_set + correct_topk), edits checked too
+            ego = ego_inputs(status)
+            feat, mem = net.trunk.scene(bev_t, cand.shape[0])
+            pref = net.scene_pref(mem, ego)
+            o = net.score_set(feat, mem, ego, cand, par, pref=pref, return_ctx=True)
+            valid = torch.from_numpy(np.load(P.packed / "valid96.npy", mmap_mode="r")[rows].astype(bool)).to(dev)
+            ce = net.correct_topk(feat, mem, ego, cand, par, o, pref=pref, valid=valid & fin)
+        else:
+            o = student_forward2(net, bev_t, cand, status, cand_parent=par)
+            ce = None
         lat = lateral_decode(cand, o["w_lat"], ego_inputs(status)[0], 0.0)
     got = {"score_logit": o["score_logit"], "w_lat": o["w_lat"], "e_lat": lat["e_lat"][..., 2:],
            "lat_traj": lat["traj"]}
+    if ce is not None and (P.infer / "edit_score_logit.npy").is_file():
+        got.update(edit_score_logit=ce["edit_score_logit"], edit_traj=ce["edit_traj"])
+        src_ref = np.load(P.infer / "edit_src.npy", mmap_mode="r")[rows]
+        if not np.array_equal(ce["src_idx"].cpu().numpy(), src_ref):
+            raise SystemExit("infer_check failed: the corrector shortlist (edit_src) differs from the dump")
     err = {}
     for k, v in got.items():
         ref = np.load(P.infer / f"{k}.npy", mmap_mode="r")[rows].astype(np.float32)

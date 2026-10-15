@@ -6,10 +6,13 @@ Shapes (B = candidates, flattened over tokens; every per-candidate tensor is alr
   xd   [B, d]            the parent's draft token after the 4 layers
   Hc   [B, 128, 48, 17]  the parent's corridor conv features (lateral axis kept)
   g    [B, d]            draft_mlp(u_d of the CANDIDATE) (kinematics only, no scene)
-  t, v, d [B, 48]        the candidate's arrival time [s], speed [m/s], lateral offset [m] at the parent's stations
-  S8   [B]               the candidate's draft length [m];  pref [B] log1p(P_ref) per candidate's token or None
+  t_in, t_leave [B, 48]  the candidate's entry / leave time [s] of the parent's station bins (sibling.on_parent)
+  v, d [B, 48]           the candidate's speed [m/s], lateral offset [m] at the parent's stations
+  S8   [B]               the candidate's draft length [m];  e [B, 3] feasibility (feasibility());
+  pref [B]               log1p(P_ref) per candidate's token or None
 Returns score_logit [B, 5] (CK_KEYS nc, dac, ep, ttc, comfort; f32), a_nc / a_ttc / a_dac [B, 48] (station hazard
-logits, f32), mask [B, 48] (stations read), w_lat [B, 6] (raw decoder controls).
+logits, f32), mask [B, 48] (stations read: bin entered within the horizon; station 0 always), t_out [B, 48]
+(min(t_leave, horizon)), w_lat [B, 6] (raw decoder controls).
 Numerics: log P_pass = sum_j m_j logsigmoid(-a_j) <= 0, clamped <= -1e-6; logit(P) = log P - log(-expm1(log P))."""
 from __future__ import annotations
 
@@ -31,6 +34,27 @@ I_NC, I_DAC, I_EP, I_TTC, I_C = (CK_KEYS.index(k) for k in ("nc", "dac", "ep", "
 LAT_STEP = 2 * LAT_MAX / (N_LAT - 1)            # 0.6 m
 EP_MIN_DIST = 5.0                                # progress_distance_threshold (ep_target.EP_DIST_THRESHOLD)
 LOGP_MAX = -1e-6
+N_FEAS = 3
+
+
+def feasibility(S: torch.Tensor, v0: torch.Tensor) -> torch.Tensor:
+    """Candidate-vs-ego-state features e [B, 3] (no scene): v0 / 15, the planned first-segment speed change
+    (S_1 / 0.5 - v0) / 5 (clamped to +-3) and the stopping deceleration v0^2 / (2 max(S_8, 0.5)) / 8 m/s^2 (clamped to
+    [0, 3]).  S [B, 9] the candidate's own knot arc lengths (S_0 = 0), v0 [B] m/s.  Plans the official LQR tracker
+    cannot follow (e.g. a 0.4 m stop at 6 m/s) are executed past their planned end; these features let the station
+    hazards learn that from the labels."""
+    S = S.float()
+    v = torch.nan_to_num(v0.float().reshape(-1), nan=0.0).clamp(min=0.0)
+    dv = ((S[:, 1] / 0.5 - v) / 5.0).clamp(-3.0, 3.0)
+    a_stop = (v * v / (2.0 * S[:, -1].clamp(min=0.5)) / 8.0).clamp(0.0, 3.0)
+    return torch.stack([v / 15.0, dv, a_stop], -1)
+
+
+def read_mask(t_in: torch.Tensor, horizon: float) -> torch.Tensor:
+    """stations read [B, 48]: the candidate enters the bin within the horizon; station 0 always (t_in(0) = 0)."""
+    m = torch.isfinite(t_in) & (t_in <= float(horizon))
+    m[:, 0] = True
+    return m
 
 
 def time_embed(t: torch.Tensor, n_freq: int) -> torch.Tensor:
@@ -79,12 +103,12 @@ class HazardReadout(nn.Module):
         d = d_model
         nt = 1 + 2 * int(cfg.n_freq)
         hh = int(cfg.haz_hidden)
-        self.h_nc = _mlp(d + HC_CH + nt + 1, hh, 1)
-        self.h_ttc = _mlp(d + HC_CH + nt + 1, hh, 1)
-        self.h_dac = _mlp(d + HC_CH + 1, hh, 1)
+        self.h_nc = _mlp(d + HC_CH + nt + 2 + N_FEAS, hh, 1)
+        self.h_ttc = _mlp(d + HC_CH + nt + 2 + N_FEAS, hh, 1)
+        self.h_dac = _mlp(d + HC_CH + 1 + N_FEAS, hh, 1)
         self.ep_head = _mlp(3 * d + 3, int(cfg.ep_hidden), 1)
-        self.comfort_head = _mlp(d, 128, 1)
-        self.lat_head = _mlp(2 * d + HC_CH if cfg.lat_haz else 2 * d, 256, N_FREE, zero_last=True)
+        self.comfort_head = _mlp(d, int(cfg.comfort_hidden), 1)
+        self.lat_head = _mlp(2 * d + HC_CH if cfg.lat_haz else 2 * d, int(cfg.lat_hidden), N_FREE, zero_last=True)
 
     @torch.no_grad()
     def set_prior(self, prior: Sequence[float]) -> None:
@@ -98,20 +122,25 @@ class HazardReadout(nn.Module):
         for head, i in ((self.ep_head, I_EP), (self.comfort_head, I_C)):
             head[-1].bias.fill_(math.log(p[i] / (1 - p[i])))
 
-    def forward(self, xs: torch.Tensor, xd: torch.Tensor, Hc: torch.Tensor, g: torch.Tensor, t: torch.Tensor,
-                v: torch.Tensor, d: torch.Tensor, S8: torch.Tensor, pref: Optional[torch.Tensor] = None
-                ) -> Dict[str, torch.Tensor]:
+    def forward(self, xs: torch.Tensor, xd: torch.Tensor, Hc: torch.Tensor, g: torch.Tensor, t_in: torch.Tensor,
+                t_leave: torch.Tensor, v: torch.Tensor, d: torch.Tensor, S8: torch.Tensor, e: torch.Tensor,
+                pref: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         B = xs.shape[0]
         dt = xs.dtype
-        m = (t <= float(self.cfg.horizon)) & torch.isfinite(t)
+        H = float(self.cfg.horizon)
+        m = read_mask(t_in, H)
+        t0 = torch.where(m, t_in.float(), torch.zeros_like(t_in.float()))
+        t_out = torch.where(m, torch.minimum(t_leave.float(), torch.full_like(t0, H)), t0).clamp(min=0.0)
+        dwell = ((t_out - t0).clamp(0.0, H) / H)[..., None].to(dt)
         f = lateral_read(Hc, d).to(dt)                                             # [B, 48, 128]
-        te = time_embed(t.float(), int(self.cfg.n_freq)).to(dt)
+        te = time_embed(t0, int(self.cfg.n_freq)).to(dt)
         vv = (v.float() / 15.0).clamp(-1.0, 3.0)[..., None].to(dt)
         dd = (d.float() / LAT_MAX).clamp(-2.0, 2.0)[..., None].to(dt)
-        z_t = torch.cat([xs, f, te, vv], -1)
+        ee = e.float().to(dt)[:, None].expand(B, N_ST, N_FEAS)
+        z_t = torch.cat([xs, f, te, dwell, vv, ee], -1)
         a_nc = self.h_nc(z_t)[..., 0].float()
         a_ttc = self.h_ttc(z_t)[..., 0].float()
-        a_dac = self.h_dac(torch.cat([xs, f, dd], -1))[..., 0].float()
+        a_dac = self.h_dac(torch.cat([xs, f, dd, ee], -1))[..., 0].float()
         mf = m.to(dt)[..., None]
         xs_mean = (xs * mf).sum(1) / mf.sum(1).clamp(min=1.0)
         S = S8.float().clamp(min=0.0)
@@ -139,27 +168,29 @@ class HazardReadout(nn.Module):
         else:
             lat_in = torch.cat([g, xs_mean], -1)
         w_lat = self.lat_head(lat_in).float()
-        return {"score_logit": logit, "a_nc": a_nc, "a_ttc": a_ttc, "a_dac": a_dac, "mask": m, "w_lat": w_lat}
+        return {"score_logit": logit, "a_nc": a_nc, "a_ttc": a_ttc, "a_dac": a_dac, "mask": m, "t_out": t_out,
+                "w_lat": w_lat}
 
 
 class PRefHead(nn.Module):
-    """One learned query over the scene tokens mem [T, 200, d] + ego (v0 / 15, a0 / 4, command one-hot) -> log1p(P_ref)
-    [T] (P_ref = labels 'pdm_progress_eff', metres)."""
+    """One learned query over the scene tokens mem [T, 200, d] (attention pooling: weights softmax_n(q . W_k LN(m_n) /
+    sqrt(kdim)), value = LN(m_n)) + ego (v0 / 15, a0 / 4, command one-hot) -> log1p(P_ref) [T] (P_ref = labels
+    'pdm_progress_eff', metres).  q starts small (~ mean pooling)."""
 
-    def __init__(self, d_model: int, n_heads: int = 6):
+    def __init__(self, d_model: int, kdim: int = 64, hidden: int = 52):
         super().__init__()
-        self.q = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.ln = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.out = _mlp(d_model + 6, 128, 1)
+        self.key = nn.Linear(d_model, int(kdim))
+        self.q = nn.Parameter(torch.randn(int(kdim)) * 0.02)
+        self.out = _mlp(d_model + 6, int(hidden), 1)
         with torch.no_grad():
             self.out[-1].bias.fill_(math.log1p(20.0))     # ~ median P_ref (val: 23.8 m)
 
     def forward(self, mem: torch.Tensor, v0: torch.Tensor, a0: torch.Tensor, cmd: torch.Tensor) -> torch.Tensor:
         T = mem.shape[0]
         kv = self.ln(mem)
-        q = self.q.expand(T, 1, -1).to(kv.dtype)
-        z = self.attn(q, kv, kv, need_weights=False)[0][:, 0]
+        att = torch.softmax((self.key(kv) @ self.q.to(kv.dtype)).float() / math.sqrt(self.q.numel()), -1)
+        z = (att.to(kv.dtype)[..., None] * kv).sum(1)
         oh = F.one_hot(cmd.reshape(T).long().clamp(0, 3), 4).to(z.dtype)
         e = torch.cat([(v0.reshape(T).float() / 15.0).to(z.dtype)[:, None], (a0.reshape(T).float() / 4.0).to(z.dtype)
                        [:, None], oh], -1)

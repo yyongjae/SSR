@@ -11,6 +11,9 @@ on_parent(pgeom, cand, is_self)
     pgeom.S and d = 0 exactly, so a parent reads its own grid without projection error.
   * t_c(j), v_c(j): corridor.arrival_time_speed(s_k, s_j, v_end) with v_end = (s_8 - s_7) / 0.5 (the same piecewise
     linear first-arrival schedule the corridor's geo channels use; beyond s_8: 4 s + (s_j - s_8) / max(v_end, 0.1)).
+  * t_in(j), t_leave(j): the same schedule at the station bin's edges s_j -+ ds / 2 (ds = s_1 - s_0): the time the
+    candidate enters / leaves station j's bin (t_in(0) = 0: every candidate starts in bin 0; a candidate stopping
+    inside bin j leaves it after 4 s).
   * d_c(j): piecewise-linear interpolation of d_k over s_k at s_j (held constant before s_0 / after s_8).
   * ok [B]: finite projection.
 Speed siblings (rule variants a +-x) lie on the parent's path (d ~ 0) up to the parent's S_8 with a different t_c(j)
@@ -45,7 +48,7 @@ def _interp(xk: torch.Tensor, yk: torch.Tensor, x: torch.Tensor) -> torch.Tensor
 @torch.no_grad()
 def on_parent(pgeom, cand: torch.Tensor, is_self: torch.Tensor) -> Dict[str, torch.Tensor]:
     """pgeom = corridor_geometry(parent [B, 8, 3]) (row b = candidate b's parent), cand [B, 8, 3], is_self [B] bool ->
-    t, v, d [B, 48] (float32), s_knots, d_knots [B, 9], ok [B]."""
+    t, v, d, t_in, t_leave [B, 48] (float32), s_knots, d_knots [B, 9], ok [B]."""
     B = cand.shape[0]
     c = cand.float()
     xy = torch.cat([torch.zeros(B, 1, 2, dtype=c.dtype, device=c.device), c[..., :2]], 1)          # [B, 9, 2]
@@ -62,6 +65,10 @@ def on_parent(pgeom, cand: torch.Tensor, is_self: torch.Tensor) -> Dict[str, tor
     v_end = torch.clamp((s_k[:, -1] - s_k[:, -2]) / T_POSE, min=0.0)
     s_j = pgeom.s.float()
     t, v = arrival_time_speed(s_k, s_j, v_end)
+    half = 0.5 * (s_j[:, 1:2] - s_j[:, :1])
+    t_in, _ = arrival_time_speed(s_k, (s_j - half).clamp(min=0.0), v_end)
+    t_leave, _ = arrival_time_speed(s_k, s_j + half, v_end)
     d = _interp(s_k, d_k, s_j)
     assert t.shape == (B, N_ST)
-    return {"t": t.float(), "v": v.float(), "d": d.float(), "s_knots": s_k, "d_knots": d_k, "ok": ok}
+    return {"t": t.float(), "v": v.float(), "d": d.float(), "t_in": t_in.float(), "t_leave": t_leave.float(),
+            "s_knots": s_k, "d_knots": d_k, "ok": ok}

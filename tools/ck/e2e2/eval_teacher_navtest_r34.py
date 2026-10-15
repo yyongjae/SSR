@@ -232,7 +232,9 @@ def sanity_checks(net, b, var, dev) -> Dict:
     out = {}
     with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
         mine = teacher_forward(net, b["bev"], b["cand"], b["status"], var)
-        ref = net(b["bev"], b["cand"], b["status"], extra=var, decode=False)
+        # the variants' parents (c = k * NVAR + v -> identity k), as teacher_forward (ignored by the mean readout)
+        ref = net(b["bev"], b["cand"], b["status"], extra=var, decode=False,
+                  extra_parent=b["cand"].float().repeat_interleave(NVAR, 1))
     out["fwd_score16_maxdiff"] = float((mine["s16"] - ref["score_logit"]).abs().max())
     out["fwd_score80_maxdiff"] = float((mine["s80"] - ref["extra_score_logit"]).abs().max())
     out["fwd_wlat16_maxdiff"] = float((mine["w16"] - ref["w_lat"]).abs().max())

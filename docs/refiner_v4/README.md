@@ -10,19 +10,27 @@ except the **e2e default arm, which is now the ck2e2e_bevkd setting** (user 2026
 | Piece | Where | Switch |
 |---|---|---|
 | BEV KD from DET + MAP as the e2e default | `online2._d_bev_kd`, `tools/ck/e2e2/ck_e2e2.yaml` | `ARM=main` -> `main_arm.set` (old main) |
-| Hazard readout (I1): scene read on each candidate's PARENT corridor (time-free stations), the candidate reads it at its own arrival time / lateral offset, per-key station hazard + noisy-OR, structured EP head, scene-free comfort head, hazard-localised lateral head | `ck/v4/readout.py`, `ck/v4/sibling.py`, `CKNet.score_set` | `v4.readout=hazard` / `--v4-readout hazard` |
-| Evidence readout (77): predicted occupancy O [48 x 17 x 8 time bins] + drivable margin D on the parent grid, official-rule evidence (footprint / TTC projection / corners), zero-init residual | `ck/v4/evidence.py` | `v4.readout=evidence` |
+| Hazard readout (I1): scene read on each candidate's PARENT corridor (time-free stations), the candidate reads every station bin it enters within 4 s with its entry time, dwell, speed, lateral offset (station 0 always: no candidate reads nothing) + its feasibility from the ego state, per-key station hazard + noisy-OR, structured EP head, scene-free comfort head, hazard-localised lateral head | `ck/v4/readout.py`, `ck/v4/sibling.py`, `CKNet.score_set` | `v4.readout=hazard` / `--v4-readout hazard` |
+| Evidence readout (77): predicted occupancy O [48 x 17 x 10 time bins, to 5.0 s] + drivable margin D on the parent grid, official-rule-shaped evidence (footprint / TTC projection / corners; the differences from the scorer are listed in `evidence.py`), zero-init residual | `ck/v4/evidence.py` | `v4.readout=evidence` |
 | P_ref scene query (77 Q1): one query over the 200 scene tokens, Huber on log1p(pdm_progress_eff) | `ck/v4/readout.PRefHead` | `v4.pref_head=true` |
-| Censored station BCE (first-failure time) | `ck/v4/losses.station_bce` | hazard + time-index sidecars (below) |
+| Censored station BCE (first-failure time -> the station bin the candidate is in at that time; specialist teachers: only their own score keys) | `ck/v4/losses.station_bce` | hazard + time-index sidecars (below) |
 | Evidence aux (GT objects / official SDF on the parent grid) | `ck/v4/losses.evidence_aux` | evidence + `lambda_ev` |
 | Parent-only score KD (I2) | `online2` loss | `v4.kd_parent_only=true` |
 | Per-family KD calibration (I2) | `ck/kd_calib.py` (`params_by_family`), `tools/ck/v4/fit_kd_calib_family.py` | point `kd_calib.det/.map` at a family file |
 | Learned corrector A (75): top-k shortlist -> 12 controls (mode B) -> re-score on the source's parent corridor; credit + AWR | `ck/v4/corrector.py`, `CKNet.correct_topk` | `v4.corrector=true` (training signal pending, below) |
 | Corridor version 2 for the student | `ck_e2e2.v4.corridor_version` | `v4.corridor_version=2` |
 
+Parameter budget: the default head sizes give the hazard + P_ref (and evidence + P_ref) critic the trainable parameter
+count of the CK2 critic (3,391,755 as trained; v4 3,391,340 / 3,391,216, tests/test_v4_review_fixes.py), so v4 vs CK2 is
+not a capacity comparison.  The corrector A (221,208) is a generator on top and is not part of that budget.
+
 ## How to run (all GPU runs need the user's approval; GPUs 0-3 only)
 
-Teacher (v4 readout, from scratch, 10 epochs like ck2T10 / ck2M10):
+Teachers (DET then MAP, ck2T10 / ck2M10 recipe + hazard + P_ref + corridor v2 + station BCE), the launcher:
+
+    V4_USER_APPROVED=1 V4_GPUS=2,3 bash tools/ck/v4/run_teachers.sh both     # -> CK/v4/train/v4T10_haz, v4M10_haz
+
+or by hand (v4 readout, from scratch, 10 epochs like ck2T10 / ck2M10):
 
     cd /workspace/yongjae/SSR-v4 && CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=$PWD torchrun --nproc_per_node=2 \
       tools/ck/train_ck2.py --arm T --run-name v4T10_haz --epochs 10 --tokens-per-batch 16 --lr 6e-4 \
@@ -63,10 +71,12 @@ eval_e2e2 dumps / labels them, tools/ck/v4/eval_edits.py compares selection over
   inference); a dedupe is exact (max diff 0) and would cut the parent-pass cost ~5x.  Cost today = CK2 (1.02x).
 * Corrector edits are not in the headline eval (eval_e2e2 summary is 96-only); `tools/ck/v4/eval_edits.py` has no
   val-frozen beta for navtest.
-* Open review items (SSR/report 79, verified 2026-10-16): empty station mask of near-stop candidates (pass ~1, no
-  gradient), `stage_infer_check` / r34 sanity check without parents, unstable leave-one-out in `credit`, A credit
-  scored critic-only while deployment blends v2_final / im, evidence bins end at 4.0 s (official TTC reads to 4.9 s),
-  AWR outside autocast with amp, v4 station / evidence aux losses ignore `--score-keys`.
+* Review SSR/report 79 (verified 2026-10-16): fixed in v4_2 -- near-stop candidates read station 0 with their dwell
+  + feasibility features (F1), `stage_infer_check` / r34 sanity check pass the parents (F2), exact leave-one-out credit
+  (F3), evidence bins to 5.0 s (F6), AWR re-score in fp32 after an amp forward (F8), station / evidence aux terms
+  restricted to the teacher's score keys (D(c)), head sizes matched to CK2 (F7 parameters).  Still open: the A credit
+  scores critic-only while deployment blends v2_final / im (F5; needs im recorded per parent), edits not in the
+  headline eval (F4), parent dedupe (F7 compute).
 
 ## Tests (CPU)
 

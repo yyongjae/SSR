@@ -209,7 +209,7 @@ class CKNet(nn.Module):
                 elif self.v4.evidence:
                     self.v4_readout = EvidenceReadout(self.v4, self.trunk.d_model)
                 if self.v4.pref_head:
-                    self.pref_head = PRefHead(self.trunk.d_model)
+                    self.pref_head = PRefHead(self.trunk.d_model, kdim=self.v4.pref_kdim, hidden=self.v4.pref_hidden)
                 if self.v4.corrector:
                     from .v4.corrector import Corrector
                     self.corrector = Corrector(self.trunk.d_model)
@@ -259,7 +259,8 @@ class CKNet(nn.Module):
                   return_ctx: bool = False) -> Dict:
         """Score one candidate set with the token's scene (feat, mem from trunk.scene):
         cand [T, K, 8, 3] -> score_logit [T, K, 5] f32, w_lat / z_lon [T, K, 6] f32, gate_logit [T, K], and for the v4
-        parent-pass readouts 'haz' = {t_arr, d_lat, haz_mask [T, K, 48], is_self [T, K]; hazard: a_nc / a_ttc / a_dac
+        parent-pass readouts 'haz' = {t_arr (bin-centre first arrival), t_in / t_out (entry / min(leave, horizon) of
+        the station bins), d_lat, haz_mask [T, K, 48], is_self [T, K]; hazard: a_nc / a_ttc / a_dac
         [T, K, 48]; evidence: occ_logit [T, K, 48, 17, M], margin [T, K, 48, 17], pts [T, K, 48, 17, 2] (parent grid
         points, N frame), lp_nc / lp_ttc / lp_dac / min_margin [T, K]}.
         readout 'mean': exactly trunk.candidates + score (the CK2 / v3 ops; parents ignored).
@@ -273,6 +274,7 @@ class CKNet(nn.Module):
                     "gate_logit": o["gate_logit"].float(), "h": o["h"]}
         if tfeat is not None:
             raise ValueError("v4 hazard readout has no temporal hook")
+        from .v4.readout import feasibility
         from .v4.sibling import on_parent
         B = T * K
         cand = cand.float()
@@ -293,14 +295,17 @@ class CKNet(nn.Module):
         pr = None if pref is None else rep(pref.reshape(T, 1).float())[:, 0]
         sh = lambda a: a.reshape(T, K, *a.shape[1:])
         if self.v4.hazard:
-            r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, sib["t"], sib["v"], sib["d"], cgeom.S[:, -1], pr)
+            e = feasibility(cgeom.S, rep(v0.float().reshape(T, 1))[:, 0])
+            r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, sib["t_in"], sib["t_leave"], sib["v"], sib["d"],
+                                cgeom.S[:, -1], e, pr)
             haz = {k: sh(r[k]) for k in ("a_nc", "a_ttc", "a_dac")}
         else:
             r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, P["geom"].s, sib["s_knots"], sib["d_knots"], sib["d"],
-                                sib["t"], cgeom.S[:, -1], pr)
+                                sib["t_in"], sib["t_leave"], cgeom.S[:, -1], pr)
             haz = {k: sh(r[k]) for k in ("occ_logit", "margin", "lp_nc", "lp_ttc", "lp_dac", "min_margin")}
             haz["pts"] = sh(P["geom"].points.detach().float())
-        haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), d_lat=sh(sib["d"]), is_self=sh(is_self))
+        haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), t_in=sh(sib["t_in"]), t_out=sh(r["t_out"]),
+                   d_lat=sh(sib["d"]), is_self=sh(is_self))
         out = {"score_logit": sh(r["score_logit"]), "w_lat": sh(r["w_lat"]),
                "z_lon": torch.zeros(T, K, N_FREE, dtype=torch.float32, device=cand.device),
                "gate_logit": torch.zeros(T, K, dtype=torch.float32, device=cand.device), "haz": haz}
@@ -344,7 +349,8 @@ class CKNet(nn.Module):
                        u: torch.Tensor, pref: Optional[torch.Tensor] = None) -> torch.Tensor:
         """log pi(u | ctx(src)) [T, k] under the CURRENT corrector for recorded sources src [T, k, 8, 3] (parents
         src_par) and recorded controls u [T, k, 12] (AWR on official labels of earlier generations)."""
-        o = self.score_set(feat, mem, ego, src, src_par, pref=pref, return_ctx=True)
+        with torch.no_grad():   # the critic only supplies the (detached) context
+            o = self.score_set(feat, mem, ego, src, src_par, pref=pref, return_ctx=True)
         T, k = src.shape[:2]
         ctx = torch.cat([o["ctx"], o["score_logit"].detach().float(),
                          (ego[0].float() / 15.0).reshape(T, 1, 1).expand(T, k, 1)], -1)

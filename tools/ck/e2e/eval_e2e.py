@@ -153,7 +153,8 @@ def extract_ck(ckpt: Path, out_dir: Path, run_name: str = "", ck_cfg: Optional[D
     # refiner v4 student (ck_e2e2.v4 block): network cfg + corridor version, recorded so load_ck rebuilds it
     from navsim.agents.para_ssr.ck.v4.config import V4Cfg
     v4b = dict(ck_cfg.get("v4") or {})
-    v4 = V4Cfg.from_dict({k: v4b[k] for k in ("readout", "pref_head", "time_free", "lat_haz", "horizon") if k in v4b})
+    v4 = V4Cfg.from_dict({k: v4b[k] for k in ("readout", "pref_head", "time_free", "lat_haz", "horizon", "corrector",
+                                              "corr_k") if k in v4b})
     cv = int(v4b.get("corridor_version", 1) or 1)
     net = CKNet("S", seed, None, score_hidden=256, lead_aux=False, corridor_version=cv, v4=v4)
     net.load_state_dict(st, strict=True)

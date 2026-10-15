@@ -56,11 +56,13 @@ class V4Cfg:
     ev_tbins: int = 8                  # evidence: occupancy time bins t = 0.5 (m + 1) s, m = 0..ev_tbins-1
     ev_eps: float = 0.3                # evidence: initial margin temperature [m] of p_out = sigmoid(-D / eps)
     ev_resid: bool = True              # evidence: zero-initialised residual MLP per key
+    corrector: bool = False            # learned corrector A on the critic's top-corr_k (needs a parent-pass readout)
+    corr_k: int = 8
     version: str = CONFIG_VERSION
 
     @property
     def on(self) -> bool:
-        return self.readout != "mean" or self.pref_head
+        return self.readout != "mean" or self.pref_head or self.corrector
 
     @property
     def hazard(self) -> bool:
@@ -80,6 +82,10 @@ class V4Cfg:
             raise ValueError(f"v4.readout {self.readout!r} not in {READOUTS}")
         if self.parent_pass and temporal_on:
             raise ValueError(f"v4.readout {self.readout!r} is not combined with the refiner-v3 temporal branch")
+        if self.corrector and not self.parent_pass:
+            raise ValueError("v4.corrector needs readout 'hazard' or 'evidence' (its context is the parent pass)")
+        if not (1 <= int(self.corr_k) <= 32):
+            raise ValueError(f"v4.corr_k {self.corr_k} must be in [1, 32]")
         if not (1 <= int(self.ev_tbins) <= 8) or not (0.01 <= float(self.ev_eps) <= 5.0):
             raise ValueError(f"v4: ev_tbins {self.ev_tbins} must be in [1, 8], ev_eps {self.ev_eps} in [0.01, 5]")
         if not (0.5 <= float(self.horizon) <= 8.0):

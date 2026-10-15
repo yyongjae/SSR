@@ -313,3 +313,38 @@ def test_evidence_forward_backward_and_aux(data):
     (o["score_logit"].sum() + o["w_lat"].sum() + o["pref_logp"].sum() + l_occ + l_m).backward()
     nog = [n for n, q in net.named_parameters() if q.requires_grad and q.grad is None]
     assert not nog, nog
+
+
+# ----------------------------------------------------------------------------------------------- corrector A
+def test_corrector_identity_credit_awr(data):
+    from navsim.agents.para_ssr.ck.v4 import corrector as CR
+    net = CKNet("S", seed=0, v4=V4Cfg(readout="hazard", pref_head=True, corrector=True, corr_k=4))
+    ego = ego_inputs(data["status"])
+    feat, mem = net.trunk.scene(data["bev"], T)
+    pref = net.scene_pref(mem, ego)
+    po = net.score_set(feat, mem, ego, data["traj96"], data["par96"], pref=pref, return_ctx=True)
+    assert po["ctx"].shape == (T, 96, 3 * 192)
+    ce = net.correct_topk(feat, mem, ego, data["traj96"], data["par96"], po, pref=pref)
+    assert ce["src_idx"].shape == (T, 4) and ce["edit_traj"].shape == (T, 4, 8, 3)
+    # mu = 0 at init -> the edit is its source (decoder mode B anchoring), re-scored like the source
+    src = torch.gather(data["traj96"], 1, ce["src_idx"][..., None, None].expand(T, 4, 8, 3))
+    assert float((ce["edit_traj"] - src).abs().max()) < 1e-4 and float(ce["mu"].abs().max()) == 0.0
+    sc = CR.critic_select_score(po["score_logit"])
+    assert torch.equal(ce["src_idx"], torch.topk(sc, 4, 1).indices)
+    # sampled edits move; their log-prob under the current policy is recomputed exactly by corrector_logp
+    ce2 = net.correct_topk(feat, mem, ego, data["traj96"], data["par96"], po, pref=pref, sample=True,
+                           generator=torch.Generator().manual_seed(0))
+    assert float((ce2["edit_traj"] - src).abs().max()) > 1e-3
+    lp = net.corrector_logp(feat, mem, ego, src, torch.gather(data["par96"], 1, ce["src_idx"][..., None, None]
+                                                              .expand(T, 4, 8, 3)), ce2["u"], pref=pref)
+    assert torch.allclose(lp, ce2["logp"], atol=1e-4)
+    # credit: an edit that is picked and better than its source gets A > 0; a picked trap A < 0
+    s_all = torch.tensor([[0.0, 0.0, 5.0], [0.0, 0.0, 5.0]])
+    R_all = torch.tensor([[0.5, 0.2, 1.0], [0.5, 0.9, 0.0]])
+    ok = torch.ones(2, 3, dtype=torch.bool)
+    c = CR.credit(s_all, R_all, ok, torch.tensor([[2], [2]]), torch.tensor([[0], [0]]))
+    assert float(c["A"][0, 0]) > 0 and float(c["A"][1, 0]) < 0 and abs(float(c["A_loc"][0, 0]) - 0.5) < 1e-6
+    # AWR: weights favour positive advantages; gradient reaches mu / log_sig
+    l = CR.awr_loss(ce2["logp"], torch.randn(T, 4) * 0.1, torch.ones(T, 4, dtype=torch.bool))
+    l.backward()
+    assert net.corrector.mu.weight.grad is not None and float(net.corrector.mu.weight.grad.abs().sum()) > 0

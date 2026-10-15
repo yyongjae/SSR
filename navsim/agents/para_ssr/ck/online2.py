@@ -145,10 +145,10 @@ def _d_v4() -> Dict[str, Any]:
     # Defaults = off (the CK2 / refiner-v3 student, bit for bit); tools/ck/e2e2/v4_arm.set turns the v4 design on.
     return {"readout": "mean", "pref_head": False, "time_free": True, "lat_haz": True, "horizon": 4.0,
             "lambda_pref": 0.1, "lambda_station": 0.5, "lambda_ev": 0.5, "corridor_version": 1,
-            "kd_parent_only": False}
+            "kd_parent_only": False, "corrector": False, "corr_k": 8}
 
 
-V4_NET_KEYS = ("readout", "pref_head", "time_free", "lat_haz", "horizon")
+V4_NET_KEYS = ("readout", "pref_head", "time_free", "lat_haz", "horizon", "corrector", "corr_k")
 
 
 _NESTED2 = {"variants": _d_variants, "lat_kd": _d_lat_kd, "warmup": _d_warmup, "onpolicy_label": _d_onpolicy_label,
@@ -323,7 +323,8 @@ class CKE2E2Config:
                    "lat_haz": _b(q["lat_haz"]), "horizon": float(q["horizon"]), "lambda_pref": float(q["lambda_pref"]),
                    "lambda_station": float(q["lambda_station"]), "lambda_ev": float(q["lambda_ev"]),
                    "corridor_version": int(q["corridor_version"]),
-                   "kd_parent_only": _b(q["kd_parent_only"])}
+                   "kd_parent_only": _b(q["kd_parent_only"]), "corrector": _b(q["corrector"]),
+                   "corr_k": int(q["corr_k"])}
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
@@ -1199,13 +1200,26 @@ class CKE2E2:
         V = C2.online_variants(top["cand"], v0_from_status(status), self.cfg.variants)
         cand, fin = _sanitize_traj(V["traj96"], top["cand"][:, 0])
         par = _keep_parent(cand, top["cand"].float().repeat_interleave(NV, 1), fin)      # c = k * 6 + v -> parent k
+        ce = None
         with torch.autocast(device_type=dev.type, enabled=False):
-            out = student_forward2(student, bev_sgrid(bev.float()), cand, status, cand_parent=par)
+            if getattr(student, "corrector", None) is not None:
+                # refiner v4 corrector A: score the 96 (+ corrector context), edit the critic's top-k, re-score
+                ego = ego_inputs(status)
+                feat, mem = student.trunk.scene(bev_sgrid(bev.float()), cand.shape[0])
+                pref = student.scene_pref(mem, ego)
+                po = student.score_set(feat, mem, ego, cand, par, pref=pref, return_ctx=True)
+                out = {"score_logit": po["score_logit"], "w_lat": po["w_lat"]}
+                ce = student.correct_topk(feat, mem, ego, cand, par, po, pref=pref, valid=V["valid96"] & fin)
+            else:
+                out = student_forward2(student, bev_sgrid(bev.float()), cand, status, cand_parent=par)
         lat = lateral_decode(cand, out["w_lat"], v0, 0.0)
         res = {"ck2_cand_idx": top["idx"], "ck2_v2_final": top["final"], "ck2_v2_im": top["im"],
                "ck2_v2_sim": top["sim"], "ck2_cand96": V["traj96"], "ck2_valid96": V["valid96"] & fin,
                "ck2_score_logit": out["score_logit"].float(), "ck2_w_lat": out["w_lat"].float(),
                "ck2_e_lat": lat["e_lat"][..., 2:].float(), "ck2_lat_traj": lat["traj"].float()}
+        if ce is not None:          # the K edits (no lateral head on top: the corrector's own lateral controls)
+            res.update(ck2_edit_traj=ce["edit_traj"].float(), ck2_edit_src=ce["src_idx"].long(),
+                       ck2_edit_u=ce["u"].float(), ck2_edit_score_logit=ce["edit_score_logit"].float())
         sel = self.cfg.infer_select
         if sel is not None:
             from . import select2 as S2
@@ -1331,6 +1345,8 @@ class CKE2E2:
         loss = loss + 0.0 * (out["score_all"].sum() + out["w_lat_all"].sum())
         if out.get("pref_logp") is not None:
             loss = loss + 0.0 * out["pref_logp"].sum()
+        if getattr(student, "corrector", None) is not None:      # in the DDP graph every step (AWR terms: _v4_terms)
+            loss = loss + 0.0 * sum(p.sum() for p in student.corrector.parameters())
         loss_val = _f(loss)
         bad_loss = not math.isfinite(loss_val)
         if bad_loss:

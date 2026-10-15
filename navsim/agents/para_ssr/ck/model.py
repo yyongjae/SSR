@@ -196,6 +196,7 @@ class CKNet(nn.Module):
         self.v4 = (v4 if v4 is not None else V4Cfg()).validate(self.temporal_cfg.on)
         self.v4_readout = None
         self.pref_head = None
+        self.corrector = None
         if self.v4.on:
             from .v4.evidence import EvidenceReadout
             from .v4.readout import HazardReadout, PRefHead
@@ -209,6 +210,9 @@ class CKNet(nn.Module):
                     self.v4_readout = EvidenceReadout(self.v4, self.trunk.d_model)
                 if self.v4.pref_head:
                     self.pref_head = PRefHead(self.trunk.d_model)
+                if self.v4.corrector:
+                    from .v4.corrector import Corrector
+                    self.corrector = Corrector(self.trunk.d_model)
             if self.v4.parent_pass:
                 # the CK2 heads the hazard readout replaces: kept in the state dict (loaders stay uniform) but frozen,
                 # so DDP / optimisers never expect a gradient for them
@@ -225,7 +229,8 @@ class CKNet(nn.Module):
             tc = self.temporal.param_counts()
             c.update(tc)
             c["total"] = c["total"] + tc["temporal_shared"] + tc["forecaster"]
-        for name, mod in (("v4_readout", self.v4_readout), ("pref_head", self.pref_head)):
+        for name, mod in (("v4_readout", self.v4_readout), ("pref_head", self.pref_head),
+                          ("corrector", self.corrector)):
             if mod is not None:                                         # keys only when on
                 c[name] = sum(p.numel() for p in mod.parameters())
                 c["total"] = c["total"] + c[name]
@@ -250,7 +255,8 @@ class CKNet(nn.Module):
         return self.pref_head(mem, v0, a0, cmd)
 
     def score_set(self, feat: torch.Tensor, mem: torch.Tensor, ego, cand: torch.Tensor,
-                  parents: Optional[torch.Tensor] = None, tfeat=None, pref: Optional[torch.Tensor] = None) -> Dict:
+                  parents: Optional[torch.Tensor] = None, tfeat=None, pref: Optional[torch.Tensor] = None,
+                  return_ctx: bool = False) -> Dict:
         """Score one candidate set with the token's scene (feat, mem from trunk.scene):
         cand [T, K, 8, 3] -> score_logit [T, K, 5] f32, w_lat / z_lon [T, K, 6] f32, gate_logit [T, K], and for the v4
         parent-pass readouts 'haz' = {t_arr, d_lat, haz_mask [T, K, 48], is_self [T, K]; hazard: a_nc / a_ttc / a_dac
@@ -295,9 +301,55 @@ class CKNet(nn.Module):
             haz = {k: sh(r[k]) for k in ("occ_logit", "margin", "lp_nc", "lp_ttc", "lp_dac", "min_margin")}
             haz["pts"] = sh(P["geom"].points.detach().float())
         haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), d_lat=sh(sib["d"]), is_self=sh(is_self))
-        return {"score_logit": sh(r["score_logit"]), "w_lat": sh(r["w_lat"]),
-                "z_lon": torch.zeros(T, K, N_FREE, dtype=torch.float32, device=cand.device),
-                "gate_logit": torch.zeros(T, K, dtype=torch.float32, device=cand.device), "haz": haz}
+        out = {"score_logit": sh(r["score_logit"]), "w_lat": sh(r["w_lat"]),
+               "z_lon": torch.zeros(T, K, N_FREE, dtype=torch.float32, device=cand.device),
+               "gate_logit": torch.zeros(T, K, dtype=torch.float32, device=cand.device), "haz": haz}
+        if return_ctx:          # corrector context (detached: the corrector never moves the critic's features)
+            mf = r["mask"].to(x.dtype)[..., None]
+            xs_mean = (x[:, 1:] * mf).sum(1) / mf.sum(1).clamp(min=1.0)
+            out["ctx"] = sh(torch.cat([g, x[:, 0], xs_mean], -1).detach().float())
+        return out
+
+    def correct_topk(self, feat: torch.Tensor, mem: torch.Tensor, ego, pool: torch.Tensor, parents: torch.Tensor,
+                     pool_out: Dict, pref: Optional[torch.Tensor] = None, sample: bool = False,
+                     k: Optional[int] = None, valid: Optional[torch.Tensor] = None,
+                     generator: Optional[torch.Generator] = None) -> Dict:
+        """refiner v4 corrector A: shortlist the top-k of pool [T, N, 8, 3] by the critic selection score
+        (corrector.critic_select_score of pool_out['score_logit'], invalid columns excluded), edit them (mu, or a
+        sample when training), decode (mode B) and re-score the edits on their source's parent corridor.  pool_out
+        = score_set(..., return_ctx=True) of the pool.  -> src_idx [T, k], u / mu / log_sig [T, k, 12], logp [T, k],
+        edit_traj [T, k, 8, 3], edit_score_logit [T, k, 5], edit_w_lat [T, k, 6], edit_haz."""
+        from .v4.corrector import critic_select_score, decode_edits
+        if self.corrector is None:
+            raise ValueError("correct_topk: this CK net has no corrector (V4Cfg.corrector)")
+        T, N = pool.shape[:2]
+        k = int(k or self.v4.corr_k)
+        sc = critic_select_score(pool_out["score_logit"].detach())
+        if valid is not None:
+            sc = torch.where(valid.bool(), sc, torch.full_like(sc, -1e9))
+        idx = torch.topk(sc, min(k, N), dim=1).indices                                 # [T, k]
+        g4 = lambda a: torch.gather(a, 1, idx.reshape(T, -1, *([1] * (a.dim() - 2))).expand(T, idx.shape[1],
+                                                                                                *a.shape[2:]))
+        src, src_par = g4(pool.float()), g4(parents.float())
+        ctx = torch.cat([g4(pool_out["ctx"]), g4(pool_out["score_logit"].detach().float()),
+                         (ego[0].float() / 15.0).reshape(T, 1, 1).expand(T, idx.shape[1], 1)], -1)
+        a = self.corrector.act(ctx, sample=sample, generator=generator)
+        edits = decode_edits(src, a["u"], ego[0])
+        oe = self.score_set(feat, mem, ego, edits, src_par, pref=pref)
+        return {"src_idx": idx, "u": a["u"], "mu": a["mu"], "log_sig": a["log_sig"], "logp": a["logp"],
+                "edit_traj": edits, "edit_score_logit": oe["score_logit"], "edit_w_lat": oe["w_lat"],
+                "edit_haz": oe.get("haz"), "ctx": ctx}
+
+    def corrector_logp(self, feat: torch.Tensor, mem: torch.Tensor, ego, src: torch.Tensor, src_par: torch.Tensor,
+                       u: torch.Tensor, pref: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """log pi(u | ctx(src)) [T, k] under the CURRENT corrector for recorded sources src [T, k, 8, 3] (parents
+        src_par) and recorded controls u [T, k, 12] (AWR on official labels of earlier generations)."""
+        o = self.score_set(feat, mem, ego, src, src_par, pref=pref, return_ctx=True)
+        T, k = src.shape[:2]
+        ctx = torch.cat([o["ctx"], o["score_logit"].detach().float(),
+                         (ego[0].float() / 15.0).reshape(T, 1, 1).expand(T, k, 1)], -1)
+        a = self.corrector(ctx)
+        return self.corrector.log_prob(a["mu"], a["log_sig"], u)
 
     # ------------------------------------------------------------------------------------------ forward
     def forward(self, bev: Optional[torch.Tensor], cand: torch.Tensor, status: torch.Tensor,

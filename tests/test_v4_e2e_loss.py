@@ -114,3 +114,25 @@ def test_v4_onpolicy_step(tmp_path, monkeypatch, readout):
     with torch.no_grad():
         res = ck.infer(st, f, {k: (v.detach() if torch.is_tensor(v) else v) for k, v in pred.items()})
     assert res["ck2_score_logit"].shape == (2, 96, 5) and torch.isfinite(res["ck2_score_logit"]).all()
+
+
+def test_v4_corrector_infer_and_loss(tmp_path):
+    c, ck, gtraj, glab = TLOSS._onpolicy(tmp_path, lat_kd={"start_mb": 0},
+                                         v4=dict(V4, readout="evidence", corrector=True))
+    net = TLOSS._student(c)
+    assert net.corrector is not None and net.v4.corr_k == 8
+    ck.epoch, ck.epoch_frac, ck.gstep = 5, 5.5, 3
+    f, t = TL.fresh(2, rows=[3, 7])
+    pred = TL.fake_predictions(2, seed=3)
+    loss, logs = ck.loss(net, f, t, pred)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert all(p.grad is not None for p in net.corrector.parameters())      # in the graph (zero weight for now)
+    net.eval()
+    with torch.no_grad():
+        res = ck.infer(net, f, {k: (v.detach() if torch.is_tensor(v) else v) for k, v in pred.items()})
+    assert res["ck2_edit_traj"].shape == (2, 8, 8, 3) and res["ck2_edit_score_logit"].shape == (2, 8, 5)
+    assert res["ck2_edit_src"].shape == (2, 8) and torch.isfinite(res["ck2_edit_score_logit"]).all()
+    # untrained corrector (mu = 0): every edit is its source column of the 96 pool
+    src = torch.gather(res["ck2_cand96"].float(), 1, res["ck2_edit_src"][..., None, None].expand(2, 8, 8, 3))
+    assert float((res["ck2_edit_traj"] - src).abs().max()) < 1e-3

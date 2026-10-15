@@ -1,0 +1,77 @@
+{
+ "n_tok": {
+  "train": 24000,
+  "dev": 8000
+ },
+ "token_overlap": 0,
+ "log_overlap": 0,
+ "n_logs": {
+  "train": 891,
+  "dev": 295
+ },
+ "drives": {
+  "train": 154,
+  "dev": 123,
+  "shared": 115
+ },
+ "dev_tokens_whose_drive_in_train_frac": 0.942125,
+ "stageT3_T_eval_dev": {
+  "n_tok": 7930,
+  "rows": 103090,
+  "row_tok_not_in_tokens": 0,
+  "in_dev": 7930,
+  "in_train": 0,
+  "in_train_fold0": 0,
+  "in_train_folds1_4": 0,
+  "log_mismatch": 0
+ },
+ "stageT3_T_eval_train_fold0": {
+  "n_tok": 4702,
+  "rows": 61126,
+  "row_tok_not_in_tokens": 0,
+  "in_dev": 0,
+  "in_train": 4702,
+  "in_train_fold0": 4702,
+  "in_train_folds1_4": 0,
+  "log_mismatch": 0
+ },
+ "stageT3_T_cfg": {
+  "n_train_tokens": 17188,
+  "n_ival_tokens": 1930,
+  "split": "train",
+  "packed": "/home/external-user/ssd/yongjae_refiner/packed/train"
+ },
+ "stageT3_none_eval_dev": {
+  "n_tok": 7930,
+  "rows": 103090,
+  "row_tok_not_in_tokens": 0,
+  "in_dev": 7930,
+  "in_train": 0,
+  "in_train_fold0": 0,
+  "in_train_folds1_4": 0,
+  "log_mismatch": 0
+ },
+ "stageT3_none_eval_train_fold0": {
+  "n_tok": 4702,
+  "rows": 61126,
+  "row_tok_not_in_tokens": 0,
+  "in_dev": 0,
+  "in_train": 4702,
+  "in_train_fold0": 4702,
+  "in_train_folds1_4": 0,
+  "log_mismatch": 0
+ },
+ "stageT3_none_cfg": {
+  "n_train_tokens": 17188,
+  "n_ival_tokens": 1930,
+  "split": "train",
+  "packed": "/home/external-user/ssd/yongjae_refiner/packed/train"
+ },
+ "train_fold_tokens": {
+  "0": 4728,
+  "1": 4791,
+  "2": 4766,
+  "3": 4860,
+  "4": 4855
+ }
+}

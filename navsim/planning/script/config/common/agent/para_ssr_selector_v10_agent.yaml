@@ -1,0 +1,73 @@
+# BEV Selector v10: PARA-SSR v2 Student Multi-Task + Domain-Specific Planning-Grounded Probe (PGP)
+# - Student: km/para-ssr-v2 full multi-task architecture (ResNet-34) + optional CK2 Refiner v2 E2E
+# - Distill v10 (docs/bev_selector_v10.md):
+#     * Fix 1 (Logit Temperature & Positional Encoding Isolation):
+#       Pre-attention LayerNorm(C) on Teacher & Student BEV keys/values + bev_pos.detach() on Teacher probe pass
+#     * Fix 2 (BEV-Pure Post-Attention FFN & Domain-Pure Sub-Score Masking):
+#       No additive q skip-connection into reward/offset heads; Comfort (index 3) masked to 0.0;
+#       P_det supervised on [NC=1.0, DAC=0.0, TTC=1.0, C=0.0, EP=0.5];
+#       P_map supervised on [NC=0.0, DAC=1.0, TTC=0.0, C=0.0, EP=0.5]
+#     * Fix 3 (Bounded Multi-Scale Spatial Gate & Confidence-Weighted Attention KD):
+#       Multi-scale spatial bias sigmas [2.0, 4.0, 8.0, 16.0]m with bounded learnable gate gamma in (0.1, 2.0)
+#       and inverse-entropy per-head KL weighting
+#     * Fix 4 (Step-Aware Warm-Up/Ramp & Bias-Corrected Fast EMA):
+#       1000-step probe warm-up + 2000-step linear KD ramp + fast EMA decay min(0.99, (1+t)/(10+t))
+#     * Sharpened Hybrid Anchor Weighting:
+#       lambda_gt=0.68, lambda_cov=0.02, lambda_risk=0.30, tau_gt=2.0, tau_risk=2.5 (N_eff in 15~35)
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Student architecture (ResNet-34 camera backbone)
+  image_architecture: resnet34.tv_in1k
+
+  # km/para-ssr-v2 Student Multi-Task Configuration
+  use_task_interaction: true
+  use_det_motion_head: true
+  use_map_head: true
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+  plan_heading_from_xy: true
+
+  # Task Gradient Balancing (Closed-loop balancer across Plan, Det, Map)
+  grad_balance_target:
+    plan: 0.4
+    det: 0.3
+    map: 0.3
+  grad_balance_warmup_iters: 10600
+  grad_balance_interval: 200
+
+  # v10 Domain-Specific Planning-Grounded Probe (PGP) Distillation
+  distill_selector: false
+  distill_selector_v6: false
+  distill_selector_v7: false
+  distill_selector_v8: false
+  distill_selector_v9: false
+  distill_selector_v10: true
+  distill_spatial_sigmas: [2.0, 4.0, 8.0, 16.0]
+  distill_lambda_gt: 0.68
+  distill_lambda_cov: 0.02
+  distill_lambda_risk: 0.30
+  distill_tau_gt: 2.0
+  distill_tau_risk: 2.5
+  distill_attn_loss_scale: 5.0
+  distill_resmap_scale: 3.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  distill_anchor_mode: cross_attn
+  distill_probe_warmup_steps: 1000
+  distill_probe_ramp_steps: 2000
+  distill_probe_loss_weight: 0.5
+  distill_probe_lr_mult: 3.0
+  distill_probe_use_ema: true
+  distill_probe_ema_decay: 0.99
+
+  # Legacy distill options turned off
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0

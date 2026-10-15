@@ -1,21 +1,15 @@
-"""SSR's navigation-guided sparse planner, ported to navsim.
+"""Command/ego-conditioned planner over BEV and private decoder memories.
 
-Path (unchanged from the nuScenes ``ParaSSRHead``):
-
-    BEV encoder -> navigation SE gating -> TokenLearner (16 scene tokens)
-    -> latent self-attention decoder -> waypoint cross-attention decoder -> MLP
-
-Two adaptations, both forced by navsim's output contract:
-
-* **4 command branches, not 3.**  navsim's ``driving_command`` is a 4-way
-  one-hot (left / straight / right / unknown); nuScenes' converter produced 3.
-* **3 output dims per waypoint, not 2.**  navsim scores a ``Trajectory`` of
-  ``(x, y, heading)`` poses, so the per-step offset regression carries heading.
-  ``loss_plan_reg`` weights heading separately (``heading_weight``) because it
-  is in radians while x/y are in metres.
-
-The horizon follows navsim's ``TrajectorySampling(time_horizon=4,
-interval_length=0.5)`` -> ``fut_ts = 8``, against nuScenes' 6.
+Three independent Pre-LN layers update the single planning query with
+BEV -> parallel detection/motion and map attention -> residual sum -> FFN.
+Both task attentions read the same post-BEV hidden. Object and map memories are built once
+from the final decoder latents; only the planning query is updated. Prediction
+coordinates and foreground confidence condition attention keys through detached
+metadata, while content values preserve gradients into both private decoders.
+With task interaction disabled, the same layers use only BEV -> FFN and the
+planner neither constructs interaction parameters nor consumes task memories.
+All modes inject current ego velocity/acceleration into the planning query and
+normalize the final residual stream before trajectory regression.
 """
 from __future__ import annotations
 
@@ -24,20 +18,12 @@ from typing import Dict, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from .tokenlearner import TokenLearnerV11
-from .transformer_blocks import (
-    LearnedPositionalEncoding,
-    build_self_attn_decoder,
-)
-from .candidate_planner import load_plan_anchors, poses_to_offsets, commanded_candidates
+from .anchor_planner import AnchorPlanner
+from .transformer_blocks import LearnedPositionalEncoding
 
 
 class PlanTaskMemoryLayer(nn.Module):
-    """One planner layer: BEV, then parallel det and map attention, then FFN.
-
-    Both task attentions read the residual left by the BEV attention. Neither
-    consumes the other branch's update. The two updates are added together.
-    """
+    """One residual planner layer, with separate query/memory Pre-LNs."""
 
     def __init__(
         self,
@@ -49,19 +35,17 @@ class PlanTaskMemoryLayer(nn.Module):
         super().__init__()
         self.use_task_interaction = use_task_interaction
         self.bev_query_norm = nn.LayerNorm(embed_dims)
-        self.bev_memory_norm = nn.LayerNorm(embed_dims)
-        self.bev_cross_attn = nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
         if use_task_interaction:
             self.det_query_norm = nn.LayerNorm(embed_dims)
             self.map_query_norm = nn.LayerNorm(embed_dims)
+        self.bev_memory_norm = nn.LayerNorm(embed_dims)
+        if use_task_interaction:
             self.det_memory_norm = nn.LayerNorm(embed_dims)
             self.map_memory_norm = nn.LayerNorm(embed_dims)
-            self.plan_det_cross_attn = nn.MultiheadAttention(
-                embed_dims, num_heads, batch_first=True
-            )
-            self.plan_map_cross_attn = nn.MultiheadAttention(
-                embed_dims, num_heads, batch_first=True
-            )
+        self.bev_cross_attn = nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
+        if use_task_interaction:
+            self.plan_det_cross_attn = nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
+            self.plan_map_cross_attn = nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
         self.ffn_norm = nn.LayerNorm(embed_dims)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dims, feedforward_channels),
@@ -81,31 +65,17 @@ class PlanTaskMemoryLayer(nn.Module):
         map_memory: Optional[torch.Tensor] = None,
         map_position: Optional[torch.Tensor] = None,
         map_confidence: Optional[torch.Tensor] = None,
-        return_bev_attn: bool = False,
-    ):
+    ) -> torch.Tensor:
         value = self.bev_memory_norm(bev)
-        # The default path keeps need_weights=False so the fused kernel, and
-        # therefore the v4 training graph, stays as it was. Attention is read
-        # only for the train-only BEV selector.
-        if return_bev_attn:
-            attended, bev_attn = self.bev_cross_attn(
-                self.bev_query_norm(h) + plan_query_pos,
-                value + bev_pos,
-                value,
-                need_weights=True,
-                average_attn_weights=True,
-            )
-            h = h + attended
-            bev_attn = bev_attn.squeeze(1)
-        else:
-            h = h + self.bev_cross_attn(
-                self.bev_query_norm(h) + plan_query_pos,
-                value + bev_pos,
-                value,
-                need_weights=False,
-            )[0]
-            bev_attn = None
+        h = h + self.bev_cross_attn(
+            self.bev_query_norm(h) + plan_query_pos,
+            value + bev_pos,
+            value,
+            need_weights=False,
+        )[0]
         if self.use_task_interaction:
+            # Fork from the same post-BEV residual; neither task attention
+            # consumes the other branch's update within this layer.
             value = self.det_memory_norm(det_memory)
             det_update = self.plan_det_cross_attn(
                 self.det_query_norm(h) + plan_query_pos,
@@ -121,35 +91,17 @@ class PlanTaskMemoryLayer(nn.Module):
                 need_weights=False,
             )[0]
             h = h + det_update + map_update
-        h = h + self.ffn(self.ffn_norm(h))
-        if return_bev_attn:
-            return h, bev_attn
-        return h
-
-
-class SELayer(nn.Module):
-    """Channel gating of the BEV feature by the navigation-command embedding."""
-
-    def __init__(self, channels: int, act_layer=nn.ReLU, gate_layer=nn.Sigmoid):
-        super().__init__()
-        self.mlp_reduce = nn.Linear(channels, channels)
-        self.act1 = act_layer()
-        self.mlp_expand = nn.Linear(channels, channels)
-        self.gate = gate_layer()
-
-    def forward(self, x: torch.Tensor, x_se: torch.Tensor) -> torch.Tensor:
-        x_se = self.mlp_reduce(x_se)
-        x_se = self.act1(x_se)
-        x_se = self.mlp_expand(x_se)
-        return x * self.gate(x_se)
+        return h + self.ffn(self.ffn_norm(h))
 
 
 class ParaSSRPlannerHead(nn.Module):
-    """BEV encoder wrapper + navigation-guided sparse-token planner.
+    """BEV encoder wrapper and three-layer planner using all task queries.
 
-    Like the nuScenes head, this owns the BEV encoder so ``only_bev=True`` can
-    short-circuit it for history frames, and it exposes ``bev_embed`` so the
-    detector can fan it out to the parallel auxiliary heads.
+    ``forward(..., only_bev=True)`` encodes current/history frames. The model
+    runs the two private heads once on the current BEV and then calls
+    ``plan_from_bev`` with their predictions and final hidden states when
+    ``use_task_interaction=True``. Command and current ego status condition
+    planning in all modes; disabling interaction removes the task memories.
     """
 
     def __init__(
@@ -169,13 +121,13 @@ class ParaSSRPlannerHead(nn.Module):
         way_num_layers: int = 1,
         num_heads: int = 8,
         feedforward_channels: int = 512,
-        use_metric_planner: bool = False,
-        num_plan_candidates: int = 16,
-        plan_anchor_path: str = "",
-        use_stl: bool = True,
-        plan_num_layers: int = 3,
-        use_task_interaction: bool = False,
         use_lidar: bool = False,
+        use_stl: bool = False,
+        plan_num_layers: int = 3,
+        det_embed_dims: Optional[int] = None,
+        motion_embed_dims: Optional[int] = None,
+        map_embed_dims: Optional[int] = None,
+        use_task_interaction: bool = True,
         plan_anchor_file: Optional[str] = None,
         plan_reward_weights: Sequence[float] = (0.1, 0.5, 0.5, 1.0),
         plan_topk: int = 6,
@@ -184,201 +136,112 @@ class ParaSSRPlannerHead(nn.Module):
         plan_rescore_refined: bool = False,
     ):
         super().__init__()
-        if use_task_interaction and (use_metric_planner or use_stl):
-            raise ValueError("task interaction requires the dense planner (use_stl=False)")
+        if use_stl:
+            raise ValueError("PARA-SSR task-memory planner requires use_stl=False")
+        if plan_num_layers != 3:
+            raise ValueError("PARA-SSR task-memory planner requires plan_num_layers=3")
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.embed_dims = embed_dims
         self.pc_range = list(pc_range)
         self.real_w = self.pc_range[3] - self.pc_range[0]
         self.real_h = self.pc_range[4] - self.pc_range[1]
-        self.num_scenes = num_scenes
+        self.num_scenes = num_scenes  # retained constructor/config compatibility
         self.num_reg_fcs = num_reg_fcs
         self.fut_ts = fut_ts
         self.ego_fut_mode = ego_fut_mode
         self.num_navi_cmd = num_navi_cmd
         self.traj_dims = traj_dims
-        self.use_metric_planner = use_metric_planner
-        self.num_plan_candidates = num_plan_candidates if use_metric_planner else 1
-        self.use_stl = True if use_metric_planner else use_stl
-        self.use_task_interaction = bool(use_task_interaction) and not self.use_stl
-        self.use_lidar = bool(use_lidar)
-        self.anchor_planner = None
-        self.plan_rescore_refined = False
-        if self.use_lidar and (self.use_stl or use_metric_planner):
-            raise ValueError("use_lidar requires the dense planner (use_stl=False)")
-        if plan_anchor_file and self.use_stl:
-            raise ValueError(
-                "plan_anchor_file requires dense planner (use_stl=False)"
-            )
+        self.use_stl = False
+        self.use_task_interaction = use_task_interaction
 
         self.transformer = transformer
-        self.positional_encoding = LearnedPositionalEncoding(
-            embed_dims // 2, bev_h, bev_w
+        self.positional_encoding = LearnedPositionalEncoding(embed_dims // 2, bev_h, bev_w)
+        self.bev_embedding = None if use_lidar else nn.Embedding(bev_h * bev_w, embed_dims)
+        self.navi_embedding = nn.Embedding(num_navi_cmd, embed_dims)
+        self.plan_query = nn.Embedding(1, embed_dims)
+        self.plan_query_pos = nn.Embedding(1, embed_dims)
+        self.plan_fuser = nn.Sequential(
+            nn.Linear(embed_dims * 2, embed_dims),
+            nn.LayerNorm(embed_dims),
+            nn.ReLU(inplace=True),
+        )
+        # Native NAVSIM [vx, vy, ax, ay] retains its physical magnitude. This
+        # private planning input is separate from BEV temporal alignment.
+        self.ego_status_encoder = nn.Sequential(
+            nn.Linear(4, embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims),
         )
 
-        # LiDAR BEV replaces the learned queries (SafeDrive). Camera-only keeps
-        # the embedding so stage-1 can freeze it without a DDP unused parameter.
-        self.bev_embedding = None if self.use_lidar else nn.Embedding(bev_h * bev_w, embed_dims)
-        self.navi_embedding = nn.Embedding(num_navi_cmd, embed_dims)
+        # The head dimensions come from configuration; no query/mode/point
+        # count is encoded in the projections or attention parameter shapes.
+        if use_task_interaction:
+            self.det_projection = nn.Linear(det_embed_dims or embed_dims, embed_dims)
+            self.motion_projection = nn.Linear(motion_embed_dims or embed_dims, embed_dims)
+            self.map_projection = nn.Linear(map_embed_dims or embed_dims, embed_dims)
+            self.det_memory_norm = nn.LayerNorm(embed_dims)
+            self.map_memory_norm = nn.LayerNorm(embed_dims)
 
-        def reg_fcs(out_dims: int) -> nn.Sequential:
-            layers = []
-            for _ in range(num_reg_fcs):
-                layers.append(nn.Linear(embed_dims, embed_dims))
-                layers.append(nn.ReLU())
-            layers.append(nn.Linear(embed_dims, out_dims))
-            return nn.Sequential(*layers)
-
-        if self.use_stl:
-            self.navi_se = SELayer(embed_dims)
-            self.tokenlearner = TokenLearnerV11(num_scenes, embed_dims * 2)
-            self.latent_decoder = build_self_attn_decoder(
-                latent_num_layers,
-                embed_dims,
-                num_heads,
-                feedforward_channels,
-                ("self_attn", "norm", "ffn", "norm"),
-                attn_dropout=0.0,
-                ffn_dropout=0.0,
-            )
-            self.way_point = nn.Embedding(
-                ego_fut_mode * self.num_plan_candidates * fut_ts, embed_dims * 2
-            )
-            self.way_decoder = build_self_attn_decoder(
-                way_num_layers,
-                embed_dims,
-                num_heads,
-                feedforward_channels,
-                ("cross_attn", "norm", "ffn", "norm"),
-                attn_dropout=0.0,
-                ffn_dropout=0.0,
-            )
-            self.ego_fut_decoder = reg_fcs(traj_dims)
-            decoders = (self.latent_decoder, self.way_decoder)
-        else:
-            self.plan_query = nn.Embedding(1, embed_dims)
-            self.plan_query_pos = nn.Embedding(1, embed_dims)
-            self.plan_fuser = nn.Sequential(
-                nn.Linear(embed_dims * 2, embed_dims),
-                nn.LayerNorm(embed_dims),
-                nn.ReLU(inplace=True),
-            )
-            # Physical ego dynamics [vx, vy, ax, ay] conditioning
-            self.ego_status_encoder = nn.Sequential(
-                nn.Linear(4, embed_dims),
+        def metadata_encoder(input_dims: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(input_dims, embed_dims),
                 nn.ReLU(inplace=True),
                 nn.Linear(embed_dims, embed_dims),
             )
-            if self.use_task_interaction:
-                self.det_projection = nn.Linear(embed_dims, embed_dims)
-                self.motion_projection = nn.Linear(embed_dims, embed_dims)
-                self.map_projection = nn.Linear(embed_dims, embed_dims)
-                self.det_memory_norm = nn.LayerNorm(embed_dims)
-                self.map_memory_norm = nn.LayerNorm(embed_dims)
 
-                def metadata_encoder(input_dims: int) -> nn.Sequential:
-                    return nn.Sequential(
-                        nn.Linear(input_dims, embed_dims),
-                        nn.ReLU(inplace=True),
-                        nn.Linear(embed_dims, embed_dims),
-                    )
+        if use_task_interaction:
+            self.det_position_encoder = metadata_encoder(2)
+            self.map_position_encoder = metadata_encoder(2)
+            self.det_confidence_encoder = metadata_encoder(1)
+            self.map_confidence_encoder = metadata_encoder(1)
+        self.planner_layers = nn.ModuleList(
+            PlanTaskMemoryLayer(embed_dims, num_heads, feedforward_channels, use_task_interaction)
+            for _ in range(plan_num_layers)
+        )
+        # SafeDrive/WoTE regress from normalized decoder output (Post-LN).
+        # Our Pre-LN stack needs an explicit output norm for that same role.
+        self.final_norm = nn.LayerNorm(embed_dims)
+        reg_layers = []
+        for _ in range(num_reg_fcs):
+            reg_layers.extend([nn.Linear(embed_dims, embed_dims), nn.ReLU()])
+        reg_layers.append(nn.Linear(embed_dims, fut_ts * traj_dims))
+        # v2: WoTE-style anchor vocabulary + PDM-score rewards (anchor_planner.py)
+        # replaces the single-trajectory regressor, which is then not built: an
+        # unused module would fail DDP's unused-parameter check.
+        self.anchor_planner = (
+            AnchorPlanner(plan_anchor_file, embed_dims, fut_ts, traj_dims, plan_reward_weights, plan_topk,
+                          kinematic=plan_kinematic, heading_from_xy=plan_heading_from_xy)
+            if plan_anchor_file else None
+        )
+        self.ego_fut_decoder = nn.Sequential(*reg_layers) if self.anchor_planner is None else None
+        # Evaluation-only diagnostic (never used in training): score the refined
+        # trajectories (anchor + offset) instead of the fixed anchors, as WoTE does at
+        # test time -- a second pass of the planner layers on re-encoded trajectories.
+        self.plan_rescore_refined = bool(plan_rescore_refined)
 
-                self.det_position_encoder = metadata_encoder(2)
-                self.map_position_encoder = metadata_encoder(2)
-                self.det_confidence_encoder = metadata_encoder(1)
-                self.map_confidence_encoder = metadata_encoder(1)
-                self.planner_layers = nn.ModuleList(
-                    PlanTaskMemoryLayer(
-                        embed_dims, num_heads, feedforward_channels, True
-                    )
-                    for _ in range(plan_num_layers)
-                )
-                self.final_norm = nn.LayerNorm(embed_dims)
-                decoders = tuple(self.planner_layers)
-            elif plan_anchor_file:
-                self.planner_layers = nn.ModuleList(
-                    PlanTaskMemoryLayer(
-                        embed_dims, num_heads, feedforward_channels, False
-                    )
-                    for _ in range(plan_num_layers)
-                )
-                self.final_norm = nn.LayerNorm(embed_dims)
-                decoders = tuple(self.planner_layers)
-            else:
-                self.plan_decoder = build_self_attn_decoder(
-                    plan_num_layers,
-                    embed_dims,
-                    num_heads,
-                    feedforward_channels,
-                    ("cross_attn", "norm", "ffn", "norm"),
-                    attn_dropout=0.0,
-                    ffn_dropout=0.0,
-                )
-                decoders = (self.plan_decoder,)
-            # Anchor vocabulary replaces the single-trajectory regressor. An
-            # unused Linear would fail DDP's unused-parameter check.
-            self.anchor_planner = None
-            self.plan_rescore_refined = False
-            if plan_anchor_file:
-                from .anchor_planner import AnchorPlanner
-
-                self.anchor_planner = AnchorPlanner(
-                    plan_anchor_file,
-                    embed_dims,
-                    fut_ts,
-                    traj_dims,
-                    plan_reward_weights,
-                    plan_topk,
-                    kinematic=plan_kinematic,
-                    heading_from_xy=plan_heading_from_xy,
-                )
-                self.plan_rescore_refined = bool(plan_rescore_refined)
-                self.ego_fut_decoder = None
-            else:
-                self.ego_fut_decoder = reg_fcs(fut_ts * traj_dims)
-
-        # Xavier initialization matching BaseModule convention
-        for decoder in decoders:
-            for parameter in decoder.parameters():
+        for layer in self.planner_layers:
+            for parameter in layer.parameters():
                 if parameter.dim() > 1:
                     nn.init.xavier_uniform_(parameter)
-
-        if self.use_metric_planner:
-            anchors = (load_plan_anchors(plan_anchor_path, num_plan_candidates, fut_ts)
-                       if plan_anchor_path else torch.zeros(num_plan_candidates, fut_ts, 3))
-            self.register_buffer("plan_anchors", anchors)
-            self.register_buffer("anchors_ready", torch.tensor(bool(plan_anchor_path)))
-            self.candidate_cls = nn.Linear(embed_dims, 1)
-            # Start at physically valid, distinct train-derived trajectories.
-            nn.init.zeros_(self.ego_fut_decoder[-1].weight)
-            nn.init.zeros_(self.ego_fut_decoder[-1].bias)
 
     def forward(
         self,
         mlvl_feats: Sequence[torch.Tensor],
         lidar2img: torch.Tensor,
         image_hw: torch.Tensor,
-        ego_motion: torch.Tensor,
+        ego_motion: Optional[torch.Tensor],
         bev_shift: torch.Tensor,
         prev_bev: Optional[torch.Tensor] = None,
-        bev_yaw: Optional[torch.Tensor] = None,
         only_bev: bool = False,
         cmd: Optional[torch.Tensor] = None,
-        ego_status: Optional[torch.Tensor] = None,
         lidar_bev: Optional[torch.Tensor] = None,
-        return_bev_attn: bool = False,
+        det_out: Optional[Dict[str, torch.Tensor]] = None,
+        map_out: Optional[Dict[str, torch.Tensor]] = None,
+        ego_status: Optional[torch.Tensor] = None,
+        bev_yaw: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor] | torch.Tensor:
-        """
-        Args:
-            mlvl_feats: list of ``[bs, num_cam, C, H, W]``
-            cmd: one-hot navigation command ``[bs, num_navi_cmd]``
-            ego_status: ``[bs, 4]`` [vx, vy, ax, ay] kinematics
-        Returns:
-            ``only_bev``: the BEV feature. Otherwise a dict with ``bev_embed``
-            ``[bs, bev_h*bev_w, C]``, ``scene_query``, ``token_attn`` and
-            ``ego_fut_preds`` ``[bs, ego_fut_mode, fut_ts, traj_dims]``.
-        """
+        """Encode BEV; interaction-enabled planning also needs both heads."""
         bs = mlvl_feats[0].shape[0]
         dtype = mlvl_feats[0].dtype
         device = mlvl_feats[0].device
@@ -391,10 +254,8 @@ class ParaSSRPlannerHead(nn.Module):
             if lidar_bev is not None:
                 raise ValueError("camera-only planner head received lidar_bev")
             bev_queries = self.bev_embedding.weight.to(dtype)
-
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w), device=device, dtype=dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
-
         bev_embed = self.transformer.get_bev_features(
             mlvl_feats,
             bev_queries,
@@ -405,14 +266,14 @@ class ParaSSRPlannerHead(nn.Module):
             image_hw=image_hw,
             ego_motion=ego_motion,
             bev_shift=bev_shift,
-            prev_bev=prev_bev,
             bev_yaw=bev_yaw,
+            prev_bev=prev_bev,
             lidar_bev=lidar_bev,
         )
         if only_bev:
             return bev_embed
-        return self.forward_from_bev(
-            bev_embed, cmd, bev_pos=bev_pos, ego_status=ego_status, return_bev_attn=return_bev_attn
+        return self.plan_from_bev(
+            bev_embed, cmd, det_out, map_out, bev_pos=bev_pos, ego_status=ego_status,
         )
 
     def prepare_task_memories(
@@ -420,16 +281,24 @@ class ParaSSRPlannerHead(nn.Module):
         det_out: Dict[str, torch.Tensor],
         map_out: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Pool decoder latents once. Box and score metadata are detached.
+        """Pool latent content once and encode detached prediction metadata.
 
-        Detection XY is metric and is normalised by the BEV range. Map points
-        are already in ``[0, 1]``. Confidence is the max sigmoid class score.
+        Detection box XY is metric, so normalize it once using the BEV range.
+        Map points are already in [0, 1] and enter their coordinate MLP as-is.
+        Both heads use sigmoid focal classification without a background logit;
+        the maximum sigmoid score is their foreground confidence.
         """
+        if not self.use_task_interaction:
+            raise ValueError("task memories are unavailable when use_task_interaction=False")
         det_hidden = det_out["det_hidden"]
         motion_hidden = det_out["motion_hidden"]
         map_point_hidden = map_out["map_point_hidden"]
         if det_hidden.ndim != 3 or motion_hidden.ndim != 4 or map_point_hidden.ndim != 4:
-            raise ValueError("expected det [B,Q,C], motion [B,Q,M,C], map [B,V,P,C] latents")
+            raise ValueError("expected batch-first det [B,Q,C], motion [B,Q,M,C], map [B,V,P,C] latents")
+        if det_hidden.shape[:2] != motion_hidden.shape[:2]:
+            raise ValueError("detection and motion hidden states must share batch and object dimensions")
+        if det_hidden.shape[0] != map_point_hidden.shape[0]:
+            raise ValueError("detection and map hidden states must share the batch dimension")
         det_memory = self.det_memory_norm(
             self.det_projection(det_hidden) + self.motion_projection(motion_hidden.mean(dim=2))
         )
@@ -450,235 +319,87 @@ class ParaSSRPlannerHead(nn.Module):
             "map_confidence": self.map_confidence_encoder(map_score),
         }
 
-    def forward_from_bev(
+    def plan_from_bev(
         self,
         bev_embed: torch.Tensor,
         cmd: Optional[torch.Tensor],
-        bev_pos: Optional[torch.Tensor] = None,
-        ego_status: Optional[torch.Tensor] = None,
         det_out: Optional[Dict[str, torch.Tensor]] = None,
         map_out: Optional[Dict[str, torch.Tensor]] = None,
-        return_bev_attn: bool = False,
+        *,
+        bev_pos: Optional[torch.Tensor] = None,
+        ego_status: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Run the planning decoder on an existing BEV feature.
+        """Plan from BEV and current [vx, vy, ax, ay] ego status.
 
-        Split out of :meth:`forward` so stage-1 planning distillation can drive
-        the *unchanged* decoder from a cached teacher BEV instead of one built
-        from images. ``forward`` passes the ``bev_pos`` it already computed;
-        when called directly it is recomputed, which is deterministic for a
-        given batch size and grid.
+        Task head outputs are consumed only when interaction is enabled. Ego
+        status is required in every planning mode and enters the initial query
+        once, before the first attention layer.
         """
-        bs = bev_embed.size(0)
-        dtype = bev_embed.dtype
-        expected = self.bev_h * self.bev_w
-        if bev_embed.size(1) != expected:
-            raise ValueError(
-                f"BEV has {bev_embed.size(1)} tokens, planner grid is "
-                f"{self.bev_h}x{self.bev_w}={expected}"
-            )
-        if bev_pos is None:
-            bev_mask = torch.zeros(
-                (bs, self.bev_h, self.bev_w), device=bev_embed.device, dtype=dtype
-            )
-            bev_pos = self.positional_encoding(bev_mask).to(dtype)
-
-        pos_embd = bev_pos.flatten(2).permute(0, 2, 1)
-
+        if self.use_task_interaction and (det_out is None or map_out is None):
+            raise ValueError("planning requires det/motion and map outputs with return_hidden=True")
+        bs, _, _ = bev_embed.shape
         if cmd is None:
-            raise ValueError("cmd is required when only_bev=False")
+            raise ValueError("cmd is required for planning")
         if cmd.size(0) != bs or cmd.numel() != bs * self.num_navi_cmd:
             raise ValueError(
                 f"expected one {self.num_navi_cmd}-way command per sample, "
                 f"but got cmd shape {tuple(cmd.shape)} for batch size {bs}"
             )
-        cmd = cmd.reshape(bs, self.num_navi_cmd)
-        cmd_idx = cmd.argmax(dim=-1)
-
-        if not self.use_stl:
-            navi = self.navi_embedding(cmd_idx).unsqueeze(1)  # [B, 1, C]
-            query = self.plan_query.weight.to(dtype).unsqueeze(0).expand(bs, -1, -1)
-            h = self.plan_fuser(torch.cat((query, navi), dim=-1))
-            if ego_status is None:
-                status = bev_embed.new_zeros((bs, 4))
-            else:
-                status = ego_status.to(dtype=dtype, device=bev_embed.device)
-                if status.shape != (bs, 4):
-                    raise ValueError(
-                        f"expected ego_status [B, 4] (vx, vy, ax, ay), got {tuple(status.shape)}"
-                    )
-            h = h + self.ego_status_encoder(status).unsqueeze(1)
-            plan_pos = self.plan_query_pos.weight.to(dtype).unsqueeze(0).expand(bs, -1, -1)
-            # One query per anchor. h_ego is the command/status feature used to
-            # re-encode refined trajectories at evaluation time.
-            h_ego = h
-            if self.anchor_planner is not None:
-                h = self.anchor_planner.queries(h)
-                plan_pos = plan_pos.expand(-1, h.shape[1], -1)
-            plan_attn = None
-            if self.use_task_interaction:
-                if det_out is None or map_out is None:
-                    raise ValueError("task interaction planning requires det/motion and map outputs")
-                memories = self.prepare_task_memories(det_out, map_out)
-                last = len(self.planner_layers) - 1
-                for index, layer in enumerate(self.planner_layers):
-                    if return_bev_attn and index == last:
-                        h, plan_attn = layer(
-                            h, plan_pos, bev_embed, pos_embd,
-                            return_bev_attn=True, **memories,
-                        )
-                    else:
-                        h = layer(h, plan_pos, bev_embed, pos_embd, **memories)
-                h = self.final_norm(h)
-                if self.anchor_planner is not None:
-                    return self._anchor_outputs(
-                        h, h_ego, plan_pos, bev_embed, pos_embd, memories, status, plan_attn,
-                    )
-                scene_query = h.transpose(0, 1)
-            elif self.anchor_planner is not None:
-                last = len(self.planner_layers) - 1
-                for index, layer in enumerate(self.planner_layers):
-                    if return_bev_attn and index == last:
-                        h, plan_attn = layer(
-                            h, plan_pos, bev_embed, pos_embd,
-                            return_bev_attn=True,
-                        )
-                    else:
-                        h = layer(h, plan_pos, bev_embed, pos_embd)
-                h = self.final_norm(h)
-                return self._anchor_outputs(
-                    h, h_ego, plan_pos, bev_embed, pos_embd, {}, status, plan_attn,
-                )
-            else:
-                plan_query = self.plan_decoder(
-                    query=h.transpose(0, 1),  # [1, B, C]
-                    key=bev_embed.permute(1, 0, 2),  # [HW, B, C]
-                    value=bev_embed.permute(1, 0, 2),
-                    query_pos=plan_pos.transpose(0, 1),
-                    key_pos=pos_embd.permute(1, 0, 2),
-                )
-                h = plan_query.transpose(0, 1)
-                scene_query = plan_query
-            plan = self.ego_fut_decoder(h[:, 0]).view(
-                bs, 1, self.fut_ts, self.traj_dims
+        if ego_status is None:
+            raise ValueError("ego_status [B,4] containing vx, vy, ax, ay is required for planning")
+        if ego_status.shape != (bs, 4):
+            raise ValueError(
+                f"expected ego_status [B,4] containing vx, vy, ax, ay, "
+                f"but got shape {tuple(ego_status.shape)} for batch size {bs}"
             )
-            planned = {
-                "bev_embed": bev_embed,
-                "scene_query": scene_query,
-                "token_attn": None,
-                "ego_fut_preds": plan.expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
-            }
-            if plan_attn is not None:
-                planned["plan_bev_attn"] = plan_attn
-            return planned
-
-        navi_embed = self.navi_embedding(cmd_idx).unsqueeze(1)  # [B, 1, C]
-        bev_navi_embed = self.navi_se(bev_embed, navi_embed)
-
-        bev_query = torch.cat((bev_navi_embed, pos_embd), -1)
-        learned_latent_query, selected = self.tokenlearner(bev_query)
-
-        learned_latent_query = learned_latent_query.permute(1, 0, 2)
-        latent_query, latent_pos = torch.split(
-            learned_latent_query, self.embed_dims, dim=2
-        )
-
-        latent_query = self.latent_decoder(
-            query=latent_query,
-            key=latent_query,
-            value=latent_query,
-            query_pos=latent_pos,
-            key_pos=latent_pos,
-        )
-
-        way_point = self.way_point.weight.to(dtype)
-        wp_pos, way_point = torch.split(way_point, self.embed_dims, dim=1)
-        wp_pos = wp_pos.unsqueeze(0).expand(bs, -1, -1).permute(1, 0, 2)
-        way_point = way_point.unsqueeze(0).expand(bs, -1, -1).permute(1, 0, 2)
-
-        way_point = self.way_decoder(
-            query=way_point,
-            key=latent_query,
-            value=latent_query,
-            query_pos=wp_pos,
-            key_pos=latent_pos,
-        )
-
-        outputs_ego_trajs = self.ego_fut_decoder(way_point)
-        if self.use_metric_planner:
-            if not self.anchors_ready.item():
-                raise RuntimeError(
-                    "metric planner needs a train-only plan_anchor_path or an initialized checkpoint"
-                )
-            residuals = outputs_ego_trajs.permute(1, 0, 2).reshape(
-                bs, self.ego_fut_mode, self.num_plan_candidates, self.fut_ts, self.traj_dims
+        if bev_pos is None:
+            mask = bev_embed.new_zeros((bs, self.bev_h, self.bev_w))
+            bev_pos = self.positional_encoding(mask).to(bev_embed.dtype)
+        bev_pos = bev_pos.flatten(2).transpose(1, 2)
+        cmd_idx = cmd.reshape(bs, self.num_navi_cmd).argmax(dim=-1)
+        navi = self.navi_embedding(cmd_idx).unsqueeze(1)
+        query = self.plan_query.weight.to(bev_embed.dtype).unsqueeze(0).expand(bs, -1, -1)
+        h = self.plan_fuser(torch.cat((query, navi), dim=-1))
+        ego_status = ego_status.to(device=h.device, dtype=h.dtype)
+        h = h + self.ego_status_encoder(ego_status).unsqueeze(1)
+        plan_pos = self.plan_query_pos.weight.to(bev_embed.dtype).unsqueeze(0).expand(bs, -1, -1)
+        memories = self.prepare_task_memories(det_out, map_out) if self.use_task_interaction else {}
+        h_ego = h
+        if self.anchor_planner is not None:
+            h = self.anchor_planner.queries(h)                      # [B, K, C]
+            plan_pos = plan_pos.expand(-1, h.shape[1], -1)
+        for layer in self.planner_layers:
+            h = layer(h, plan_pos, bev_embed, bev_pos, **memories)
+        h = self.final_norm(h)
+        if self.anchor_planner is not None:
+            # NAVSIM ego status is (vx, vy, ax, ay) in the ego frame: vx is the speed along heading
+            out = self.anchor_planner(h, init_speed=ego_status[:, 0])
+            if self.plan_rescore_refined and not self.training:
+                out.update(self._rescore_refined(out, h_ego, plan_pos, bev_embed, bev_pos, memories))
+            poses = out["trajectory"]                               # absolute poses [B, T, 3]
+            steps = torch.diff(torch.cat([poses.new_zeros(bs, 1, self.traj_dims), poses], dim=1), dim=1)
+            out.update(
+                bev_embed=bev_embed, scene_query=h.transpose(0, 1), token_attn=None,
+                # per-step offsets of the selected trajectory, so every consumer of the
+                # v1 API (select_trajectory, validation metrics, plan_map) keeps working
+                ego_fut_preds=steps.unsqueeze(1).expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
             )
-            candidates = residuals + poses_to_offsets(self.plan_anchors)[None, None]
-            candidate_features = way_point.permute(1, 0, 2).reshape(
-                bs, self.ego_fut_mode, self.num_plan_candidates, self.fut_ts, self.embed_dims
-            ).mean(dim=-2)
-            logits = self.candidate_cls(candidate_features).squeeze(-1)
-            return {
-                "bev_embed": bev_embed,
-                "bev_pos": pos_embd,
-                "scene_query": latent_query,
-                "token_attn": selected,
-                "candidate_offsets": candidates,
-                "candidate_logits": commanded_candidates(logits, cmd),
-                "plan_anchors": self.plan_anchors,
-            }
-        outputs_ego_trajs = outputs_ego_trajs.permute(1, 0, 2).view(
-            bs, self.ego_fut_mode, self.fut_ts, self.traj_dims
-        )
-
+            return out
+        plan = self.ego_fut_decoder(h[:, 0]).view(bs, 1, self.fut_ts, self.traj_dims)
+        # Keep the existing command-branch loss and evaluation API. The single
+        # trajectory has already been conditioned on the command embedding.
         return {
             "bev_embed": bev_embed,
-            "scene_query": latent_query,
-            "token_attn": selected,
-            "ego_fut_preds": outputs_ego_trajs,
+            "scene_query": h.transpose(0, 1),
+            "token_attn": None,
+            "ego_fut_preds": plan.expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
         }
 
-    def _anchor_outputs(
-        self,
-        h: torch.Tensor,
-        h_ego: torch.Tensor,
-        plan_pos: torch.Tensor,
-        bev_embed: torch.Tensor,
-        bev_pos: torch.Tensor,
-        memories: Dict[str, torch.Tensor],
-        ego_status: torch.Tensor,
-        plan_attn: Optional[torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        """WoTE anchor + offset. ego_fut_preds stays the v1 per-step offset API."""
-        bs = h.shape[0]
-        out = self.anchor_planner(h, init_speed=ego_status[:, 0])
-        if self.plan_rescore_refined and not self.training:
-            out.update(self._rescore_refined(
-                out, h_ego, plan_pos, bev_embed, bev_pos, memories,
-            ))
-        poses = out["trajectory"]
-        steps = torch.diff(
-            torch.cat([poses.new_zeros(bs, 1, self.traj_dims), poses], dim=1), dim=1,
-        )
-        out.update(
-            bev_embed=bev_embed,
-            bev_pos=bev_pos,
-            scene_query=h.transpose(0, 1),
-            token_attn=None,
-            ego_fut_preds=steps.unsqueeze(1).expand(
-                bs, self.ego_fut_mode, self.fut_ts, self.traj_dims,
-            ),
-        )
-        if plan_attn is not None:
-            out["plan_bev_attn"] = plan_attn
-        return out
-
     def _rescore_refined(self, out, h_ego, plan_pos, bev_embed, bev_pos, memories):
-        """Evaluation only: re-encode anchor + offset and pick among the refined set."""
+        """WoTE-style test-time selection: re-encode anchor + offset, rescore, pick among the refined."""
         ap = self.anchor_planner
-        refined = (
-            ap.trajectory_anchors.unsqueeze(0).to(out["trajectory_offset"].dtype)
-            + out["trajectory_offset"]
-        )
+        refined = (ap.trajectory_anchors.unsqueeze(0).to(out["trajectory_offset"].dtype)
+                   + out["trajectory_offset"])                                  # [B, K, T, 3]
         h2 = ap.queries(h_ego, trajectories=refined)
         for layer in self.planner_layers:
             h2 = layer(h2, plan_pos, bev_embed, bev_pos, **memories)
@@ -687,21 +408,13 @@ class ParaSSRPlannerHead(nn.Module):
         top = final2.topk(k, dim=-1).indices
         gather = top[:, :, None, None].expand(-1, -1, ap.fut_ts, ap.traj_dims)
         top_traj = refined.gather(1, gather)
-        return {
-            "trajectory": top_traj[:, 0],
-            "plan_rescore_final_rewards": final2,
-            "plan_rescore_sim_rewards": sim2,
-            "plan_rescore_topk_index": top,
-            "plan_rescore_topk_trajectory": top_traj,
-        }
+        return {"trajectory": top_traj[:, 0], "plan_rescore_final_rewards": final2,
+                "plan_rescore_sim_rewards": sim2, "plan_rescore_topk_index": top,
+                "plan_rescore_topk_trajectory": top_traj}
 
-    # navsim driving_command index order, from
-    # navsim/planning/scenario_builder: [left, straight, right, unknown]
     CMD_NAMES = ("left", "straight", "right", "unknown")
 
-    def select_trajectory(
-        self, ego_fut_preds: torch.Tensor, cmd: torch.Tensor
-    ) -> torch.Tensor:
+    def select_trajectory(self, ego_fut_preds: torch.Tensor, cmd: torch.Tensor) -> torch.Tensor:
         """Pick the commanded branch and cumsum offsets into absolute poses."""
         bs = ego_fut_preds.shape[0]
         cmd_idx = cmd.reshape(bs, self.num_navi_cmd).argmax(dim=-1)

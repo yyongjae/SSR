@@ -66,6 +66,21 @@ PARA-SSR은 기존 SSR에서 다음 FFP/future world model 경로를 제거했�
 
 따라서 temporal queue는 과거 프레임과 현재 프레임만 포함한다. `queue[-1]`이 실제 current frame이므로 current image와 box/map/planning GT가 같은 시점에 정렬된다.
 
+### 1.3.1 PARA-Drive planner 옵션 (`use_stl=false`)
+
+`agent.config.use_stl=false`로 두면 SSR의 scene-token 경로(navi SE → TokenLearner → latent decoder → waypoint decoder)를 만들지 않고, PARA-Drive(CVPR 2024, Sec. 4) planner를 쓴다.
+
+```
+[learnable plan query ⊕ command embedding] → Linear+LN+ReLU
+  → cross-attention × plan_num_layers (key/value = 전체 bev_embed + bev_pos)
+  → MLP → fut_ts × 3
+```
+
+- command는 출력 분기 선택이 아니라 query 조건으로 들어간다. 출력은 모든 command slot에 같은 plan을 채워 `[B, 4, T, 3]` 형태를 유지하므로 loss(commanded branch, 전체 평균)와 `select_trajectory`는 STL과 동일하다.
+- BEV encoder, LiDAR, aux head, GradBalancer는 그대로다. `token_attn`은 출력되지 않는다.
+- 실제 크기 기준 planner 파라미터(BEV encoder 제외): STL 2.42M, PARA-Drive 1.85M (`plan_num_layers=3`).
+- 체크포인트는 플래그와 함께만 strict load 된다. 평가 시에도 `agent.config.use_stl=false`를 넘겨야 한다.
+
 ### 1.4 한 번의 학습 iteration에서 일어나는 일
 
 실제 진입점은 `ParaSSR.forward_train()`이다.

@@ -1,0 +1,284 @@
+# Stage T (teacher refiner) 구현 상태
+
+작성: 2026-09-28 09:30 KST (통합 단계). 설계 계약은 `report/refiner_T/IMPL_SPEC.md`, 판정 규칙은 `report/refiner_T/PRESTATED_DECISION_RULE.txt`를 따른다.
+
+## 0. 요약
+
+- 파이프라인 전체를 구현했다. 코드 29개 파일, CPU 테스트 23개 파일에서 **테스트 185개가 모두 통과**했다(전체 한 번에 약 2분 20초).
+- 실제 데이터 20개 토큰(train 12, dev 8)으로 처음부터 끝까지 CPU에서 돌렸다. 경로는 데이터 → refiner(R_T, R_none) → 대리 손실 → 역전파 → 최적화 → `eval_refiner` → 공식 채점이다. 모든 단계가 돌았다.
+  - "수정하지 않은" 초안은 원래 공식 점수를 **정확히**(float64 비트 단위) 돌려준다.
+- 백그라운드에서 데이터를 만들고 있다. 전부 끝나는 시각은 약 **10:45–11:15**이다. 이 작업들은 metric cache, SDF, 초안 은행, packing이다.
+  - 물체(M6) 전체 빌드는 이번에 실행해서 끝냈다.
+- **GPU 학습을 시작하기 전에 정할 것**이 넷 있다(§4의 D1–D4).
+  1. M8 기준 2개가 미달이다.
+  2. 초안 은행 실패율이 목표보다 낮다.
+  3. loss weight 후보를 정해야 한다.
+  4. GPU 예산을 정해야 한다.
+
+## 1. 만들어진 것
+
+### 1.1 코드
+
+패키지 `navsim/agents/para_ssr/refiner/`:
+
+| 파일 | 역할 |
+|---|---|
+| `geometry.py` | 초안 경로(C2 스플라인), arc length, 연장 |
+| `decoder.py` | M4 교정 디코더, 초안 교란 생성기 |
+| `gt_future.py` | M6 미래 물체(GT) 조회 |
+| `sdf.py` | 주행 가능 영역 SDF |
+| `surrogate.py` | M7 대리 손실(충돌, DAC, 진행, 편안함, 수정량, gate) |
+| `adapters.py` | teacher BEV → S grid, z-score, 1×1 어댑터 |
+| `corridor.py` | 통로 샘플링과 전역 token |
+| `refiner_net.py` | M5 refiner |
+| `data.py` | teacher cache 접근, split packing(memmap), loader |
+
+도구 `tools/refiner/`:
+
+| 파일 | 역할 |
+|---|---|
+| `make_splits.py`, `build_metric_cache.py`, `extract_human.py` | split 생성, metric cache, 사람 궤적 |
+| `build_future_objects.py`, `build_sdf.py`, `validate_sdf.py` | 물체, SDF |
+| `score_trajectories.py`, `check_scorer_equivalence.py` | 공식 채점(batch) |
+| `make_draft_bank.py`, `validate_decoder.py`, `validate_surrogate.py` | 초안 은행, 디코더 검증, M8 |
+| `train_refiner.py`, `eval_refiner.py` | 학습, 평가 |
+| `smoke_refiner.py` | 이전 smoke(초안 은행이 생기기 전 버전) |
+| **이번에 추가** | |
+| `integrate_smoke.py` | 실제 데이터 end-to-end 검사(§1.3) |
+| `pack_follow.py` | 상류 작업이 끝나는 대로 packing을 이어서 하는 작업 |
+| `stageT_decision.py` | 교차 적합 θ 선택 + dev 판정(사전 규칙 구현) |
+| `stageT_gpu_plan.sh` | GPU 여러 장에 run 30개/6개를 분배 |
+| `stageT_gpu_commands.sh` | run 1개: 학습 후 평가 |
+
+테스트는 `tools/refiner/tests/test_*.py` 23개 파일이다. 이번에 `test_pack_follow.py`(3개), `test_stageT_decision.py`(5개), `test_integrate_smoke.py`(2개)를 추가했다.
+
+### 1.2 검증 수치(모듈별, 모두 CPU)
+
+- **공식 채점기 동일성**
+  - batch 채점(PDM-Closed와 최대 13개 초안을 함께 채점)이 단독 `pdm_score`와 **불일치 0건**이다. 1,300 토큰, 8,500 궤적에서 NC, DAC, DDC, EP, TTC, comfort, PDMS 7개 값을 비교했다.
+  - 구성: navtest K=6 1,000토큰, K=13 100토큰, E navtrain 200토큰.
+  - 그냥 한꺼번에 채점하면 틀린다. EP는 2,163건, DDC는 76건이 달라진다(K=6 세트).
+  - progress 임계값은 5.0 m이다(공식 yaml).
+- **M6 미래 물체 재구성**
+  - metric cache 다각형 대비 모서리 최대 오차는 **7.6e-6 m**이다.
+  - (track, 시각) 쌍 약 600만 개에서 존재 여부 불일치는 **0건**이다.
+  - 대상은 1,279토큰이다(navtest 무작위 500 + NC 실패 279 + navtrain E 500).
+  - UNKNOWN 비율은 0이다(기준 궤적 3종).
+- **SDF와 공식 DAC 일치**
+  - LQR로 추적한 41개 footprint에서 "모서리 SDF < 0"이 공식 DAC와 **548/550** 일치한다. 놓침 2건, 오경보 0건, AUC 0.9999다.
+  - 놓친 2건은 폭 10 cm 미만의 지도 틈 때문이다. 0.25 m grid로는 표현할 수 없다.
+  - 추적 전 원시 41점 기준으로는 무작위 토큰에서 97.3% 일치하고 recall은 0.684다. 이 차이는 SDF가 아니라 LQR 추적 때문이다.
+- **디코더(M4)**
+  - 교정량 0이면 원래 초안이 **비트 단위로 그대로** 나온다. navtest 초안 12,146개와 사람 궤적 12,146개, float32/64, mode A/B에서 확인했다.
+  - |δa|는 [-4, +2] 안에 있다.
+  - 왕복 재현(교란 초안 → 사람 궤적 복원)은 98.3%가 0.1 m 이내다.
+- **metric cache와 사람 궤적**
+  - navtest 20토큰을 다시 캐시해서 120번 채점했다. 결과가 완전히 같다.
+  - 사람 궤적 오차는 1.8e-6 m다(float32 변환 오차뿐).
+- **M8 대리 손실 사전 기준**(dev 800토큰, 212개 log, 공식 채점 궤적 32,269개)
+
+  | 기준 | 결과 | 95% CI | 판정 |
+  |---|---|---|---|
+  | A1 NC recall ≥ 0.70 | 0.948 (471/497) | 0.924–0.966 | **통과** |
+  | A2 사람 궤적 오경보 ≤ 2% | 2.75% (22/800) | 1.7–4.1% | **미달** |
+  | A3 P(공식으로 고쳐짐 \| 대리 손실이 고쳤다고 판단) ≥ 0.6 | 0.510 (349/684) | 0.472–0.548 | **미달** |
+
+  - A2: 걸린 사람 궤적 22개는 모두 물체와 0.16–0.35 m 떨어져 지나갔다. margin 0에서는 오경보가 0%다.
+  - A3: 실패 원인은 교정이 틀려서가 아니라 0.3 m margin에서 판단이 부정확하기 때문이다.
+    - 대리 손실이 "고쳤다"고 한 684건 중 실제 NC 실패는 379건이었고, 그중 92%(349건)가 공식으로도 고쳐졌다.
+    - 나머지 305건은 공식 NC가 원래 통과하던 근접 통과였다.
+- **초안 은행 공식 실패율**(1차 pass 결과, 유효 초안만. 실패 = NC<1 또는 DAC<1 또는 DDC<1)
+
+  | | 토큰 | 유효 초안 비율 | 실패율 | NC<1 | DAC<1 | TTC<1 | 실패율(+TTC) |
+  |---|---|---|---|---|---|---|---|
+  | train | 14,844 | 94.5% | **12.1%** | 4.8% | 8.5% | 10.8% | 17.6% |
+  | dev | 5,837 | 94.7% | **12.1%** | 5.2% | 8.1% | 11.3% | 17.7% |
+
+  - 계열별(train): identity 0%, small 2.3%, L-const 2.7%, ignore-brake 3.4%, creep 80%(455개), lateral 21%, combined 25%, CV 66%, heading-drift 20%(10개).
+  - 목표 20–35%에 못 미친다(§4 D2).
+  - 채점 오류는 0건이다.
+
+### 1.3 통합 smoke(`tools/refiner/integrate_smoke.py`)
+
+- 대상: 실제 초안 은행, 라벨, 물체, SDF, centerline, teacher, train 12 + dev 8토큰. 각 토큰은 서로 다른 log에서 뽑았다.
+- 결과 파일: `report/refiner_T/integration_smoke.json`. 실행 시간은 170 s다.
+
+| 검사 | 내용 | 결과 |
+|---|---|---|
+| A 패킹 | 6개 part를 실제 출처로 pack | 20/20행 완료. 초안은 npz와, 라벨은 채점 행과 **완전히 같음**. centerline 최대 1,148 vertex(잘림 0). 물체 최대 306(버림 0) |
+| B1 라벨 재현 | pack의 원래 초안을 `score_token`으로 다시 채점 | 260궤적에서 **불일치 0**(8개 값 + pdm_progress_eff) |
+| B2 수정 없음 = 원래 점수 | 학습 안 된 net(두 arm) → 디코딩 → `eval_refiner` → 채점 CLI | τ1 바이트 == τ0 바이트. θ=0(전부 "수정")에서도 7개 공식 값이 은행 라벨과 **정확히 같음**(arm마다 104개). PDMS 0.801211…로 동일 |
+| C 대리 손실 연결 | 학습 루프의 SceneBatch vs 대리 손실 자체 builder | col, dac, cmf, mod 차이 0. prog 차이 ≤ 7.2e-7(centerline float32 저장). UNKNOWN 판정 동일(비율 0) |
+| D 기울기 | 156개 초안 batch, 두 arm | 모든 기울기 유한 |
+| E CLI 학습 | `train_refiner.py` 두 arm, 4 step | loss와 grad norm 유한. 실제 대리 손실 사용 |
+| F CLI 평가 | predict → score → report. θ = p_g 중앙값이라 두 gate 분기가 모두 나옴 | gate 적용 궤적을 직접 채점한 값과 섞은 값이 **104/104 일치**(arm마다) |
+
+D 기울기 검사의 세부:
+
+- step 0에서는 head(8/119 파라미터)에만 기울기가 흐른다. 교정 head의 마지막 층을 0으로 초기화했기 때문이고, 의도한 동작이다. step 1부터는 119/119에 흐른다.
+- 8 step 동안 안정적이었다.
+- step 0의 correction loss는 두 arm에서 같다(0.04913). 파라미터 수는 trunk가 두 arm 모두 3,375,181이고, adapter만 41,152(T)와 0(none)으로 다르다.
+
+과적합 탐침(arm none, gate 제외, lr 3e-4, 같은 batch로 60 step):
+
+- correction loss가 0.0491에서 0.0436으로 **11% 줄었다**. 충돌 항은 23%, DAC 항은 32% 줄었다.
+- 처음 약 40 step 동안은 모든 초안에 거의 같은 작은 교정을 낸다. 그 뒤부터 초안마다 다른 교정(최대 1.2 m)을 배운다.
+- 결과는 `integration_smoke.json`의 `D2_overfit_train`에 있다.
+- 같은 탐침을 lr 1e-3으로 200 step 돌렸다(`_integrate/logs/overfit_1e-3.log`).
+  - 균일 교정 구간은 약 60 step으로 더 길었다.
+  - 200 step에서 correction loss는 0.0491에서 0.0286으로 **42% 줄었다**. 충돌 항은 39%, DAC 항은 56% 줄었다.
+  - 교정 크기는 초안 중앙값이 0.03 m, 최대가 1.8 m다. 대부분은 거의 건드리지 않고 일부만 크게 고치는 형태로 수렴한다.
+
+### 1.4 통합 단계에서 고친 것
+
+1. **centerline padding** `CL_MAX`: 1024 → 1536(`data.py`).
+   - `surrogate.py`가 centerline crop을 +150 m에서 +250 m로 늘렸다(08:59). 그래서 실제 vertex 수가 최대 1,153개가 되어 pack에서 잘리고 있었다. `test_data.py`가 이것으로 실패했다.
+2. **물체 padding** `A_MAX`: 640 → 800.
+   - 전체 물체 빌드에서 train 최대 781개가 나왔다(640 초과 14토큰). dev 최대는 592다. 이제 train/dev에서 버려지는 물체가 없다.
+   - pack 형식 버전은 `refiner_pack_v2`다. 토큰당 409 KiB이므로 train은 약 10.1 GB, dev는 약 3.4 GB다.
+3. **학습 기본값**: `train_refiner.py --surrogate` 기본값을 `auto`에서 `real`로 바꿨다. 대리 손실이 없거나 깨지면 stub으로 조용히 넘어가지 않고 오류가 난다. stub은 `--surrogate stub`으로만 쓸 수 있다.
+4. **GPU 스크립트**
+   - 동시에 도는 run의 평가를 `flock`으로 한 줄로 세웠다. 평가마다 채점 worker 4개를 쓰기 때문이다.
+   - 로그를 덮어쓰지 않고 이어서 쓰게 했다.
+5. **`stageT_decision.py`의 버그**: 입력 DataFrame을 제자리에서 바꾸던 버그를 테스트로 찾아 고쳤다.
+
+## 2. 백그라운드 작업(09:29 기준)
+
+| 작업 | PID | 진행 | 예상 완료 | 로그 | 중지 |
+|---|---|---|---|---|---|
+| metric cache (worker 4) | 2558232 (pgid 2558230) | 새 토큰 19,210/22,526, 오류 0, 약 2.0 tok/s | 약 09:57(+ manifest 5분) | `metric_cache/logs/build.log` | `kill -TERM -- -2558230` |
+| SDF (worker 2, 15분마다 추적) | 2573988 (pgid) | 이번 pass 대상 14,226개 중 13,561개 처리(6,475개 새로 생성). metric cache를 뒤따름 | 약 10:15–10:30 | `sdf/logs/build_navtrain.log` | `kill -TERM -- -2573988` |
+| 초안 은행 생성·채점 (worker 2) | 2949694 (pgid) | 1차 pass 완료(train 14,844, dev 5,837, 오류 0). 2차 pass에서 train 5,317개 생성 후 채점 중(오류 0). 15분마다 다음 pass | 약 10:30–10:45 | `drafts/logs/run.log` | `kill -TERM -- -2949694` |
+| **packing (이번에 실행, worker 2)** | 3163541 (pgid 3163536) | 1차 pass: 학습에 쓸 수 있는 행이 dev 4,586/7,930, train 14,243/23,820. 15분마다 다시 pass | 상류 완료 후 약 10:45–11:15 | `packed/logs/follow.log`, `packed/<split>/follow_status.json` | `kill -TERM -- -3163536` |
+| 물체 전체 빌드 (이번에 실행, worker 2) | 3127507 (종료) | **완료**: train 24,000, dev 8,000, 오류 0, 약 4분. 물체 수 최대 781(train) / 592(dev) | – | `objects/logs/build_full.log` | – |
+
+- 로그 경로의 앞부분은 모두 `/home/external-user/ssd/yongjae_refiner/`이다.
+- 모든 작업은 같은 명령으로 다시 실행하면 이어서 진행한다.
+  - packing: `CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 nohup nice -n 10 /home/external-user/miniconda3/envs/ssr/bin/python tools/refiner/pack_follow.py --splits dev,train --workers 2 --interval 900 --max-h 12 > /home/external-user/ssd/yongjae_refiner/packed/logs/follow.log 2>&1 &`
+  - packing은 모든 part가 채워지면 스스로 멈춘다. 상류 작업이 모두 끝났는데 새로 채울 것이 없을 때도 멈춘다.
+- 참고: frame gap 토큰(train 180개, dev 70개)은 초안을 만들지 않으므로 학습에서 빠진다.
+
+## 3. IMPL_SPEC과 다른 점
+
+모두 해당 모듈 docstring 맨 위에 적혀 있다. 인터페이스는 바꾸지 않았고, 선택 인자만 추가했다.
+
+- **geometry/decoder**
+  - 경로 매개변수는 채점기의 polyline arc length다. 0.2 m 이내 정지 떨림 점은 knot에서 뺐다.
+  - 곡률 투영은 점별 방식이다(K = max(κ_lim, 1.1·|κ_draft|), 6회 반복). spec 식을 그대로 쓰면 원래 경로가 한계를 넘는 5.6–7% 초안에서 횡 교정이 모두 막힌다.
+  - 끝 조건은 not-a-knot이다. 곡률은 1/m, g는 0.2에서 잘랐다(둘 다 flag를 남김).
+  - 교란 전용 mode 'P'를 추가했다. CV 무효 규칙과 heading-drift 크기는 직접 정했다.
+- **채점기**: 출력 key를 추가했다(mult, ttc_track 등). `--tokens`는 선택 사항이다.
+- **M6**
+  - UNKNOWN 정의에 "원점에서 R − 10 m 밖"을 추가했다.
+  - 도달 거리는 GT ego 뒤차축에서 잰다.
+  - 정적 물체의 속도는 0이다(metric cache와 같음).
+  - `frame_idx`는 frame dict의 필드 값이다.
+- **SDF**
+  - distance transform 대신 셀 중심의 정확한 부호 거리를 쓴다(DT는 오차 0.07–0.11 m, 격자 끝 오류가 있었다).
+  - 유효 영역은 가장자리에서 0.125 m씩 줄었다. 값은 ±10 m로 잘랐다. 저장은 subset별(navtrain/navtest)이다.
+- **split/cache**
+  - 모든 log를 한쪽(train 또는 dev)에 배정한 뒤 log 안에서 같은 비율로 토큰을 솎았다. 층화 기준은 (city, part)다.
+  - E의 cache 9,000개 중 8,997개를 재사용했다(복사).
+  - a0는 부호 있는 종가속도다.
+- **초안 은행**
+  - 실패율 목표 20–35%는 A_p 범위만으로 닿을 수 없다. 가장 넓은 범위에서도 14%라서 spec 범위 U[0.2, 1.3]을 유지했다.
+  - 기각된 계열의 초안은 사람 궤적 바이트에 `valid=False`를 붙여 둔다.
+  - 운동학 검사는 0.5 s keyframe에서 사람 궤적 대비로 한다.
+- **대리 손실**
+  - keyframe 편안함 기준은 한계의 1.0배다. spec은 0.9배지만, 0.9배로는 사람 궤적 위반이 1.6–2.1%라 spec 자체의 수용 기준(≤1%)을 넘는다.
+  - t0 jerk 항은 뺐다.
+  - 사람-물체 겹침 mask는 정확한 SAT 검사로 한다.
+  - 비용은 n = 1..40의 평균이다.
+  - centerline은 [-30, +250] m로 잘랐다.
+  - TTC와 DDC 대리 손실은 없다.
+- **모델/학습**
+  - u_d 69차원에 ego (vx, vy, ax, ay)를 넣었다. spec 목록은 65개다.
+  - 두 번째 flag는 "연장 곡률이 잘렸는지"다.
+  - 마지막에 LayerNorm을 넣었다. grad clip은 1.0이다. gate BCE는 유효 초안만으로 계산한다.
+  - teacher z-score 통계는 run이 실제로 학습하는 토큰(최대 2,048개)으로 계산한다. 그래서 OOF 평가 토큰이 통계에 들어가지 않는다.
+  - 물체 padding은 800, centerline padding은 1536이다.
+  - loss weight는 placeholder다(col 1, dac 1, prog 2, cmf 0.1, mod 0.1, gate 0.5).
+- **판정 스크립트**(`stageT_decision.py`, 사전 규칙을 해석한 부분)
+  - P2는 "NC+TTC 실패 감소량 = none − T"(pp)로 정의했다. 규칙의 "하한 > 0"과 방향을 맞추기 위해서다.
+  - 규칙의 PASS 줄에는 DAC/DDC 비열등이 없다. 그래서 판정에 섞지 않고 옆에 따로 보고한다.
+  - θ는 OOF 예산 안에서 가장 작은 θ다. 이것이 가장 많이 교정하는 gate다.
+  - seed는 초안별로 평균한다.
+
+## 4. 남은 문제와 위험
+
+### GPU 학습 전에 결정할 것
+
+- **D1. M8 기준 A2, A3 미달.** spec은 이때 "보고 후 M7b(미분 가능한 추적 근사)를 고려"하라고 한다. 선택지는 다음과 같다.
+  - (a) 현재 대리 손실로 학습을 진행한다. A1은 통과했고, A3 미달은 margin 0.3 m의 정밀도 문제이며, 실제 NC 실패 수정률은 92%다.
+  - (b) M7b를 구현한다. 교정 후 남은 NC 실패 82건 중 37건은 원시 기준 궤적으로는 보이지 않는다. 그중 36건은 LQR 추적 상태에서 잡힌다.
+  - (c) m_col이나 사람 mask 규칙을 바꾼다.
+  - 대리 손실을 바꾸면 학습을 다시 해야 하므로 먼저 정해야 한다.
+  - 참고로 DAC margin 0.2 m에서 사람 오경보는 6.1%다(margin 0이면 0.4%).
+- **D2. 초안 은행 실패율 12%**(목표 20–35%). gate의 양성 가중치는 약 8–9다. 목표에 가까이 가는 방법은 다음과 같다.
+  - TTC를 실패 라벨에 넣는다(17.6%).
+  - 가속 초안이 centerline을 쓰게 한다(pilot 실패율 14.2%, 유효 비율 99.5%).
+  - 횡 오프셋을 넓힌다.
+  - slot 구성을 바꾼다(13개 중 4개가 identity/small).
+  - 초안 은행을 바꾸면 pack의 drafts와 labels part를 다시 만들어야 한다(`--redo drafts,labels`).
+- **D3. loss weight 후보.** 사전 규칙은 "θ와 weight를 교차 적합으로 고른다"고 한다. weight 후보 하나당 교차 적합 run이 30개 필요하다. 후보 목록(예: col 2배, mod 0.3배)은 정해야 한다.
+- **D4. GPU 예산.**
+  - GPU 속도는 아직 재지 않았다. fp16을 GPU에서 돌려 본 적도 없다(CPU autocast만 확인).
+  - 추정은 이렇다. 한 epoch는 약 2,100–2,700 step이고 40 epoch면 약 90k–110k step이다. arm T는 teacher 파일 읽기만으로 step당 약 0.085 s가 든다(loader worker 2). 그러면 run 하나에 약 2–5시간이고, 36개 run(교차 적합 30 + 최종 6)이면 약 70–180 GPU시간이다.
+  - early stopping(patience 6)으로 줄어들 수 있다. §5의 시간 측정 pilot을 먼저 돌리기를 권한다.
+
+### 알려진 한계와 위험
+
+- **mode A 불감대**: 제어점이 0 위로 밀리면 기울기가 0이다. z = 0에서 제동 쪽 기울기 크기는 절반이다(부호는 맞음). leaky 변형은 없다.
+- **학습 초기의 균일 교정 구간**: 과적합 탐침에서 처음 수십 step 동안 모든 초안에 같은 교정을 낸다. 실제 학습 곡선은 GPU에서 확인해야 한다.
+- **"small" 초안의 2.3%가 실패**한다(주로 도로 가장자리 DAC). gate는 이것을 양성으로 본다. CV 초안(66% 실패)이 은행 실패의 큰 몫을 차지한다.
+- **pack은 part 단위로 한 번 채우면 끝**이다. 상류 산출물(초안 은행 config, 대리 손실의 centerline crop 상수)이 바뀌면 해당 part를 `--redo`로 다시 만들어야 한다.
+- **navtest는 아직 준비하지 않았다**(navtest human npz, pack). 최종 보고 전에 필요하다.
+- **예전 smoke 데이터**: `smoke_refiner.py`의 `_smoke/packed`는 예전 layout(640/1024)이다. 다시 돌리려면 그 디렉터리를 지워야 한다(pack이 layout 불일치를 거부함). 이제는 `integrate_smoke.py`가 그 역할을 한다.
+- **채점기와 공식 eval CSV의 작은 차이**: 저장된 모델 궤적을 다시 채점하면 EP가 최대 4.2e-4 다르다(batch 문제는 아님). 저장된 pkl을 만든 GPU 추론과 eval 때 추론이 달랐던 것으로 보인다.
+- **frame gap 정의 차이**: 0.75–0.88%와 설계 문서의 1.34%를 맞춰 보지 않았다. train 쪽 log 6개는 반올림 때문에 토큰을 하나도 받지 못했다.
+- **shapely 경고**: centerline에 길이 0인 선분이 있어서 `line_locate_point` RuntimeWarning이 난다. 투영 결과는 유한하고 공식 채점기와 같은 linestring을 쓰므로 무해하다(200토큰 확인).
+- **해석상의 한계**(blocker 아님): teacher가 navtrain 전체로 학습되었으므로 train과 dev 모두 in-sample이다.
+
+## 5. GPU를 받으면 실행할 명령
+
+모두 `cd /home/external-user/yongjae/SSR`에서 실행한다. `<GPUS>`에는 GPU 번호를 공백으로 구분해 넣는다(예: `"2 3"`, 프로세스에 보이는 CUDA index).
+
+```bash
+# 0. 준비 확인: 두 split 모두 "complete": true 여야 한다 (plan 스크립트도 확인하며, FORCE=1이면 건너뜀)
+grep -E '"complete"|"ready"|"n_usable"' /home/external-user/ssd/yongjae_refiner/packed/{train,dev}/follow_status.json
+
+# 1. (권장) 시간 측정 pilot: 300 step, 로그의 sec로 step 시간 확인
+OMP_NUM_THREADS=2 nice -n 10 /home/external-user/miniconda3/envs/ssr/bin/python tools/refiner/train_refiner.py \
+  --arm T --fold 0 --seed 0 --gpu <GPU> --workers 2 --tag gpupilot --max-steps 300 --epochs 1 --log-every 50 --max-val-batches 20
+
+# 2. 교차 적합: arm {T, none} x fold {0..4} x seed {0,1,2} = run 30개, 각 run은 자기 fold를 OOF로 평가
+nohup tools/refiner/stageT_gpu_plan.sh crossfit "<GPUS>" > /home/external-user/ssd/yongjae_refiner/runs/logs/plan_crossfit.log 2>&1 &
+#    loss weight 후보를 더 돌릴 때(D3):
+#    TAG=w_col2 nohup tools/refiner/stageT_gpu_plan.sh crossfit "<GPUS>" --w col=2,dac=1,prog=2,cmf=0.1,mod=0.1 > .../plan_crossfit_w_col2.log 2>&1 &
+
+# 3. arm별 θ(와 weight) 선택 (train OOF만 사용, dev는 읽지 않음)
+CUDA_VISIBLE_DEVICES="" /home/external-user/miniconda3/envs/ssr/bin/python tools/refiner/stageT_decision.py select \
+  --wtags stageT --seeds 0,1,2 --folds 0,1,2,3,4 --budget-ep 0.5 --out report/refiner_T/crossfit_selection.json
+
+# 4. 최종 학습 (전체 fold) + dev 평가: arm {T, none} x seed {0,1,2} = run 6개
+#    (weight 후보가 여럿이면 선택된 TAG와 --w로 실행)
+nohup tools/refiner/stageT_gpu_plan.sh final "<GPUS>" > /home/external-user/ssd/yongjae_refiner/runs/logs/plan_final.log 2>&1 &
+
+# 5. 사전 규칙 판정 (seed 평균, log-cluster paired bootstrap 10,000)
+CUDA_VISIBLE_DEVICES="" /home/external-user/miniconda3/envs/ssr/bin/python tools/refiner/stageT_decision.py compare \
+  --selection report/refiner_T/crossfit_selection.json --seeds 0,1,2 --n-boot 10000 --out report/refiner_T/decision_dev.json
+```
+
+- run 하나만 돌릴 때는 `tools/refiner/stageT_gpu_commands.sh <GPU> <T|none> <fold: -1|0..4> <seed> [--w ...]`를 쓴다. 학습 후 평가까지 한다.
+  - 로그: `/home/external-user/ssd/yongjae_refiner/runs/logs/<run>.{train,eval}.log`
+  - run 디렉터리: `runs/<TAG>_<arm>_fold<k>_seed<s>/`
+- dev 평가만 따로 할 때:
+
+  ```bash
+  OMP_NUM_THREADS=1 nice -n 10 /home/external-user/miniconda3/envs/ssr/bin/python tools/refiner/eval_refiner.py all \
+    --run /home/external-user/ssd/yongjae_refiner/runs/stageT_T_fold-1_seed0 --split dev --gpu <GPU> --workers 4 \
+    --theta 0.5 --sweep --budget-ep 0.5
+  ```
+
+- 중단 후 재개: 같은 명령을 다시 실행한다. 학습은 `ckpt_last.pt`에서 이어가고, 끝난 run(DONE)은 건너뛴다.
+- 사전 규칙에서 [default]로 표시된 값(예산 0.5점, margin 0.5 pp, 동등 범위 ±0.2점, seed 3개)은 **첫 dev 평가 전까지만** 바꿀 수 있다. `stageT_decision.py`의 인자로 바꾼다.

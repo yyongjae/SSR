@@ -1,4 +1,5 @@
 from typing import Tuple
+import cv2
 import hydra
 from hydra.utils import instantiate
 import logging, torch
@@ -16,6 +17,21 @@ from navsim.common.dataclasses import SceneFilter
 from navsim.agents.abstract_agent import AbstractAgent
 
 logger = logging.getLogger(__name__)
+
+
+def _worker_init(worker_id: int) -> None:
+    """Keep every dataloader worker single-threaded.
+
+    A worker is already a process, so its libraries' own thread pools add no
+    parallelism -- they only oversubscribe the machine.  OpenCV defaults to one
+    thread per core and is inherited through the fork, so N workers x C cores
+    threads fight over C cores: measured here at 2,685 threads on 32 cores and
+    491k context switches/second, which starved the GPUs to ~60% and made a
+    step 18x slower than its compute cost.  PyTorch already pins its own
+    intra-op threads in workers; OpenCV and the OpenMP runtimes do not.
+    """
+    cv2.setNumThreads(0)
+    torch.set_num_threads(1)
 
 CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
@@ -116,27 +132,24 @@ def main(cfg: DictConfig) -> None:
         train_data, val_data = build_datasets(cfg, agent)
 
     if hasattr(agent, "filter_datasets_to_teacher_cache"):
+        # aux_distill BEV distillation: keep only training tokens every teacher
+        # cache has (ReSMap covers navtrain train_logs only).  No-op when it is off.
         agent.filter_datasets_to_teacher_cache(train_data, val_data)
-
-    if hasattr(agent, "validate_metric_cache"):
-        agent.validate_metric_cache((train_data, val_data))
 
     logger.info("Building Datasets")
     if len(train_data) == 0:
-        raise RuntimeError(
-            "training set is empty after teacher-cache filtering; "
-            "the teacher cache does not cover this split"
-        )
-    train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True)
+        raise RuntimeError("training set is empty (after teacher-cache filtering, if the distillation is on)")
+    train_dataloader = DataLoader(
+        train_data, **cfg.dataloader.params, shuffle=True, worker_init_fn=_worker_init
+    )
     logger.info("Num training samples: %d", len(train_data))
     if len(val_data) == 0:
         val_dataloader = None
-        logger.warning(
-            "Validation set is empty after teacher-cache filtering; "
-            "skipping validation. ReSMap's published cache is train_logs only."
-        )
+        logger.warning("Validation set is empty (teacher-cache filtering); validation is skipped")
     else:
-        val_dataloader = DataLoader(val_data, **cfg.dataloader.params, shuffle=False)
+        val_dataloader = DataLoader(
+            val_data, **cfg.dataloader.params, shuffle=False, worker_init_fn=_worker_init
+        )
         logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")

@@ -1,0 +1,230 @@
+Stage T pre-stated decision rule (written 2026-09-28, BEFORE any refiner result exists). Values marked [default] may be changed by the user only before the first dev evaluation.
+
+Question: Is the teacher refiner (R_T: reads frozen BEVFusion 50x100 BEV) a better corrector than the same refiner without scene features (R_none)?
+Data: dev = held-out navtrain logs (log-level split, city-stratified). Drafts = the dev draft bank (13 per token: human perturbations + constant-velocity), official PDM scoring (v1 fork, scorer equivalence-tested).
+Inference rule per arm: apply correction iff p_g >= theta, else keep the ORIGINAL draft. theta and loss weights chosen by 5-fold log-level cross-fitting inside the TRAIN pool only, per arm, under the same budget.
+Seeds: 3 per arm [default]. Statistics: log-cluster paired bootstrap (10,000), 95% CI, seed-averaged.
+
+Primary endpoints (R_T - R_none), all at the progress budget: mean EP loss vs original drafts <= 0.5 points [default]:
+ P1 official PDMS difference over all dev drafts.
+ P2 total failures: NC and TTC failures (primary); DAC and DDC as non-inferiority (R_T not worse by more than 0.5 percentage points [default]).
+ P3 new failures (any of NC, DAC, DDC, TTC, comfort on drafts that passed before): R_T not worse than R_none by more than 0.5 percentage points [default].
+Sanity (must hold for the measurement to count): at least one arm improves PDMS over "no correction" with CI lower bound > 0.
+
+Outcomes:
+ PASS: P1 lower CI > 0 AND P2 (NC+TTC) lower CI > 0 AND P3 non-inferior  -> teacher refiner qualified as KD teacher; proceed to stage E (E1 vs E2).
+ EQUIVALENT: P1 and P2 CIs inside +-0.2 PDMS points / +-0.5 pp [default] -> "under the current frozen-feature / refiner setting the teacher shows no correction advantage".
+   This does NOT rule out benefits in E2E joint training (e.g. convergence); whether to run stage E is the user's decision.
+ INCONCLUSIVE: neither -> add seeds / enlarge dev; no conclusion.
+ WORSE: R_T significantly below R_none -> diagnose (adapter, normalisation, map information) before any conclusion.
+Reported but not decisive: real-draft-like subsets (constant-velocity, L-const), family-wise results, R_GT-cur if added, surrogate-vs-official agreement (M8).
+navtest is NOT used for this decision; it is used once for the final frozen report.
+Interpretation limits (not blockers): the teacher was trained on all navtrain (teacher features are in-sample on train and dev pools); no student features are compared in stage T.
+
+=== AMENDMENT 1 (2026-09-28 ~10:00, user decisions, BEFORE any training or dev evaluation) ===
+- Seeds: 1 (seed 0). No seed ablation. Consequence: bootstrap CIs cover data (log) variability only, not training variability; stated as a limitation.
+- Runs: 2 in total = arm {T, none} x fold 0 x seed 0. Each run trains on train folds 1-4 (early stopping on its inner-val training logs, 10 %),
+  theta is selected on its out-of-fold train fold 0 (stageT_decision.py select --folds 0 --seeds 0; smallest theta within the 0.5-point EP budget),
+  and the SAME model is evaluated on dev (stageT_decision.py compare --final-fold 0 --seeds 0). No cross-fitting over 5 folds, no separate final runs.
+- Loss weights: fixed at the implementation defaults for both arms (col 1, dac 1, prog 2, cmf 0.1, mod 0.1, gate 0.5); no weight search.
+- Gate label: 1[NC<1 or DAC<1 or DDC<1 or TTC<1] (train_refiner.py --gate-ttc 1). EP is not a gate label (continuous; slow drafts are not fixable in mode A);
+  it enters through the progress loss and the EP budget / PDMS endpoints.
+- Surrogate margins (m_col, m_dac, human mask): set from the D1-b re-check on TRAIN-split pools (report/refiner_T/m8_recheck/), to be recorded here before training.
+All other clauses unchanged.
+
+=== AMENDMENT 2 (2026-09-28 14:16 KST, surrogate margins from D1-b, BEFORE any stage-T training or dev evaluation) ===
+Source: report/refiner_T/m8_recheck/ (SELECTION_RULE.txt, sweep pool 800 train logs) and m8_recheck/confirm/ (CONFIRM_RULE.txt,
+disjoint pool 842 tokens / 91 train logs). Dev and navtest were not read.
+- Sweep choice S* = (m_col 0.15, m_dac 0.10, SAT human mask): NOT CONFIRMED on the disjoint pool
+  (DAC human false alarm 0.0226 [0.011, 0.036] > 0.02; A1 0.915, A2 0.0095, A3 0.609 passed; safety guard vs default passed).
+- Pre-stated fallback (CONFIRM_RULE.txt "Config to use for training"): rule order over settings feasible on BOTH pools and
+  passing the guard -> sid 13 = (m_col 0.15 m, m_dac 0.05 m, SAT human mask).
+    sweep:   A1 0.907, A2 0.0025, A3 0.608 [0.562, 0.656], DAC human FA 0.0088
+    confirm: A1 0.915, A2 0.0095, A3 0.607 [0.534, 0.685], DAC human FA 0.0095
+- Training for both arms: train_refiner.py --m-col 0.15 --m-dac 0.05 (SurrogateConfig defaults otherwise; code defaults unchanged).
+Limitations stated now: A3 is fragile (CI contains 0.60 on both pools); the smaller margins correct fewer official NC failures
+than the old default (paired, confirm pool: P(NC fixed | source NC fail) 0.66 vs 0.74 under guided correction) -- the price of
+fewer false alarms on human driving. Applies equally to both arms.
+
+=== AMENDMENT 3 (2026-09-28 ~16:55 KST, user decision "B and B+", written AFTER run 1's dev result was seen, BEFORE any run-2 code or number) ===
+Run 1 (tag stageT) stays reported as is: INCONCLUSIVE (report/refiner_T/DECISION_RUN1.md). Reason for run 2: the mode-A
+deceleration channel was dead in both arms (z_lon > 0 on 100 % of drafts, also on the train OOF fold 0 -> diagnosis does
+not need dev). Run 2 = tag stageT2, same everything as run 1 (arms T / none, fold 0, seed 0, train folds 1-4 with 10 %
+inner-val, m_col 0.15 / m_dac 0.05, gate label NC|DAC|DDC|TTC, fixed loss weights, same P1-P3 endpoints, thresholds and
+outcome rules) except:
+(1) Dead-zone fix (training only). The mode-A forward stays exactly min(c, 0) (identity bit-exact at zero correction,
+    deceleration only). The backward passes a straight-through gradient of slope lam through the clamped part (c > 0).
+    Optional hinge penalty w_zd * mean(relu(z_lon)^2) on the raw longitudinal controls (keeps them near the live side;
+    no effect on the forward trajectory). Code defaults stay lam = 0, w_zd = 0 (run 1 reproducible).
+    Variant selection on TRAIN data only, before run 2: V1 (lam 1.0, w_zd 0), V2 (lam 0.1, w_zd 0), V3 (lam 1.0, w_zd 0.01);
+    each x arm {T, none}, 2 epochs, fold 0, seed 0 (same loaders/schedule length as run 2 is NOT required; pilot only).
+    Liveness(v, arm) = fraction of inner-val drafts with any decoded c < 0.  Eligible = liveness >= 1 % in BOTH arms.
+    Choice = eligible variant with the lowest mean (over the two arms) inner-val loss after epoch 2; ties -> V1.
+    If none is eligible: stop and report (no run 2).
+(2) Progress budget (B+). The theta rule stays "smallest theta within the budget", but the EP loss is measured only on
+    drafts that pass NC, DAC and DDC both before and after correction (pure slowdown cost; official EP is 0 for drafts
+    failing a multiplicative metric, which made the run-1 budget non-binding). Budget 0.5 points, OOF fold 0 as before.
+    Dev EP loss on the same definition is reported next to the outcome.
+(3) Liveness gate before dev: after run-2 training, if either arm has liveness < 1 % on OOF fold 0, dev is NOT evaluated;
+    report instead.
+Run 2's outcome is reported together with run 1's; neither replaces the other.
+Amendment 3 clarification (17:20 KST, before any pilot number): "inner-val loss" for the V1-V3 choice = the logged
+'loss_ex_zd' of the epoch-2 validation record (the objective shared by all variants, i.e. without the hinge term).
+Liveness = the logged 'val_liveness' of the same record. Early stopping in run 2 uses the code's validation 'loss' (which
+includes the hinge term when w_zd > 0). theta selection: stageT_decision.py select --budget-def passing (compare inherits it).
+Amendment 3 pilot result (17:56 KST; train inner-val only; logs runs/logs/pilot2V*_{T,none}.train.log, epoch-2 records):
+  V1 (lam 1.0, w_zd 0):    val_liveness T 0.0303 / none 0.0198 -> eligible; loss_ex_zd T 0.51184 / none 0.57514, mean 0.54349
+  V2 (lam 0.1, w_zd 0):    val_liveness T 0.0408 / none 0.0162 -> eligible; loss_ex_zd T 0.43820 / none 0.54506, mean 0.49163
+  V3 (lam 1.0, w_zd 0.01): val_liveness T 0.0546 / none 0.0172 -> eligible; loss_ex_zd T 0.43932 / none 0.56548, mean 0.50240
+  Choice by the rule: V2 -> run 2 uses --lon-st-slope 0.1 --w-zdead 0 for both arms (TAG stageT2).
+
+=== AMENDMENT 4 (2026-09-28 23:45 KST, user decision "B" after run 2, BEFORE any run-3 code or number) ===
+Run 1 and run 2 stay reported as they are (both INCONCLUSIVE; DECISION_RUN1.md, DECISION_RUN2.md). Reason for run 3: the
+primary endpoint P2 counts NC+TTC failures, but the training surrogate has no TTC term; run 2's P2 deficit is entirely TTC.
+Run 3 = tag stageT3, identical to run 2 (arms T / none, fold 0, seed 0, train folds 1-4 + 10 % inner-val, m_col 0.15 /
+m_dac 0.05, gate label NC|DAC|DDC|TTC, lon_st_slope 0.1, w_zdead 0, loss weights col 1 / dac 1 / prog 2 / cmf 0.1 / mod 0.1 /
+gate 0.5, budget-def passing 0.5 points, liveness gate >= 1 % on OOF fold 0 before dev, same P1-P3 endpoints, thresholds and
+outcome rules) plus ONE added loss term:
+(1) TTC surrogate C_ttc (mirrors pdm_scorer._calculate_ttc): for every dense time n (0.1 s grid, n = 0..40) and projection
+    horizon delta in {0.3, 0.6, 0.9} s, the ego box at pose_n is translated by v_n * delta along heading h_n (v_n, h_n = speed and
+    heading of the corrected dense trajectory) and compared with the GT future objects at dense time n + 10 delta (objects cover
+    0-5 s). Same smooth box separation g, same not-behind mask (behind_m -1.3 m), same object weights (agent 1 / static 0.5) and
+    the same human-overlap mask rule applied to the human trajectory's own projected boxes. Penalty beta * softplus((m_ttc - g)/beta),
+    mean over n, summed over objects and horizons as in collision_cost. Weight w_ttc = 1 (fixed, same as col). delta = 0 is the
+    existing collision term. Not mirrored (stated limitation): the official exclusion of already-collided tracks and red-light
+    tokens, the "ahead" cone / multiple-lane / intersection rule (approximated by not-behind).
+(2) m_ttc chosen on TRAIN data only (the D1-b sweep pool, m8_recheck/tokens.parquet, 800 logs), BEFORE run 3, by flags only
+    (no guided optimisation): grid m_ttc in {0, 0.05, 0.10, 0.15} m.
+      TTC flag(tau) = collision flag at m_col 0.15 (delta 0) OR any projected separation g < m_ttc (delta 0.3/0.6/0.9).
+      T1 = P(TTC flag | official TTC < 1), over the bank drafts;  T2 = P(TTC flag | human draft k = 0, official TTC = 1).
+      Feasible = T1 >= 0.70 AND T2 <= 0.02. Choice = the largest feasible m_ttc. If none is feasible: the setting with the fewest
+      failed criteria, then the smallest shortfall (0.70 - T1)+ + (T2 - 0.02)+, then the larger margin; run 3 proceeds with it and
+      the failure is reported as a limitation. CIs: log bootstrap (2,000).
+Run 3's outcome is reported together with runs 1 and 2; none replaces another.
+Amendment 4 m_ttc result (2026-09-29 00:20 KST; train sweep pool only; report/refiner_T/ttc_select/):
+  m_ttc 0.00: T1 0.856, T2 0.0037 | 0.05: T1 0.864, T2 0.0037 | 0.10: T1 0.872, T2 0.0050 | 0.15: T1 0.880, T2 0.0063 -> all feasible.
+  Choice by the rule: m_ttc = 0.15 (largest feasible; grid edge). Run 3 flags for both arms:
+  --m-col 0.15 --m-dac 0.05 --lon-st-slope 0.1 --gate-ttc 1 --w col=1,dac=1,prog=2,cmf=0.1,mod=0.1,ttc=1 --m-ttc 0.15 (TAG stageT3).
+
+=== AMENDMENT 5 (2026-09-29 ~03:20 KST, user request "eval", BEFORE any navtest refiner number) ===
+Final frozen navtest evaluation of stage T (the one navtest use named in this rule):
+- Models: the frozen run-3 checkpoints runs/stageT3_{T,none}_fold0_seed0/ckpt_best.pt; theta from report/refiner_T/run3/selection.json
+  (0 for both arms); no retraining, no re-selection, nothing tuned on navtest.
+- Drafts: the navtest draft bank built with the SAME generator, config and seeding procedure as the train/dev banks (13 per token),
+  labelled by the same batched official scorer; human trajectories / objects / SDF built with the same tools. Any unavoidable
+  deviation (e.g. missing 8 s human path at log ends) is applied identically to both arms and reported.
+- Endpoints, statistics and outcome rule: identical to the dev decision (P1, P2, P2-ni, P3, sanity; log-cluster paired bootstrap
+  10,000; PASS / WORSE / EQUIVALENT / INCONCLUSIVE). Reported next to the dev result; the dev PASS is not replaced.
+- navtest has 0 drive overlap with navtrain and is out-of-sample for the BEVFusion teacher; it tests the two threats found in the
+  run-3 audit (drive-level overlap, teacher in-sample). Reported, not decisive: per-city results, per-family results.
+Teacher-shuffle control (descriptive, dev only): R_T run 3 evaluated with teacher features permuted across dev tokens (fixed seed 0,
+each token receives another token's BEV); compared with R_T (true BEV) and R_none on the same drafts and endpoints.
+
+=== AMENDMENT 6 (2026-09-29, user decisions A-(a), B-(b), D-(a); BEFORE any run-4 code or number) ===
+Run 4 = tag stageT4: four arms trained from scratch on TRAIN_LOGS-ONLY tokens (NAVSIM default_train_val_test_log_split
+train_logs; the ReSMap cache covers exactly these; val_logs tokens are excluded from every arm): train pool = train split
+rows in train_logs (folds 1-4 train with 10 % inner-val, fold 0 for theta), dev = dev rows in train_logs, navtest = all
+evaluable navtest tokens (both caches cover navtest).
+Arms (trunk identical, only the adapter differs):
+  none : zeros.
+  T    : BEVFusion 50x100 bev_feature (as runs 1-3).
+  M    : ReSMap neck BEV feature (256 ch, 50x100, 0.64 m) mapped to the S grid by the empirically verified transform,
+         per-channel z-score (train tokens), 1x1 256->128, GELU, 1x1 128->64 (same form as T).        [A-(a)]
+  TM   : separate T and M adapters (each with its own z-score), outputs concatenated (128 ch) -> 1x1 128->64.   [B-(b)]
+Everything else as run 3: m_col 0.15, m_dac 0.05, m_ttc 0.15, weights col 1 / dac 1 / prog 2 / cmf 0.1 / mod 0.1 /
+ttc 1 / gate 0.5, gate label NC|DAC|DDC|TTC, lon_st_slope 0.1, budget-def passing 0.5, liveness gate >= 1 % on OOF fold 0
+for every arm before dev (unless the loss terms are changed by a further amendment BEFORE training).
+Comparisons and decision [D-(a)]: C1 T vs none, C2 M vs none, C3 TM vs T, C4 TM vs M. Each with the pre-stated P1, P2
+(NC or TTC), P2-ni (DAC, DDC), P3 and the same outcome rule, but with Bonferroni-adjusted two-sided CIs for 4 comparisons
+(98.75 %, log-cluster paired bootstrap 10,000). DAC difference reported with its CI for every comparison. Outcomes are
+computed on dev and, once, on navtest with the frozen run-4 models. Reported, not decisive: per-city, per-family, teacher
+shuffle control per teacher arm (dev), branch-drop analysis for TM (zero one adapter's input at evaluation, dev).
+Amendment 6 addendum (user choice "1"): run-4 loss terms stay exactly as run 3 (no DDC surrogate, no EPDMS-only terms).
+At the final navtest evaluation, EPDMS (navsim v2 scorer, as used in report 29) of the refined trajectories is also
+reported for every arm; reported, not decisive.
+Amendment 6 implementation notes (before training): TM fuse = concat(det 64, map 64) -> 1x1 128->64 (no activation);
+TM det/map branch inits equal the T / M adapters for the same seed; branch-drop = the dropped branch's normalised input set
+to 0 (training-mean feature). EPDMS at the navtest evaluation: full navtest (all evaluable tokens, 13 drafts, 5 sets:
+originals + 4 arms), measured ~1.6 h with 8 CPU workers.
+
+=== AMENDMENT 7 (2026-09-29 ~16:00 KST, user priorities: E2E results as fast as possible) ===
+- EPDMS: dropped from stage T entirely.
+- TM arm: put on hold (training stopped at the user's request; ckpt_last kept for a possible resume). Comparisons C3/C4 are
+  not run now.
+- Deferred (to be run later, same pre-stated procedures, results reported when run): run-4 dev/navtest comparisons C1/C2,
+  teacher-shuffle controls, branch-drop.
+- Kept now: the liveness gate (>= 1 % on OOF fold 0) for R_T and R_M of run 4 before either is used as a KD teacher.
+- Stage E will use the run-4 R_T and R_M (train_logs only) as two separate frozen teacher refiners.
+
+=== STAGE E PLAN (2026-09-29 ~16:20 KST, BEFORE any stage-E code or number; user deadline: results on 2026-09-30) ===
+Arms (all PARA-SSR trained FROM SCRATCH, same data = navtrain train_logs, same seed 0, same epoch budget N):
+  E0 = existing PARA-SSR interaction_final (30 epochs; reference only; also its checkpoint at epoch N as a same-budget reference).
+  E1 = PARA-SSR + student refiner (stage-T refiner architecture; adapter reads the student's own BEV) trained with the stage-T
+       GT surrogate losses on tau_final (col 1, ttc 1, dac 1, prog 2, cmf 0.1, mod 0.1; m_col .15, m_dac .05, m_ttc .15; lon_st_slope .1).
+  E2 = E1 + correction KD from TWO frozen teacher refiners (run-4 R_T on BEVFusion BEV, run-4 R_M on ReSMap BEV; option (a):
+       one student refiner, KD loss = mean of the two teacher losses), L1 on the raw control points (z_lon, w_lat) of the same draft.
+Gradient paths (report 36 v2 M10 defaults): tau0 -> both refiners stop-grad; student BEV -> student refiner gradient scale 0.1;
+surrogate/KD never reach tau0; PARA-SSR's own losses unchanged. Half of the samples feed a perturbed sg(tau0) (stage-T bank
+perturbation) to the student and teacher refiners (signal-vanishing guard). No gate training (no online official labels);
+the correction is always applied (theta 0, as selected in stage T).
+lambda_KD: 0 in epoch 0, linear ramp over epochs 1-2, then constant; its constant value fixed from the GPU pilot so that the
+weighted KD loss equals the student-refiner surrogate loss (mean of the last 100 pilot steps), identical rule for E2 only.
+Epoch budget N: from the measured pilot speed, the largest N such that E1 and E2 (one GPU each, in parallel, same effective batch
+as E0) finish training by 2026-09-30 18:00 KST; the LR schedule spans N epochs. Evaluation: official navtest PDMS of tau_final
+(primary) and tau0, for E1 and E2 (and E0 at epoch N). Primary contrast: E2 - E1 on navtest PDMS (and NC, TTC, DAC rates);
+log-cluster paired bootstrap CI. Stated limits: one seed, reduced epoch budget, teacher refiners from stage T run 4 require the
+liveness gate (>= 1 %) before use.
+
+=== STAGE E PLAN — REVISION 1 (2026-09-29 ~16:40 KST, user decisions; BEFORE any stage-E number) ===
+- E2 only for now; E1 on hold (to be run later with the identical config).
+- E2E training config UNCHANGED from the reference experiments (interaction_final / para_ssr_v2_r34 / det_motion_plan):
+  batch 4 per GPU, effective batch 128, 30 epochs, same optimizer / LR schedule / data (navtrain train_logs).
+  GPUs 0,1,4,5 (4 GPUs): accumulate_grad_batches 8 (= 128 / (4 x 4)) so that the effective batch and the number of
+  optimizer steps equal the 2-GPU x accumulate-16 reference. This is the only config value that differs, and it keeps the
+  training setting identical.
+- lambda_KD schedule reverts to report 36 v2: 0 in epochs 0-4, linear ramp over epochs 5-9, constant afterwards; the constant
+  from the pilot rule (weighted KD loss = student-refiner surrogate loss, mean of the last 100 pilot steps).
+- Primary contrast until E1 exists: E2 - E0 (E0 = interaction_final, same config) on navtest PDMS; this measures refiner +
+  surrogate + KD together. The teacher-necessity contrast E2 - E1 follows when E1 is run.
+
+=== STAGE E PLAN — REVISION 2 (2026-09-29 17:40 KST, BEFORE the pilot and any E2 number) ===
+- Teacher liveness gate (OOF fold 0, run 4): R_T 0.1576, R_M 0.1254 -> both pass (report/refiner_T/run4/liveness_oof_*.json).
+- kd_space = decoded: KD = L1 between student and teacher DECODED corrections of the same draft (longitudinal control
+  points c_lon[2:] in m/s after the mode-A clamp, lateral offsets e_lat[2:] in m), mean over the two teachers. Reason: raw
+  z_lon of the teachers is saturated (+7..+13) on drafts that need no braking; L1 on raw values would push the student into
+  the dead zone (review finding, CPU smoke: teacher raw liveness 0).
+- W (warm-up epochs) = 3 = E0's warm-up; E2 runs with train4 on GPUs 0,1,4,5 (batch 4 x acc 8 = 128, 30 epochs; the
+  grad-balancer counters are scaled by acc/16 so their cadence in optimiser steps equals E0's).
+- lambda_c from the E2 pilot (1 GPU, 300 micro-batches, W = 3, decoded, lambda 0 = log only) by the pre-stated rule.
+- Launch only after the GT inputs (objects, SDF, side store) cover all E2E training tokens, so that a later E1 run sees the
+  same GT from step 0 (no asymmetric masking).
+Revision 2 pilot result (2026-09-29 ~17:45 KST; work_dirs/stageE_pilot_E2, summary report/refiner_T/stageE_pilot_E2_summary.json):
+  last-100 means: L_sur_weighted 0.6372, L_KD (decoded, mean of 2 teachers) 0.03329 -> lambda_c = 19.14 (fixed for E2).
+  0.38 s per micro-batch (1 GPU, batch 4), peak 12.8 GB; student refiner live 0.47; GT ok 59 % during the pilot (prep running).
+
+=== STAGE E PLAN — REVISION 3 (2026-09-29 ~21:30 KST, final E2 settings, user-confirmed; BEFORE any E2 training number) ===
+Base model: PARA-SSR v1 (interaction_final recipe; E0 = interaction_final). One draft per sample.
+Drafts: epochs 0-4 (ref_human_only_until 5): 100 % stage-T-bank perturbations of the GT human trajectory (uniform over the 12
+non-identity slots, logged 8 s human path); from epoch 5: per sample Bernoulli(0.5) perturbed GT human draft, else sg(tau0)
+(kd_draft_source human_mix). Same drafts feed the student and both teachers, for surrogate and KD.
+KD: kd_space decoded; kd_balance ema (weight = r * EMA(L_sur)/EMA(L_KD), EMAs all-reduced, momentum 0.99), r ramps 0 -> 1 over
+epochs 0-5 (kd_start_epoch 0, kd_ratio_ramp_epochs 5), weight cap 100. The stage-E pilot lambda_c 19.14 is NOT used.
+Gradients: surrogate + KD reach the student refiner and, at scale 1.0 (ref_bev_grad_scale 1.0), everything upstream of the
+student BEV; never the planner (tau0 stop-grad) nor the det/map/motion heads. Teachers frozen.
+Recipe unchanged from E0 (30 epochs, warm-up 3, effective batch 128 = 4 GPUs x 4 x acc 8). E1 later: identical settings
+without KD. Primary contrast: E2 - E1 (navtest PDMS, tau_final); E2 - E0 reported meanwhile.
+Revision 3 clarification (2026-09-29 ~23:55 KST, E2 running, before any E2 evaluation number): as implemented, an invalid
+perturbation (~7 % of samples) keeps the UNPERTURBED GT human trajectory in epochs 0-4 and the unperturbed sg(tau0) from epoch 5;
+the realised draft shares (ref/frac_human, ref/frac_draft_human) are reported with the results. E1 uses the same code. Known,
+accepted differences E1 vs E2 besides KD: E2 re-seeds the CUDA RNG once when the teachers are loaded (dropout masks differ from
+step 2); the comparison is at the result level (scene bootstrap), not bitwise.
+
+=== STAGE E — E2 EVALUATION SPEC (2026-09-30 19:35 KST, E2 training finished, BEFORE any E2 evaluation number) ===
+- Checkpoint: E2 epoch 29 (epoch=29-step=19950.ckpt = last), same convention as E0 (interaction_final epoch 29).
+- navtest official PDMS (the standard eval pipeline, scripts/evaluation/eval_para_ssr.sh) for: E2 tau_final (primary output),
+  E2 tau0 (planner health), and E0 (existing CSV work_dirs/eval/para_ssr_interaction_final/2026.09.17.00.09.41.csv).
+- Reported (descriptive; the stage-E decision rule for E2 - E1 is still open and will be fixed before E1 is evaluated):
+  E2 - E0, E2_tau0 - E0, E2 - E2_tau0: PDMS and NC / DAC / DDC / TTC / EP / C, paired by token, log-cluster bootstrap 95 % CI.
+- Side experiment (descriptive, answers "is the teacher refiner reliable on real planner drafts?"): E0's navtest trajectories
+  (work_dirs/eval/para_ssr_interaction_final_navtest_trajectories.pkl) corrected by the frozen run-4 refiners R_T, R_M, R_none
+  (and run-3 R_T), theta 0 (always applied), scored by the stage-T batched official scorer; compared with E0 on the same tokens.

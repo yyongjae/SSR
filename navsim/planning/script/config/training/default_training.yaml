@@ -38,7 +38,7 @@ checkpoint:
 # W&B runs ALONGSIDE TensorBoard and is fail-open: an SDK/service failure
 # disables telemetry for the process instead of killing a DDP rank.
 wandb:
-  enable: false
+  enable: true
   project: para-ssr
   name: null          # null -> experiment_name
   group: null
@@ -74,7 +74,9 @@ trainer:
 
     accelerator: gpu  # distribution method
     strategy: ddp
-    precision: 16-mixed  # floating point precision
+    # PARA-SSR sets training_precision=32; other agents retain the shared default.
+    # An explicit trainer.params.precision override still takes precedence.
+    precision: ${oc.select:agent.config.training_precision,16-mixed}
     num_nodes: 1  # Number of nodes used for training
 
     num_sanity_val_steps: 0  # number of validation steps to run before training begins

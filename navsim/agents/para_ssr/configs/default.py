@@ -8,11 +8,7 @@ Values fall into three groups:
 * **optimisation** -- the WoTE/SeerDrive-derived recipe (see report #09 §4).
 """
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
-
-# WoTE's released 256 K-means trajectories and the packed per-token PDM scores.
-_PLAN_VB = Path(__file__).resolve().parents[4] / "data" / "planning_vb"
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
@@ -63,22 +59,17 @@ class ParaSSRConfig:
     # the BEV encoder, detector/motion head and vector-map head:
     # x_right in [-32, 32] m and y_forward in [0, 32] m.
     #
-    # The RESOLUTION is not TransFuser's, because TransFuser has no single BEV
-    # to copy.  It carries two: the LiDAR C5 at 8x8, which is what its 31
-    # trajectory/agent queries cross-attend to, and an FPN map at 64x64, which
-    # only the dense semantic head reads.  Here one `bev_embed` serves the
-    # planner, the detection head and the map head at once, so it has to satisfy
-    # the most demanding of them -- the vector map head, scored by chamfer
-    # distance at 0.5 / 1.0 / 1.5 m.  A one-metre cell would leave the feature
-    # coarser than the strictest threshold it is graded on.
-    #
-    # 50 x 100 square cells, 0.64 m on both axes. This is the interaction-branch
-    # grid and the native grid of the BEVFusion 50x100 cache and the ReSMap
-    # cache. The older 100 x 100 student (0.32 m forward) is the measured v4
-    # run; it is not this default.
+    # The grid is 50 rows over the 32 m of y_forward by 100 columns over the
+    # 64 m of x_right: square 0.64 m cells, 5,000 queries.  This is the
+    # BEVFusion teacher's grid (bevfusion/configs/navsim/default.yaml: voxel
+    # 0.08 m, sparse_shape [400, 800, 41], out_size_factor 8 -> 50 x 100), so
+    # the teacher's cached ``bev_feature`` maps onto ``bev_embed`` cell for
+    # cell with a lateral flip and no resampling (teacher_cache/*_50x100).  The
+    # earlier 100 x 100 variant had 0.32 x 0.64 m cells and needed the
+    # longitudinal axis resampled against that teacher.
     pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
-    bev_h: int = 50
-    bev_w: int = 100
+    bev_h: int = 50     # y_forward: 32 m / 50 = 0.64 m per row
+    bev_w: int = 100    # x_right:  64 m / 100 = 0.64 m per column
 
     # Deliberately identical to pc_range.  A different map range would make the
     # map decoder's normalized reference points address the wrong physical BEV
@@ -109,32 +100,65 @@ class ParaSSRConfig:
     encoder_attn_dropout: float = 0.1
     encoder_ffn_dropout: float = 0.1
 
+    # Historical flag name: now controls full SE(2) history feature alignment
+    # (translation AND rotation) before temporal attention, once per frame.
     use_shift: bool = True
-    # 18-d ego status stays out of the BEV queries. Command and [vx, vy, ax, ay]
-    # condition the planner. History alignment still uses bev_shift.
+    # Ego velocity/acceleration condition the planning query directly. Keep
+    # geometric history alignment via bev_shift + yaw, without learned BEV status
+    # conditioning. The legacy feature/config fields remain cache-compatible.
     use_ego_motion: bool = False
     ego_motion_norm: bool = True
     use_cams_embeds: bool = True
     use_grid_mask: bool = True
 
-    # LiDAR branch (km/para-ssr-v2, modules/lidar_encoder.py). Off keeps the
-    # learned BEV queries and the existing feature-cache key. On, the front-ROI
-    # cloud seeds the queries and a gated deformable cross-attention.
+    # ------------------------------------------------------------------ #
+    # LiDAR branch (SafeDrive wiring, see modules/lidar_encoder.py)
+    # ------------------------------------------------------------------ #
+    # The merged NAVSIM point cloud at every frame in ``frame_indices`` is
+    # clipped to the front ROI, converted to SSR axes and encoded into a
+    # ``[embed_dims, bev_h, bev_w]`` BEV.  That BEV replaces the learned BEV
+    # query embedding and is the value of a deformable ``lidar_cross_attn``
+    # in every encoder layer, gated against the camera cross-attention.
+    # History frames need it too, or ``prev_bev`` would be a different kind of
+    # feature from the current BEV it is aligned with.
     use_lidar: bool = False
+    # Padded rows per frame.  Measured on trainval: ~50k points fall inside the
+    # 32 x 64 m front ROI of a ~91k-point frame (max 53k over the sample);
+    # longer clouds are thinned deterministically, never dropped at random.
     lidar_max_points: int = 65536
+    # Metres, ego frame (rear axle ~0.3-0.5 m above ground).  99% of in-ROI
+    # points lie below 5.1 m and none below -3 m; same bounds as the teacher.
+    # Independent of pc_range's z, which only places the camera pillars.
     lidar_z_range: Tuple[float, float] = (-3.0, 5.0)
+    # "sparse": SafeDrive's SpMiddleResNetFHD on spconv (pip install
+    # spconv-cu126 on this rig).  "pillar": spconv-free PointPillars-style
+    # fallback.  Both return [embed_dims, bev_h, bev_w].
     lidar_encoder: str = "sparse"
+    # sparse: (x_right, y_forward, z) metres.  The backbone's stride is 8, so
+    # x/y voxels must be cell / 8 = 0.08 m -> a 400 x 800 x 40 grid (41 deep
+    # with SafeDrive's +1), which the four stride-2 stages take to 50 x 100 x 2
+    # -> 128 * 2 = 256 channels = embed_dims, no projection.  This is also the
+    # BEVFusion teacher's voxel size.
     lidar_voxel_size: Tuple[float, float, float] = (0.08, 0.08, 0.2)
+    # pillar: (longitudinal, lateral) metres.  Must divide the BEV cell by one
+    # power of two on both axes; 0.64 / 0.16 = 4 -> a 200 x 400 pillar canvas
+    # that the 2D backbone reduces back to 50 x 100.
     lidar_pillar_size: Tuple[float, float] = (0.16, 0.16)
     lidar_pillar_channels: int = 64
     lidar_backbone_channels: Tuple[int, ...] = (64, 128, 256)
     lidar_backbone_layers: Tuple[int, ...] = (3, 5, 5)
     lidar_neck_channels: int = 128
+    # Sampling points of the per-layer LiDAR deformable cross-attention.
     lidar_attn_points: int = 8
 
     # ------------------------------------------------------------------ #
     # planning head
     # ------------------------------------------------------------------ #
+    # Three Pre-LN blocks; optionally read private decoder memories after BEV.
+    # Scene-token settings below are retained as inert config compatibility.
+    use_stl: bool = False
+    use_task_interaction: bool = True
+    plan_num_layers: int = 3
     num_scenes: int = 16
     num_reg_fcs: int = 2
     latent_num_layers: int = 3
@@ -146,54 +170,6 @@ class ParaSSRConfig:
     # navsim scores (x, y, heading); nuScenes SSR regressed (x, y) only
     traj_dims: int = 3
     heading_weight: float = 0.5
-    # Dense planner only. Lateral tail is off: version_3's amax dominated the
-    # plan gradient and raised DAC failures. Progress is a shortfall up to
-    # ``plan_tail_progress_cap`` of the GT polyline. See plan v4.
-    # The bumper probe stays in the code with weight 0. The training contract
-    # is v4: lat off, progress 0.003, cap 0.9.
-    plan_tail_lat_weight: float = 0.0
-    plan_tail_progress_weight: float = 0.003
-    plan_tail_progress_cap: float = 0.9
-    plan_ttc_proxy_weight: float = 0.0
-    # When False, removes TokenLearner (token selector) and uses dense BEV cross-attention (PARA-Drive style)
-    use_stl: bool = False
-    plan_num_layers: int = 3
-    # Plan query cross-attends final det/motion and map decoder states in
-    # parallel and adds the two updates. Requires both auxiliary heads.
-    use_task_interaction: bool = True
-
-    # Optional NAVSIM metric-supervised candidate planner. Enabled separately by
-    # agent=para_ssr_metric_agent, so the single-trajectory baseline is retained.
-    use_metric_planner: bool = False
-    num_plan_candidates: int = 16   # per command, independent of ego_fut_mode
-    plan_anchor_path: str = ""      # train-only npz; anchors persist in checkpoint
-    candidate_cls_loss_weight: float = 1.0
-    metric_loss_weight: float = 1.0
-    # NC, DAC, DDC, EP, TTC, comfort, aggregate score (NAVSIM v1 PDM)
-    metric_loss_weights: Tuple[float, ...] = (3.0, 3.0, 1.0, 2.0, 4.0, 1.0, 1.0)
-    candidate_score_weight: float = 0.1  # log imitation probability at selection
-    metric_score_weight: float = 1.0     # log predicted aggregate PDM score
-    metric_detach_bev: bool = False
-    metric_cache_path: str = ""     # world cache for BOTH training/validation
-    metric_cache_size: int = 8      # max decompressed scenes per training process
-
-    # WoTE-style anchor vocabulary (km/para-ssr-v2 modules/anchor_planner.py).
-    # The student plans by scoring the 256 anchors and adding an offset.
-    # Requires use_task_interaction. sim_reward targets come from plan_score_file.
-    plan_anchor: bool = True
-    plan_anchor_file: Optional[str] = str(_PLAN_VB / "trajectory_anchors_256.npy")
-    plan_score_file: Optional[str] = str(_PLAN_VB / "pdm_score_256")
-    plan_reward_weights: Tuple[float, float, float, float] = (0.1, 0.5, 0.5, 1.0)
-    plan_topk: int = 6
-    plan_kinematic: bool = False
-    plan_heading_from_xy: bool = True
-    plan_rescore_refined: bool = False
-    plan_offset_loss_weight: float = 1.0
-    plan_im_reward_weight: float = 1.0
-    plan_sim_reward_weight: float = 1.0
-    # Evaluation-only post-process. Training still regresses the raw poses.
-    heading_from_path: bool = False
-    kinematic_projection: bool = False
 
     # ------------------------------------------------------------------ #
     # auxiliary head 1: detection + motion
@@ -247,10 +223,9 @@ class ParaSSRConfig:
         default_factory=lambda: dict(plan=2.0, det=1.0, motion=1.0, map=1.0)
     )
     # Closed-loop control of each task's gradient share at the shared BEV.
-    # Same target as the nuScenes 60-epoch arm (PARA_SSR_e2e_60ep.py:114), so
-    # the two runs stay comparable.  Set to None for the unscaled reference.
-    # Measured unscaled on real navsim batches: plan 0.25% / det 73.5% /
-    # map 26.2% -- the planner barely steers the shared feature without this.
+    # Retain the previous target; re-measure shares for the new planner.
+    # Planning includes direct BEV and both latent-memory paths. Set to None
+    # for the unscaled reference.
     grad_balance_target: Dict[str, float] = field(
         default_factory=lambda: dict(plan=0.4, det=0.3, map=0.3)
     )
@@ -266,12 +241,95 @@ class ParaSSRConfig:
     grad_balance_warmup_iters: int = 10600
     grad_norm_log_interval: int = 200
 
-    # aux heads are train-only by default (PARA-Drive's runtime advantage)
+    # ------------------------------------------------------------------ #
+    # planning-readout distillation from the cached ReSMap teacher
+    # (report/19_planning_readout.md).  All off by default.
+    # ------------------------------------------------------------------ #
+    # none | readout | random | feature   (see readout/distill.py)
+    kd_mode: str = "none"
+    # Root of the sharded ReSMap cache (index.json, bev/, vectors/, ...).
+    kd_teacher_cache: Optional[str] = None
+    # Stage-1 readout trained on the teacher BEV; its h_enc is frozen.
+    kd_readout_ckpt: Optional[str] = None
+    # cosine | mse, on z (readout/random) or on the BEV (feature).
+    kd_distance: str = "cosine"
+    # Fixed lambda.  With "distill" in grad_balance_target the balancer then
+    # rescales the term's BEV gradient on top of this.
+    kd_weight: float = 1.0
+    # Micro-batch counts, the grad_balance_warmup_iters convention: lambda is 0
+    # for kd_warmup_iters, then ramps linearly to kd_weight over kd_ramp_iters.
+    # z_S is meaningless while the student BEV is still random.
+    kd_warmup_iters: int = 0
+    kd_ramp_iters: int = 0
+    # Identity-initialised 1x1 conv on the student BEV before h_enc (design s05).
+    kd_adapter: bool = False
+    # none | global | command.  Remove the scene-independent part of z before the
+    # distance (report/19 s3): 95% of the energy of z is the per-command mean, and
+    # matching it carries no scene information.  Only for kd_mode readout|random.
+    kd_center: str = "none"
+    # EMA momentum of those running means over micro-batches.
+    kd_center_momentum: float = 0.99
+    # kd_mode=random: seed of the fixed random 256-d projection.
+    kd_random_seed: int = 0
+    # kd_mode=sens_feature: random trajectory-space probes per step (K backward
+    # passes through the frozen reader) estimating the per-cell trajectory change.
+    kd_sens_probes: int = 4
+
+    # Planning-side map consistency (plan_map.py): hinge on the commanded
+    # trajectory's footprint corners against the SDF of the drivable area the
+    # DAC metric uses.  0 = off: no target builder, no term.
+    # ---- v2 planner: WoTE-style anchors + PDM-score rewards (modules/anchor_planner.py) ----
+    # Off = the v1 single-query L1 regression.  The two files are WoTE's released
+    # extra data (K-means anchors, and the PDM scores of every anchor per token).
+    plan_anchor: bool = False
+    plan_anchor_file: Optional[str] = None
+    plan_score_file: Optional[str] = None
+    plan_reward_weights: Tuple[float, float, float, float] = (0.1, 0.5, 0.5, 1.0)   # WoTE reward_weights
+    plan_topk: int = 6
+    # Kinematic-bicycle output layer (modules/kinematics.py, from TOAD): the offset
+    # head predicts control corrections and the poses are their rollout.
+    plan_kinematic: bool = False
+    # Heading from the path (modules/kinematics.bezier_xyyaw, from DiffusionDriveV2):
+    # the offset head predicts x, y only.  v2 regressing heading separately left it
+    # ~3 deg off the path direction (median, epoch 1), which the PDM tracker follows.
+    plan_heading_from_xy: bool = False
+    # evaluation-only diagnostic: select among anchor + offset re-encoded and rescored (WoTE test time)
+    plan_rescore_refined: bool = False
+    plan_offset_loss_weight: float = 1.0       # WoTE traj_offset_loss_weight
+    plan_im_reward_weight: float = 1.0         # WoTE im_reward_loss (unweighted)
+    plan_sim_reward_weight: float = 1.0        # WoTE sim_reward_loss (unweighted; x5 inside)
+
+    # Evaluation-only post-processing: heading := direction of travel of the planned
+    # path (para_ssr_model.heading_from_path).  On the v1 control it lifts PDMS
+    # 84.74 -> 85.61 (DAC +0.70, EP +0.75): the PDM simulator tracks position AND
+    # heading, and predicted headings that disagree with the path pull it off line.
+    heading_from_path: bool = False
+    # Evaluation-only: TOAD's kinematic projection (modules/kinematics.py) of the
+    # planned trajectory, i.e. its test-time step without the CEM search.
+    kinematic_projection: bool = False
+
+    plan_map_weight: float = 0.0
+    plan_map_margin: float = 0.0
+    # (x0, x1, y0, y1) in the current ego frame of NAVSIM trajectories:
+    # x forward, y left, rear axle.  4 s at 18 m/s stays inside x1.
+    plan_map_extent: Tuple[float, float, float, float] = (-8.0, 72.0, -32.0, 32.0)
+    plan_map_res: float = 0.25
+    plan_map_clip: float = 10.0
+    # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
+    # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
+    # always uses GT.
+    map_label_source: str = "gt"
+    map_pseudo_score_thr: float = 0.3
+
+    # Eval auxiliary predictions. With interaction on, decoders always run;
+    # with it off, evaluation can omit their computation as well.
     test_aux_heads: bool = False
 
     # ------------------------------------------------------------------ #
     # optimisation -- WoTE/SeerDrive recipe, see report #09 §4
     # ------------------------------------------------------------------ #
+    # Also used by the shared Hydra training entrypoint; wrappers already use 32.
+    training_precision: int = 32
     optimizer_type: str = "AdamW"
     weight_decay: float = 1e-4
     max_epochs: int = 30
@@ -282,47 +340,121 @@ class ParaSSRConfig:
     grad_clip_norm: float = 35.0
 
     # ------------------------------------------------------------------ #
-    # planning distillation (docs/PLANNING_DISTILLATION.md, NAVSIM caches)
+    # Stage E: student refiner (+ correction KD).  'off' = E0, nothing is
+    # built, loaded or computed (bit-identical, tools/refiner/stageE_parity.py).
+    # See navsim/agents/para_ssr/refiner/e2e.py and
+    # report/refiner_T/stageE_impl_plan.md.
     # ------------------------------------------------------------------ #
-    # Stage 2: frozen stage-1 adapters pull the student BEV towards a frozen
-    # teacher's cached BEV.  Off by default; nothing below is read when off.
+    refiner_mode: str = "off"            # off | E1 (surrogate) | E2 (surrogate + KD)
+    ref_bev_grad_scale: float = 0.1      # gradient scale student BEV <- refiner
+    ref_w: float = 1.0                   # weight of the surrogate loss
+    ref_term_weights: Dict[str, float] = field(
+        default_factory=lambda: dict(col=1.0, ttc=1.0, dac=1.0, prog=2.0, cmf=0.1, mod=0.1)
+    )
+    ref_m_col: float = 0.15
+    ref_m_dac: float = 0.05
+    ref_m_ttc: float = 0.15
+    ref_lon_st_slope: float = 0.1        # mode-A straight-through slope (training only)
+    ref_perturb_frac: float = 0.5        # share of samples fed a perturbed sg(tau0)
+    ref_seed: int = 0                    # refiner init + perturbation rng
+    ref_lr_mult: float = 3.0             # refiner lr = lr * 3 (stage-T 3e-4 peak)
+    ref_weight_decay: float = 0.01
+    ref_clip: float = 1.0                # refiner-only grad-norm clip (before the global 35)
+    ref_data_root: str = "/home/external-user/ssd/yongjae_refiner"
+    kd_teacher_runs: Tuple[str, ...] = ()
+    kd_lambda: float = 0.0               # lambda_KD constant (from the pilot rule)
+    kd_space: str = ""                   # KD control space raw | tanh | decoded; E2 training refuses "" (user choice)
+    kd_ramp: Tuple[float, float] = (5.0, 10.0)   # 0 before epoch a, linear to 1 at epoch b (REVISION 1: 5-9)
+    ref_eval_traj: str = "final"         # eval output: final (tau_final) | tau0
+    # KD balance / draft options (defaults = the behaviour before these options existed; refiner/e2e.py docstring)
+    kd_balance: str = "fixed"            # fixed: kd_lambda x ramp | ema: w = kd_ratio * EMA(L_sur_w) / EMA(L_KD)
+    kd_ratio: float = 1.0                # ema: target weighted-KD / weighted-surrogate magnitude ratio
+    kd_ema_m: float = 0.99               # ema momentum (bias-corrected)
+    kd_ema_floor: float = 1e-4           # ema: floor on EMA(L_KD) in the denominator
+    kd_start_epoch: Optional[float] = None   # ema: KD on from this epoch (no ramp); None -> kd_ramp[0]
+    kd_draft_source: str = "tau0"        # tau0: perturbed sg(tau0) | human_mix: perturbed GT human traj (else sg(tau0))
+    ref_human_only_until: Optional[float] = None  # epoch < this: every draft = perturbed GT human (invalid -> unperturbed
+                                         #   GT human); from then on kd_draft_source applies.  None = off
+    kd_ratio_ramp_epochs: Optional[float] = None  # ema: ratio 0 -> kd_ratio linearly over [kd_start, kd_start + this]; None = off
+    kd_weight_max: Optional[float] = None         # ema: cap on the KD weight (after the ratio); None = no cap
+    grad_share_every: int = 50           # E1/E2: log ||dL/d bev_embed|| of E0 / surrogate / KD every n micro-batches (0 = off)
+
+    # ------------------------------------------------------------------ #
+    # CK Phase 2 (report 45; navsim/agents/para_ssr/ck/online.py): v2 + CK
+    # end-to-end.  Empty dict / enabled false = off: nothing is built,
+    # loaded or computed (v2 bit-identical).  Parsed by CKE2EConfig.from_any.
+    # ------------------------------------------------------------------ #
+    ck_e2e: Dict[str, Any] = field(default_factory=dict)
+    # CK2 e2e (navsim/agents/para_ssr/ck/online2.py; SSR/report/47 s9): v2 + CK2 student
+    # from scratch.  Empty dict / enabled false = off (nothing built / loaded / computed).
+    # Parsed by CKE2E2Config.from_any; exclusive with ck_e2e.
+    ck_e2e2: Dict[str, Any] = field(default_factory=dict)
+    # self.log(..., sync_dist=...) of the per-micro-batch loss logs
+    # (ParaSSRLoggingCallback, AgentLightningModule).  True = previous
+    # behaviour; False removes the per-micro-batch all-reduce (DDP -14 %).
+    log_sync_dist: bool = True
+
+    # ------------------------------------------------------------------ #
+    # BEV planning distillation, merged from aux_distill (ba7640d;
+    # docs/bev_selector_v8.md, navsim/agents/para_ssr/distill/).  Off by
+    # default: nothing below is read, built or loaded when use_distill is
+    # false (refiner / v2 bit-identical).  On this kyungmin-v2 core only the
+    # trajectory-anchor path (distill_selector_v6 / v7 / v8) is supported; the
+    # stage-1 adapter, corridor and register-selector paths (v1-v5) depend on
+    # aux_distill's own v2 port (forward_from_bev, use_metric_planner) and are
+    # not wired here.
+    # ------------------------------------------------------------------ #
     use_distill: bool = False
     # Root holding BEVFusion ``cache_{train,val}_50x100`` and the ReSMap shards.
     distill_feature_root: str = ""
-    # ``{branch: {cache_name, adapter: {...}, loss_weight}}``.  A single teacher
-    # is supported deliberately: the MapTRv2 cache does not exist yet, and
-    # requiring both would block the BEVFusion-only experiment that can run now.
+    # ``{branch: {cache_name, adapter: {...}, loss_weight[, flip_w, cache_subdirs, feature_key]}}``.
+    # The anchor path (v6-v8) needs both branches and ignores ``adapter``.
     distill_branches: Dict[str, Dict] = field(
         default_factory=lambda: {
             "bevfusion": {
                 "cache_name": "bevfusion",
                 "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
                 "loss_weight": 1.0,
-                "flip_w": True,
             },
             "resmap": {
                 "cache_name": "resmap",
                 "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
                 "loss_weight": 1.0,
+                # fusion_v1: transpose only.  ReSMap's lateral index 0 is y_left = +32 m, i.e.
+                # already student column 0; aux_distill's default flip_w=True mirrored the map
+                # teacher left/right (GT check, 187 navtrain tokens: road IoU 0.965 transpose-only
+                # vs 0.360 with the flip, better on 187/187; = refiner/resmap_cache.py, kd_bev_1).
                 "flip_w": False,
             },
         }
     )
-    # ``{branch: /path/to/stage1_adapter.ckpt}``
+    # ``{branch: /path/to/stage1_adapter.ckpt}`` (stage-1 paths only; unused by v6-v8)
     distill_adapter_checkpoints: Dict[str, str] = field(default_factory=dict)
     # BEVFusion directory ``cache_train_50x100``. ReSMap is sharded and already
     # 50x100 after the lateral/forward transpose. Same shape as the student,
     # so stage 2 does not resample either teacher.
     distill_cache_size: Tuple[int, int] = (50, 100)
     distill_loss_weight: float = 1.0
+    # Seed of the frozen random probe of the anchor path (anchor/cmd/status MLPs,
+    # q/k/v/out projections): built under torch.random.fork_rng, so turning the
+    # distillation on changes neither the v2 / refiner init nor the global RNG
+    # stream (data order).  aux_distill drew the probe from the global RNG.
+    distill_probe_seed: int = 0
+    # Where the anchor path gets its two teacher BEVs (bevfusion, resmap):
+    #   "store"   aux_distill's TeacherFeatureStore, read in the training process from
+    #             distill_feature_root by targets['scene_token'];
+    #   "targets" the refiner e2e targets kd_bev_0 (DET = BEVFusion) / kd_bev_1 (MAP = ReSMap,
+    #             transpose only), loaded by the ck_e2e2 dataloader workers for the CK2 teachers
+    #             anyway (no extra I/O); tokens with kd_ok False are left out of the term.
+    distill_teacher_source: str = "store"
+    # Legacy v1-v5 knobs (inert on the anchor path; kept because the
+    # aux_distill agent yamls set them).
     use_corridor_mask: bool = True
     # NAVSIM GT poses are (x_forward, y_left); BEV cells are SSR (x_right, y_forward).
     distill_trajectory_frame: str = "navsim"
     corridor_sigma_base: float = 2.5
     corridor_sigma_growth: float = 0.1
     corridor_base_weight: float = 0.1
-    # Heading-aligned corridor: long along-track; cross-track matches v1
-    # isotropic 2.5 m so lane edges stay in the distill mask (DAC).
     corridor_sigma_along: float = 4.0
     corridor_sigma_cross: float = 2.5
     corridor_sigma_along_growth: float = 0.15
@@ -331,7 +463,6 @@ class ParaSSRConfig:
     distill_agent_inflate: float = 1.5
     distill_agent_future_sigma: float = 1.5
     distill_map_sigma: float = 1.25
-    # 0: keep kerb cells. Positive values punch sidewalk-overlapping road edges.
     distill_walkway_suppress: float = 0.0
     distill_boundary_kernel: int = 3
     distill_mse_weight: float = 1.0
@@ -342,36 +473,25 @@ class ParaSSRConfig:
     distill_attn_weight: float = 0.0
     distill_attn_tau: float = 0.5
     distill_adaptive_branch: bool = False
-    # Look-prior KL was learned on version_2 (0.284 → 0.069) and did not move
-    # navtest PDMS. The code path stays; the default is off.
     distill_plan_look_weight: float = 0.0
     distill_plan_look_tau: float = 0.5
-    # Head response KD on adapter tokens is off: the adapter is a planning
-    # projector, not a det/map teacher. Unmatched DETR bbox/traj L1 exploded.
     distill_head_kd_weight: float = 0.0
     distill_head_kd_tau: float = 2.0
     distill_head_kd_det: bool = False
     distill_head_kd_det_geom: bool = False
-    # Train-only BEV registers. Off so the v4 adapter + corridor launcher is
-    # unchanged. The selector recipe is docs/bev_selector_v3.md.
     distill_selector: bool = False
     distill_selector_registers: int = 16
     distill_selector_div_sigma: float = 4.0
-    # Five epochs at ~10639 microbatches/rank (2 GPU x batch 4, navtrain).
     distill_selector_tok_warmup_steps: int = 53195
-    # Log-gaussian width. Sigma anneals 6 m to 2 m inside the same softmax.
     distill_selector_anchor_sigma: float = 6.0
     distill_selector_anchor_sigma_end: float = 2.0
-    # Late cover target: sharpen planner attention, then mix the bank prior.
     distill_selector_plan_tau: float = 0.3
     distill_selector_struct_mix: float = 0.5
-    # Advanced distillation: linear projection adapter, loss un-dilution, hybrid loss, spatial boost
     distill_selector_proj: bool = False
     distill_selector_tok_scale: float = 1.0
     distill_selector_loss_type: str = "l2"
     distill_selector_struct_mask_boost: float = 0.0
-
-    # v6: Trajectory-Anchor-Guided Distillation (Pure Plan-Only Student)
+    # v6: Trajectory-Anchor-Guided Distillation
     distill_selector_v6: bool = False
     distill_anchor_winner_boost: float = 1.0
     distill_anchor_tau: float = 2.0
@@ -379,14 +499,12 @@ class ParaSSRConfig:
     distill_anchor_loss_type: str = "hybrid"
     distill_anchor_proj: bool = True
     distill_anchor_mode: str = "cross_attn"
-
-    # v7: Trajectory-Anchor-Guided Distillation with Spatial Bias & Attention Alignment
+    # v7: + spatial bias & attention alignment
     distill_selector_v7: bool = False
     distill_spatial_sigma: float = 4.0
     distill_attn_loss_scale: float = 5.0
     distill_resmap_scale: float = 3.0
-
-    # v8: Hybrid Anchor Weighting & Multi-Scale Spatial Distance Bias Distillation
+    # v8: hybrid anchor weighting & multi-scale spatial distance bias
     distill_selector_v8: bool = False
     distill_spatial_sigmas: Tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
     distill_lambda_gt: float = 0.6
@@ -394,15 +512,22 @@ class ParaSSRConfig:
     distill_lambda_risk: float = 0.2
     distill_tau_gt: float = 5.0
     distill_tau_risk: float = 8.0
-
-    # Stage 1: train one adapter + the unchanged planning decoder from the
-    # cached teacher BEV alone.  Produces the checkpoints stage 2 freezes.
+    # v9/v10: Domain-Specific Planning-Grounded Probe (PGP) + 4 structural fixes
+    distill_selector_v9: bool = False
+    distill_selector_v10: bool = False
+    distill_probe_warmup_steps: int = 1000
+    distill_probe_ramp_steps: int = 2000
+    distill_probe_loss_weight: float = 1.0
+    distill_probe_lr_mult: float = 3.0
+    distill_probe_use_ema: bool = True
+    distill_probe_ema_decay: float = 0.99
+    # aux_distill stage-1 teacher adapter (not supported on this core)
     teacher_adapter_branch: str = "bevfusion"
 
     @property
     def needs_scene_token(self) -> bool:
-        """Targets must carry the frame token for any cache-addressed path."""
-        return bool(self.use_metric_planner or self.use_distill)
+        """Targets must carry the frame token for the cache-addressed distillation."""
+        return bool(self.use_distill)
 
     @property
     def bev_grid_length(self) -> Tuple[float, float]:

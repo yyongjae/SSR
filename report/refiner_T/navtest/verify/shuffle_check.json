@@ -1,0 +1,72 @@
+{
+ "pairing_ok": true,
+ "orig_identical": true,
+ "n_valid": 97386,
+ "n_tokens": 7930,
+ "pdms": {
+  "orig": 0.8214725612023819,
+  "T": 0.8955624079219051,
+  "shuffled": 0.7877497194978359,
+  "none": 0.8811753171359197
+ },
+ "dac_fail_pct": {
+  "orig": 7.971371655063356,
+  "shuffled": 9.90594130573183
+ },
+ "PDMS_true_minus_shuf_points": [
+  10.781268842406918,
+  10.174842446673301,
+  11.40749177885034
+ ],
+ "PDMS_shuf_minus_none_points": [
+  -9.34255976380839,
+  -9.946537127930183,
+  -8.742508007575987
+ ],
+ "PDMS_shuf_minus_orig_points": [
+  -3.3722841704546003,
+  -3.962401913899833,
+  -2.7900677273371164
+ ],
+ "NCTTC_true_minus_shuf_pp": [
+  -5.704105312878648,
+  -6.286967837458295,
+  -5.14461155166121
+ ],
+ "NCTTC_shuf_minus_none_pp": [
+  4.91343724970735,
+  4.33359904553271,
+  5.51862845758479
+ ],
+ "P1_T_minus_none_dev": [
+  1.4387090785985288,
+  1.182946401801161,
+  1.704188440712625
+ ],
+ "map": {
+  "n": 7930,
+  "fixed_points": 0,
+  "is_permutation": true,
+  "covers_eval_tokens": true,
+  "same_log_frac": 0.00605296343001261
+ },
+ "predict_meta": {
+  "run": "/home/external-user/ssd/yongjae_refiner/runs/stageT3_T_fold0_seed0",
+  "ckpt": "best",
+  "split": "dev",
+  "fold": null,
+  "n_tokens": 7930,
+  "mode": "A",
+  "arm": "T",
+  "sec": 56.0,
+  "created": "2026-09-29T13:54:14",
+  "tau1_eq_tau0_frac": 0.044097390629547,
+  "teacher_shuffle": {
+   "seed": 0,
+   "n": 7930,
+   "kind": "seeded cyclic derangement",
+   "fixed_points": 0,
+   "same_log_frac": 0.00605296343001261
+  }
+ }
+}

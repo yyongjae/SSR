@@ -166,16 +166,34 @@ def test_store_requires_a_manifest(tmp_path, config):
 # --------------------------------------------------------------------- #
 # stage 1 -> stage 2
 # --------------------------------------------------------------------- #
+# fusion_v1 merges aux_distill onto the kyungmin-v2 core without aux_distill's own
+# v2 port, so the stage-1 TeacherAdapterPlanner (num_plan_candidates,
+# use_metric_planner, plan_anchor_path, forward_from_bev) and aux_distill's
+# plan-tail / TTC-proxy planner losses do not exist here.
+_NO_STAGE1 = pytest.mark.skip(
+    reason="fusion_v1: stage-1 TeacherAdapterPlanner needs aux_distill's own v2 planner "
+           "API (not merged); only the v6-v8 trajectory-anchor path runs on this core")
+_NO_PLAN_TAIL = pytest.mark.skip(
+    reason="fusion_v1: aux_distill's plan_tail / ttc_proxy planner losses are not part "
+           "of the kyungmin-v2 core")
+
+
 def _stage1_checkpoint(tmp_path, config, cache):
+    # fusion_v1: an adapter-only stage-1 checkpoint under the 'agent.model.adapter.'
+    # prefix the stage-2 loader reads (TeacherAdapterPlanner is not buildable here).
     cfg = replace(config, use_distill=True, input_target=True,
                   distill_feature_root=cache)
-    model = TeacherAdapterPlanner(cfg)
+    torch.manual_seed(0)
+    adapter = PlanningBEVAdapter(
+        **dict(cfg.distill_branches[cfg.teacher_adapter_branch].get(
+            "adapter", {"channels": cfg.embed_dims})))
     path = str(tmp_path / "stage1.ckpt")
-    torch.save({"state_dict": {"agent.model." + k: v
-                               for k, v in model.state_dict().items()}}, path)
-    return cfg, model, path
+    torch.save({"state_dict": {"agent.model.adapter." + k: v
+                               for k, v in adapter.state_dict().items()}}, path)
+    return cfg, None, path
 
 
+@_NO_STAGE1
 def test_stage1_trains_adapter_and_planner(tmp_path, config, cache):
     cfg, model, _ = _stage1_checkpoint(tmp_path, config, cache)
     bev = TeacherFeatureStore(cache, "bevfusion").load_batch(
@@ -271,6 +289,7 @@ def test_real_cache_matches_the_student_geometry(config):
 # --------------------------------------------------------------------- #
 # launchability
 # --------------------------------------------------------------------- #
+@_NO_STAGE1
 def test_both_stages_instantiate_through_hydra(tmp_path, config, cache, monkeypatch):
     """navsim builds agents from yaml, so an unregistered agent is unreachable."""
     from hydra import compose, initialize_config_dir
@@ -299,6 +318,7 @@ def test_both_stages_instantiate_through_hydra(tmp_path, config, cache, monkeypa
     assert not any(p.requires_grad for p in stage2._distill.adapters.parameters())
 
 
+@_NO_STAGE1
 def test_stage1_has_no_unused_parameters(config, cache):
     """An unreduced parameter makes DDP abort; single-process runs never show it."""
     cfg = replace(config, use_distill=True, input_target=True,
@@ -376,6 +396,7 @@ def test_real_resmap_cache_matches_geometry_and_loads(config):
     assert batch.shape == (1, config.embed_dims, 50, 100)
 
 
+@_NO_STAGE1
 def test_stage1_planner_follows_teacher_cache_grid(tmp_path, config):
     """The stage-1 planner grid is the teacher cache, including a 50x100 cache."""
     root = _write_cache(str(tmp_path / "c"), config, shape=[50, 100])
@@ -584,6 +605,7 @@ def test_distill_head_kd_det_defaults_off():
     assert cfg.distill_head_kd_weight == 0.0
 
 
+@_NO_PLAN_TAIL
 def test_v4_defaults_cap_progress_and_drop_the_lateral_tail():
     cfg = ParaSSRConfig()
     assert cfg.corridor_sigma_cross == 2.5
@@ -600,6 +622,7 @@ def test_v4_defaults_cap_progress_and_drop_the_lateral_tail():
     assert cfg.plan_tail_progress_cap == 0.9
 
 
+@_NO_PLAN_TAIL
 def test_plan_tail_is_zero_on_gt_and_penalizes_the_worst_step():
     from navsim.agents.para_ssr.para_ssr_loss import compute_plan_tail_loss
 
@@ -650,6 +673,7 @@ def test_plan_tail_is_zero_on_gt_and_penalizes_the_worst_step():
     assert prog_capped_short.item() < prog.item()
 
 
+@_NO_PLAN_TAIL
 def test_v4_grid_is_square_50x100_and_the_ttc_proxy_stays_off():
     cfg = ParaSSRConfig()
     assert (cfg.bev_h, cfg.bev_w) == (50, 100)
@@ -678,6 +702,7 @@ def _ttc_batch(offsets, box_xy, *, yaw=1.5707963267948966, size=2.0):
     return preds, mask, command, box, valid, fut, fut_mask
 
 
+@_NO_PLAN_TAIL
 def test_plan_ttc_proxy_hits_only_the_forward_ssr_box():
     from navsim.agents.para_ssr.para_ssr_loss import (
         _PACIFICA_FRONT_LENGTH_M,
@@ -794,3 +819,11 @@ def test_planning_look_kd_matches_prior_mass():
     loss = planning_look_kd(student, prior, tau=0.5)
     loss.backward()
     assert student.grad[0, :, 2, 2].abs().sum() > student.grad[0, :, 7, 7].abs().sum()
+
+
+def test_v4_grid_is_square_50x100():
+    # fusion_v1: the grid half of test_v4_grid_is_square_50x100_and_the_ttc_proxy_stays_off
+    # (the plan_ttc_proxy / plan_tail fields are aux_distill-only).
+    cfg = ParaSSRConfig()
+    assert (cfg.bev_h, cfg.bev_w) == (50, 100)
+    assert tuple(cfg.distill_cache_size) == (50, 100)

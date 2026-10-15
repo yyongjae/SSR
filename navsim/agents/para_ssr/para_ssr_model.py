@@ -1,18 +1,20 @@
-"""PARA-SSR model: shared BEV encoder with three parallel heads.
-
-Mirrors ``projects/mmdet3d_plugin/SSR/para_ssr.py``:
+"""PARA-SSR: shared BEV, independent perception heads, task-memory planner.
 
 * history frames build ``prev_bev`` under ``no_grad`` (they exist to give the
   temporal self-attention something to attend to, not to be trained through);
 * the current frame's BEV is produced by the planning head, which owns the
   encoder;
-* with task interaction, the planner cross-attends the final det/motion and
-  map decoder states in parallel and adds those updates to the BEV update;
-* without it, auxiliary heads still read ``bev_embed`` through ``_ScaleGrad``
-  so their own parameters train at full strength while their BEV gradient is
-  throttled. Interaction mode leaves that valve off and corrects BEV gradients
-  by task origin in the loss, so the planning path through the decoders stays
-  unscaled.
+* with task interaction, perception latents feed the planner; without it,
+  heads train independently from shared BEV and may be absent for plan-only;
+* shared-BEV gradient balancing happens by loss origin in ``ParaSSRLoss``.
+  Scaling decoder inputs would incorrectly scale planning gradients that
+  travel through those decoders;
+* ego velocity/acceleration condition the planning query only; temporal BEV
+  alignment warps history with the geometric ``bev_shift`` and relative yaw;
+* with ``use_lidar`` (SafeDrive) each frame's point cloud is encoded into a
+  LiDAR BEV first, which seeds the BEV queries and feeds the per-layer LiDAR
+  cross-attention -- for history frames as well, so ``prev_bev`` is the same
+  kind of feature as the current BEV it is aligned with.
 """
 from __future__ import annotations
 
@@ -30,38 +32,24 @@ from .modules.map_head import ParaMapHead
 from .modules.planner_head import ParaSSRPlannerHead
 
 
-def heading_from_path(poses: torch.Tensor, min_step: float = 0.5) -> torch.Tensor:
-    """Evaluation-only: replace each pose heading by the path direction.
 
-    ``poses`` is ``[B, T, 3]`` in the NAVSIM ego frame. The direction at step
-    ``t`` is the central difference of the path, with the origin before the
-    first pose. Steps shorter than ``min_step`` metres keep the predicted heading.
+def heading_from_path(poses: torch.Tensor, min_step: float = 0.5) -> torch.Tensor:
+    """Evaluation-only: replace each pose's heading by the path's direction of travel.
+
+    ``poses`` [B, T, 3] (x forward, y left, heading).  The direction at pose t is
+    the central difference p[t+1] - p[t-1] (origin before the first pose, backward
+    difference at the last).  Where the car barely moves (< ``min_step`` metres
+    over that span) the predicted heading is kept.  The PDM simulator tracks
+    position AND heading, so a heading that disagrees with the path steers the
+    simulated car off the planned line.
     """
-    xy = torch.cat([poses.new_zeros(poses.shape[0], 1, 2), poses[..., :2]], dim=1)
-    nxt = torch.cat([xy[:, 2:], xy[:, -1:]], dim=1)
-    delta = nxt - xy[:, :-1]
-    tangent = torch.atan2(delta[..., 1], delta[..., 0])
-    moving = delta.norm(dim=-1) >= min_step
+    xy = torch.cat([poses.new_zeros(poses.shape[0], 1, 2), poses[..., :2]], dim=1)   # [B, T+1, 2]
+    nxt = torch.cat([xy[:, 2:], xy[:, -1:]], dim=1)                                 # p[t+1], last repeats
+    d = nxt - xy[:, :-1]                                                            # p[t+1] - p[t-1]
+    tangent = torch.atan2(d[..., 1], d[..., 0])
+    moving = d.norm(dim=-1) >= min_step
     heading = torch.where(moving, tangent, poses[..., 2])
     return torch.cat([poses[..., :2], heading.unsqueeze(-1)], dim=-1)
-
-
-class _ScaleGrad(torch.autograd.Function):
-    """Identity forward; scales the gradient flowing backwards.
-
-    Down-weighting an auxiliary *loss* would slow the head itself, which is the
-    opposite of what is wanted when the heads are meant to become teachers.
-    """
-
-    @staticmethod
-    def forward(ctx, x, scale):
-        ctx.scale = scale
-        return x
-
-    @staticmethod
-    def backward(ctx, grad):
-        return grad * ctx.scale, None
-
 
 class GridMask(nn.Module):
     """SSR's input augmentation: erase a regular grid of image patches."""
@@ -130,19 +118,25 @@ class ParaSSRModel(nn.Module):
         super().__init__()
         self._config = config
         cfg = config
-        self.use_task_interaction = bool(getattr(cfg, "use_task_interaction", False))
-        if self.use_task_interaction and (
-            cfg.use_metric_planner or getattr(cfg, "use_stl", False)
-        ):
-            raise ValueError("task interaction requires use_stl=False and use_metric_planner=False")
-        if self.use_task_interaction and (
-            not cfg.use_det_motion_head or not cfg.use_map_head
-        ):
-            raise ValueError("task interaction requires both the det/motion head and the map head")
-        plan_anchor = bool(getattr(cfg, "plan_anchor", False))
-        plan_anchor_file = getattr(cfg, "plan_anchor_file", None) if plan_anchor else None
-        if plan_anchor and not plan_anchor_file:
-            raise ValueError("plan_anchor requires plan_anchor_file")
+        if cfg.use_stl or cfg.plan_num_layers != 3:
+            raise ValueError("PARA-SSR requires use_stl=False and plan_num_layers=3")
+        if cfg.use_ego_motion:
+            raise ValueError(
+                "PARA-SSR routes ego status to planning; use_ego_motion must be False "
+                "(geometric BEV translation/rotation alignment uses use_shift)"
+            )
+        self.use_task_interaction = bool(cfg.use_task_interaction)
+        if self.use_task_interaction and (not cfg.use_det_motion_head or not cfg.use_map_head):
+            raise ValueError("the planner requires both det/motion and map heads")
+        if tuple(cfg.map_pc_range) != tuple(cfg.pc_range):
+            raise ValueError("shared BEV/detection/map must use one physical ROI")
+        active_tasks = ["plan"]
+        if cfg.use_det_motion_head:
+            active_tasks.extend(("det", "motion"))
+        if cfg.use_map_head:
+            active_tasks.append("map")
+        if any(cfg.task_loss_weight.get(task, 1.0) <= 0 for task in active_tasks):
+            raise ValueError("active task supervision must all be enabled; remove an unused head instead")
         self._backbone_frozen_stages = int(getattr(cfg, "frozen_stages", -1))
         self._backbone_norm_requires_grad = bool(
             getattr(cfg, "norm_requires_grad", False)
@@ -172,8 +166,8 @@ class ParaSSRModel(nn.Module):
             feedforward_channels=cfg.ffn_channels,
             ffn_dropout=cfg.encoder_ffn_dropout,
             attn_dropout=cfg.encoder_attn_dropout,
-            use_lidar=bool(getattr(cfg, "use_lidar", False)),
-            num_points_lidar=int(getattr(cfg, "lidar_attn_points", 8)),
+            use_lidar=cfg.use_lidar,
+            num_points_lidar=cfg.lidar_attn_points,
         )
         transformer = SSRPerceptionTransformer(
             embed_dims=cfg.embed_dims,
@@ -202,29 +196,18 @@ class ParaSSRModel(nn.Module):
             way_num_layers=cfg.way_num_layers,
             num_heads=cfg.num_heads,
             feedforward_channels=cfg.ffn_channels,
-            use_metric_planner=cfg.use_metric_planner,
-            num_plan_candidates=cfg.num_plan_candidates,
-            plan_anchor_path=cfg.plan_anchor_path,
-            use_stl=getattr(cfg, "use_stl", False),
-            plan_num_layers=getattr(cfg, "plan_num_layers", 3),
+            use_lidar=cfg.use_lidar,
+            use_stl=cfg.use_stl,
+            plan_num_layers=cfg.plan_num_layers,
             use_task_interaction=self.use_task_interaction,
-            use_lidar=bool(getattr(cfg, "use_lidar", False)),
-            plan_anchor_file=plan_anchor_file,
+            plan_anchor_file=getattr(cfg, "plan_anchor_file", None) if getattr(cfg, "plan_anchor", False) else None,
             plan_reward_weights=getattr(cfg, "plan_reward_weights", (0.1, 0.5, 0.5, 1.0)),
-            plan_topk=int(getattr(cfg, "plan_topk", 6)),
+            plan_topk=getattr(cfg, "plan_topk", 6),
             plan_kinematic=bool(getattr(cfg, "plan_kinematic", False)),
             plan_heading_from_xy=bool(getattr(cfg, "plan_heading_from_xy", False)),
             plan_rescore_refined=bool(getattr(cfg, "plan_rescore_refined", False)),
         )
-        self.lidar_encoder = (
-            build_lidar_encoder(cfg) if getattr(cfg, "use_lidar", False) else None
-        )
-
-        if cfg.use_metric_planner:
-            from .modules.candidate_planner import CandidateMetricHead
-            self.metric_head = CandidateMetricHead(
-                cfg.embed_dims, cfg.num_heads, cfg.fut_ts, cfg.metric_detach_bev
-            )
+        self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
 
         self.det_motion_head = (
             ParaDetMotionHead(
@@ -325,12 +308,12 @@ class ParaSSRModel(nn.Module):
         return [feat.view(B, N, C, h, w)]
 
     def lidar_bev(self, features: Dict[str, torch.Tensor], t: int) -> Optional[torch.Tensor]:
-        """LiDAR BEV ``[B, C, bev_h, bev_w]`` at queue step ``t``, or ``None``."""
+        """LiDAR BEV ``[B, C, bev_h, bev_w]`` for queue step ``t``, or ``None``."""
         if self.lidar_encoder is None:
             return None
         if "lidar_points" not in features or "lidar_num_points" not in features:
             raise ValueError(
-                "a use_lidar model needs lidar_points and lidar_num_points; "
+                "a use_lidar model needs lidar_points/lidar_num_points features; "
                 "rebuild the feature cache with use_lidar enabled"
             )
         return self.lidar_encoder(
@@ -348,14 +331,17 @@ class ParaSSRModel(nn.Module):
         was_training = self.training
         was_cache_enabled = torch.is_autocast_cache_enabled()
         try:
-            # History and the current frame share weights. Caching a weight
-            # cast under no_grad would let the current frame reuse a detached
-            # copy. Disable only the cache; keep the caller's autocast state.
+            # History and the trainable current frame share weights and the
+            # caller's autocast context. Caching a weight cast under no_grad
+            # would let the current frame reuse a detached copy and silently
+            # lose encoder gradients. Disable only caching for history;
+            # preserve the caller's autocast enabled state and dtype.
             torch.set_autocast_cache_enabled(False)
             self.eval()
             if was_training and self.lidar_encoder is not None:
-                # Image BN stays frozen. The from-scratch LiDAR BN must use the
-                # same statistics mode for history and the current frame.
+                # The image backbone uses frozen BN, whereas the from-scratch
+                # LiDAR BN must use the same statistics mode for history and
+                # current frames (as in SafeDrive).
                 self.lidar_encoder.train()
             prev_bev = None
             for t in range(T - 1):
@@ -364,7 +350,7 @@ class ParaSSRModel(nn.Module):
                     feats,
                     lidar2img=features["lidar2img"],
                     image_hw=features["image_hw"],
-                    ego_motion=features["ego_motion"][:, t],
+                    ego_motion=None,
                     bev_shift=features["bev_shift"][:, t],
                     bev_yaw=features["ego_motion"][:, t, 2].detach(),
                     prev_bev=prev_bev,
@@ -380,6 +366,8 @@ class ParaSSRModel(nn.Module):
     def forward(
         self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None
     ) -> Dict[str, torch.Tensor]:
+        # Interaction requires perception at inference too. In parallel mode,
+        # run_aux only requests optional eval perception; training runs all heads.
         cfg = self._config
         if run_aux is None:
             run_aux = self.training or cfg.test_aux_heads
@@ -388,180 +376,62 @@ class ParaSSRModel(nn.Module):
 
         cams = features["camera_feature"]
         cur_feats = self.extract_img_feat(cams[:, -1])
-        ego_status = (
-            features["status_feature"][:, cfg.num_navi_cmd:]
-            if "status_feature" in features and features["status_feature"].shape[-1] > cfg.num_navi_cmd
-            else features.get("ego_status")
-        )
-        head_kwargs = dict(
+        bev_embed = self.pts_bbox_head(
+            cur_feats,
             lidar2img=features["lidar2img"],
             image_hw=features["image_hw"],
-            ego_motion=features["ego_motion"][:, -1],
+            ego_motion=None,
             bev_shift=features["bev_shift"][:, -1],
+            # Read only relative yaw from the existing cache vector. This is
+            # geometry for history alignment, not learned status conditioning.
             bev_yaw=features["ego_motion"][:, -1, 2].detach(),
             prev_bev=prev_bev,
-            cmd=features["command"],
-            ego_status=ego_status,
+            only_bev=True,
             lidar_bev=self.lidar_bev(features, -1),
-            return_bev_attn=bool(
-                getattr(cfg, "distill_selector", False)
-                or getattr(cfg, "distill_selector_v6", False)
-                or getattr(cfg, "distill_selector_v7", False)
-                or getattr(cfg, "distill_selector_v8", False)
-            ),
         )
-        if not self.use_task_interaction:
-            outs = self.pts_bbox_head(cur_feats, **head_kwargs)
-            return self._predictions_from_plan(features, outs, run_aux)
 
-        bev_embed = self.pts_bbox_head(cur_feats, only_bev=True, **head_kwargs)
-        det_out = self.det_motion_head(bev_embed, return_hidden=True)
-        map_out = self.map_head(bev_embed, return_hidden=True)
-        planned = self.pts_bbox_head.forward_from_bev(
-            bev_embed,
-            features["command"],
-            ego_status=ego_status,
-            det_out=det_out,
-            map_out=map_out,
-            return_bev_attn=bool(
-                getattr(cfg, "distill_selector", False)
-                or getattr(cfg, "distill_selector_v6", False)
-                or getattr(cfg, "distill_selector_v7", False)
-                or getattr(cfg, "distill_selector_v8", False)
-            ),
+        run_heads = self.use_task_interaction or self.training or run_aux
+        det_out = (
+            self.det_motion_head(bev_embed, return_hidden=self.use_task_interaction)
+            if run_heads and self.det_motion_head is not None else None
+        )
+        map_out = (
+            self.map_head(bev_embed, return_hidden=self.use_task_interaction)
+            if run_heads and self.map_head is not None else None
+        )
+        outs = self.pts_bbox_head.plan_from_bev(
+            bev_embed, features["command"], det_out, map_out,
+            # The cached status is command + (vx, vy, ax, ay) in NAVSIM's
+            # native ego axes and metric units. Command has its own embedding.
+            ego_status=features["status_feature"][:, cfg.num_navi_cmd:],
         )
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
-            "ego_fut_preds": planned["ego_fut_preds"],
+            "ego_fut_preds": outs["ego_fut_preds"],
             "trajectory": self.pts_bbox_head.select_trajectory(
-                planned["ego_fut_preds"], features["command"]
+                outs["ego_fut_preds"], features["command"]
             ),
         }
-        if "bev_pos" in planned and planned["bev_pos"] is not None:
-            predictions["bev_pos"] = planned["bev_pos"]
-        if "plan_bev_attn" in planned:
-            predictions["plan_bev_attn"] = planned["plan_bev_attn"]
-        if "trajectory_offset" in planned:
-            # Anchor planner already selected an absolute pose. Keep the offset
-            # and reward tensors the anchor loss reads.
-            for key in (
-                "trajectory",
-                "plan_topk_trajectory",
-                "plan_topk_reward",
-                "plan_topk_index",
-                "plan_final_rewards",
-                "trajectory_offset",
-                "im_rewards",
-                "sim_rewards",
-                "trajectory_anchors",
-            ):
-                predictions[key] = planned[key]
-            predictions.update({
-                key: value for key, value in planned.items() if key.startswith("plan_rescore_")
-            })
-        predictions["trajectory"] = self._postprocess_trajectory(
-            predictions["trajectory"], features
-        )
-        if self.training or run_aux:
-            predictions.update(det_out)
-            predictions.update(map_out)
-        return predictions
-
-    def _postprocess_trajectory(
-        self, trajectory: torch.Tensor, features: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """Evaluation-only heading and kinematic projection. Training is unchanged."""
-        cfg = self._config
-        if self.training:
-            return trajectory
-        if getattr(cfg, "heading_from_path", False):
-            trajectory = heading_from_path(trajectory)
-        if getattr(cfg, "kinematic_projection", False):
+        if "trajectory_offset" in outs:  # v2 anchor planner: selected anchor + offset, and what its losses need
+            predictions.update({k: outs[k] for k in (
+                "trajectory", "plan_topk_trajectory", "plan_topk_reward", "plan_topk_index",
+                "plan_final_rewards", "trajectory_offset", "im_rewards", "sim_rewards", "trajectory_anchors")})
+            predictions.update({k: v for k, v in outs.items() if k.startswith("plan_rescore_")})
+        if getattr(cfg, "heading_from_path", False) and not self.training:
+            predictions["trajectory"] = heading_from_path(predictions["trajectory"])
+        if getattr(cfg, "kinematic_projection", False) and not self.training:
+            # TOAD's test-time projection without its CEM search: inverse kinematics
+            # -> clamp to the comfort envelope -> kinematic-bicycle rollout
             from .modules.kinematics import bicycle_rollout, clamp_controls, poses_to_controls
+            v0 = features["status_feature"][:, cfg.num_navi_cmd].to(predictions["trajectory"].dtype)
+            ctrl = clamp_controls(poses_to_controls(predictions["trajectory"], v0, 0.5))
+            predictions["trajectory"], _ = bicycle_rollout(ctrl, v0, 0.5)
+        # Training always exposes predictions needed by every supervised loss,
+        # even when a caller explicitly passes run_aux=False.
+        if self.training or run_aux:
+            if det_out is not None:
+                predictions.update(det_out)
+            if map_out is not None:
+                predictions.update(map_out)
 
-            v0 = features["status_feature"][:, cfg.num_navi_cmd].to(trajectory.dtype)
-            controls = clamp_controls(poses_to_controls(trajectory, v0, 0.5))
-            trajectory, _ = bicycle_rollout(controls, v0, 0.5)
-        return trajectory
-
-    def _predictions_from_plan(
-        self,
-        features: Dict[str, torch.Tensor],
-        outs: Dict[str, torch.Tensor],
-        run_aux: bool,
-    ) -> Dict[str, torch.Tensor]:
-        cfg = self._config
-        bev_embed = outs["bev_embed"]
-        predictions: Dict[str, torch.Tensor] = {
-            "bev_embed": bev_embed,
-        }
-        if "bev_pos" in outs and outs["bev_pos"] is not None:
-            predictions["bev_pos"] = outs["bev_pos"]
-        if outs.get("token_attn") is not None:
-            predictions["token_attn"] = outs["token_attn"]
-        if "plan_bev_attn" in outs:
-            predictions["plan_bev_attn"] = outs["plan_bev_attn"]
-        if "trajectory_offset" in outs:
-            for key in (
-                "trajectory",
-                "plan_topk_trajectory",
-                "plan_topk_reward",
-                "plan_topk_index",
-                "plan_final_rewards",
-                "trajectory_offset",
-                "im_rewards",
-                "sim_rewards",
-                "trajectory_anchors",
-            ):
-                if key in outs:
-                    predictions[key] = outs[key]
-            predictions.update({
-                key: value for key, value in outs.items() if key.startswith("plan_rescore_")
-            })
-            if "ego_fut_preds" in outs:
-                predictions["ego_fut_preds"] = outs["ego_fut_preds"]
-        elif cfg.use_metric_planner:
-            from .modules.candidate_planner import (
-                commanded_candidates, offsets_to_poses, rank_candidates,
-            )
-            candidates = offsets_to_poses(commanded_candidates(
-                outs["candidate_offsets"], features["command"]
-            ))
-            metric_logits = self.metric_head(
-                bev_embed, outs["bev_pos"], candidates, features["status_feature"]
-            )
-            trajectory, selected, ranks = rank_candidates(
-                candidates, outs["candidate_logits"], metric_logits,
-                cfg.candidate_score_weight, cfg.metric_score_weight,
-            )
-            predictions.update({
-                "candidate_offsets": outs["candidate_offsets"],
-                "candidate_logits": outs["candidate_logits"],
-                "plan_anchors": outs["plan_anchors"],
-                "trajectory_candidates": candidates,
-                "metric_logits": metric_logits,
-                "candidate_rank_scores": ranks,
-                "selected_candidate": selected,
-                "trajectory": trajectory,
-            })
-        else:
-            predictions.update({
-                "ego_fut_preds": outs["ego_fut_preds"],
-                "trajectory": self.pts_bbox_head.select_trajectory(
-                    outs["ego_fut_preds"], features["command"]
-                ),
-            })
-
-        if run_aux and self.det_motion_head is not None:
-            s = self.aux_grad_scale.get("det", 1.0)
-            bev_det = bev_embed if s == 1.0 else _ScaleGrad.apply(bev_embed, s)
-            predictions.update(self.det_motion_head(bev_det))
-        if run_aux and self.map_head is not None:
-            s = self.aux_grad_scale.get("map", 1.0)
-            bev_map = bev_embed if s == 1.0 else _ScaleGrad.apply(bev_embed, s)
-            predictions.update(self.map_head(bev_map))
-
-        predictions["trajectory"] = self._postprocess_trajectory(
-            predictions["trajectory"], features
-        )
         return predictions

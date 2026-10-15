@@ -1,0 +1,51 @@
+M8 re-check on the TRAIN split: surrogate margin / human-mask selection rule.
+Written 2026-09-28 ~09:55 KST, BEFORE any train-split re-check number was computed. Nothing in this file is changed after the run starts.
+Script: tools/refiner/m8_recheck.py. Dev tokens and navtest are never read for this selection.
+
+Pool
+  About 800 TRAIN-split tokens (splits/train.parquet), each from a different log (one token per log, seed 0).
+  Eligible tokens have: the 13-draft bank with official labels (scores/train.parquet, no error), objects (objects/train),
+  a navtrain SDF, a human trajectory without a frame gap, and a metric cache.
+  Bank drafts used = k = 0 (human identity) plus the valid perturbed drafts k = 1..12.
+  Invalid bank slots are stored as human bytes with valid = False and are skipped.
+
+Grid (48 settings)
+  m_col in {0, 0.05, 0.1, 0.15, 0.2, 0.3} m
+  m_dac in {0, 0.05, 0.1, 0.2} m
+  human-overlap mask in {exact SAT overlap (current default), none}
+  Every other surrogate constant is the code default (SurrogateConfig()), and the loss weights are DEFAULT_WEIGHTS.
+
+Definitions per setting s (same as validate_surrogate.py; the flags are on the raw 41-point reference)
+  col flag(tau) = min over counted (object, n) of the smooth separation g < m_col
+    The mask follows s. This is col_viol > 0 at the setting's margin.
+  dac flag(tau) = min over valid corners and n of SDF < m_dac.
+  guided(s)     = the correction of each valid perturbed bank draft (k = 1..12), computed as in validate_surrogate.py:
+    60 Adam steps at lr 0.05 on surrogate_loss(DEFAULT_WEIGHTS, config s), starting from z = w = 0,
+    keeping the best iterate. An output within 1e-6 m of its source keeps the source bytes and is not a pair.
+  A1(s)  = P(col flag | official NC < 1), over the bank drafts.
+  A2(s)  = P(col flag | human identity draft k = 0, official NC = 1).
+  A3(s)  = P(official NC(tau0) < 1 and NC(tau1) = 1 | col flag(tau0) and not col flag(tau1)), over the guided(s) pairs.
+  DAC recall(s)    = P(dac flag | official DAC < 1), over the bank drafts.
+  DAC false alarm  = P(dac flag | official DAC = 1), over the bank drafts.
+  DAC human FA(s)  = P(dac flag | k = 0, official DAC = 1).
+  DAC-A3(s)        = the A3 formula with DAC / dac flag in place of NC / col flag.
+  CIs: log-cluster bootstrap (2,000 resamples) and Clopper-Pearson.
+    With one token per log, the bootstrap resamples tokens.
+
+Feasible  = A1 >= 0.70  AND  A2 <= 0.02  AND  A3 >= 0.60  AND  DAC human FA <= 0.02.
+  Point estimates are used, as in the original M8 acceptance.
+Choice    = among the feasible settings, the LARGEST margins, which give a safety buffer for LQR tracking deviation:
+  1. the largest m_col;
+  2. then the largest m_dac;
+  3. then the current mask (exact SAT) over "none" if both are feasible. Nothing is changed without evidence.
+If none is feasible:
+  - report the Pareto front of the 48 settings over (A1 up, A2 down, A3 up, DAC human FA down);
+  - report the closest setting, which is the one with:
+      1. the fewest failed criteria;
+      2. then the smallest total shortfall
+         (0.70 - A1)+ + (A2 - 0.02)+ + (0.60 - A3)+ + (DAC human FA - 0.02)+;
+      3. then the larger margins, in the order above.
+Reported, not in the rule:
+  - DAC recall, DAC false alarm and DAC-A3;
+  - the same flags on the official LQR-tracked states, labelled as the ceiling of an ideal M7b tracker;
+  - the residual NC failures after guided(s): how many have no raw-reference flag, and how many of those are flagged on the tracked states.

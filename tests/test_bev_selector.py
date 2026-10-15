@@ -308,13 +308,8 @@ def test_default_planner_layer_still_returns_a_tensor():
     meta = torch.zeros(2, 3, 8)
     out = layer(h, pos, bev, bev_pos, memory, meta, meta, memory, meta, meta)
     assert out.shape == h.shape
-    hidden, attn = layer(
-        h, pos, bev, bev_pos, memory, meta, meta, memory, meta, meta,
-        return_bev_attn=True,
-    )
-    assert hidden.shape == h.shape
-    assert attn.shape == (2, 4)
-    assert torch.allclose(attn.sum(dim=-1), torch.ones(2), atol=1e-5)
+    # fusion_v1: the return_bev_attn half (the register-selector hook of aux_distill's
+    # own v2 port) is not merged onto the kyungmin-v2 PlanTaskMemoryLayer.
 
 
 def test_selector_yaml_turns_grad_balance_off():

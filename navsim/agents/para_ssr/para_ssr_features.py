@@ -6,17 +6,20 @@ Produces, per sample:
 ``lidar2img``       ``[N_cam, 4, 4]``         SSR-BEV frame -> image pixels
 ``image_hw``        ``[N_cam, 2]``            (H, W) after resize/crop
 ``bev_shift``       ``[T, 2]``                normalised ego motion per step
-``ego_motion``      ``[T, ego_motion_dims]``  query conditioning vector
+``ego_motion``      ``[T, ego_motion_dims]``  legacy vector; relative yaw at [:,2] aligns BEV
 ``command``         ``[4]``                   driving command one-hot
-``status_feature``  ``[8]``                   command + velocity + acceleration
-``lidar_points``    ``[T, N_max, 5]``         only when ``use_lidar``: front-ROI points
-``lidar_num_points`` ``[T]``                  only when ``use_lidar``: real rows per frame
+``status_feature``  ``[8]``                   command + current planner velocity/acceleration
+``lidar_points``    ``[T, N_max, 5]``         (use_lidar) front-ROI points in SSR
+                                              axes, zero-padded
+``lidar_num_points`` ``[T]``                  (use_lidar) real rows per frame
 
 Coordinate frames
 -----------------
 SSR's BEV is VAD's ego frame: **x lateral (+right), y longitudinal (+forward)**.
 navsim/nuPlan lidar is **x forward, y left**.  ``T_LIDAR_FROM_SSR`` below folds
 that rotation into ``lidar2img`` so the model itself never sees the difference.
+LiDAR points have no matrix to hide behind, so ``_get_lidar`` rotates them into
+SSR axes explicitly: ``x_right = -y_left``, ``y_forward = x_forward``.
 
 Ego motion
 ----------
@@ -54,8 +57,10 @@ T_LIDAR_FROM_SSR = np.array(
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Per-point layout of ``lidar_points``. Intensity is 0..255 and ring is 0..39
-# on this rig; both are scaled into roughly unit range for the pillar MLP.
+# Per-point layout of ``lidar_points``; part of the feature cache identity.
+# NAVSIM's merged cloud is (x, y, z, intensity, ring, lidar_id) per LidarIndex;
+# the sensor id is dropped, intensity (0..255) and ring (0..39 on this rig)
+# are scaled to roughly unit range for the pillar MLP.
 LIDAR_POINT_LAYOUT: Tuple[str, ...] = ("x_right", "y_forward", "z", "intensity", "ring")
 LIDAR_INTENSITY_SCALE = 255.0
 LIDAR_RING_SCALE = 40.0
@@ -102,8 +107,6 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
     def get_unique_name(self) -> str:
         """Cache name, invalidated by any config that changes the tensors."""
         cfg = self._config
-        # use_lidar=False must keep this key. Adding the flag itself would
-        # invalidate the camera caches that Stage 2 already reads.
         fields = [
             ("bev_h", cfg.bev_h),
             ("bev_w", cfg.bev_w),
@@ -113,13 +116,15 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
             ("frame_indices", cfg.frame_indices),
             ("image_scale", cfg.image_scale),
             ("pc_range", cfg.pc_range),
+            ("use_lidar", cfg.use_lidar),
         ]
-        if getattr(cfg, "use_lidar", False):
+        if cfg.use_lidar:
+            # Only what reaches the tensor: padding length, z clip and layout.
+            # Pillar/backbone sizes are model-side and do not touch the cache.
             fields += [
-                ("use_lidar", True),
                 ("lidar_layout", LIDAR_POINT_LAYOUT),
                 ("lidar_max_points", cfg.lidar_max_points),
-                ("lidar_z_range", tuple(cfg.lidar_z_range)),
+                ("lidar_z_range", cfg.lidar_z_range),
             ]
         return cache_key("para_ssr_feature", fields)
 
@@ -159,7 +164,7 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
             "command": command,
             "status_feature": status_feature,
         }
-        if getattr(cfg, "use_lidar", False):
+        if cfg.use_lidar:
             clouds = [self._get_lidar(agent_input, t) for t in frame_indices]
             features["lidar_points"] = torch.stack([points for points, _ in clouds])
             features["lidar_num_points"] = torch.tensor(
@@ -167,11 +172,11 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
             )
         return features
 
+    # ------------------------------------------------------------------ #
     def _get_lidar(self, agent_input: AgentInput, frame_idx: int) -> Tuple[torch.Tensor, int]:
-        """Front-ROI cloud in SSR axes, padded to ``lidar_max_points``.
+        """Front-ROI point cloud in SSR axes, padded to ``lidar_max_points``.
 
-        Returns ``[N_max, 5]`` and how many leading rows are real. nuPlan lidar
-        is x-forward, y-left; the stored cloud is x-right, y-forward.
+        Returns the ``[N_max, 5]`` tensor and how many leading rows are real.
         """
         cfg = self._config
         pc = getattr(agent_input.lidars[frame_idx], "lidar_pc", None)
@@ -189,8 +194,11 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
         x_forward, y_left, z, intensity, ring = pc[0], pc[1], pc[2], pc[3], pc[4]
         x_right = -y_left
         y_forward = x_forward
+
         x0, y0, _, x1, y1, _ = cfg.pc_range
         z0, z1 = cfg.lidar_z_range
+        # Half-open bounds: a point exactly on the far edge would otherwise map
+        # to a pillar one past the canvas.
         keep = (
             (x_right >= x0) & (x_right < x1)
             & (y_forward >= y0) & (y_forward < y1)
@@ -199,8 +207,12 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
         )
         index = np.flatnonzero(keep)
         if index.size > cfg.lidar_max_points:
+            # Uniform thinning along scan order: deterministic (the cache must
+            # not depend on a RNG) and spatially unbiased, since the merged scan
+            # interleaves the five sensors rather than sorting by position.
             picks = np.linspace(0, index.size - 1, cfg.lidar_max_points).round().astype(np.int64)
             index = index[picks]
+
         points = np.zeros((cfg.lidar_max_points, len(LIDAR_POINT_LAYOUT)), dtype=np.float32)
         count = int(index.size)
         points[:count, 0] = x_right[index]
@@ -256,11 +268,13 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
     def _get_ego_motion(
         self, agent_input: AgentInput, frame_indices: Sequence[int]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """BEV shift and the query-conditioning vector, per queue step.
+        """BEV shift and the legacy ego vector, per queue step.
 
         ``ego_pose`` is ``(x, y, heading)`` in the *current* frame, x forward,
         y left.  For queue step ``k`` the shift is the ego displacement from
         frame ``k-1`` to frame ``k``, expressed in frame ``k``'s own axes.
+        Temporal feature alignment also reads relative yaw at ``motion[2]``;
+        the remaining vector entries are retained for cache compatibility.
         """
         cfg = self._config
         poses = [

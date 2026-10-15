@@ -21,7 +21,7 @@ from navsim.agents.WoTE.WoTE_loss import compute_wote_loss
 from navsim.agents.WoTE.WoTE_targets import WoTETargetBuilder
 from navsim.agents.WoTE.WoTE_features import WoTEFeatureBuilder
 from navsim.common.dataclasses import AgentInput, Trajectory, SensorConfig
-import math
+import math, inspect
 from torch.optim.lr_scheduler import _LRScheduler
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch.optim as optim
@@ -181,9 +181,11 @@ class WarmupCosLR(_LRScheduler):
         self.min_lr = min_lr
         self.lr = lr
         self.epochs = epochs
-        try:
+        self.warmup_epochs = warmup_epochs
+        # torch>=2.4 dropped the LRScheduler `verbose` argument.
+        if 'verbose' in inspect.signature(_LRScheduler.__init__).parameters:
             super(WarmupCosLR, self).__init__(optimizer, last_epoch, verbose)
-        except TypeError:
+        else:
             super(WarmupCosLR, self).__init__(optimizer, last_epoch)
 
     def state_dict(self):

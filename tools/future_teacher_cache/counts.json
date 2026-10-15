@@ -1,0 +1,14 @@
+{
+ "train": {
+  "scene_tokens": 103288,
+  "future_frames_to_run": 112152,
+  "logs": 1192,
+  "cached_existing": 103288
+ },
+ "test": {
+  "scene_tokens": 12146,
+  "future_frames_to_run": 12900,
+  "logs": 136,
+  "cached_existing": 12146
+ }
+}

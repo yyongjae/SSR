@@ -302,10 +302,16 @@ class TeacherFeatureStore:
         raw = np.asarray(self._mmap_cache[shard][row])
         # In ReSMap, axes are (C, lateral, forward) = (256, 100, 50)
         # Transpose to (C, forward=50, lateral=100)
+        # fusion_v1: lateral index 0 is y_left = +32 m, i.e. already the student column 0,
+        # so ReSMap needs the transpose only -- configure flip_w=False for this store
+        # (configs/default.py distill_branches); flipping mirrors the map left/right.
         if raw.ndim == 3 and raw.shape[1] > raw.shape[2]:
             raw = raw.transpose(0, 2, 1)
         if self.flip_w:
             raw = raw[:, :, ::-1].copy()
+        else:
+            # fusion_v1: own the memory (a transposed memmap row is a read-only view)
+            raw = np.array(raw)
         return raw
 
     def load_batch(

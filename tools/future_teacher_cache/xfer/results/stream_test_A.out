@@ -1,0 +1,43 @@
+fake archives total bytes 33363037
+== run 1 (P=4, all 8 archives)
+[stream_extract] 2026-10-03T22:12:10+09:00 archives=4 mods='camera lidar' P=4 root=/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/testA/root state=/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/testA/state base=http://127.0.0.1:18765/resolve
+[stream_extract] summary {'done': 4, 'skipped_empty': 1, 'failed': 3} streamed_this_run=7 archives 0.03 GB in 15s = 1.77 MB/s aggregate
+[stream_extract] NOT DONE: lidar_2:failed camera_3:failed lidar_3:failed
+PASS run1 exit != 0 (failures expected)
+PASS camera_0 done
+PASS lidar_0 done
+PASS camera_1 done
+PASS lidar_1 done
+PASS camera_2 skipped_empty
+PASS lidar_2 failed (not found)
+PASS camera_3 failed (sha)
+PASS lidar_3 failed (commit conflict)
+PASS preexisting file untouched
+PASS resume happened (rstream retries>0 on done archives)
+PASS server saw Range resume requests
+PASS sha ok on done archives
+PASS no staging leftovers
+PASS camera_3 (sha) / lidar_2 (not found) placed nothing in root
+PASS lidar_3 committed its other files (sha-verified) except the conflict
+PASS extracted == listed for done archives (71 files), 0 extra, 0 missing, byte-identical
+== run 2 (rerun unchanged: done archives skipped, failures retried and still fail)
+PASS run2 exit != 0
+PASS done archives not re-requested
+PASS failed archives retried
+PASS status attempts rewritten for lidar_2
+== run 3 (fix list / tree / conflict, rerun all -> everything done)
+[stream_extract] 2026-10-03T22:12:28+09:00 archives=4 mods='camera lidar' P=4 root=/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/testA/root state=/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/testA/state base=http://127.0.0.1:18765/resolve
+[stream_extract] summary {'done': 7, 'skipped_empty': 1} streamed_this_run=3 archives 0.01 GB in 0s = 84.41 MB/s aggregate
+PASS run3 exit 0
+PASS all done/skipped
+== run 4 (kill mid-stream, then resume at archive granularity), P=2, slow server
+tests/test_a.sh: line 124: 2780685 Killed                  setsid bash "$X/stream_extract.sh" -l "$W/lists" -r "$W/root2" -s "$W/state2" --base-url "http://127.0.0.1:$PORT/resolve" --tree-dir "$W/tree" -P 2 0 1 2 3 > "$W/run4a.out" 2>&1
+PASS run4 nothing of the killed run still alive
+killed after 1 done
+[2026-10-03T22:12:37+09:00] camera_3 done in 3.479s (6935753 B, sha ok, {"committed_new":24,"already_present_same_size":0,"conflict_different_size":0,"conflict_examples":[],"missing_after_commit":0})
+[stream_extract] summary {'done': 7, 'skipped_empty': 1} streamed_this_run=6 archives 0.03 GB in 5s = 4.74 MB/s aggregate
+PASS run4 resume exit 0
+PASS run4 killed with partial progress (1 done)
+PASS run4 root2 identical to run3 root
+PASS run4 staging empty
+TEST A: 28 passed, 0 failed

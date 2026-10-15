@@ -52,7 +52,22 @@ def _front_input():
         )
         for frame in range(4)
     ]
-    return SimpleNamespace(cameras=camera_frames, ego_statuses=statuses)
+    # Merged clouds only at the selected frames, in NAVSIM's (x forward, y left)
+    # axes and (x, y, z, intensity, ring, lidar_id) layout; the rear half and a
+    # few high points exist so the front-ROI crop has something to remove.
+    lidars = [SimpleNamespace(lidar_pc=None), SimpleNamespace(lidar_pc=None)]
+    for frame in (2, 3):
+        rng = np.random.default_rng(frame)
+        count = 400
+        cloud = np.zeros((6, count), dtype=np.float32)
+        cloud[0] = rng.uniform(-40.0, 40.0, count)
+        cloud[1] = rng.uniform(-40.0, 40.0, count)
+        cloud[2] = rng.uniform(-1.0, 6.0, count)
+        cloud[3] = rng.integers(0, 255, count)
+        cloud[4] = rng.integers(0, 40, count)
+        cloud[5] = rng.integers(0, 5, count)
+        lidars.append(SimpleNamespace(lidar_pc=cloud))
+    return SimpleNamespace(cameras=camera_frames, ego_statuses=statuses, lidars=lidars)
 
 
 def test_python_and_hydra_defaults_use_the_same_three_front_cameras():
@@ -71,18 +86,22 @@ def test_python_and_hydra_defaults_use_the_same_three_front_cameras():
         ParaSSRAgent._validate_config(candidate, candidate.trajectory_sampling)
 
 
-def test_default_sensor_config_loads_only_front_cameras_at_selected_history_frames():
+@pytest.mark.parametrize("use_lidar", [True, False])
+def test_default_sensor_config_loads_only_front_cameras_at_selected_history_frames(use_lidar):
     agent = ParaSSRAgent.__new__(ParaSSRAgent)
     torch.nn.Module.__init__(agent)
-    agent._config = ParaSSRConfig()
+    agent._config = ParaSSRConfig(use_lidar=use_lidar)
     sensors = agent.get_sensor_config()
 
     for frame in range(4):
         expected = set(FRONT_CAMERAS) if frame in (2, 3) else set()
+        if use_lidar and frame in (2, 3):
+            expected.add("lidar_pc")
         assert set(sensors.get_sensors_at_iteration(frame)) == expected
     for name in set(SURROUND_CAMERAS) - set(FRONT_CAMERAS):
         assert getattr(sensors, name) is False
-    assert sensors.lidar_pc is False
+    # LiDAR follows the same queue as the cameras: history BEVs need it too.
+    assert sensors.lidar_pc == ([2, 3] if use_lidar else False)
 
 
 @pytest.mark.parametrize("camera_names", [FRONT_CAMERAS, FRONT_CAMERAS[::-1]])
@@ -136,7 +155,9 @@ def test_feature_cache_separates_front_surround_and_reordered_cameras():
 
 def test_front_camera_model_has_finite_backward_on_front_only_bev():
     torch.manual_seed(9)
+    # Camera-only arm: this test is about the front-camera path, not the LiDAR branch.
     config = ParaSSRConfig(
+        use_lidar=False,
         image_architecture="resnet18",
         backbone_pretrained=False,
         image_scale=1.0,

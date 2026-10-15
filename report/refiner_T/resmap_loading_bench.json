@@ -1,0 +1,22 @@
+{
+ "resmap_index_load_s": 0.209,
+ "resmap": {
+  "single_process_cold_ms": 3.87,
+  "single_process_warm_ms": 0.45,
+  "loader_w2_pass1_ms": 2.94,
+  "loader_w2_pass2_ms": 1.88
+ },
+ "bevfusion": {
+  "single_process_cold_ms": 5.08,
+  "single_process_warm_ms": 1.6,
+  "loader_w2_pass1_ms": 3.78,
+  "loader_w2_pass2_ms": 1.93
+ },
+ "config": {
+  "n": 480,
+  "workers": 2,
+  "batch": 8,
+  "seed": 7,
+  "time": "2026-09-29T14:47:00"
+ }
+}

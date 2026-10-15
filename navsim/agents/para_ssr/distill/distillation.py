@@ -135,6 +135,8 @@ class PlanningDistillation(nn.Module):
         selector_v6: bool = False,
         selector_v7: bool = False,
         selector_v8: bool = False,
+        selector_v9: bool = False,
+        selector_v10: bool = False,
         spatial_sigma: float = 4.0,
         spatial_sigmas: Optional[Sequence[float]] = None,
         lambda_gt: float = 0.6,
@@ -150,6 +152,12 @@ class PlanningDistillation(nn.Module):
         anchor_loss_type: str = "hybrid",
         anchor_proj: bool = True,
         anchor_mode: str = "cross_attn",
+        anchor_file: Optional[str] = None,
+        probe_warmup_steps: int = 1000,
+        probe_ramp_steps: int = 2000,
+        probe_loss_weight: float = 1.0,
+        probe_use_ema: bool = True,
+        probe_ema_decay: float = 0.99,
     ) -> None:
         super().__init__()
         if not branches:
@@ -206,6 +214,8 @@ class PlanningDistillation(nn.Module):
         self.selector_v6 = bool(selector_v6)
         self.selector_v7 = bool(selector_v7)
         self.selector_v8 = bool(selector_v8)
+        self.selector_v9 = bool(selector_v9)
+        self.selector_v10 = bool(selector_v10)
         self.spatial_sigma = float(spatial_sigma)
         self.spatial_sigmas = tuple(float(s) for s in spatial_sigmas) if spatial_sigmas is not None else None
         self.lambda_gt = float(lambda_gt)
@@ -221,6 +231,14 @@ class PlanningDistillation(nn.Module):
         self.anchor_loss_type = str(anchor_loss_type)
         self.anchor_proj = bool(anchor_proj)
         self.anchor_mode = str(anchor_mode)
+        self.probe_warmup_steps = int(probe_warmup_steps)
+        self.probe_ramp_steps = int(probe_ramp_steps)
+        self.probe_loss_weight = float(probe_loss_weight)
+        self.probe_use_ema = bool(probe_use_ema)
+        self.probe_ema_decay = float(probe_ema_decay)
+        # fusion_v1: the spatial bias is built from the planner's own anchor file
+        # (config.plan_anchor_file) instead of the hard-coded byounggun path.
+        self.anchor_file = None if anchor_file is None else str(anchor_file)
 
         self.adapters = nn.ModuleDict()
         self.stores: Dict[str, TeacherFeatureStore] = {}
@@ -229,7 +247,8 @@ class PlanningDistillation(nn.Module):
         self.teacher_tokens_student_grid: Dict[str, torch.Tensor] = {}
         self.student_tokens_student_grid: Dict[str, torch.Tensor] = {}
 
-        if self.selector_mode or self.selector_v6 or self.selector_v7 or self.selector_v8:
+        is_anchor = self.selector_v6 or self.selector_v7 or self.selector_v8 or self.selector_v9 or self.selector_v10
+        if self.selector_mode or is_anchor:
             # Registers / Anchors replace the frozen adapter. Stage-1 checkpoints are not
             # read, so the v4 launcher is the only path that requires them.
             active_branch_names = [
@@ -255,7 +274,7 @@ class PlanningDistillation(nn.Module):
         for name in active_branch_names:
             raw = branches[name]
             cfg = dict(raw)
-            if self.selector_mode or self.selector_v6 or self.selector_v7 or self.selector_v8:
+            if self.selector_mode or is_anchor:
                 cfg.pop("adapter", None)
             else:
                 adapter = PlanningBEVAdapter(**dict(cfg.pop("adapter", {})))
@@ -311,10 +330,19 @@ class PlanningDistillation(nn.Module):
             )
 
         self.anchor_distill: Optional[TrajectoryAnchorDistillation] = None
-        if self.selector_v6 or self.selector_v7 or self.selector_v8:
+        if is_anchor:
             from .anchor_distill import TrajectoryAnchorDistillation
 
-            ver = "v8" if self.selector_v8 else ("v7" if self.selector_v7 else "v6")
+            if self.selector_v10:
+                ver = "v10"
+            elif self.selector_v9:
+                ver = "v9"
+            elif self.selector_v8:
+                ver = "v8"
+            elif self.selector_v7:
+                ver = "v7"
+            else:
+                ver = "v6"
             self.anchor_distill = TrajectoryAnchorDistillation(
                 channels=self.selector_channels,
                 pc_range=self.pc_range,
@@ -336,6 +364,13 @@ class PlanningDistillation(nn.Module):
                 use_proj=self.anchor_proj,
                 mode=self.anchor_mode,
                 version=ver,
+                probe_warmup_steps=self.probe_warmup_steps,
+                probe_ramp_steps=self.probe_ramp_steps,
+                probe_loss_weight=self.probe_loss_weight,
+                probe_use_ema=self.probe_use_ema,
+                probe_ema_decay=self.probe_ema_decay,
+                **({} if self.anchor_file is None
+                   else {"trajectory_anchors_file": self.anchor_file}),
             )
 
     # ------------------------------------------------------------------ #
@@ -577,14 +612,29 @@ class PlanningDistillation(nn.Module):
         trajectory_anchors: Optional[torch.Tensor] = None,
         bev_pos: Optional[torch.Tensor] = None,
         sim_reward: Optional[torch.Tensor] = None,
+        sim_reward_valid: Optional[torch.Tensor] = None,
+        teacher_tokens: Optional[Sequence[torch.Tensor]] = None,
     ):
-        """``student_bev`` is ``[B, bev_h*bev_w, C]``; returns (losses, metrics)."""
-        if self.selector_v6 or self.selector_v7 or self.selector_v8:
+        """``student_bev`` is ``[B, bev_h*bev_w, C]``; returns (losses, metrics).
+
+        ``teacher_tokens`` (fusion_v1, anchor path only): the two teacher BEVs (bevfusion,
+        resmap) already on the student grid as ``[B, bev_h*bev_w, C]``; the stores are not read.
+        """
+        if (
+            self.selector_v6
+            or self.selector_v7
+            or self.selector_v8
+            or self.selector_v9
+            or self.selector_v10
+        ):
             return self._anchor_forward(
                 student_bev, tokens, trajectory_anchors, trajectories,
                 command=command, ego_status=ego_status, bev_pos=bev_pos,
-                sim_reward=sim_reward,
+                sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
+                teacher_tokens=teacher_tokens,
             )
+        if teacher_tokens is not None:
+            raise ValueError("teacher_tokens is only supported on the trajectory-anchor path")
         if self.selector_mode:
             return self._selector_forward(
                 student_bev, tokens, plan_attn, command, ego_status,
@@ -725,15 +775,26 @@ class PlanningDistillation(nn.Module):
         ego_status: Optional[torch.Tensor] = None,
         bev_pos: Optional[torch.Tensor] = None,
         sim_reward: Optional[torch.Tensor] = None,
+        sim_reward_valid: Optional[torch.Tensor] = None,
+        teacher_tokens: Optional[Sequence[torch.Tensor]] = None,
     ):
         if self.anchor_distill is None:
             raise RuntimeError("trajectory anchor distillation was not constructed")
         if trajectory_anchors is None:
-            from navsim.agents.para_ssr.configs.default import _PLAN_VB
-            anchors_path = str(_PLAN_VB / "trajectory_anchors_256.npy")
-            import numpy as np
-            trajectory_anchors = torch.tensor(
-                np.load(anchors_path), dtype=student_bev.dtype, device=student_bev.device
+            # fusion_v1: the kyungmin-v2 core has no _PLAN_VB fallback; the anchor path
+            # needs the planner's own anchors (plan_anchor on).
+            raise ValueError("trajectory anchor distillation needs predictions['trajectory_anchors'] "
+                             "(plan_anchor on)")
+        if teacher_tokens is not None:
+            teachers = [t.to(device=student_bev.device, dtype=student_bev.dtype)
+                        for t in teacher_tokens]
+            if len(teachers) != 2 or any(t.shape != student_bev.shape for t in teachers):
+                raise ValueError("teacher_tokens must be (bevfusion, resmap), each shaped like "
+                                 f"student_bev {tuple(student_bev.shape)}")
+            return self.anchor_distill(
+                student_bev, teachers, trajectory_anchors,
+                gt_trajectory=gt_trajectory, command=command, ego_status=ego_status,
+                bev_pos=bev_pos, sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
             )
         teachers = []
         for name in ("bevfusion", "resmap"):
@@ -749,7 +810,7 @@ class PlanningDistillation(nn.Module):
         return self.anchor_distill(
             student_bev, teachers, trajectory_anchors,
             gt_trajectory=gt_trajectory, command=command, ego_status=ego_status,
-            bev_pos=bev_pos, sim_reward=sim_reward,
+            bev_pos=bev_pos, sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
         )
 
     def _selector_forward(
@@ -854,6 +915,8 @@ def build_planning_distillation(config):
         selector_v6=bool(getattr(config, "distill_selector_v6", False)),
         selector_v7=bool(getattr(config, "distill_selector_v7", False)),
         selector_v8=bool(getattr(config, "distill_selector_v8", False)),
+        selector_v9=bool(getattr(config, "distill_selector_v9", False)),
+        selector_v10=bool(getattr(config, "distill_selector_v10", False)),
         spatial_sigma=float(getattr(config, "distill_spatial_sigma", 4.0)),
         spatial_sigmas=getattr(config, "distill_spatial_sigmas", (2.0, 4.0, 8.0, 16.0)),
         lambda_gt=float(getattr(config, "distill_lambda_gt", 0.6)),
@@ -881,6 +944,12 @@ def build_planning_distillation(config):
         anchor_loss_type=str(getattr(config, "distill_anchor_loss_type", "hybrid")),
         anchor_proj=bool(getattr(config, "distill_anchor_proj", True)),
         anchor_mode=str(getattr(config, "distill_anchor_mode", "cross_attn")),
+        anchor_file=getattr(config, "plan_anchor_file", None) or None,
+        probe_warmup_steps=int(getattr(config, "distill_probe_warmup_steps", 1000)),
+        probe_ramp_steps=int(getattr(config, "distill_probe_ramp_steps", 2000)),
+        probe_loss_weight=float(getattr(config, "distill_probe_loss_weight", 0.5)),
+        probe_use_ema=bool(getattr(config, "distill_probe_use_ema", True)),
+        probe_ema_decay=float(getattr(config, "distill_probe_ema_decay", 0.99)),
     )
     module.validate_manifests(config)
     return module

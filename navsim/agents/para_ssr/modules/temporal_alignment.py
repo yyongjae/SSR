@@ -55,31 +55,22 @@ def warp_previous_bev(
     with torch.autocast(device_type=prev_bev.device.type, enabled=False):
         shifts = bev_shift.detach().to(device=prev_bev.device, dtype=geometry_dtype)
         yaw = bev_yaw.detach().to(device=prev_bev.device, dtype=geometry_dtype)
-        x = torch.arange(width, device=prev_bev.device, dtype=geometry_dtype) + 0.5
-        y = torch.arange(height, device=prev_bev.device, dtype=geometry_dtype) + 0.5
-        y, x = torch.meshgrid(
-            y * (y_span / height) + y_min,
-            x * (x_span / width) + x_min,
-            indexing="ij",
-        )
+        x = (torch.arange(width, device=prev_bev.device, dtype=geometry_dtype) + 0.5)
+        y = (torch.arange(height, device=prev_bev.device, dtype=geometry_dtype) + 0.5)
+        y, x = torch.meshgrid(y * (y_span / height) + y_min,
+                              x * (x_span / width) + x_min, indexing="ij")
         x = x[None] + shifts[:, 0, None, None] * x_span
         y = y[None] + shifts[:, 1, None, None] * y_span
         cosine = yaw.cos()[:, None, None]
         sine = yaw.sin()[:, None, None]
         x_previous = cosine * x - sine * y
         y_previous = sine * x + cosine * y
-        grid = torch.stack(
-            (
-                2 * (x_previous - x_min) / x_span - 1,
-                2 * (y_previous - y_min) / y_span - 1,
-            ),
-            dim=-1,
-        )
+        # align_corners=False maps ROI boundaries to -1/+1; therefore cell
+        # centers map exactly to pixel centers, including rectangular grids.
+        grid = torch.stack((2 * (x_previous - x_min) / x_span - 1,
+                            2 * (y_previous - y_min) / y_span - 1), dim=-1)
         aligned = F.grid_sample(
-            prev_bev.to(geometry_dtype),
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=False,
+            prev_bev.to(geometry_dtype), grid, mode="bilinear",
+            padding_mode="zeros", align_corners=False,
         )
     return aligned.to(prev_bev.dtype)

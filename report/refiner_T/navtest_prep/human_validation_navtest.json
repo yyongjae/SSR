@@ -1,0 +1,34 @@
+{
+ "table_all": {
+  "n": 12146,
+  "human_valid": 12146,
+  "traj_xy_err": 0.0,
+  "traj_h_err": 0.0,
+  "v0_err": 9.5367431640625e-07,
+  "a0_err": 0.0,
+  "cmd_mismatch": 0
+ },
+ "navtest_scene_and_mc": {
+  "n": 100,
+  "n_frame_gap": 10,
+  "max_abs": {
+   "traj_xy_err": 1.8965775581136768e-06,
+   "traj_h_err": 5.478667253200343e-08,
+   "path5_xy_err": 1.8965775581136768e-06,
+   "path5_h_err": 5.7868508429592673e-08,
+   "t0_pose_err": 0.0,
+   "t0_vel_err": 0.0,
+   "t0_acc_err": 0.0,
+   "v0_err": 9.5367431640625e-07
+  },
+  "scene_cmd_all_equal": true
+ },
+ "counts": {
+  "n": 12146,
+  "frame_gap": 45,
+  "gap4": 36,
+  "n_avail_ge16": 11989,
+  "n_reg_ge16": 11907,
+  "n_reg_lt16_nongap": 194
+ }
+}

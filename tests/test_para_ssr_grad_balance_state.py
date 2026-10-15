@@ -131,3 +131,39 @@ def test_invalid_balancer_schedule_fails_fast(kwargs):
 def test_unsupported_valve_target_fails_fast(key):
     with pytest.raises(ValueError, match="unsupported"):
         ParaSSRLoss(_loss_config({"plan": 1.0, key: 1.0}))
+
+
+@pytest.mark.parametrize(
+    "disabled, remaining",
+    [({"use_map_head": False}, {"plan", "det"}), ({"use_det_motion_head": False}, {"plan", "map"})],
+)
+def test_head_ablations_drop_the_missing_valve_from_the_balancer(disabled, remaining):
+    from navsim.agents.para_ssr.para_ssr_loss import ParaSSRLoss
+
+    config = _loss_config(target={"plan": 0.4, "det": 0.3, "map": 0.3}, **disabled)
+    loss_fn = ParaSSRLoss(config)
+    assert set(loss_fn.balancer.target) == remaining
+    # ratios against plan are what the balancer solves with; they are unchanged
+    other = (remaining - {"plan"}).pop()
+    assert loss_fn.balancer.target[other] / loss_fn.balancer.target["plan"] == pytest.approx(0.75)
+    assert set(loss_fn.balancer.log_dict()) == {f"gscale/{other}"}
+
+
+@pytest.mark.parametrize("task", ["plan", "det", "map"])
+@pytest.mark.parametrize("invalid_norm", [float("nan"), float("inf"), -float("inf"), -1.])
+@pytest.mark.parametrize("already_measured", [True, False])
+def test_invalid_norm_preserves_controller_state_and_later_update_recovers(
+    task, invalid_norm, already_measured,
+):
+    balancer = GradBalancer(dict(plan=.4, det=.3, map=.3), momentum=.9)
+    if already_measured:
+        balancer.update(dict(plan=1., det=4., map=3.))
+    previous_scales, previous_seen = dict(balancer.scale), set(balancer._seen)
+    bad = dict(plan=1., det=8., map=6.)
+    bad[task] = invalid_norm
+    balancer.update(bad)
+    assert balancer.scale == previous_scales
+    assert balancer._seen == previous_seen
+    balancer.update(dict(plan=.1, det=8., map=6.))
+    assert all(0 < value < previous_scales[name] for name, value in balancer.scale.items())
+    assert balancer._seen == {"det", "map"}

@@ -1,0 +1,58 @@
+Stage-T run 3: m_ttc selection rule (PRESTATED_DECISION_RULE.txt AMENDMENT 4 (2)), implementation details.
+Written 2026-09-28, BEFORE any number of this selection was computed. Nothing in this file is changed after the run starts.
+Script: tools/refiner/ttc_select.py. Dev tokens, navtest and every eval_dev directory are never read.
+Disclosure: before this file was written, the implementer's sanity check (tools/refiner/ttc_flag_check.py, 100 tokens of this
+same pool, m_ttc = 0 only) was seen: combo flag recall 0.910 on 89 bank TTC failures, 0 of 100 human drafts flagged,
+0 human TTC failures. No other m_ttc and no full-pool number was seen.
+
+Rule (copied verbatim from AMENDMENT 4 (2))
+  m_ttc chosen on TRAIN data only (the D1-b sweep pool, m8_recheck/tokens.parquet, 800 logs), BEFORE run 3, by flags only
+  (no guided optimisation): grid m_ttc in {0, 0.05, 0.10, 0.15} m.
+    TTC flag(tau) = collision flag at m_col 0.15 (delta 0) OR any projected separation g < m_ttc (delta 0.3/0.6/0.9).
+    T1 = P(TTC flag | official TTC < 1), over the bank drafts;  T2 = P(TTC flag | human draft k = 0, official TTC = 1).
+    Feasible = T1 >= 0.70 AND T2 <= 0.02. Choice = the largest feasible m_ttc. If none is feasible: the setting with the fewest
+    failed criteria, then the smallest shortfall (0.70 - T1)+ + (T2 - 0.02)+, then the larger margin; run 3 proceeds with it and
+    the failure is reported as a limitation. CIs: log bootstrap (2,000).
+
+Pool and data (identical to the D1-b sweep, m8_recheck.py)
+  tokens   <data>/m8_recheck/tokens.parquet: 800 train tokens, one per log (800 logs).
+  labels   <data>/m8_recheck/labels_pool.parquet (the stored official labels snapshot of the D1-b sweep; column ttc).
+           Cross-check: the ttc labels are compared with the official re-scores stored in the D1-b sweep shards
+           (<data>/m8_recheck/shards, pool == "bank"); any mismatch is reported (the snapshot stays the label source).
+  drafts   <data>/drafts/train/<token>.npz (drafts, family, valid; split must be "train").
+  objects  <data>/objects/train/<token>.npz via gt_future.load_objects (0..5 s, 51 dense times).
+  human    <data>/human/train.npz (traj; frame_gap must be False).
+  scene    surrogate.collate_scenes([surrogate.scene_from_numpy(objs, human_traj=human)]) -- same objects and human
+           trajectory as m8_recheck.process_token (which also passes sdf / centerline / progress refs; those do not enter
+           collision_cost or ttc_cost).  Cross-check: col_g below must equal the sweep's g_s_sat column for every bank row
+           (reported as max |difference|).
+
+Bank drafts (as the D1-b sweep's "bank" pool, which M8's A1 used)
+  bank_k = [0] + [k in 1..12 with valid[k]]: k = 0 is the human identity draft; invalid slots (stored as human bytes with
+  valid = False) are skipped.  T1's denominator = all bank drafts (k = 0 included, as M8's A1) with official ttc < 1.
+  Also reported (not decisive): T1 over the perturbed drafts only (k >= 1); it differs only if a human draft fails TTC.
+  T2's denominator = k = 0 drafts with official ttc == 1.
+
+Flags (raw dense reference, as M8; official labels were scored on the LQR-tracked states -- stated limitation)
+  dense   = geometry.dense_reference(draft) in float64, 41 points at 0.1 s.
+  col_g   = collision_cost(dense, scene, cfg = SurrogateConfig())["gmin"]  (smooth g, not-behind -1.3 m, SAT human mask,
+            n = n_from..40 = 1..40).  collision flag at m_col 0.15 <=> col_g < 0.15.
+  ttc_g   = ttc_cost(dense, scene, cfg = SurrogateConfig(), details=True)["gmin"]  (projected ego box at pose_n moved
+            v_n * delta along h_n, delta in (0.3, 0.6, 0.9) s, vs objects at dense time n + 10 delta; same smooth g,
+            not-behind, human mask from the human trajectory's own projected boxes; n = 1..40 as C_col; no stopped-ego skip,
+            ttc_min_speed = None, as the Amendment 4 formula).  gmin is margin-free, so projected flag at m <=> ttc_g < m.
+  TTC flag(m_ttc) = (col_g < 0.15) OR (ttc_g < m_ttc).   (+inf gmin = no counted pair = not flagged.)
+
+Statistics
+  Point estimates decide (as the M8 selection).  Per rate: k / n, Clopper-Pearson 95 % (validate_surrogate._cp) and the
+  log-cluster bootstrap 95 % percentile interval (validate_surrogate._boot: 2,000 multinomial resamples of logs, seed 0;
+  one token per log -> resamples tokens).
+  Errors: a token whose computation fails is excluded and listed; if any token fails, the counts are reported with it.
+
+Reported, not in the rule
+  - T1 split by draft family (decoder.FAMILY_NAME);
+  - false-alarm rate P(TTC flag | official ttc == 1) over all bank drafts;
+  - T1 / T2 of the delta-0 collision flag alone (col_g < 0.15) and of the projected flag alone (ttc_g < m_ttc);
+  - T1 / T2 with the official stopped-ego skip (ttc_min_speed 5e-3 m/s) and with n_from = 0 (diagnostics only).
+Outputs: report/refiner_T/ttc_select/{ttc_select.json, ttc_select.csv}; per-draft rows <data>/ttc_select/rows.parquet.
+CPU only (CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=2 nice -n 10), <= 2 worker processes, torch 1 thread per worker.

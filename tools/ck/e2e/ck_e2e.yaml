@@ -1,0 +1,51 @@
+# CK Phase 2 (v2 + CK e2e, 30 epoch) -- ParaSSRConfig.ck_e2e defaults for the main run (report 45, contract
+# ck_phase2_e2e config.ck_e2e_keys).  launch_util.py turns every leaf into '++agent.config.ck_e2e.<key>=<value>'
+# (nested dicts as dotted leaves).  io_dir is filled at launch with <RUN>/ck_e2e.  Smoke overrides live in
+# smoke_e2e.sh (E2E_CK_SET), never here.
+enabled: true
+io_dir: ""
+topk: 16
+teacher_det_run: /home/external-user/ssd/yongjae_refiner/ck/train/ckT_p1
+teacher_map_run: /home/external-user/ssd/yongjae_refiner/ck/train/ckM_p1
+teacher_which: last
+teacher_amp: true
+teacher_rescore_kd: true
+amp: false
+bev_grad_scale: 1.0
+seed: 0
+score_prior: phase1
+loss_weight: 1.0
+lambda_score: 1.0
+lambda_corr_score: 1.0
+lambda_kd_score: 0.5
+lambda_sur: 1.0
+kd_ctrl_w:
+  lon: 0.25
+  lat: 1.0
+kd_ema:
+  ratio: 1.0
+  m: 0.99
+  floor: 0.0001
+  cap: 10.0
+  start_mb: 500
+lon_st_slope: 0.1
+lr_mult: 3.0
+weight_decay: 0.01
+clip: 1.0
+replay_until_epoch: 5
+record_from_epoch: 4
+record_until_epoch: null
+onpolicy_from_epoch: 5
+kd_ramp_epochs: 0.0   # user 2026-10-07: keep KD r=1 through the ep 5 on-policy switch (no 1->0->1 dip)
+label_lag: 1
+label_refresh_every_mb: 500
+phase1:
+  packed: /home/external-user/ssd/yongjae_refiner/ck/packed/navtrain_train
+  labels_cand: /home/external-user/ssd/yongjae_refiner/ck/labels/navtrain_train/cand
+  labels_kd_corr: /home/external-user/ssd/yongjae_refiner/ck/labels/navtrain_train/kd_corr
+  kd_targets: /home/external-user/ssd/yongjae_refiner/ck/kd_targets/phase1
+rec_chunk_tokens: 64
+grad_share_every: 50
+log_every: 1
+infer_outputs: true
+strict_rows: 0.999

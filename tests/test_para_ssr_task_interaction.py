@@ -54,7 +54,7 @@ def test_plan_loss_reaches_both_decoder_latents():
         feedforward_channels=16,
         fut_ts=4,
         use_stl=False,
-        plan_num_layers=1,
+        plan_num_layers=3,  # fusion_v1: the kyungmin-v2 head supports 3 layers only
         use_task_interaction=True,
     )
     bev = torch.randn(2, 4, 8, requires_grad=True)
@@ -74,9 +74,8 @@ def test_plan_loss_reaches_both_decoder_latents():
         "all_map_pts_preds": torch.rand(1, 2, 2, 4, 2),
         "all_map_cls_scores": torch.randn(1, 2, 2, 3),
     }
-    preds = head.forward_from_bev(
-        bev, cmd, ego_status=status, det_out=det_out, map_out=map_out,
-    )
+    # fusion_v1: kyungmin-v2 entry point (aux_distill's port calls it forward_from_bev)
+    preds = head.plan_from_bev(bev, cmd, det_out, map_out, ego_status=status)
     assert preds["ego_fut_preds"].shape == (2, head.ego_fut_mode, 4, 3)
     preds["ego_fut_preds"].sum().backward()
     assert det_hidden.grad.abs().sum() > 0

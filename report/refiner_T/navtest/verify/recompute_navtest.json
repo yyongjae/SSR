@@ -1,0 +1,179 @@
+{
+ "orig_identical_across_arms": true,
+ "orig_vs_scores_parquet_maxabs": 0.0,
+ "orig_missing_in_scores": 0,
+ "log_mismatch_scores_vs_tokens": 0,
+ "scores_errors": 0,
+ "scores_rec_not_ok": 0,
+ "tau1_vs_scores_tau1_maxabs_T": 0.0,
+ "tau1_missing_T": 0,
+ "tau1_errors_T": 0,
+ "pdms_formula_maxabs_T_orig": 0.0,
+ "pdms_formula_maxabs_T_tau1": 0.0,
+ "tau1_vs_scores_tau1_maxabs_none": 0.0,
+ "tau1_missing_none": 0,
+ "tau1_errors_none": 0,
+ "pdms_formula_maxabs_none_orig": 0.0,
+ "pdms_formula_maxabs_none_tau1": 0.0,
+ "n_rows": 157313,
+ "n_valid_paired": 148517,
+ "n_valid_flag": 148517,
+ "n_invalid_but_finite": 8796,
+ "p_g_min": {
+  "T": 0.004451041109859943,
+  "none": 0.007846239022910595
+ },
+ "endpoints": {
+  "P1_d_pdms_points": {
+   "mean": 1.3546836476406805,
+   "lo": 1.0542303543802138,
+   "hi": 1.6768681378076802
+  },
+  "P2_ncttc_reduction_pp": {
+   "mean": 0.6410040601412633,
+   "lo": 0.40141641304404685,
+   "hi": 0.8900319843129335
+  },
+  "P2ni_dac_excess_pp": {
+   "mean": -0.9217799982493586,
+   "lo": -1.2320461434033827,
+   "hi": -0.6462540958515163
+  },
+  "P2ni_ddc_excess_pp": {
+   "mean": 0.003366617962926803,
+   "lo": -0.0014562010560422898,
+   "hi": 0.010745610577456769
+  },
+  "P3_new_fail_excess_pp": {
+   "mean": -0.2733693785896564,
+   "lo": -0.3855868428359745,
+   "hi": -0.16350719349955944
+  },
+  "sanity_T_vs_orig_points": {
+   "mean": 7.25403791420104,
+   "lo": 6.808828408403297,
+   "hi": 7.722695933630716
+  },
+  "sanity_none_vs_orig_points": {
+   "mean": 5.8993542665603576,
+   "lo": 5.539019725387938,
+   "hi": 6.27482470592891
+  }
+ },
+ "n_logs": 136,
+ "ep_loss_passing_points_T": 0.09231427944164745,
+ "n_passing_T": 129263,
+ "pdms_T": 0.8821547741301939,
+ "rates_T": {
+  "nc": 1.432159281429062,
+  "ttc": 6.377721068968535,
+  "dac": 4.250018516398796,
+  "ddc": 0.01144650107395113,
+  "comfort": 0.05453921099941421,
+  "ncttc": 6.578371499558973
+ },
+ "ep_loss_passing_points_none": 0.12321387207027126,
+ "n_passing_none": 128731,
+ "pdms_none": 0.8686079376537871,
+ "rates_none": {
+  "nc": 1.9519650949049603,
+  "ttc": 7.0227650706653115,
+  "dac": 5.171798514648155,
+  "ddc": 0.008079883111024326,
+  "comfort": 0.05925247614751173,
+  "ncttc": 7.219375559700236
+ },
+ "pdms_orig": 0.8096143949881837,
+ "rates_orig": {
+  "nc": 5.0297272366126435,
+  "ttc": 11.233730818694156,
+  "dac": 8.774079734979834,
+  "ddc": 0.008753206703609687,
+  "comfort": 0.05992579974009709,
+  "ncttc": 11.4478477211363
+ },
+ "ncttc_counts": {
+  "orig_fail": 17002,
+  "fixed_T": 7688,
+  "fixed_none": 6696,
+  "new_T": 456,
+  "new_none": 416
+ },
+ "new_any_counts": {
+  "T": 334,
+  "none": 740
+ },
+ "city_token_log_consistent": true,
+ "city": {
+  "sg-one-north": {
+   "P1_d_pdms_points": [
+    1.502303792139934,
+    0.6727183097972491,
+    3.023800503908072
+   ],
+   "P2_ncttc_reduction_pp": [
+    -0.1294184259483944,
+    -0.45951439989685255,
+    0.11864836631128756
+   ],
+   "n_tokens": 1914,
+   "n_logs": 13
+  },
+  "us-ma-boston": {
+   "P1_d_pdms_points": [
+    1.3693854188405468,
+    0.7380489791512757,
+    1.9993476800094572
+   ],
+   "P2_ncttc_reduction_pp": [
+    0.938337801608579,
+    0.446917624225541,
+    1.459605084343564
+   ],
+   "n_tokens": 3731,
+   "n_logs": 51
+  },
+  "us-nv-las-vegas-strip": {
+   "P1_d_pdms_points": [
+    1.2727143224725186,
+    0.8942641068091643,
+    1.6816864604626334
+   ],
+   "P2_ncttc_reduction_pp": [
+    0.893372947099117,
+    0.4369380046244483,
+    1.3202201056359841
+   ],
+   "n_tokens": 4019,
+   "n_logs": 50
+  },
+  "us-pa-pittsburgh-hazelwood": {
+   "P1_d_pdms_points": [
+    1.34371555813559,
+    0.6655164363970912,
+    1.972353686953913
+   ],
+   "P2_ncttc_reduction_pp": [
+    0.428622844616039,
+    -0.014263144190186724,
+    0.7689282428962421
+   ],
+   "n_tokens": 2437,
+   "n_logs": 22
+  },
+  "non_lv": {
+   "P1_d_pdms_points": [
+    1.3943930825400848,
+    0.9743822269316268,
+    1.8349491762788173
+   ],
+   "P2_ncttc_reduction_pp": [
+    0.5187458145508701,
+    0.23629514571666296,
+    0.8167432761757862
+   ],
+   "n_tokens": 8082,
+   "n_logs": 86
+  }
+ }
+}

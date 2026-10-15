@@ -1,0 +1,168 @@
+{
+ "outcome": "PASS",
+ "sanity": {
+  "ok": true,
+  "d_pdms_vs_orig_points_T": {
+   "mean": 7.254037914201039,
+   "lo": 6.811770558649971,
+   "hi": 7.72278163847117,
+   "n_logs": 136,
+   "n": 148517
+  },
+  "d_pdms_vs_orig_points_none": {
+   "mean": 5.899354266560358,
+   "lo": 5.54258316545296,
+   "hi": 6.274965936889054,
+   "n_logs": 136,
+   "n": 148517
+  }
+ },
+ "endpoints": {
+  "P1_d_pdms_points": {
+   "mean": 1.3546836476406803,
+   "lo": 1.047297021317363,
+   "hi": 1.6773494258296746,
+   "n_logs": 136,
+   "n": 148517
+  },
+  "P2_ncttc_reduction_pp": {
+   "mean": 0.6410040601412633,
+   "lo": 0.39531426214860454,
+   "hi": 0.8837153256425154,
+   "n_logs": 136,
+   "n": 148517
+  },
+  "P2ni_dac_excess_pp": {
+   "mean": -0.9217799982493587,
+   "lo": -1.22953382692442,
+   "hi": -0.6433764067750914,
+   "n_logs": 136,
+   "n": 148517
+  },
+  "P2ni_ddc_excess_pp": {
+   "mean": 0.003366617962926803,
+   "lo": -0.0014397345195053784,
+   "hi": 0.010542147572689233,
+   "n_logs": 136,
+   "n": 148517
+  },
+  "P3_new_fail_excess_pp": {
+   "mean": -0.27336937858965643,
+   "lo": -0.38427173492131955,
+   "hi": -0.16711614917674,
+   "n_logs": 136,
+   "n": 148517
+  }
+ },
+ "p3_non_inferior": true,
+ "dac_ddc_non_inferior": true,
+ "arms": {
+  "T": {
+   "theta": 0.0,
+   "wtag": "stageT3",
+   "n_drafts": 148517,
+   "budget_def": "passing",
+   "ep_loss_points": 0.09231427944164745,
+   "ep_loss_points_all": -6.295013399053408,
+   "ep_loss_points_passing": 0.09231427944164745,
+   "n_passing": 129263.0,
+   "d_pdms_points": 7.254037914201039,
+   "pdms": 0.8821547741301939,
+   "pdms_orig": 0.8096143949881837,
+   "modified_frac": 1.0,
+   "within_budget": true
+  },
+  "none": {
+   "theta": 0.0,
+   "wtag": "stageT3",
+   "n_drafts": 148517,
+   "budget_def": "passing",
+   "ep_loss_points": 0.12321387207027126,
+   "ep_loss_points_all": -4.949712424694209,
+   "ep_loss_points_passing": 0.12321387207027126,
+   "n_passing": 128731.0,
+   "d_pdms_points": 5.899354266560358,
+   "pdms": 0.8686079376537871,
+   "pdms_orig": 0.8096143949881837,
+   "modified_frac": 1.0,
+   "within_budget": true
+  }
+ },
+ "n_paired_drafts": 148517,
+ "n_logs": 136,
+ "seeds": [
+  0
+ ],
+ "n_boot": 10000,
+ "margin_pp": 0.5,
+ "eq_points": 0.2,
+ "eq_pp": 0.5,
+ "budget_def": "passing",
+ "eval_name": "eval_navtest",
+ "by_family": {
+  "identity": {
+   "n": 12101,
+   "d_pdms_points_T_minus_none": 0.12530678392692726,
+   "d_pdms_points_T": -0.23591579874686708,
+   "d_pdms_points_none": -0.3612225826737943,
+   "ncttc_reduction_pp": -0.09090157838195191
+  },
+  "small": {
+   "n": 36227,
+   "d_pdms_points_T_minus_none": 0.5161024314570725,
+   "d_pdms_points_T": 0.7783834467143618,
+   "d_pdms_points_none": 0.26228101525728936,
+   "ncttc_reduction_pp": -0.04416595357054131
+  },
+  "lconst": {
+   "n": 51821,
+   "d_pdms_points_T_minus_none": 1.2969263800016835,
+   "d_pdms_points_T": 1.471107893841876,
+   "d_pdms_points_none": 0.17418151384019245,
+   "ncttc_reduction_pp": 1.1501128885972867
+  },
+  "ignore_brake": {
+   "n": 3142,
+   "d_pdms_points_T_minus_none": 3.383634926630096,
+   "d_pdms_points_T": 2.710515410256847,
+   "d_pdms_points_none": -0.6731195163732487,
+   "ncttc_reduction_pp": 3.0553787396562697
+  },
+  "creep": {
+   "n": 423,
+   "d_pdms_points_T_minus_none": 24.152876280535853,
+   "d_pdms_points_T": 59.04255319148937,
+   "d_pdms_points_none": 34.88967691095351,
+   "ncttc_reduction_pp": 27.18676122931442
+  },
+  "lat": {
+   "n": 22254,
+   "d_pdms_points_T_minus_none": 1.0896704665989603,
+   "d_pdms_points_T": 14.907678739026123,
+   "d_pdms_points_none": 13.818008272427162,
+   "ncttc_reduction_pp": -1.2896557922171294
+  },
+  "combined": {
+   "n": 10448,
+   "d_pdms_points_T_minus_none": 3.0331391610472433,
+   "d_pdms_points_T": 15.90282741655176,
+   "d_pdms_points_none": 12.869688255504515,
+   "ncttc_reduction_pp": 0.05742725880551302
+  },
+  "cv": {
+   "n": 12098,
+   "d_pdms_points_T_minus_none": 3.0570781526304196,
+   "d_pdms_points_T": 36.73089111525003,
+   "d_pdms_points_none": 33.673812962619614,
+   "ncttc_reduction_pp": 3.7444205653827076
+  },
+  "hdrift": {
+   "n": 3,
+   "d_pdms_points_T_minus_none": 0.0018556374933605586,
+   "d_pdms_points_T": 0.0010184628064087895,
+   "d_pdms_points_none": -0.0008371746869517693,
+   "ncttc_reduction_pp": 0.0
+  }
+ },
+ "selection_file": "report/refiner_T/run3/selection.json"
+}

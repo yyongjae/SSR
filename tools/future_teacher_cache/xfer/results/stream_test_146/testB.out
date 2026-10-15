@@ -1,0 +1,7 @@
+[stream_extract] 2026-10-03T22:13:04+09:00 archives=1 mods='camera lidar' P=2 root=/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/sensor_test state=/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/stateB base=https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/a76f840b65e972bc45e56c2adced897498e9a026
+[2026-10-03T22:13:04+09:00] lidar_146 attempt 1: 107 files, 1228436113 bytes, https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/a76f840b65e972bc45e56c2adced897498e9a026/openscene-v1.1/openscene_sensor_trainval_lidar/openscene_sensor_trainval_lidar_146.tgz
+[2026-10-03T22:13:04+09:00] camera_146 attempt 1: 291 files, 1772587391 bytes, https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/a76f840b65e972bc45e56c2adced897498e9a026/openscene-v1.1/openscene_sensor_trainval_camera/openscene_sensor_trainval_camera_146.tgz
+[2026-10-03T22:35:00+09:00] camera_146 done in 1316.638s (1772587391 B, sha ok, {"committed_new":291,"already_present_same_size":0,"conflict_different_size":0,"conflict_examples":[],"missing_after_commit":0})
+[2026-10-03T22:43:38+09:00] lidar_146 done in 1834.439s (1228436113 B, sha ok, {"committed_new":107,"already_present_same_size":0,"conflict_different_size":0,"conflict_examples":[],"missing_after_commit":0})
+[stream_extract] summary {'done': 2} streamed_this_run=2 archives 3.00 GB in 1835s = 1.64 MB/s aggregate
+EXIT=0

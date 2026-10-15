@@ -1,0 +1,28 @@
+{
+ "dev": {
+  "n_tokens": 7930,
+  "gt_per_tok": 19.398360655737704,
+  "pred_per_tok": 17.51967213114754,
+  "recall@1m_pooled": 0.8913988909763438,
+  "precision@1m_pooled": 0.9869863457399717,
+  "frac_tokens_recall1_@1m": 0.35359394703657,
+  "mean_centre_err@1m": 0.06748269280299275,
+  "recall@2m_pooled": 0.8932255946538039,
+  "precision@2m_pooled": 0.9890089324916685,
+  "frac_tokens_recall1_@2m": 0.3567465321563682,
+  "mean_centre_err@2m": 0.07068495911530082
+ },
+ "navtest": {
+  "n_tokens": 760,
+  "gt_per_tok": 13.485526315789473,
+  "pred_per_tok": 11.547368421052632,
+  "recall@1m_pooled": 0.8312030441994341,
+  "precision@1m_pooled": 0.9707155879671833,
+  "frac_tokens_recall1_@1m": 0.33289473684210524,
+  "mean_centre_err@1m": 0.07784882084836048,
+  "recall@2m_pooled": 0.8353010049760953,
+  "precision@2m_pooled": 0.9755013673655424,
+  "frac_tokens_recall1_@2m": 0.3381578947368421,
+  "mean_centre_err@2m": 0.0881055620707024
+ }
+}

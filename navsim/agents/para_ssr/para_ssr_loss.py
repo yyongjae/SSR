@@ -10,14 +10,28 @@ Three multipliers stack, exactly as in the nuScenes config:
 gradient entering ``bev_embed`` and leaves each head's own parameter gradients
 alone, which is why it can hold a task's influence on the shared feature down
 without slowing the head itself.
+
+Shared-gradient balancing requires FP32 forward/backward. Mixed-precision
+training is supported only with balancing disabled and neutral manual scales.
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, Optional, Tuple
 
 import torch
 
-from .modules.grad_balance import GradBalancer, all_reduce_mean, balance_shared_gradients
+from .modules.anchor_planner import anchor_plan_losses
+from .plan_map import plan_map_loss
+from .readout.distill import ReadoutDistiller
+from .modules.grad_balance import (
+    GradBalancer,
+    all_reduce_mean,
+    balance_shared_gradients,
+    require_full_precision_for_balancing,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def compute_plan_loss(
@@ -62,144 +76,6 @@ def compute_plan_loss(
     # configured loss whenever a weight (notably heading_weight) changes.
     loss = err.mean()
 
-    return loss, _plan_command_metrics(err, weight, mode)
-
-
-def compute_plan_tail_loss(
-    ego_fut_preds: torch.Tensor,
-    gt_offsets: torch.Tensor,
-    gt_mask: torch.Tensor,
-    command: torch.Tensor,
-    gt_poses: Optional[torch.Tensor] = None,
-    progress_cap: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Worst lateral miss and one-sided progress shortfall of the commanded mode.
-
-    Both are zero when that mode matches GT. Lateral backprops through the
-    worst valid waypoint. Progress is polyline length from the origin.
-    ``progress_cap`` stops the shortfall once the prediction reaches that
-    fraction of the GT length, so the last part of the human path is not
-    pulled in. Only a path shorter than ``cap * len(GT)`` is penalized.
-    """
-    cap = float(progress_cap)
-    if not 0.0 < cap <= 1.0:
-        raise ValueError(f"progress_cap must be in (0, 1], got {progress_cap}")
-    batch, _, steps, _ = ego_fut_preds.shape
-    cmd_idx = command.reshape(batch, -1).argmax(dim=-1)
-    pred_xy = ego_fut_preds[
-        torch.arange(batch, device=ego_fut_preds.device), cmd_idx
-    ][..., :2].cumsum(dim=-2)
-    gt_xy = gt_offsets[..., :2].cumsum(dim=-2) if gt_poses is None else gt_poses[..., :2]
-    mask = gt_mask.reshape(batch, steps).to(dtype=pred_xy.dtype)
-
-    lateral = (pred_xy[..., 1] - gt_xy[..., 1]).abs() * mask
-    lat_tail = lateral.amax(dim=-1).mean()
-
-    def _length(xy: torch.Tensor) -> torch.Tensor:
-        prev = torch.cat((xy.new_zeros(batch, 1, 2), xy[:, :-1]), dim=1)
-        return ((xy - prev).norm(dim=-1) * mask).sum(dim=-1)
-
-    shortfall = (cap * _length(gt_xy) - _length(pred_xy)).clamp_min(0).mean()
-    return lat_tail, shortfall
-
-
-# Pacifica front bumper, rear axle to bumper. Matches
-# ``nuplan...get_pacifica_parameters().front_length``, which the PDM scorer uses.
-_PACIFICA_FRONT_LENGTH_M = 4.049
-_TTC_STEP_S = 0.5
-_TTC_PROJECTION_S = (0.5, 1.0)
-_TTC_STOP_SPEED_MPS = 5e-3
-_TTC_PENETRATION_CLAMP_M = 1.0
-
-
-def compute_plan_ttc_proxy(
-    ego_fut_preds: torch.Tensor,
-    gt_mask: torch.Tensor,
-    command: torch.Tensor,
-    gt_boxes: torch.Tensor,
-    gt_valid: torch.Tensor,
-    gt_fut_trajs: torch.Tensor,
-    gt_fut_masks: torch.Tensor,
-) -> torch.Tensor:
-    """Penetration of the commanded bumper's 0.5s and 1.0s probes into GT boxes.
-
-    The polyline is open-loop and 2 Hz. NAVSIM waypoints are converted to SSR
-    with :func:`navsim_trajectory_to_ssr`. Agent boxes stay in the SSR code
-    ``(x_right, y_forward, z, width, length, height, yaw, ...)``, and the yaw
-    axes match the occupancy splat in ``distill/masks.py``. A step slower than
-    the scorer's stopped threshold contributes 0. The hinge is the depth inside
-    the box, clamped at 1 m, and is 0 for agents behind the rear axle.
-    """
-    from .distill.masks import navsim_trajectory_to_ssr
-
-    batch, _, steps, _ = ego_fut_preds.shape
-    agents = int(gt_boxes.size(1))
-    if agents == 0 or steps == 0:
-        return ego_fut_preds.new_zeros(())
-    if gt_fut_trajs.size(2) != steps:
-        raise ValueError(
-            "gt_fut_trajs steps must match the plan horizon, "
-            f"got {gt_fut_trajs.size(2)} and {steps}"
-        )
-
-    cmd_idx = command.reshape(batch, -1).argmax(dim=-1)
-    offsets = ego_fut_preds[torch.arange(batch, device=ego_fut_preds.device), cmd_idx]
-    poses_xy = offsets[..., :2].cumsum(dim=-2)
-    heading = offsets[..., 2].cumsum(dim=-1)
-    poses = torch.cat(
-        (
-            poses_xy,
-            torch.atan2(heading.sin(), heading.cos()).unsqueeze(-1),
-        ),
-        dim=-1,
-    )
-    ssr = navsim_trajectory_to_ssr(poses)
-    origin = poses.new_zeros(batch, 1, 2)
-    segment = torch.cat((origin, poses_xy[:, :-1]), dim=1)
-    speed = (poses_xy - segment).norm(dim=-1) / _TTC_STEP_S
-    forward = torch.stack((ssr[..., 2].cos(), ssr[..., 2].sin()), dim=-1)
-    bumper = ssr[..., :2] + _PACIFICA_FRONT_LENGTH_M * forward
-    probes = []
-    for delta_t in _TTC_PROJECTION_S:
-        probes.append(bumper + (speed * delta_t).unsqueeze(-1) * forward)
-    points = torch.stack(probes, dim=2)
-
-    centers = gt_boxes[:, :, None, :2] + gt_fut_trajs.cumsum(dim=2)
-    centers = centers.permute(0, 2, 1, 3)
-    yaw = gt_boxes[:, :, 6]
-    half_l = gt_boxes[:, :, 4] * 0.5
-    half_w = gt_boxes[:, :, 3] * 0.5
-    delta = points[:, :, :, None, :] - centers[:, :, None, :, :]
-    cos_y = yaw.cos()[:, None, None, :]
-    sin_y = yaw.sin()[:, None, None, :]
-    dx = delta[..., 0]
-    dy = delta[..., 1]
-    along = cos_y * dx + sin_y * dy
-    across = -sin_y * dx + cos_y * dy
-    outside_l = along.abs() - half_l[:, None, None, :]
-    outside_w = across.abs() - half_w[:, None, None, :]
-    outside = torch.hypot(outside_l.clamp_min(0), outside_w.clamp_min(0))
-    inside = torch.minimum(torch.maximum(outside_l, outside_w), outside.new_zeros(()))
-    penetration = (-(outside + inside)).clamp(0, _TTC_PENETRATION_CLAMP_M)
-
-    ahead = ((centers - ssr[:, :, None, :2]) * forward[:, :, None, :]).sum(dim=-1) > 0
-    agent_ok = gt_valid.bool()[:, None, :] & (gt_fut_masks > 0.5).permute(0, 2, 1)
-    moving = speed > _TTC_STOP_SPEED_MPS
-    keep = ahead & agent_ok
-    keep = keep[:, :, None, :] & moving[:, :, None, None]
-    penetration = penetration.masked_fill(~keep, 0)
-    step = penetration.amax(dim=(2, 3))
-
-    mask = gt_mask.reshape(batch, steps).to(dtype=step.dtype)
-    counted = mask.sum(dim=-1)
-    scene = (step * mask).sum(dim=-1) / counted.clamp_min(1)
-    scene = torch.where(counted > 0, scene, torch.zeros_like(scene))
-    return scene.mean()
-
-
-def _plan_command_metrics(
-    err: torch.Tensor, weight: torch.Tensor, mode: int
-) -> Dict[str, torch.Tensor]:
     # Diagnostics per command. Reported as SUMS and COUNTS, not ratios: turn
     # commands are absent from most batches, and a per-iteration ratio would
     # either read 0.0 (a lie) or NaN (which propagates through all-reduce).
@@ -211,7 +87,7 @@ def _plan_command_metrics(
         for i in range(min(mode, len(names))):
             metrics[f"plan_err_sum/{names[i]}"] = num[i]
             metrics[f"plan_n/{names[i]}"] = den[i]
-    return metrics
+    return loss, metrics
 
 
 class ParaSSRLoss(torch.nn.Module):
@@ -222,26 +98,60 @@ class ParaSSRLoss(torch.nn.Module):
         self._config = config
         self.iteration = 0
         self.balancer: Optional[GradBalancer] = None
+        self.distiller: Optional[ReadoutDistiller] = None
+        if getattr(config, "kd_mode", "none") != "none":
+            self.distiller = ReadoutDistiller(config)
         if config.grad_balance_target:
             target = dict(config.grad_balance_target)
-            unsupported = set(target) - {"plan", "det", "map"}
+            unsupported = set(target) - {"plan", "det", "map", "distill"}
             if unsupported:
                 raise ValueError(
                     "unsupported grad_balance_target keys "
                     f"{sorted(unsupported)}; use 'det' for the shared "
-                    "detection+motion valve and only plan/det/map targets"
+                    "detection+motion valve and only plan/det/map/distill targets"
                 )
-            self.balancer = GradBalancer(
-                target=target,
-                interval=config.grad_balance_interval,
-                momentum=config.grad_balance_momentum,
-                clamp=tuple(config.grad_balance_clamp),
-                warmup_iters=config.grad_balance_warmup_iters,
-            )
+            # The distillation term reaches the model only through bev_embed
+            # (its reader is frozen), so the BEV-level correction scales it
+            # exactly.  Without a distillation term there is nothing to steer.
+            if "distill" in target and getattr(config, "kd_mode", "none") == "none":
+                logger.info("grad_balance_target drops 'distill': kd_mode is none")
+                del target["distill"]
+            # Head ablations (use_det_motion_head / use_map_head = false) keep
+            # the default target dict -- a Hydra override merges keys, it cannot
+            # remove one -- so drop the valve of a head that does not exist.
+            # The balancer only ever uses target ratios against plan, so the
+            # remaining tasks keep exactly the shares they had in the full
+            # model (plan 0.4 : det 0.3 with the map head gone, for instance).
+            for task, enabled in (
+                ("det", getattr(config, "use_det_motion_head", True)),
+                ("map", getattr(config, "use_map_head", True)),
+            ):
+                if task in target and not enabled:
+                    logger.info(
+                        "grad_balance_target drops %r: that head is disabled", task
+                    )
+                    del target[task]
+            # Plan-only has no relative task share to control, even if a caller
+            # retains the Hydra multi-task target dictionary.
+            if set(target) == {"plan"} and not (
+                getattr(config, "use_det_motion_head", True)
+                or getattr(config, "use_map_head", True)
+            ):
+                logger.info("GradBalancer disabled: planning is the only active task")
+            else:
+                self.balancer = GradBalancer(
+                    target=target,
+                    interval=config.grad_balance_interval,
+                    momentum=config.grad_balance_momentum,
+                    clamp=tuple(config.grad_balance_clamp),
+                    warmup_iters=config.grad_balance_warmup_iters,
+                )
 
     def get_extra_state(self) -> Dict:
         """Persist controller state through regular Lightning checkpoints."""
         state = {"iteration": int(self.iteration)}
+        if self.distiller is not None and self.distiller.start_iter is not None:
+            state["kd_start_iter"] = int(self.distiller.start_iter)
         if self.balancer is not None:
             state["balancer"] = {
                 "scale": dict(self.balancer.scale),
@@ -253,6 +163,8 @@ class ParaSSRLoss(torch.nn.Module):
         if not state:
             return
         self.iteration = int(state.get("iteration", 0))
+        if self.distiller is not None and "kd_start_iter" in state:
+            self.distiller.start_iter = int(state["kd_start_iter"])
         balancer_state = state.get("balancer")
         if self.balancer is not None and balancer_state is not None:
             restored_scale = balancer_state.get("scale", {})
@@ -262,9 +174,10 @@ class ParaSSRLoss(torch.nn.Module):
             self.balancer._seen = set(balancer_state.get("seen", ()))
 
     def apply_aux_scales(self, model) -> None:
-        """Synchronize the model valve before every auxiliary forward pass."""
+        """Synchronize task-origin coefficients (never decoder input valves)."""
         if self.balancer is None:
             return
+        # distill has no decoder valve; its scale is applied at BEV in forward()
         model.aux_grad_scale = {
             task: self.balancer.scale_for(task) for task in ("det", "map")
         }
@@ -281,111 +194,66 @@ class ParaSSRLoss(torch.nn.Module):
         tw = cfg.task_loss_weight
         logs: Dict[str, torch.Tensor] = {}
         task_losses: Dict[str, torch.Tensor] = {}
+        # Validate the original outputs before individual loss routines promote
+        # predictions to FP32. Also reject AMP during controller warm-up, rather
+        # than letting a long run fail only once its scales become non-neutral.
+        active_scales = (
+            {task: self.balancer.scale_for(task) for task in ("det", "map", "distill")}
+            if self.balancer is not None
+            else dict(getattr(model, "aux_grad_scale", {}))
+        )
+        manual_correction = any(
+            prediction_key in predictions and float(active_scales.get(task, 1.0)) != 1.0
+            for task, prediction_key in (
+                ("det", "all_cls_scores"), ("map", "all_map_cls_scores")
+            )
+        )
+        if model.training and (self.balancer is not None or manual_correction):
+            require_full_precision_for_balancing(predictions.values())
 
         # ---- planning -------------------------------------------------
-        if getattr(cfg, "use_metric_planner", False):
-            from .modules.candidate_planner import candidate_imitation_loss, candidate_metric_loss
-            plan_loss, cls_loss, plan_metrics = candidate_imitation_loss(
-                predictions, targets, cfg.heading_weight
-            )
-            if cfg.metric_loss_weight > 0:
-                if "candidate_metric_targets" not in targets:
-                    raise ValueError("metric planner loss requires simulator-scored candidate_metric_targets")
-                metric_loss, metric_logs = candidate_metric_loss(
-                    predictions["metric_logits"], targets["candidate_metric_targets"],
-                    cfg.metric_loss_weights,
-                )
-            else:
-                # Same-K imitation-only ablation: no rollout/no invented labels.
-                # A zero graph edge keeps the optional critic DDP-compatible.
-                metric_loss = predictions["metric_logits"].sum() * 0.0
-                metric_logs = {}
-            # All three objectives steer the planning branch. Group them before
-            # shared-BEV diagnostics so balancing measures the actual gradient.
-            plan_total = (plan_loss + cfg.candidate_cls_loss_weight * cls_loss
-                          + cfg.metric_loss_weight * metric_loss)
-            balance_plan = plan_total
-            logs["loss_plan_cls"] = cls_loss.detach()
-            logs["loss_plan_metric"] = metric_loss.detach()
-            logs["loss_plan_cls_weighted"] = (cls_loss * cfg.candidate_cls_loss_weight * tw.get("plan", 1.0)).detach()
-            logs["loss_plan_metric_weighted"] = (metric_loss * cfg.metric_loss_weight * tw.get("plan", 1.0)).detach()
-            logs.update(metric_logs)
-        else:
-            plan_loss, plan_metrics = compute_plan_loss(
-                predictions["ego_fut_preds"],
-                targets["trajectory_offsets"],
-                targets["trajectory_mask"],
-                targets["command"],
-                heading_weight=cfg.heading_weight,
-            )
-            lat_w = float(getattr(cfg, "plan_tail_lat_weight", 0.0) or 0.0)
-            prog_w = float(getattr(cfg, "plan_tail_progress_weight", 0.0) or 0.0)
-            if lat_w != 0.0 or prog_w != 0.0:
-                lat_tail, prog_tail = compute_plan_tail_loss(
-                    predictions["ego_fut_preds"],
-                    targets["trajectory_offsets"],
-                    targets["trajectory_mask"],
-                    targets["command"],
-                    gt_poses=targets.get("trajectory"),
-                    progress_cap=float(getattr(cfg, "plan_tail_progress_cap", 1.0)),
-                )
-            else:
-                lat_tail = plan_loss.detach().new_zeros(())
-                prog_tail = lat_tail
-            # Valve measures imitation L1. The progress shortfall and the TTC
-            # proxy stay in the total loss and do not set the det/map scales.
-            balance_plan = plan_loss
-            ttc_w = float(getattr(cfg, "plan_ttc_proxy_weight", 0.0) or 0.0)
-            if ttc_w != 0.0:
-                ttc_proxy = compute_plan_ttc_proxy(
-                    predictions["ego_fut_preds"],
-                    targets["trajectory_mask"],
-                    targets["command"],
-                    targets["gt_boxes"],
-                    targets["gt_valid"],
-                    targets["gt_fut_trajs"],
-                    targets["gt_fut_masks"],
-                )
-            else:
-                ttc_proxy = plan_loss.detach().new_zeros(())
-            plan_total = plan_loss + lat_w * lat_tail + prog_w * prog_tail + ttc_w * ttc_proxy
-            logs["loss_plan_tail_lat"] = lat_tail.detach()
-            logs["loss_plan_tail_progress"] = prog_tail.detach()
-            logs["loss_plan_ttc_proxy"] = ttc_proxy.detach()
-            if "trajectory_offset" in predictions:
-                # Anchor planner: WoTE's three terms replace the L1 regression.
-                # loss_plan_reg above stays the selected-trajectory L1 for logs.
-                from .modules.anchor_planner import anchor_plan_losses
-
-                if "sim_reward" not in targets or "sim_reward_valid" not in targets:
-                    raise KeyError(
-                        "plan_anchor needs sim_reward and sim_reward_valid targets; "
-                        "set plan_score_file"
-                    )
-                anchor_losses = anchor_plan_losses(
-                    predictions,
-                    targets["trajectory"],
-                    targets["sim_reward"],
-                    targets["sim_reward_valid"],
-                )
-                plan_total = (
-                    float(getattr(cfg, "plan_offset_loss_weight", 1.0)) * anchor_losses["traj_offset_loss"]
-                    + float(getattr(cfg, "plan_im_reward_weight", 1.0)) * anchor_losses["im_reward_loss"]
-                    + float(getattr(cfg, "plan_sim_reward_weight", 1.0)) * anchor_losses["sim_reward_loss"]
-                )
-                balance_plan = plan_total
-                logs.update({
-                    f"plan_v2/{name}": value.detach() for name, value in anchor_losses.items()
-                })
-        plan_w = tw.get("plan", 1.0)
-        task_losses["plan"] = plan_total * plan_w
-        plan_for_balance = balance_plan * plan_w
+        plan_loss, plan_metrics = compute_plan_loss(
+            predictions["ego_fut_preds"],
+            targets["trajectory_offsets"],
+            targets["trajectory_mask"],
+            targets["command"],
+            heading_weight=cfg.heading_weight,
+        )
+        task_losses["plan"] = plan_loss * tw.get("plan", 1.0)
         logs["loss_plan_reg"] = plan_loss.detach()
+        if "trajectory_offset" in predictions:
+            # v2 anchor planner: WoTE's three terms replace the L1 regression.  The L1
+            # of the SELECTED trajectory stays in the logs (loss_plan_reg and the
+            # per-command sums) as the v1-comparable planning error; it is not trained.
+            if "sim_reward" not in targets:
+                raise KeyError("plan_anchor needs the sim_reward target: set plan_score_file")
+            al = anchor_plan_losses(predictions, targets["trajectory"], targets["sim_reward"],
+                                    targets["sim_reward_valid"])
+            task_losses["plan"] = tw.get("plan", 1.0) * (
+                float(cfg.plan_offset_loss_weight) * al["traj_offset_loss"]
+                + float(cfg.plan_im_reward_weight) * al["im_reward_loss"]
+                + float(cfg.plan_sim_reward_weight) * al["sim_reward_loss"])
+            logs.update({f"plan_v2/{k}": v.detach() for k, v in al.items()})
         # Keep the historical raw metric, but expose the value that actually
         # enters total_loss so plan=2.0 is not hidden in dashboards.
-        logs["loss_plan_reg_weighted"] = (plan_loss * tw.get("plan", 1.0)).detach()
-        logs["loss_plan_total"] = task_losses["plan"].detach()
+        logs["loss_plan_reg_weighted"] = task_losses["plan"].detach()
         logs.update(plan_metrics)
+
+        # ---- planning-side map consistency (plan_map.py) ---------------
+        plan_map_weight = float(getattr(cfg, "plan_map_weight", 0.0))
+        if plan_map_weight > 0:
+            if "drivable_sdf" not in targets:
+                if model.training:
+                    raise KeyError("plan_map_weight > 0 needs the drivable_sdf target (DrivableAreaTargetBuilder)")
+            else:
+                pm_loss, pm_metrics = plan_map_loss(
+                    predictions["ego_fut_preds"], targets["command"], targets["trajectory_offsets"],
+                    targets["trajectory_mask"], targets["drivable_sdf"], tuple(cfg.plan_map_extent),
+                    float(cfg.plan_map_margin),
+                )
+                task_losses["plan"] = task_losses["plan"] + plan_map_weight * pm_loss
+                logs["loss_plan_map"] = pm_loss.detach()
+                logs.update(pm_metrics)
 
         # ---- detection + motion ---------------------------------------
         if model.det_motion_head is not None and "all_cls_scores" in predictions:
@@ -410,25 +278,26 @@ class ParaSSRLoss(torch.nn.Module):
 
         # ---- vector map -----------------------------------------------
         if model.map_head is not None and "all_map_cls_scores" in predictions:
-            map_losses = model.map_head.loss(
-                predictions,
-                targets["gt_map_pts"],
-                targets["gt_map_labels"],
-                targets["gt_map_valid"],
-            )
+            map_pts, map_labels, map_valid = self._map_labels(targets, logs)
+            map_losses = model.map_head.loss(predictions, map_pts, map_labels, map_valid)
             task_losses["map"] = sum(map_losses.values()) * tw.get("map", 1.0)
             logs.update({k: v.detach() for k, v in map_losses.items()})
 
+        # ---- readout-space distillation (report/19) ---------------------
+        if self.distiller is not None and "teacher_bev" in targets:
+            ego = features.get("status_feature")
+            ego = ego[:, cfg.num_navi_cmd:] if ego is not None else None
+            kd = self.distiller(predictions["bev_embed"], targets, self.iteration, ego=ego)
+            task_losses["distill"] = kd["loss"]
+            logs["loss_distill"] = kd["loss"].detach()
+            logs["kd/raw"] = kd["raw"]
+            logs["kd/coef"] = kd["coef"]
+            logs["kd/valid_frac"] = kd["valid_frac"]
+            if "raw_uncentered" in kd:
+                logs["kd/raw_uncentered"] = kd["raw_uncentered"]
+
         # ---- shared-BEV gradient measurement / balancing ---------------
         bev_embed = predictions["bev_embed"]
-        measurement_losses = dict(task_losses)
-        measurement_losses["plan"] = plan_for_balance
-        if "det" in measurement_losses and "motion" in measurement_losses:
-            # Detection and motion share one valve. Measure their sum so
-            # reinforcement and cancellation both show up in the norm.
-            measurement_losses["det"] = (
-                measurement_losses["det"] + measurement_losses.pop("motion")
-            )
         need_balance = (
             self.balancer is not None
             and model.training
@@ -441,23 +310,21 @@ class ParaSSRLoss(torch.nn.Module):
             and bev_embed.requires_grad
             and self.iteration % cfg.grad_norm_log_interval == 0
         )
-        use_interaction = bool(getattr(model, "use_task_interaction", False))
-        if use_interaction:
-            # Heads were run on the unscaled BEV. Correct only the auxiliary
-            # task's BEV gradient; planning through those decoders stays at 1.
-            total_loss, norms = balance_shared_gradients(
-                sum(task_losses.values()),
-                bev_embed,
-                measurement_losses,
-                dict(getattr(model, "aux_grad_scale", {})),
-                measure_norms=bool(need_balance or need_log),
+        measurement_losses = dict(task_losses)
+        if "motion" in measurement_losses:
+            # Combine before differentiation to account for cancellation.
+            measurement_losses["det"] = measurement_losses.get("det", 0.0) + (
+                measurement_losses.pop("motion")
             )
-        else:
-            total_loss = sum(task_losses.values())
-            norms = (
-                self._measure_bev_grad_norms(bev_embed, measurement_losses)
-                if need_balance or need_log else {}
-            )
+        # The coefficients captured above belong to this graph. A controller
+        # update below applies to the next microbatch.
+        total_loss, norms = balance_shared_gradients(
+            sum(task_losses.values()),
+            bev_embed,
+            measurement_losses,
+            active_scales if model.training else {},
+            measure_norms=bool(need_balance or need_log),
+        )
         if need_balance or need_log:
             norms = all_reduce_mean(norms, bev_embed.device)
             total = sum(norms.values()) or 1.0
@@ -475,18 +342,50 @@ class ParaSSRLoss(torch.nn.Module):
         if model.training:
             self.iteration += 1
         logs["loss"] = total_loss.detach()
+        # LiDAR/camera blend per encoder layer.  Verification on real scenes
+        # (report/12 5-2) showed the LiDAR-seeded BEV dominating early on, so the
+        # gate and the two attention magnitudes are what to watch for a starved
+        # camera branch.
+        head = getattr(model, "pts_bbox_head", None)
+        encoder = getattr(getattr(head, "transformer", None), "encoder", None)
+        for index, layer in enumerate(getattr(encoder, "layers", [])):
+            gate = getattr(layer, "lidar_gate", None)
+            if gate is not None:
+                logs[f"lidar_gate/layer{index}"] = torch.sigmoid(gate).mean().detach()
+            for name, value in (getattr(layer, "last_attn_norms", None) or {}).items():
+                logs[f"attn_norm/{name}_layer{index}"] = value
+
         return total_loss, logs
 
     # ------------------------------------------------------------------ #
+    def _map_labels(self, targets, logs):
+        """GT map labels, or the teacher's where the teacher has the frame."""
+        gt = (targets["gt_map_pts"], targets["gt_map_labels"], targets["gt_map_valid"])
+        if getattr(self._config, "map_label_source", "gt") != "teacher":
+            return gt
+        if "teacher_map_pts" not in targets:
+            raise KeyError(
+                "map_label_source='teacher' but the batch has no teacher_map_pts; "
+                "is ResMapTeacherTargetBuilder registered?"
+            )
+        hit = targets["teacher_valid"].view(-1).bool()
+        logs["kd/pseudo_frac"] = hit.float().mean().detach()
+        pick = lambda t, g: torch.where(hit.view(-1, *([1] * (g.dim() - 1))), t.to(g.dtype), g)
+        return (
+            pick(targets["teacher_map_pts"], gt[0]),
+            pick(targets["teacher_map_labels"], gt[1]),
+            pick(targets["teacher_map_valid"], gt[2]),
+        )
+
     @staticmethod
     def _measure_bev_grad_norms(
         bev_embed: torch.Tensor, task_losses: Dict[str, torch.Tensor]
     ) -> Dict[str, float]:
         """``||dL_task / d bev_embed||`` per task.
 
-        ``autograd.grad`` differentiates through ``_ScaleGrad``, so the measured
-        norm already carries whatever valve is currently in effect -- which is
-        exactly what ``GradBalancer.update`` expects and backs out.
+        These are raw task-origin norms, including all direct and indirect
+        routes. Training applies coefficients explicitly in
+        ``balance_shared_gradients``; no decoder boundary scales them.
         """
         norms: Dict[str, float] = {}
         for task, loss in task_losses.items():

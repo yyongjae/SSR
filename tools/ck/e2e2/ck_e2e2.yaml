@@ -107,4 +107,5 @@ v4:                                          # refiner v4 (navsim/agents/para_ss
   corridor_version: 1                        # 1 = original, 2 = refiner-fix B1
   kd_parent_only: false                      # score KD on the parent (identity) columns only (report 72 I2)
   corrector: false                           # learned corrector A on the critic's top-corr_k (hazard / evidence readout)
-  corr_k: 8
+  corr_k: 8                                  # = e2e_data2.EDIT_K (the recorded edit block)
+  lambda_awr: 0.1                            # corrector AWR weight (official labels of the recorded edits)

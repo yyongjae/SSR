@@ -88,10 +88,12 @@ def decode_edits(src: torch.Tensor, u: torch.Tensor, v0: torch.Tensor) -> torch.
 
 
 def credit(s_all: torch.Tensor, R_all: torch.Tensor, ok_all: torch.Tensor, edit_cols: torch.Tensor,
-           src_cols: torch.Tensor, tau: float = 0.05, lambda_loc: float = 0.5) -> Dict[str, torch.Tensor]:
-    """s_all / R_all / ok_all [B, N] (selection scores, official PDMS, label ok of the pool + edits), edit_cols /
-    src_cols [B, K] (column of each edit and of its source in the same N) -> A_sel, A_loc, A [B, K] (0 where not
-    ok)."""
+           src_cols: Optional[torch.Tensor] = None, tau: float = 0.05, lambda_loc: float = 0.5,
+           R_src: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    """s_all / R_all / ok_all [B, N] (selection scores, official PDMS, label ok of the set + edits), edit_cols [B, K]
+    (column of each edit in the same N); the source's PDMS either from src_cols [B, K] (columns in N) or given as
+    R_src [B, K] (the source need not be in the set, e.g. the on-policy label set) -> A_sel, A_loc, A [B, K] (0 where
+    not ok)."""
     s = torch.where(ok_all, s_all.float(), torch.full_like(s_all.float(), -1e4)) / tau
     R = torch.where(ok_all, R_all.float(), torch.zeros_like(R_all.float()))
     p = torch.softmax(s, -1)
@@ -101,8 +103,12 @@ def credit(s_all: torch.Tensor, R_all: torch.Tensor, ok_all: torch.Tensor, edit_
     # f(S \\ i): renormalise without i
     f_wo = (f_all - pe * Re) / (1.0 - pe).clamp(min=1e-6)
     a_sel = f_all - f_wo
-    a_loc = Re - torch.gather(R, 1, src_cols)
-    ok = torch.gather(ok_all, 1, edit_cols) & torch.gather(ok_all, 1, src_cols)
+    if R_src is not None:
+        a_loc = Re - R_src.float()
+        ok = torch.gather(ok_all, 1, edit_cols)
+    else:
+        a_loc = Re - torch.gather(R, 1, src_cols)
+        ok = torch.gather(ok_all, 1, edit_cols) & torch.gather(ok_all, 1, src_cols)
     A = torch.where(ok, a_sel + lambda_loc * a_loc, torch.zeros_like(a_sel))
     return {"A_sel": torch.where(ok, a_sel, torch.zeros_like(a_sel)), "A_loc": torch.where(ok, a_loc, torch.zeros_like(a_loc)),
             "A": A, "ok": ok}

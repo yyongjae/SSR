@@ -22,6 +22,10 @@ Output  lab/ep{E}/{traj, labels, cand_ok, valid, row_state}.npy + meta.json (for
         (labels / ok bit-identical); the indices travel back with the result and are stashed per task key until the
         row is written.  A generation created by an older labeler gets the file (all -2) only when this labeler writes
         new rows into it; its earlier rows stay -2 (unknown).
+        refiner v4 corrector A: a chunk with the optional edit block (e2e_data2.REC2_EDIT_KEYS: edit_traj [n, 8, 8, 3],
+        edit_src, edit_u, edit_valid) is scored in the SAME score_token call as its 96 (96 + 8 trajectories; per-
+        trajectory results are batch-independent), the 96 results go to the generation as before, the 8 to the
+        optional edit_* files (e2e_data2.GEN2_EDIT_FILES; invalid edits stay unscored, edit_ok False).
 Defaults --workers 32 (user), --world-size 2 (2-GPU run), --max-epoch 28.  CPU only, OMP_NUM_THREADS=1, os.nice(5).
 """
 from __future__ import annotations
@@ -114,6 +118,7 @@ class Labeler2(L1.Labeler):
         self.time_idx = bool(time_idx)                   # refiner v4: optional generation file time_idx.npy
         self.valid: Dict[tuple, np.ndarray] = {}         # key -> [96] bool, alongside self.traj
         self.tidx: Dict[tuple, np.ndarray] = {}          # key -> [96, 3] int8 of scored, not yet written tasks
+        self.edit: Dict[tuple, Dict[str, np.ndarray]] = {}   # refiner v4: key -> the row's edit block (traj/src/u/valid)
 
     def score_fn(self):
         return score_one2 if self.time_idx else L1.score_one
@@ -135,7 +140,8 @@ class Labeler2(L1.Labeler):
         return self.gens[epoch]
 
     # ------------------------------------------------------------------- task flow
-    def _queue(self, ep: int, ckey: str, i: int, r: int, trajs: np.ndarray, valid: Optional[np.ndarray] = None):
+    def _queue(self, ep: int, ckey: str, i: int, r: int, trajs: np.ndarray, valid: Optional[np.ndarray] = None,
+               edit: Optional[Dict[str, np.ndarray]] = None):
         key = (ep, ckey, i, r)
         self.rows_busy.add((ep, r))
         self.traj[key] = np.ascontiguousarray(trajs, np.float32)            # written to the generation as recorded
@@ -143,6 +149,11 @@ class Labeler2(L1.Labeler):
         task_traj = self.traj[key]
         if self.skip_invalid and not self.valid[key].all():
             task_traj = np.where(self.valid[key][:, None, None], task_traj, np.float32(np.nan)).astype(np.float32)
+        if edit is not None:                       # refiner v4: + the 8 edits in the same score_token call
+            self.edit[key] = edit
+            et = np.where(np.asarray(edit["valid"], bool)[:, None, None], np.asarray(edit["traj"], np.float32),
+                          np.float32(np.nan)).astype(np.float32)
+            task_traj = np.concatenate([task_traj, et], 0)
         lg = self.logs[r]
         mcp = f"fake:{self.tok[r]}" if (self.scorer == "fake" and lg == "__fake__") else \
             str(L1.CM.mc_path(self.split, lg, self.tok[r]))
@@ -154,6 +165,13 @@ class Labeler2(L1.Labeler):
         trajs = np.asarray(d["traj"], np.float32)
         assert trajs.ndim == 4 and trajs.shape[1:] == (G_K, 8, 3), f"{trajs.shape}: not [n, {G_K}, 8, 3]"
         return d, trajs, np.asarray(d["valid"], bool)
+
+    @staticmethod
+    def _edit_of(d, i: int) -> Optional[Dict[str, np.ndarray]]:
+        if "edit_traj" not in d:
+            return None
+        return {"traj": np.asarray(d["edit_traj"][i], np.float32), "src": np.asarray(d["edit_src"][i], np.int16),
+                "u": np.asarray(d["edit_u"][i], np.float32), "valid": np.asarray(d["edit_valid"][i], bool)}
 
     def take_chunk(self, c: dict):
         ep, path = int(c["epoch"]), str(c["path"])
@@ -177,7 +195,7 @@ class Labeler2(L1.Labeler):
                 st["n_skip"] += 1
                 self.tot["tok_skip"] += 1
             else:
-                self._queue(ep, path, i, r, trajs[i], valid[i])
+                self._queue(ep, path, i, r, trajs[i], valid[i], self._edit_of(d, i))
                 st["n_tasks"] += 1
         if st["n_tasks"] == 0:
             self._finish_chunk(st)
@@ -192,6 +210,7 @@ class Labeler2(L1.Labeler):
         if key not in self.traj:                    # error path (or written): drop the companion validity
             self.valid.pop(key, None)
             self.tidx.pop(key, None)
+            self.edit.pop(key, None)
 
     def _write(self, ep: int):
         """Scored rows of epoch ep -> generation (write_generation_rows2: data, flush, row_state, flush)."""
@@ -206,10 +225,34 @@ class Labeler2(L1.Labeler):
             if TIDX_FILE not in g:                  # generation of an older labeler: add the file (all -2) now
                 g = self.gens[ep] = D2.open_generation2(self.io, ep, self.n_rows, "r+", optional=(TIDX_FILE,))
                 self.log(f"[{_t()}] generation ep{ep:03d}: optional {TIDX_FILE}.npy added (earlier rows -2)")
-            tid = np.stack([self.tidx.get(k, TI.unknown((G_K,))) for k, _, _ in buf])
+            tid = np.stack([self.tidx.get(k, TI.unknown((G_K,)))[:G_K] for k, _, _ in buf])
+        eds = None
+        if any(k in self.edit for k, _, _ in buf):  # refiner v4: split the 96 + 8 results, write the edit block
+            if any(f not in g for f in D2.GEN2_EDIT_FILES):
+                opt = ((TIDX_FILE,) if self.time_idx else ()) + D2.GEN2_EDIT_FILES
+                g = self.gens[ep] = D2.open_generation2(self.io, ep, self.n_rows, "r+", optional=opt)
+                self.log(f"[{_t()}] generation ep{ep:03d}: optional edit files added")
+            KE = D2.EDIT_K
+            nan_lab = np.full((KE, len(L1.LABEL_COLS)), np.nan, np.float32)
+            eds = {"edit_traj": [], "edit_labels": [], "edit_ok": [], "edit_src": [], "edit_u": []}
+            for k, lab, ok in buf:
+                e = self.edit.get(k)
+                if e is None or len(lab) < G_K + KE:
+                    eds["edit_traj"].append(np.full((KE, 8, 3), np.nan, np.float32))
+                    eds["edit_labels"].append(nan_lab)
+                    eds["edit_ok"].append(np.zeros(KE, bool))
+                    eds["edit_src"].append(np.full(KE, -1, np.int16))
+                    eds["edit_u"].append(np.full((KE, D2.N_U), np.nan, np.float32))
+                    continue
+                eds["edit_traj"].append(np.asarray(e["traj"], np.float32))
+                eds["edit_labels"].append(np.asarray(lab[G_K:G_K + KE], np.float32))
+                eds["edit_ok"].append(np.asarray(ok[G_K:G_K + KE], bool) & np.asarray(e["valid"], bool))
+                eds["edit_src"].append(np.asarray(e["src"], np.int16))
+                eds["edit_u"].append(np.asarray(e["u"], np.float32))
+            eds = {k: np.stack(v) for k, v in eds.items()}
         w = D2.write_generation_rows2(g, rows, np.stack([self.traj[k] for k, _, _ in buf]),
-                                      np.stack([b[1] for b in buf]), np.stack([b[2] for b in buf]),
-                                      np.stack([self.valid[k] for k, _, _ in buf]), time_idx=tid)
+                                      np.stack([b[1][:G_K] for b in buf]), np.stack([b[2][:G_K] for b in buf]),
+                                      np.stack([self.valid[k] for k, _, _ in buf]), time_idx=tid, edits=eds)
         for (key, _, _), wrote in zip(buf, w):
             st = self.chunks[key[1]]
             if wrote:
@@ -223,6 +266,7 @@ class Labeler2(L1.Labeler):
             self.traj.pop(key, None)
             self.valid.pop(key, None)
             self.tidx.pop(key, None)
+            self.edit.pop(key, None)
             self.rows_busy.discard((ep, key[3]))
 
     # ------------------------------------------------------------------- retry
@@ -256,7 +300,7 @@ class Labeler2(L1.Labeler):
                     if g["row_state"][r] == 1 or (ep, r) in self.rows_busy or int(d["row"][i]) != r:
                         continue
                     self.chunks[ckey] = st
-                    self._queue(ep, ckey, i, r, trajs[i], valid[i])
+                    self._queue(ep, ckey, i, r, trajs[i], valid[i], self._edit_of(d, i))
                     st["n_tasks"] += 1
                     n += 1
         self.log(f"[{_t()}] retry-errors: {n} rows queued")

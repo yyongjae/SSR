@@ -775,6 +775,15 @@ class WarmupSampler:
 
 # ----------------------------------------------------------------------------------------------- rec2 chunks
 REC2_KEYS = ("row", "traj", "valid", "cand_idx", "v2_final", "v0", "gstep")
+# refiner v4 corrector A (optional, all four or none): the EDIT_K edits of the step's shortlist per token
+EDIT_K = 8
+N_U = 12
+REC2_EDIT_KEYS = ("edit_traj", "edit_src", "edit_u", "edit_valid")
+
+
+def _edit_want(n: int) -> Dict[str, Tuple[tuple, Any]]:
+    return {"edit_traj": ((n, EDIT_K, 8, 3), np.float32), "edit_src": ((n, EDIT_K), np.int16),
+            "edit_u": ((n, EDIT_K, N_U), np.float32), "edit_valid": ((n, EDIT_K), np.bool_)}
 
 
 def _check_rec2(a: Dict[str, np.ndarray]) -> None:
@@ -784,6 +793,11 @@ def _check_rec2(a: Dict[str, np.ndarray]) -> None:
     want = {"row": ((n,), np.int64), "traj": ((n, G_K, 8, 3), np.float32), "valid": ((n, G_K), np.bool_),
             "cand_idx": ((n, K16), np.int16), "v2_final": ((n, K16), np.float32), "v0": ((n,), np.float32),
             "gstep": ((n,), np.int64), "epoch": ((), np.int32), "rank": ((), np.int32), "fmt": ((), np.int32)}
+    have_e = [k for k in REC2_EDIT_KEYS if k in a]
+    if have_e:                                     # refiner v4: the optional edit block is all-or-none
+        if len(have_e) != len(REC2_EDIT_KEYS):
+            raise ValueError(f"rec2 chunk: partial edit block {have_e} (need all of {list(REC2_EDIT_KEYS)})")
+        want.update(_edit_want(n))
     for name, (shape, dt) in want.items():
         if name not in a:
             raise ValueError(f"rec2 chunk: missing {name}")
@@ -792,7 +806,12 @@ def _check_rec2(a: Dict[str, np.ndarray]) -> None:
             raise ValueError(f"rec2 chunk {name}: {x.shape} {x.dtype} != {shape} {np.dtype(dt)}")
 
 
-def _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank) -> Dict[str, np.ndarray]:
+def _edit_arrays(edits: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    return {"edit_traj": _np(edits["traj"]).astype(np.float32), "edit_src": _np(edits["src"]).astype(np.int16),
+            "edit_u": _np(edits["u"]).astype(np.float32), "edit_valid": _np(edits["valid"]).astype(bool)}
+
+
+def _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank, edits=None) -> Dict[str, np.ndarray]:
     row = _np(row).astype(np.int64).reshape(-1)
     n = len(row)
     a = {"row": row, "traj": _np(traj).astype(np.float32), "valid": _np(valid).astype(bool),
@@ -801,16 +820,19 @@ def _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank) -
          "gstep": np.broadcast_to(_np(gstep).astype(np.int64).reshape(-1), (n,)).copy(),
          "epoch": np.asarray(int(epoch), np.int32), "rank": np.asarray(int(rank), np.int32),
          "fmt": np.asarray(REC2_FMT, np.int32)}
+    if edits is not None:
+        a.update(_edit_arrays(edits))
     _check_rec2(a)
     return a
 
 
-def write_rec2_chunk(path: PathLike, row, traj, valid, cand_idx, v2_final, v0, gstep, epoch: int, rank: int) -> Path:
+def write_rec2_chunk(path: PathLike, row, traj, valid, cand_idx, v2_final, v0, gstep, epoch: int, rank: int,
+                     edits=None) -> Path:
     """Atomic (np.savez to '.{name}.tmp{pid}' in the same dir, then os.replace).  row int64 [n], traj f32 [n,96,8,3],
     valid bool [n,96], cand_idx int16 [n,16], v2_final f32 [n,16], v0 f32 [n], gstep int64 [n] (scalar broadcast),
     epoch / rank int32 [], fmt int32 [] = 2."""
     path = Path(path)
-    a = _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank)
+    a = _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank, edits)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".{path.name}.tmp{os.getpid()}"
     with open(tmp, "wb") as f:
@@ -845,10 +867,13 @@ class CandRecorder2:
         self.chunks: List[str] = []
         self._buf: Dict[str, List[np.ndarray]] = {k: [] for k in REC2_KEYS}
         self._n_buf = 0
+        self._edits: Optional[bool] = None           # refiner v4: every add of a recorder carries edits, or none
 
-    def add(self, rows, traj96, valid96, cand_idx, v2_final, v0, gstep: int) -> int:
+    def add(self, rows, traj96, valid96, cand_idx, v2_final, v0, gstep: int, edits=None) -> int:
         """rows int64 [n] (row < 0 skipped), traj96 f32 [n,96,8,3] (exactly the trajectories of the step),
-        valid96 bool [n,96], cand_idx [n,16], v2_final [n,16], v0 [n] -> number of tokens buffered."""
+        valid96 bool [n,96], cand_idx [n,16], v2_final [n,16], v0 [n] -> number of tokens buffered.
+        edits (refiner v4 corrector A, optional): {traj [n,8,8,3], src [n,8] (96-column of the source), u [n,8,12],
+        valid [n,8]}; a recorder either always or never gets them."""
         if self.closed:
             raise RuntimeError("CandRecorder2.add after close_epoch")
         r = _np(rows).reshape(-1).astype(np.int64)
@@ -859,6 +884,17 @@ class CandRecorder2:
         t = _np(traj96)
         if t.shape[1:] != (G_K, 8, 3):
             raise ValueError(f"CandRecorder2: traj96 {t.shape} != [n, {G_K}, 8, 3]")
+        has_e = edits is not None
+        if self._edits is None:
+            self._edits = has_e
+            if has_e:
+                self._buf.update({k: [] for k in REC2_EDIT_KEYS})
+        elif self._edits != has_e:
+            raise ValueError("CandRecorder2: edits given in some adds and not in others")
+        if has_e:
+            ea = _edit_arrays(edits)
+            for k, v in ea.items():
+                self._buf[k].append(v[keep])
         self._buf["row"].append(r[keep])
         self._buf["traj"].append(t[keep].astype(np.float32))
         self._buf["valid"].append(_np(valid96)[keep].astype(bool))
@@ -876,8 +912,10 @@ class CandRecorder2:
         take = {k: v[:n] for k, v in cat.items()}
         rest = {k: v[n:] for k, v in cat.items()}
         path = Path(ED.rec_chunk_path(self.io_dir, self.epoch, self.rank, self.attempt, self.seq))
+        ed = ({"traj": take["edit_traj"], "src": take["edit_src"], "u": take["edit_u"], "valid": take["edit_valid"]}
+              if self._edits else None)
         write_rec2_chunk(path, take["row"], take["traj"], take["valid"], take["cand_idx"], take["v2_final"],
-                         take["v0"], take["gstep"], self.epoch, self.rank)
+                         take["v0"], take["gstep"], self.epoch, self.rank, edits=ed)
         self.chunks.append(path.name)
         self.seq += 1
         self.n_tokens += n
@@ -905,10 +943,19 @@ GEN2_FILES = {"traj": ((G_K, 8, 3), np.float32, np.nan), "labels": ((G_K, N_LAB)
 GEN2_KEYS = tuple(GEN2_FILES)
 # refiner v4 optional generation files: created only when a writer asks (open_generation2 optional=...), listed in
 # meta.json 'optional_files'; a generation without one reads as its fill value (time_idx: -2 = unknown)
-GEN2_OPT_FILES = {"time_idx": ((G_K, N_TIDX), np.int8, TIDX_UNKNOWN)}
+GEN2_OPT_FILES = {"time_idx": ((G_K, N_TIDX), np.int8, TIDX_UNKNOWN),
+                  # refiner v4 corrector A: the EDIT_K edits per row (traj / official labels / ok / 96-source column /
+                  # controls), written by the labeler from the rec2 edit block
+                  "edit_traj": ((EDIT_K, 8, 3), np.float32, np.nan), "edit_labels": ((EDIT_K, N_LAB), np.float32, np.nan),
+                  "edit_ok": ((EDIT_K,), np.bool_, False), "edit_src": ((EDIT_K,), np.int16, -1),
+                  "edit_u": ((EDIT_K, N_U), np.float32, np.nan)}
+GEN2_EDIT_FILES = ("edit_traj", "edit_labels", "edit_ok", "edit_src", "edit_u")
 GEN2_OPT_KEYS = tuple(GEN2_OPT_FILES)
 GEN2_OPT_NOTE = {"time_idx": "first-failure state index n (t = 0.1 n s) cols " + ", ".join(TI.TIDX_COLS)
-                             + "; -1 none, -2 unknown (not scored / not ok / row written before the file existed)"}
+                             + "; -1 none, -2 unknown (not scored / not ok / row written before the file existed)",
+                 "edit_traj": "refiner v4 corrector edits (decoder mode B) of the shortlist, NaN = none",
+                 "edit_labels": "official labels (LABEL_COLS) of edit_traj", "edit_ok": "label ok of edit_traj",
+                 "edit_src": "96-column of each edit's source (-1 none)", "edit_u": "the 12 recorded controls"}
 
 
 def _gen2_meta_ok(meta: Dict[str, Any], d: Path) -> None:
@@ -927,7 +974,9 @@ def _check_optional2(optional) -> Tuple[str, ...]:
 
 def _opt_meta2(name: str) -> List[Any]:
     shape, dt, fill = GEN2_OPT_FILES[name]
-    return [list(shape), np.dtype(dt).name, int(fill), GEN2_OPT_NOTE.get(name, "")]
+    f = (None if isinstance(fill, float) and np.isnan(fill) else
+         bool(fill) if np.dtype(dt) == np.bool_ else int(fill) if np.issubdtype(np.dtype(dt), np.integer) else float(fill))
+    return [list(shape), np.dtype(dt).name, f, GEN2_OPT_NOTE.get(name, "")]
 
 
 def _create_opt_file2(d: Path, name: str, n_rows: int) -> None:
@@ -935,7 +984,7 @@ def _create_opt_file2(d: Path, name: str, n_rows: int) -> None:
     shape, dt, fill = GEN2_OPT_FILES[name]
     tmp = d / f".{name}.npy.tmp{os.getpid()}"
     mm = np.lib.format.open_memmap(tmp, mode="w+", dtype=dt, shape=(int(n_rows),) + shape)
-    mm[...] = fill
+    mm[...] = (bool(fill) if np.dtype(dt) == np.bool_ else fill)
     mm.flush()
     del mm
     os.replace(tmp, d / f"{name}.npy")
@@ -1016,7 +1065,7 @@ def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: s
 
 
 def write_generation_rows2(gen: Dict[str, Any], rows, traj, labels, cand_ok, valid, overwrite: bool = False,
-                           time_idx=None) -> np.ndarray:
+                           time_idx=None, edits=None) -> np.ndarray:
     """Single-writer helper for the labeler: for rows not yet done (row_state != 1, unless overwrite) write traj
     [n,96,8,3], labels [n,96,9], cand_ok [n,96], valid [n,96] (and, when the generation was opened with the optional
     time_idx file, time_idx int8 [n,96,3]; None -> -2 = unknown for those rows); flush; then row_state = 1; flush.
@@ -1029,6 +1078,12 @@ def write_generation_rows2(gen: Dict[str, Any], rows, traj, labels, cand_ok, val
     assert traj.shape == (n, G_K, 8, 3) and labels.shape == (n, G_K, N_LAB) and cand_ok.shape == (n, G_K) \
         and valid.shape == (n, G_K), (traj.shape, labels.shape, cand_ok.shape, valid.shape)
     has_t = "time_idx" in gen
+    if edits is not None:                       # refiner v4: {edit_traj, edit_labels, edit_ok, edit_src, edit_u} [n, ...]
+        if any(k not in gen for k in GEN2_EDIT_FILES):
+            raise ValueError("write_generation_rows2: edits given but the generation was opened without the edit files")
+        edits = {k: np.asarray(edits[k]) for k in GEN2_EDIT_FILES}
+        for k in GEN2_EDIT_FILES:
+            assert edits[k].shape == (n,) + GEN2_OPT_FILES[k][0], (k, edits[k].shape)
     if time_idx is not None:
         if not has_t:
             raise ValueError("write_generation_rows2: time_idx given but the generation was opened without the "
@@ -1055,6 +1110,10 @@ def write_generation_rows2(gen: Dict[str, Any], rows, traj, labels, cand_ok, val
     if has_t:
         gen["time_idx"][r] = time_idx[sel] if time_idx is not None else TIDX_UNKNOWN
         names += ("time_idx",)
+    if edits is not None:
+        for k in GEN2_EDIT_FILES:
+            gen[k][r] = edits[k][sel]
+        names += GEN2_EDIT_FILES
     for name in names:
         gen[name].flush()
     st[r] = 1
@@ -1089,11 +1148,11 @@ class LabelStore2:
 
     def __init__(self, io_dir: PathLike, n_rows: int = N_ROWS, packed: PathLike = WARMUP_DEFAULT["packed"],
                  var_sampling: str = "type_balanced", ep_target: str = EP_TARGET_DEFAULT, with_tidx: bool = False,
-                 with_pref: bool = False):
+                 with_pref: bool = False, with_edits: bool = False):
         if var_sampling not in VAR_SAMPLING:
             raise ValueError(f"var_sampling must be one of {VAR_SAMPLING}")
         self.ep_target = check_ep_target(ep_target)
-        self.with_tidx, self.with_pref = bool(with_tidx), bool(with_pref)
+        self.with_tidx, self.with_pref, self.with_edits = bool(with_tidx), bool(with_pref), bool(with_edits)
         self.io_dir = Path(io_dir)
         self.n_rows = int(n_rows)
         self.packed = str(packed)
@@ -1124,8 +1183,8 @@ class LabelStore2:
     def _gen(self, epoch: int) -> Dict[str, Any]:
         g = self._gens.get(epoch)
         if g is None:
-            g = self._gens[epoch] = open_generation2(self.io_dir, epoch, self.n_rows, "r",
-                                                     optional=("time_idx",) if self.with_tidx else ())
+            opt = (("time_idx",) if self.with_tidx else ()) + (GEN2_EDIT_FILES if self.with_edits else ())
+            g = self._gens[epoch] = open_generation2(self.io_dir, epoch, self.n_rows, "r", optional=opt)
         return g
 
     def refresh(self, max_epoch: int) -> Dict[str, Any]:
@@ -1192,6 +1251,14 @@ class LabelStore2:
         has = np.zeros(B, bool)
         tid = TI.unknown((B, KG)) if self.with_tidx else None
         pref = np.full(B, np.nan, np.float32) if self.with_pref else None
+        E = None
+        if self.with_edits:                      # refiner v4 corrector A (see lookup_edits in the class docstring)
+            E = {"E_traj": np.zeros((B, EDIT_K, 8, 3), np.float32), "E_y": np.zeros((B, EDIT_K, 5), np.float32),
+                 "E_ok": np.zeros((B, EDIT_K), bool), "E_src": np.full((B, EDIT_K), -1, np.int64),
+                 "E_u": np.zeros((B, EDIT_K, N_U), np.float32), "E_pdms": np.zeros((B, EDIT_K), np.float32),
+                 "E_src_pdms": np.zeros((B, EDIT_K), np.float32),
+                 "E_src_traj": np.zeros((B, EDIT_K, 8, 3), np.float32),
+                 "E_src_par": np.zeros((B, EDIT_K, 8, 3), np.float32), "G_pdms": np.zeros((B, KG), np.float32)}
         se = self.src_epoch
         ident = np.arange(K16, dtype=np.int64) * NV
         for b, rr in enumerate(r):
@@ -1230,6 +1297,30 @@ class LabelStore2:
                 tid[b] = TI.sanitize(np.asarray(g["time_idx"][rr])[c], ok[b])
             if pref is not None:
                 pref[b] = TI.pref_of(lab9)
+            if E is not None:
+                P_ = LABEL_COLS.index("pdms")
+                E["G_pdms"][b] = np.nan_to_num(lab9[c, P_], nan=0.0)
+                if all(k in g for k in GEN2_EDIT_FILES):
+                    es = np.asarray(g["edit_src"][rr], np.int64)
+                    et = np.asarray(g["edit_traj"][rr], np.float32)
+                    el9 = np.asarray(g["edit_labels"][rr], np.float32)
+                    ey = ck_targets(el9, self.ep_target)
+                    eu = np.asarray(g["edit_u"][rr], np.float32)
+                    eok = (np.asarray(g["edit_ok"][rr], bool) & (es >= 0) & np.isfinite(et).all((-1, -2))
+                           & np.isfinite(ey).all(-1) & np.isfinite(eu).all(-1))
+                    esc = np.clip(es, 0, G_K - 1)
+                    eok &= cok[esc] & np.isfinite(lab9[esc, P_])
+                    E["E_traj"][b] = np.where(eok[:, None, None], et, 0.0)
+                    E["E_y"][b] = np.where(eok[:, None], ey, 0.0)
+                    E["E_ok"][b] = eok
+                    E["E_src"][b] = es
+                    E["E_u"][b] = np.where(eok[:, None], eu, 0.0)
+                    E["E_pdms"][b] = np.where(eok, np.nan_to_num(el9[:, P_], nan=0.0), 0.0)
+                    E["E_src_pdms"][b] = np.where(eok, np.nan_to_num(lab9[esc, P_], nan=0.0), 0.0)
+                    st_ = np.where(np.isfinite(t[esc]).all((-1, -2))[:, None, None], t[esc], 0.0)
+                    pt_ = t[(esc // NV) * NV]
+                    E["E_src_traj"][b] = st_
+                    E["E_src_par"][b] = np.where(np.isfinite(pt_).all((-1, -2))[:, None, None], pt_, st_)
         out = {"G_traj": torch.from_numpy(traj), "G_y": torch.from_numpy(y), "G_ok": torch.from_numpy(ok),
                "G_vtype": torch.from_numpy(vt), "G_col": torch.from_numpy(col), "G_src": torch.from_numpy(src),
                "G_epoch": torch.from_numpy(gep), "has": torch.from_numpy(has)}
@@ -1237,6 +1328,8 @@ class LabelStore2:
             out["G_tidx"] = torch.from_numpy(tid)
         if pref is not None:
             out["G_pref"] = torch.from_numpy(pref)
+        if E is not None:
+            out.update({k: torch.from_numpy(v) for k, v in E.items()})
         if device is not None:
             out = {k: v.to(device, non_blocking=True) for k, v in out.items()}
         return out

@@ -148,7 +148,7 @@ def _d_v4() -> Dict[str, Any]:
     # Defaults = off (the CK2 / refiner-v3 student, bit for bit); tools/ck/e2e2/v4_arm.set turns the v4 design on.
     return {"readout": "mean", "pref_head": False, "time_free": True, "lat_haz": True, "horizon": 4.0,
             "lambda_pref": 0.1, "lambda_station": 0.5, "lambda_ev": 0.5, "corridor_version": 1,
-            "kd_parent_only": False, "corrector": False, "corr_k": 8}
+            "kd_parent_only": False, "corrector": False, "corr_k": 8, "lambda_awr": 0.1}
 
 
 V4_NET_KEYS = ("readout", "pref_head", "time_free", "lat_haz", "horizon", "corrector", "corr_k")
@@ -329,7 +329,7 @@ class CKE2E2Config:
                    "lambda_station": float(q["lambda_station"]), "lambda_ev": float(q["lambda_ev"]),
                    "corridor_version": int(q["corridor_version"]),
                    "kd_parent_only": _b(q["kd_parent_only"]), "corrector": _b(q["corrector"]),
-                   "corr_k": int(q["corr_k"])}
+                   "corr_k": int(q["corr_k"]), "lambda_awr": float(q["lambda_awr"])}
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
@@ -444,7 +444,9 @@ class CKE2E2Config:
         from ..refiner.corridor import CORRIDOR_VERSIONS
         if q["corridor_version"] not in CORRIDOR_VERSIONS:
             raise ValueError(f"ck_e2e2.v4.corridor_version must be in {CORRIDOR_VERSIONS}, got {q['corridor_version']}")
-        if q["lambda_pref"] < 0 or q["lambda_station"] < 0 or q["lambda_ev"] < 0:
+        if q["corrector"] and q["corr_k"] != 8:
+            raise ValueError("ck_e2e2.v4.corrector: corr_k must be 8 (= e2e_data2.EDIT_K, the recorded edit block)")
+        if q["lambda_pref"] < 0 or q["lambda_station"] < 0 or q["lambda_ev"] < 0 or q["lambda_awr"] < 0:
             raise ValueError(f"ck_e2e2.v4 lambda_pref / lambda_station must be >= 0, got {q}")
         kc = self.kd_calib
         if kc["enabled"]:
@@ -571,7 +573,8 @@ def _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra
         if extra is not None:
             allp = torch.cat([allp, _parents_or_self(extra, extra_parent)], 1)
     pref = student.scene_pref(mem, ego)
-    o = student.score_set(feat, mem, ego, allc, allp, pref=pref)
+    corr = getattr(student, "corrector", None) is not None
+    o = student.score_set(feat, mem, ego, allc, allp, pref=pref, return_ctx=corr)
     sc, w = o["score_logit"], o["w_lat"].float()
     out = {"score_logit": sc[:, :K], "extra_score_logit": None if extra is None else sc[:, K:],
            "w_lat": w[:, :K], "w_lat_extra": None if extra is None else w[:, K:], "score_all": sc, "w_lat_all": w,
@@ -579,6 +582,9 @@ def _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra
     if "haz" in o:
         out["haz"] = {k: v[:, :K] for k, v in o["haz"].items()}
         out["extra_haz"] = None if extra is None else {k: v[:, K:] for k, v in o["haz"].items()}
+    if corr:                                          # corrector A: its context and the scene (recording / AWR)
+        out["ctx_all"] = o["ctx"]
+        out["scene"] = (feat, mem, ego, pref)
     return out
 
 
@@ -1026,6 +1032,8 @@ class CKE2E2:
                 kw["with_tidx"] = True
             if q["pref_head"]:
                 kw["with_pref"] = True
+            if q["corrector"]:
+                kw["with_edits"] = True
             self._labels = LabelStore2(self.cfg.io_dir, n_rows=N_ROWS, packed=self.cfg.warmup["packed"],
                                        var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target, **kw)
         return self._labels
@@ -1145,6 +1153,8 @@ class CKE2E2:
         B, Kc = cand.shape[:2]
         tc = top["cand"].float()
         kd_par = torch.gather(tc, 1, P["parent"].to(dev).long()[..., None, None].expand(-1, -1, *tc.shape[2:]))
+        if "E_ok" in G:
+            return self._with_edits(cand, fin, P, G, G_traj, G_fin, kd_par, targets, top, V, dev)
         return {"cand": cand, "cand_ok": P["ok"] & fin, "extra": G_traj, "y": G["G_y"].float(),
                 "cand_parent": _keep_parent(cand, kd_par, P["ok"] & fin),
                 "extra_parent": _keep_parent(G_traj, label_set_parents(G, targets, self.sampler(), dev),
@@ -1159,9 +1169,63 @@ class CKE2E2:
                 "var_valid_frac": float(V["valid96"].reshape(B, K16, NV)[:, :, 1:].float().mean()),
                 "top": top, "V": V}
 
+    def _with_edits(self, cand, fin, P, G, G_traj, G_fin, kd_par, targets, top, V, dev) -> Dict[str, Any]:
+        """current_batch of a corrector student (refiner v4 A): the label set G + the generation's recorded edits
+        (their official labels: the critic's BCE also learns the edits; parents = their source's identity), and the
+        AWR inputs S['E'] (recorded sources, parents, controls, PDMS of edits / sources / G)."""
+        B, Kc = cand.shape[:2]
+        KG = G_traj.shape[1]
+        E = {k: v.to(dev) for k, v in G.items() if k.startswith("E_") or k == "G_pdms"}
+        e_ok = E["E_ok"].bool()
+        g_par = _keep_parent(G_traj, label_set_parents(G, targets, self.sampler(), dev), G["G_ok"].bool() & G_fin)
+        extra = torch.cat([G_traj, E["E_traj"].float()], 1)
+        tid = G.get("G_tidx")
+        if tid is not None:
+            tid = torch.cat([tid, torch.full((B, e_ok.shape[1], tid.shape[-1]), -2, dtype=tid.dtype, device=dev)], 1)
+        return {"cand": cand, "cand_ok": P["ok"] & fin, "extra": extra,
+                "y": torch.cat([G["G_y"].float(), E["E_y"].float()], 1),
+                "cand_parent": _keep_parent(cand, kd_par, P["ok"] & fin),
+                "extra_parent": torch.cat([g_par, E["E_src_par"].float()], 1),
+                "vtype_kd": P["vtype"].to(dev).long(), "tidx_lab": tid, "pref": G.get("G_pref"),
+                "ok_lab": torch.cat([G["G_ok"].bool() & G_fin, e_ok], 1),
+                "vtype_lab": torch.cat([G["G_vtype"].long(), torch.full_like(e_ok, NV, dtype=torch.long)], 1),
+                "sur_pos": torch.arange(K16, device=dev)[None].expand(B, -1),
+                "sur_tok_ok": torch.ones(B, dtype=torch.bool, device=dev),
+                "lat_mask": torch.ones(B, Kc, dtype=torch.bool, device=dev),
+                "kd_tok_ok": torch.ones(B, dtype=torch.bool, device=dev), "src": G["G_src"].long(),
+                "var_valid_frac": float(V["valid96"].reshape(B, K16, NV)[:, :, 1:].float().mean()),
+                "top": top, "V": V, "E": E, "n_G": KG,
+                "kd_col96": torch.cat([torch.arange(K16, device=dev)[None].expand(B, -1) * NV,
+                                       P["cols"].to(dev).long()], 1)}
+
+    def corrector_edits(self, student, out: Dict, S: Dict, s_kd: torch.Tensor) -> Optional[Dict[str, torch.Tensor]]:
+        """refiner v4 A, recording: the corrector's sampled edits of the top EDIT_K KD candidates (the current top-16
+        + sampled variants, critic-only selection score) -> {traj [B,8,8,3], src [B,8] (96-column), u [B,8,12],
+        valid [B,8]} for CandRecorder2.add, or None (no corrector / no KD column map)."""
+        from .v4.corrector import critic_select_score, decode_edits
+        if getattr(student, "corrector", None) is None or "kd_col96" not in S or "ctx_all" not in out:
+            return None
+        Kc = S["cand"].shape[1]
+        feat, mem, ego, pref = out["scene"]
+        sc = critic_select_score(s_kd.detach())
+        sc = torch.where(S["cand_ok"].bool(), sc, torch.full_like(sc, -1e9))
+        k = int(self.cfg.v4["corr_k"])
+        idx = torch.topk(sc, k, dim=1).indices
+        B = idx.shape[0]
+        g = lambda a: torch.gather(a, 1, idx.reshape(B, k, *([1] * (a.dim() - 2))).expand(B, k, *a.shape[2:]))
+        src = g(S["cand"].float())
+        ctx = torch.cat([g(out["ctx_all"][:, :Kc]), g(s_kd.detach().float()),
+                         (ego[0].float() / 15.0).reshape(B, 1, 1).expand(B, k, 1)], -1)
+        with torch.no_grad():
+            a = student.corrector.act(ctx.detach(), sample=True)
+        traj = decode_edits(src, a["u"], ego[0])
+        valid = g(S["cand_ok"].bool()) & torch.isfinite(traj).flatten(2).all(-1)
+        return {"traj": traj.detach(), "src": torch.gather(S["kd_col96"], 1, idx), "u": a["u"].detach(),
+                "valid": valid}
+
     # -------------------------------------------------------------------------------------- refiner v4 terms
-    def _v4_terms(self, inner: torch.Tensor, out: Dict, S: Dict, logs: Dict[str, float], targets=None
-                  ) -> torch.Tensor:
+    def _v4_terms(self, inner: torch.Tensor, out: Dict, S: Dict, logs: Dict[str, float], targets=None,
+                  student=None, s_lab: Optional[torch.Tensor] = None) -> torch.Tensor:
         """+ lambda_pref * Huber(log1p P_ref) (out pref_logp; target S 'pref' [B] m, else the GT loader's ref_p_pdm on
         ref_gt_ok tokens), + lambda_ev * (occupancy BCE + margin Huber) of the evidence readout on the KD set's own-
         parent candidates (GT-ok tokens), + lambda_station * censored station BCE of the hazard readout on the label set
@@ -1190,12 +1254,40 @@ class CKE2E2:
             l_occ, l_m, s_ev = V4L.evidence_aux(hk, ref)
             logs.update({f"v4/{k}": float(v) for k, v in s_ev.items()})
             inner = inner + q["lambda_ev"] * (l_occ + l_m)
+        if S.get("E") is not None and student is not None and getattr(student, "corrector", None) is not None \
+                and q["lambda_awr"] > 0 and s_lab is not None:
+            inner = inner + q["lambda_awr"] * self._awr(student, out, S, s_lab, logs)
         haz = out.get("extra_haz") if S.get("extra") is not None else out.get("haz")
         if haz is not None and "a_nc" in haz and S.get("tidx_lab") is not None and q["lambda_station"] > 0:
             l_st, st = V4L.station_bce(haz, S["tidx_lab"].long(), S["y"].float(), S["ok_lab"].bool())
             logs.update({f"v4/{k}": float(v) for k, v in st.items()})
             inner = inner + q["lambda_station"] * l_st
         return inner
+
+    def _awr(self, student, out: Dict, S: Dict, s_lab: torch.Tensor, logs: Dict[str, float]) -> torch.Tensor:
+        """AWR of the corrector on the generation's recorded edits (official labels, report 61 credit): log pi(u) of
+        the recorded controls under the current policy for the recorded sources; credit over the label set G + the
+        edits with the current critic-only selection scores (detached), A_loc against the source's official PDMS."""
+        from .v4.corrector import awr_loss, credit, critic_select_score
+        E, nG = S["E"], int(S["n_G"])
+        feat, mem, ego, pref = out["scene"]
+        logp = student.corrector_logp(feat, mem, ego, E["E_src_traj"].float(), E["E_src_par"].float(),
+                                      E["E_u"].float(), pref=pref)
+        s_all = critic_select_score(s_lab.detach())
+        KE = E["E_ok"].shape[1]
+        R_all = torch.cat([E["G_pdms"].float(), E["E_pdms"].float()], 1)
+        ok_all = S["ok_lab"].bool()
+        cols = (nG + torch.arange(KE, device=s_all.device))[None].expand(s_all.shape[0], -1)
+        c = credit(s_all, R_all, ok_all, cols, R_src=E["E_src_pdms"].float())
+        l = awr_loss(logp, c["A"], c["ok"])
+        n = int(c["ok"].sum())
+        logs["v4/awr"] = _f(l)
+        logs["v4/awr_n"] = float(n)
+        if n:
+            logs["v4/awr_A_mean"] = float(c["A"][c["ok"]].mean())
+            logs["v4/awr_Aloc_mean"] = float(c["A_loc"][c["ok"]].mean())
+            logs["v4/edit_better_frac"] = float((c["A_loc"][c["ok"]] > 1e-6).float().mean())
+        return l
 
     # -------------------------------------------------------------------------------------- inference
     @torch.no_grad()
@@ -1285,7 +1377,9 @@ class CKE2E2:
                 rec = (top, C2.online_variants(top["cand"], v0v, c.variants))
         t_var = time.time() - tv
         n_rec = 0
-        if rec is not None and self.recorder is not None:
+        # refiner v4 corrector: the on-policy record also carries the step's edits -> recorded after the forward
+        defer_rec = getattr(student, "corrector", None) is not None and phase == "onpolicy" and "kd_col96" in S
+        if rec is not None and self.recorder is not None and not defer_rec:
             top, V = rec
             n_rec = self.recorder.add(rows, V["traj96"], V["valid96"], top["idx"], top["final"], v0v, self.gstep)
             self.cum["rec_tokens"] += n_rec
@@ -1308,6 +1402,11 @@ class CKE2E2:
                                    cand_parent=S.get("cand_parent"), extra_parent=S.get("extra_parent"))
         s_kd = out["score_logit"].float()
         s_lab = s_kd if S["extra"] is None else out["extra_score_logit"].float()
+        if rec is not None and self.recorder is not None and defer_rec:
+            top, V = rec
+            n_rec = self.recorder.add(rows, V["traj96"], V["valid96"], top["idx"], top["final"], v0v, self.gstep,
+                                      edits=self.corrector_edits(student, out, S, s_kd))
+            self.cum["rec_tokens"] += n_rec
         corr = lateral_decode(S["cand"], out["w_lat"], v0, c.lon_st_slope)
         e_s = corr["e_lat"][..., 2:].float()
         Kc = S["cand"].shape[1]
@@ -1353,7 +1452,7 @@ class CKE2E2:
             self.ema.update(ema_sur, ema_kd)
             w = float(self.ema.weight(self.mb))
         inner = inner + (r * w) * l_lat
-        inner = self._v4_terms(inner, out, S, logs, targets)
+        inner = self._v4_terms(inner, out, S, logs, targets, student, s_lab)
         loss = c.loss_weight * inner
         loss = loss + 0.0 * (out["score_all"].sum() + out["w_lat_all"].sum())
         if out.get("pref_logp") is not None:

@@ -129,16 +129,27 @@ def collate(items):
 
 
 # ----------------------------------------------------------------------------------------------- model passes
-def score_set(net, feat, mem, cand: torch.Tensor, ego, chunk: int, use_amp: bool) -> Dict[str, torch.Tensor]:
+def score_set(net, feat, mem, cand: torch.Tensor, ego, chunk: int, use_amp: bool,
+              parents: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
     """CK score head + raw controls of a candidate set [T, K, 8, 3] with fixed scene features (chunks over K;
-    candidates are independent: per-candidate self-attention, cross-attention only to the token's global memory)."""
+    candidates are independent: per-candidate self-attention, cross-attention only to the token's global memory).
+    refiner v4 teacher: CKNet.score_set with each candidate's parent draft (parents [T, K, 8, 3]; None = itself)."""
     v0, a0, eds, cmd = ego
     T, K = cand.shape[:2]
     kc = max(1, chunk // max(T, 1))
     outs = {"logit": [], "w_lat": [], "z_lon": []}
+    v4 = getattr(net, "v4_readout", None) is not None
+    pref = net.scene_pref(mem, ego) if v4 else None
     for k0 in range(0, K, kc):
         c = cand[:, k0:k0 + kc].float()
         with torch.autocast(device_type=cand.device.type, dtype=torch.float16, enabled=use_amp):
+            if v4:
+                pc = None if parents is None else parents[:, k0:k0 + kc].float()
+                o4 = net.score_set(feat, mem, ego, c, pc, pref=pref)
+                outs["logit"].append(o4["score_logit"].float())
+                outs["w_lat"].append(o4["w_lat"].float())
+                outs["z_lon"].append(o4["z_lon"].float())
+                continue
             o = net.trunk.candidates(feat, mem, c, v0, a0, eds, cmd)
             lg = net.score(o, T, c.shape[1])
         outs["logit"].append(lg.float())
@@ -177,7 +188,7 @@ def infer_batch(net, bev, status, anchors: torch.Tensor, chunk: int, use_amp: bo
     var = make_variants(tau16, v0n, speeds=SPEEDS, lats=LATS, combine=COMBINE, ext=EXT)
     traj96 = var["traj"].reshape(T, K16 * NV, 8, 3)
     valid96 = var["valid"].reshape(T, K16 * NV).cpu().numpy()
-    g2 = score_set(net, feat, mem, traj96, ego, chunk, use_amp)
+    g2 = score_set(net, feat, mem, traj96, ego, chunk, use_amp, parents=tau16.float().repeat_interleave(NV, 1))
     prob96 = torch.sigmoid(g2["logit"]).cpu().numpy()
     sc96 = sel_score(prob96)
     col = S2.select96(np.zeros((T, K16)), np.ones((T, K16)), prob96, valid96, beta=1.0,

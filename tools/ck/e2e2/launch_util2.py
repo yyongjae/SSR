@@ -62,6 +62,8 @@ LaunchError = LU.LaunchError
 PY = LU.PY
 CK2_YAML = HERE / "ck_e2e2.yaml"
 BEVKD_SET = HERE / "bevkd_arm.set"
+MAIN_SET = HERE / "main_arm.set"          # refiner-v4: the ck2e2e_main arm (BEV KD off; the yaml default is bevkd)
+V4_SET = HERE / "v4_arm.set"              # refiner v4 student
 CK_DATA = "/home/external-user/ssd/yongjae_refiner/ck"
 E2E_ROOT = f"{CK_DATA}/ck2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/ck2/e2e_smoke"
@@ -105,6 +107,9 @@ def check_paths(ck: Dict[str, Any]) -> None:
 
 
 def arm_of(ck: Dict[str, Any]) -> str:
+    v4 = ck.get("v4") or {}
+    if str(v4.get("readout", "mean")) != "mean" or str(v4.get("pref_head", False)).lower() in ("true", "1"):
+        return "v4"
     return "bevkd" if bool((ck.get("bev_kd") or {}).get("enabled")) else "main"
 
 

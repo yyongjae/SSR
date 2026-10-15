@@ -1,0 +1,261 @@
+"""refiner v4 network (navsim/agents/para_ssr/ck/v4): off = CK2 / v3 bit for bit, hazard readout geometry and
+numerics, losses, checkpoint round trips, student / teacher entry points.  CPU, synthetic inputs, ~1 min.
+
+  cd /workspace/yongjae/SSR-v4 && nice -n 10 env PYTHONPATH=$PWD OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+      CUDA_VISIBLE_DEVICES= /venv/ssr/bin/python -m pytest -q -p no:cacheprovider tests/test_v4_model.py
+"""
+import json
+import math
+
+import numpy as np
+import pytest
+import torch
+
+from navsim.agents.para_ssr.ck import online2 as O
+from navsim.agents.para_ssr.ck.cands2 import online_variants
+from navsim.agents.para_ssr.ck.model import CKNet, load_ck, save_ck
+from navsim.agents.para_ssr.ck.v4 import V4Cfg
+from navsim.agents.para_ssr.ck.v4 import losses as V4L
+from navsim.agents.para_ssr.ck.v4.readout import noisy_or_logit, pref_loss, time_embed
+from navsim.agents.para_ssr.ck.v4.sibling import on_parent
+from navsim.agents.para_ssr.refiner.corridor import arrival_time_speed, corridor_geometry
+from navsim.agents.para_ssr.refiner.e2e import ego_inputs
+
+T = 2
+HAZ = V4Cfg(readout="hazard", pref_head=True)
+
+
+def _draft(v, kap):
+    t = torch.arange(1, 9, dtype=torch.float64) * 0.5
+    s = v * t
+    if abs(kap) < 1e-9:
+        return torch.stack([s, 0 * s, 0 * s], -1)
+    return torch.stack([torch.sin(kap * s) / kap, (1 - torch.cos(kap * s)) / kap, kap * s], -1)
+
+
+def _pool():
+    top = torch.stack([torch.stack([_draft(6 + 0.3 * k, 0.01 * (k - 8) + 1e-4) for k in range(16)])
+                       for _ in range(T)])                                           # [T, 16, 8, 3] f64
+    V = online_variants(top, torch.full((T,), 6.0, dtype=torch.float64), None)
+    status = torch.zeros(T, 8)
+    status[:, 1] = 1
+    status[:, 4] = 6.0
+    return top.float(), V["traj96"].float(), V["valid96"], status
+
+
+@pytest.fixture(scope="module")
+def data():
+    torch.manual_seed(0)
+    top, traj96, valid96, status = _pool()
+    return {"top": top, "traj96": traj96, "valid96": valid96, "status": status, "bev": torch.randn(T, 256, 50, 100),
+            "par96": top.repeat_interleave(6, 1)}
+
+
+# ----------------------------------------------------------------------------------------------- config
+def test_v4cfg_parse():
+    assert not V4Cfg().on and V4Cfg.from_dict(None) == V4Cfg() == V4Cfg.from_dict({})
+    c = V4Cfg.from_dict({"readout": "hazard", "pref_head": "true", "horizon": "3.5", "n_freq": "2"})
+    assert c.hazard and c.pref_head and c.horizon == 3.5 and c.n_freq == 2 and c.on
+    assert V4Cfg.from_dict(c.to_dict()) == c
+    with pytest.raises(ValueError, match="unknown"):
+        V4Cfg.from_dict({"readout": "hazard", "bogus": 1})
+    with pytest.raises(ValueError):
+        V4Cfg.from_dict({"readout": "max"})
+    with pytest.raises(ValueError, match="temporal"):
+        V4Cfg(readout="hazard").validate(temporal_on=True)
+
+
+# ----------------------------------------------------------------------------------------------- off = CK2
+def test_off_is_bit_identical(data):
+    n0 = CKNet("S", seed=3)
+    n1 = CKNet("S", seed=3, v4=V4Cfg())
+    a, b = n0.state_dict(), n1.state_dict()
+    assert list(a) == list(b) and all(torch.equal(a[k], b[k]) for k in a)
+    o0 = n0(data["bev"], data["traj96"], data["status"], decode=False)
+    o1 = n1(data["bev"], data["traj96"], data["status"], decode=False, cand_parent=data["par96"])
+    for k in ("score_logit", "w_lat", "z_lon", "gate_logit"):
+        assert torch.equal(o0[k], o1[k]), k
+    # score_set (mean) == trunk.candidates + score
+    ego = ego_inputs(data["status"])
+    feat, mem = n0.trunk.scene(data["bev"], T)
+    o = n0.trunk.candidates(feat, mem, data["traj96"], *ego)
+    ss = n0.score_set(feat, mem, ego, data["traj96"], data["par96"])
+    assert torch.equal(ss["score_logit"], n0.score(o, T, 96)) and torch.equal(ss["w_lat"], o["w_lat"].float())
+
+
+def test_v4_modules_do_not_shift_the_ck2_init():
+    """v4 heads are built after every CK2 module under their own seed: the shared parameters equal the CK2 init."""
+    a = CKNet("S", seed=5).state_dict()
+    b = CKNet("S", seed=5, v4=HAZ).state_dict()
+    assert all(torch.equal(a[k], b[k]) for k in a)
+    assert set(b) - set(a) and all(k.startswith(("v4_readout.", "pref_head.")) for k in set(b) - set(a))
+
+
+# ----------------------------------------------------------------------------------------------- geometry
+def test_on_parent_self_and_siblings(data):
+    top, traj96 = data["top"], data["traj96"]
+    B = T * 96
+    flat = traj96.reshape(B, 8, 3)
+    par = data["par96"].reshape(B, 8, 3)
+    pg = corridor_geometry(par)
+    is_self = (flat == par).flatten(1).all(1)
+    assert int(is_self.sum()) == T * 16
+    sib = on_parent(pg, flat, is_self)
+    # a parent reads its own grid exactly as its corridor's geo channel (same schedule)
+    t_ref, _ = arrival_time_speed(pg.S.float(), pg.s.float(), pg.v_end.float())
+    assert torch.equal(sib["t"][is_self], t_ref[is_self]) and float(sib["d"][is_self].abs().max()) == 0.0
+    v = torch.arange(B) % 6
+    t, d = sib["t"], sib["d"]
+    reach = t <= 4.0
+    # speed siblings stay on the parent path up to the parent's S_8; slower siblings arrive later, a+0.5 earlier.
+    # Beyond the parent's S_8 the CK2 a+0.5 variant is extended STRAIGHT (cands2 ext 'straight') while the parent
+    # corridor follows its end curvature, so a+0.5 leaves the parent grid there (report 72 I4; up to ~0.4 m here)
+    inside = pg.s <= pg.S[:, -2:-1]       # up to the parent's S_7 (the a+0.5 knot 8 already lies beyond its S_8)
+    for vi in (1, 2, 3):
+        sel = v == vi
+        assert float(d[sel][(reach & inside)[sel]].abs().max()) < 0.05
+    assert float(d[v == 3][(reach & ~inside)[v == 3]].abs().max()) > 0.1          # the I4 mismatch is visible
+    j = 30
+    assert bool((t[v == 1, j] > t[v == 0, j] + 0.05).all()) and bool((t[v == 3, j] < t[v == 0, j] - 0.02).all())
+    # lateral siblings: the smoothstep ramp (20 % .. 100 % of S_8) ends at ~ -0.5 / +0.5 m, same schedule as the parent
+    dk = sib["d_knots"]
+    assert abs(float(dk[v == 4, -1].mean()) + 0.5) < 0.06 and abs(float(dk[v == 5, -1].mean()) - 0.5) < 0.06
+    assert bool((dk[v == 4, 1:].diff(dim=1) <= 0.02).all()) and bool((dk[v == 5, 1:].diff(dim=1) >= -0.02).all())
+    assert float((t[v == 4] - t[v == 0])[reach[v == 0]].abs().mean()) < 0.05
+
+
+# ----------------------------------------------------------------------------------------------- numerics
+def test_noisy_or_and_time_embed():
+    a = torch.tensor([[-3.0, -2.0, 0.5, 4.0]])
+    m = torch.tensor([[True, True, False, True]])
+    p = torch.sigmoid(-a)[m].prod()
+    assert abs(float(torch.sigmoid(noisy_or_logit(a, m))) - float(p)) < 1e-6
+    big = noisy_or_logit(torch.full((1, 48), -30.0), torch.zeros(1, 48, dtype=torch.bool))
+    assert float(big) > 10                                             # nothing read -> pass ~ 1, finite
+    e = time_embed(torch.tensor([0.0, 2.0, 20.0]), 3)
+    assert e.shape == (3, 7) and float(e[2, 0]) == 2.0                 # clamped to 8 s
+
+
+def test_station_targets():
+    t = torch.arange(48, dtype=torch.float32)[None, None] * 0.1         # station j reached at 0.1 j s
+    m = torch.ones(1, 3, 48, dtype=torch.bool)
+    m[..., 41:] = False
+    tidx = torch.tensor([[20, -1, -2]])                                  # fail at 2.0 s / pass / unknown
+    y = torch.tensor([[0.0, 1.0, 0.0]])
+    ok = torch.ones(1, 3, dtype=torch.bool)
+    tg, w = V4L.station_targets(t.expand(1, 3, 48), m, tidx, y, ok)
+    assert float(tg[0, 0, 20]) == 1 and float(w[0, 0, 20]) == 1 and float(tg[0, 0].sum()) == 1
+    assert float(w[0, 0, 19]) == 0 and float(w[0, 0, 21]) == 0 and float(w[0, 0, 30]) == 0      # near / censored
+    assert float(w[0, 0, :18].sum()) == 18 and float(w[0, 0, 18]) == 0                        # before tau - 0.25 s
+    assert float(w[0, 1].sum()) == 41 and float(tg[0, 1].sum()) == 0                           # pass: all read
+    assert float(w[0, 2].sum()) == 0                                                           # unknown
+    haz = {"a_nc": torch.zeros(1, 3, 48), "a_ttc": torch.zeros(1, 3, 48), "a_dac": torch.zeros(1, 3, 48),
+           "haz_mask": m, "t_arr": t.expand(1, 3, 48)}
+    y5 = torch.ones(1, 3, 5)
+    y5[0, 0] = 0
+    l, st = V4L.station_bce(haz, torch.stack([tidx] * 3, -1), y5, ok)
+    assert abs(float(l) - math.log(2)) < 1e-5 and st["st_npos_nc"] == 1.0
+    assert float(pref_loss(torch.tensor([math.log1p(10.0)]), torch.tensor([10.0]))) < 1e-9
+    assert float(pref_loss(torch.tensor([1.0]), torch.tensor([float("nan")]))) == 0.0
+
+
+# ----------------------------------------------------------------------------------------------- hazard net
+def test_hazard_forward_backward(data):
+    net = CKNet("S", seed=0, v4=HAZ)
+    net.set_score_prior([0.97, 0.97, 0.9, 0.95, 0.99])
+    frozen = [n for n, p in net.named_parameters() if not p.requires_grad]
+    assert any(n.startswith("score_head") for n in frozen) and any(n.startswith("trunk.lat_head") for n in frozen)
+    o = net(data["bev"], data["traj96"], data["status"], decode=True, cand_parent=data["par96"],
+            extra=data["traj96"][:, :8], extra_parent=data["par96"][:, :8])
+    assert o["score_logit"].shape == (T, 96, 5) and o["w_lat"].shape == (T, 96, 6) and o["pref_logp"].shape == (T,)
+    assert torch.isfinite(o["score_logit"]).all() and float(o["z_lon"].abs().max()) == 0.0
+    assert torch.allclose(o["extra_score_logit"], o["score_logit"][:, :8], atol=1e-5)
+    p = torch.sigmoid(o["score_logit"])
+    assert abs(float(p[..., 2].mean()) - 0.9) < 0.05                   # EP prior
+    loss = o["score_logit"].sum() + o["w_lat"].sum() + o["pref_logp"].sum()
+    loss.backward()
+    nog = [n for n, q in net.named_parameters() if q.requires_grad and q.grad is None]
+    assert not nog, nog
+    # explicit self parents == no parents
+    o2 = net(data["bev"], data["top"], data["status"], decode=False)
+    o3 = net(data["bev"], data["top"], data["status"], decode=False, cand_parent=data["top"])
+    assert torch.allclose(o2["score_logit"], o3["score_logit"], atol=1e-6)
+
+
+def test_checkpoint_round_trip(tmp_path, data):
+    net = CKNet("S", seed=1, v4=HAZ, corridor_version=2)
+    run = tmp_path / "run"
+    cfg = {"arm": "S", "seed": 1, "score_hidden": 256, "lead_aux": 0, "corridor_version": 2, "v4": HAZ.to_dict()}
+    save_ck(run / "ckpt_last.pt", net, cfg)
+    (run / "config.json").write_text(json.dumps(cfg))
+    net2, _ = load_ck(run, "last", "cpu")
+    assert net2.v4 == HAZ and net2.corridor_version == 2
+    a, b = net.state_dict(), net2.state_dict()
+    assert all(torch.equal(a[k], b[k]) for k in a)
+    net.eval()
+    o1 = net(data["bev"], data["traj96"], data["status"], decode=False, cand_parent=data["par96"])
+    o2 = net2(data["bev"], data["traj96"], data["status"], decode=False, cand_parent=data["par96"])
+    assert torch.equal(o1["score_logit"], o2["score_logit"])
+
+
+# ----------------------------------------------------------------------------------------------- student / teacher paths
+def test_student_build_and_forward(tmp_path, data):
+    cfg = O.CKE2E2Config.from_any({"v4": {"readout": "hazard", "pref_head": True, "corridor_version": 2}})
+    stu = O.build_student_ck2(cfg, apply_prior=False)
+    assert stu.v4_readout is not None and stu.pref_head is not None and stu.corridor_version == 2
+    bev = data["bev"]
+    out = O.student_forward2(stu, bev, data["traj96"][:, :48], data["status"], extra=data["traj96"][:, 48:],
+                             cand_parent=data["par96"][:, :48], extra_parent=data["par96"][:, 48:])
+    assert out["score_logit"].shape == (T, 48, 5) and out["extra_score_logit"].shape == (T, 48, 5)
+    assert out["haz"]["a_nc"].shape == (T, 48, 48) and out["extra_haz"]["t_arr"].shape == (T, 48, 48)
+    assert out["pref_logp"].shape == (T,) and out["score_all"].shape == (T, 96, 5)
+    # same as CKNet.forward over the 96 with parents
+    ref = stu(bev, data["traj96"], data["status"], decode=False, cand_parent=data["par96"])
+    assert torch.allclose(out["score_all"], ref["score_logit"], atol=1e-5)
+    # the CK2 student is unchanged by the new code paths (no v4 block)
+    s0 = O.build_student_ck2(O.CKE2E2Config.from_any({}), apply_prior=False)
+    o0 = O.student_forward2(s0, bev, data["traj96"][:, :48], data["status"], extra=data["traj96"][:, 48:],
+                            cand_parent=data["par96"][:, :48])
+    assert "haz" not in o0 and "pref_logp" not in o0
+
+
+def test_teacher_forward_v4(data):
+    net = CKNet("S", seed=2, v4=V4Cfg(readout="hazard")).eval()
+    ego = ego_inputs(data["status"])
+    with torch.no_grad():
+        s, w = O.teacher_forward(net, data["bev"], data["traj96"], ego, parents=data["par96"])
+        ref = net(data["bev"], data["traj96"], data["status"], decode=False, cand_parent=data["par96"])
+    assert torch.allclose(s, ref["score_logit"], atol=1e-6) and torch.allclose(w, ref["w_lat"], atol=1e-6)
+
+
+def test_label_set_parents():
+    """generation rows: a variant's parent is G_traj[k]; fallback rows: anchors self, variants -> var anchor table."""
+    B, KG = 2, 4
+    traj = torch.arange(B * KG * 24, dtype=torch.float32).reshape(B, KG, 8, 3)
+    G = {"G_traj": traj, "G_vtype": torch.tensor([[0, 0, 1, 4], [0, 0, 3, 2]], dtype=torch.int8),
+         "G_col": torch.tensor([[0, 6, 1, 10], [-1, -1, 9, 2]], dtype=torch.int16),
+         "has": torch.tensor([True, False])}
+
+    class _S:
+        def anchors_t(self, dev):
+            return torch.full((256, 8, 3), 7.0) + torch.arange(256.0)[:, None, None]
+
+    targets = {"ck2_var_anchor": torch.tensor([[0] * 16, [3, 9] + [0] * 14])}
+    par = O.label_set_parents(G, targets, _S(), "cpu")
+    assert torch.equal(par[0, 0], traj[0, 0]) and torch.equal(par[0, 1], traj[0, 1])
+    assert torch.equal(par[0, 2], traj[0, 0]) and torch.equal(par[0, 3], traj[0, 1])    # col 1 -> k 0, col 10 -> k 1
+    assert torch.equal(par[1, 0], traj[1, 0])                                            # fallback anchor: self
+    assert float(par[1, 2, 0, 0]) == 7.0 + 9 and float(par[1, 3, 0, 0]) == 7.0 + 3       # col 9 -> k 1, col 2 -> k 0
+
+
+def test_arm_sets_and_tags():
+    from tools.ck.e2e import launch_util as LU
+    from tools.ck.e2e2 import launch_util2 as L2
+    base = L2.load_ck2_yaml()
+    assert L2.arm_of(base) == "bevkd"
+    main = LU.apply_sets(base, LU.read_lines(str(L2.MAIN_SET)))
+    assert L2.arm_of(main) == "main" and main["bev_kd"]["enabled"] is False
+    v4 = LU.apply_sets(base, LU.read_lines(str(L2.V4_SET)))
+    assert L2.arm_of(v4) == "v4" and v4["bev_kd"]["enabled"] is True
+    c = O.CKE2E2Config.from_any(dict(v4, enabled=False))
+    assert c.v4_net().hazard and c.v4["corridor_version"] == 2 and c.v4["kd_parent_only"]

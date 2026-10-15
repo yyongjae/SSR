@@ -129,7 +129,9 @@ def _d_kd_calib() -> Dict[str, Any]:
 def _d_bev_kd() -> Dict[str, Any]:
     # ratio_<t> / cap_<t>: optional per-teacher overrides of ratio / cap (None = the shared value) for that teacher's
     # RatioController (bev_kd_arm.controllers_from_cfg)
-    return {"enabled": False, "teachers": ["det"], "distance": "mse", "init": "zero", "ln": True, "target_clip": None,
+    # refiner-v4 default (user 2026-10-15: the ck2e2e_bevkd setting = BEV KD from both teachers); the ck2e2e_main arm
+    # (enabled false, teachers [det]) is tools/ck/e2e2/main_arm.set
+    return {"enabled": True, "teachers": ["det", "map"], "distance": "mse", "init": "zero", "ln": True, "target_clip": None,
             "ratio": 0.1, "cap": 0.25, "m": 0.9, "w_max": None, "start_mb": 10600, "adapter_weight": 1.0,
             "lr_mult": 3.0, "weight_decay": 0.01, "ratio_det": None, "ratio_map": None, "cap_det": None,
             "cap_map": None}
@@ -138,8 +140,18 @@ def _d_bev_kd() -> Dict[str, Any]:
 BEV_KD_PER_TEACHER = ("ratio_det", "ratio_map", "cap_det", "cap_map")
 
 
+def _d_v4() -> Dict[str, Any]:
+    # refiner v4 (ck/v4): network readout (V4Cfg keys) + student loss weights + corridor version + KD routing.
+    # Defaults = off (the CK2 / refiner-v3 student, bit for bit); tools/ck/e2e2/v4_arm.set turns the v4 design on.
+    return {"readout": "mean", "pref_head": False, "time_free": True, "lat_haz": True, "horizon": 4.0,
+            "lambda_pref": 0.1, "lambda_station": 0.5, "corridor_version": 1, "kd_parent_only": False}
+
+
+V4_NET_KEYS = ("readout", "pref_head", "time_free", "lat_haz", "horizon")
+
+
 _NESTED2 = {"variants": _d_variants, "lat_kd": _d_lat_kd, "warmup": _d_warmup, "onpolicy_label": _d_onpolicy_label,
-            "bev_kd": _d_bev_kd, "kd_calib": _d_kd_calib}
+            "bev_kd": _d_bev_kd, "kd_calib": _d_kd_calib, "v4": _d_v4}
 KD_CALIB_TEACHERS = ("det", "map")
 _INFER_SELECT_KEYS = ("beta", "set", "lat_mode")
 
@@ -210,6 +222,7 @@ class CKE2E2Config:
     infer_select: Optional[Dict[str, Any]] = None
     strict_rows: float = 0.999
     bev_kd: Dict[str, Any] = field(default_factory=_d_bev_kd)
+    v4: Dict[str, Any] = field(default_factory=_d_v4)
 
     # ------------------------------------------------------------------------------------------ parse
     @classmethod
@@ -304,6 +317,11 @@ class CKE2E2Config:
                        **{k: _opt_float(b[k]) for k in BEV_KD_PER_TEACHER}}
         kc = dict(self.kd_calib)
         self.kd_calib = {"enabled": _b(kc["enabled"]), **{t: _opt_str(kc[t]) for t in KD_CALIB_TEACHERS}}
+        q = dict(self.v4)
+        self.v4 = {"readout": str(q["readout"]), "pref_head": _b(q["pref_head"]), "time_free": _b(q["time_free"]),
+                   "lat_haz": _b(q["lat_haz"]), "horizon": float(q["horizon"]), "lambda_pref": float(q["lambda_pref"]),
+                   "lambda_station": float(q["lambda_station"]), "corridor_version": int(q["corridor_version"]),
+                   "kd_parent_only": _b(q["kd_parent_only"])}
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
@@ -319,6 +337,11 @@ class CKE2E2Config:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def v4_net(self):
+        """V4Cfg of the student network (ck/v4/config.py; the v4 block's network keys)."""
+        from .v4.config import V4Cfg
+        return V4Cfg.from_dict({k: self.v4[k] for k in V4_NET_KEYS})
 
     @property
     def compute_dtype(self) -> torch.dtype:
@@ -405,6 +428,16 @@ class CKE2E2Config:
                 if k.split("_", 1)[1] not in bk["teachers"]:
                     raise ValueError(f"ck_e2e2.bev_kd.{k} is set but teacher {k.split('_', 1)[1]!r} is not in "
                                      f"bev_kd.teachers {bk['teachers']}")
+        q = self.v4
+        try:
+            self.v4_net()
+        except ValueError as e:
+            raise ValueError(f"ck_e2e2.v4: {e}") from None
+        from ..refiner.corridor import CORRIDOR_VERSIONS
+        if q["corridor_version"] not in CORRIDOR_VERSIONS:
+            raise ValueError(f"ck_e2e2.v4.corridor_version must be in {CORRIDOR_VERSIONS}, got {q['corridor_version']}")
+        if q["lambda_pref"] < 0 or q["lambda_station"] < 0:
+            raise ValueError(f"ck_e2e2.v4 lambda_pref / lambda_station must be >= 0, got {q}")
         kc = self.kd_calib
         if kc["enabled"]:
             if all(kc[t] is None for t in KD_CALIB_TEACHERS):
@@ -486,7 +519,12 @@ def build_student_ck2(cfg: CKE2E2Config, apply_prior: bool = True):
     from .model import CKNet
 
     cfg = CKE2E2Config.from_any(cfg)
-    net = CKNet("S", int(cfg.seed), score_hidden=256, lead_aux=False)
+    kw: Dict[str, Any] = {}                    # refiner v4 / refiner-fix B1 (defaults: the CK2 call, unchanged)
+    if cfg.v4["corridor_version"] != 1:
+        kw["corridor_version"] = int(cfg.v4["corridor_version"])
+    if cfg.v4_net().on:
+        kw["v4"] = cfg.v4_net()
+    net = CKNet("S", int(cfg.seed), score_hidden=256, lead_aux=False, **kw)
     net.trunk.adapter.bev_grad_scale = float(cfg.bev_grad_scale)
     frozen = freeze_lon_gate(net)
     rep: Dict[str, Any] = {"source": None, "score_prior": None, "score_prior_source": None, "frozen": frozen}
@@ -509,9 +547,66 @@ def lateral_decode(cand: torch.Tensor, w_lat: torch.Tensor, v0: torch.Tensor, sl
     return correct(cand.float(), torch.zeros_like(w), w, v0, slope)
 
 
+def _parents_or_self(cand: torch.Tensor, parent: Optional[torch.Tensor]) -> torch.Tensor:
+    return cand.float() if parent is None else parent.float()
+
+
+def _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra_parent) -> Dict:
+    """student_forward2 for a refiner v4 student (hazard readout and / or P_ref head): ONE score_set over cat(cand,
+    extra) with cat(parents) (None = itself) -> the student_forward2 keys + haz / extra_haz ([B, K(2), 48] station
+    tensors) + pref_logp [B] (None without the P_ref head)."""
+    B, K = cand.shape[:2]
+    allc = cand.float() if extra is None else torch.cat([cand.float(), extra.float()], 1)
+    allp = None
+    if student.v4_readout is not None and (cand_parent is not None or extra_parent is not None):
+        allp = _parents_or_self(cand, cand_parent)
+        if extra is not None:
+            allp = torch.cat([allp, _parents_or_self(extra, extra_parent)], 1)
+    pref = student.scene_pref(mem, ego)
+    o = student.score_set(feat, mem, ego, allc, allp, pref=pref)
+    sc, w = o["score_logit"], o["w_lat"].float()
+    out = {"score_logit": sc[:, :K], "extra_score_logit": None if extra is None else sc[:, K:],
+           "w_lat": w[:, :K], "w_lat_extra": None if extra is None else w[:, K:], "score_all": sc, "w_lat_all": w,
+           "ego": ego, "pref_logp": pref}
+    if "a_nc" in o:
+        hk = ("a_nc", "a_ttc", "a_dac", "haz_mask", "t_arr", "d_lat")
+        out["haz"] = {k: o[k][:, :K] for k in hk}
+        out["extra_haz"] = None if extra is None else {k: o[k][:, K:] for k in hk}
+    return out
+
+
+def label_set_parents(G: Dict[str, torch.Tensor], targets, sampler, dev) -> torch.Tensor:
+    """Parent drafts [B, KG, 8, 3] of the on-policy label set G (refiner v4 hazard readout):
+      generation rows (has): identities (G_vtype 0) are their own parents, a variant's parent is the identity of its
+        top-16 rank k = G_col // 6, i.e. G_traj[:, k] (LabelStore2.lookup puts the 16 identities first in k order);
+      fallback rows (cands2.fill_fallback): anchors are their own parents, a variant's parent is the anchor of its
+        variant-file column (targets ck2_var_anchor[col // 6] -> the AnchorSampler anchor table);
+      rows without data: themselves."""
+    traj = G["G_traj"].to(dev).float()
+    B, KG = traj.shape[:2]
+    vt = G["G_vtype"].to(dev).long()
+    col = G["G_col"].to(dev).long()
+    has = G["has"].to(dev).bool().reshape(B, 1)
+    var = vt > 0
+    k = (col.clamp(min=0) // NV).clamp(max=K16 - 1)
+    gen_par = torch.gather(traj, 1, k[..., None, None].expand(B, KG, *traj.shape[2:]))
+    anc = sampler.anchors_t(dev)
+    va = targets["ck2_var_anchor"].to(dev).long()                                 # [B, 16] anchor ids
+    fb_par = anc[torch.gather(va, 1, k)]                                          # [B, KG, 8, 3]
+    par = torch.where((var & has)[..., None, None], gen_par, traj)
+    par = torch.where((var & ~has & (col >= 0))[..., None, None], fb_par.to(traj.dtype), par)
+    return par
+
+
+def _keep_parent(cand_s: torch.Tensor, parent: torch.Tensor, good: torch.Tensor) -> torch.Tensor:
+    """Candidates replaced by the fallback (not good) are their own parents; non-finite parents too."""
+    g = good.bool() & torch.isfinite(parent).flatten(2).all(-1)
+    return torch.where(g[..., None, None], parent.float(), cand_s.float())
+
+
 # ----------------------------------------------------------------------------------------------- teachers
-def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optional[Dict[str, torch.Tensor]] = None
-                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optional[Dict[str, torch.Tensor]] = None,
+                    parents: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """The KD teacher ops under the caller's autocast / no_grad: trunk.scene once, trunk.candidates on `cand`, score
     -> (score logits [B,K,5] f32, w_lat [B,K,6]).  A temporal teacher (net.temporal, refiner-v3) additionally runs
     TemporalBranch.scene(objs) once and binds its hook to this candidate set -- the order and ops of
@@ -524,6 +619,9 @@ def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optio
     if temporal is not None and objs is None:
         raise ValueError("teacher_forward: this teacher has a temporal branch: its causal object rows are required")
     feat, mem = net.trunk.scene(bev, B)
+    if getattr(net, "v4_readout", None) is not None:    # refiner v4 teacher: hazard readout on the parents' corridors
+        o = net.score_set(feat, mem, ego, cand, parents, pref=net.scene_pref(mem, ego))
+        return o["score_logit"], o["w_lat"]
     tf = None if temporal is None else temporal.hook(temporal.scene(objs), B, K)
     o = net.trunk.candidates(feat, mem, cand, *ego, tfeat=tf)
     return net.score(o, B, K), o["w_lat"]
@@ -688,7 +786,7 @@ class TeacherPair2:
 
     @torch.no_grad()
     def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None, objs_det=None,
-            obj_ok_det=None) -> Dict[str, torch.Tensor]:
+            obj_ok_det=None, parents: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """bev_* [B, 256, 50, 100] (f16 cache), ok_* [B], cand [B, K, 8, 3] (finite), status [B, 8], cand_ok [B, K]
         -> kd_score_prob f32 [B,K,5] (combine_teacher: nc/ttc DET, dac MAP, ep/comfort mean), kd_e_lat f32 [B,K,6]
         = 0.5 (e_DET + e_MAP) (decode z_lon = 0, slope 0), kd_ok bool [B,K] = DET ok & MAP ok (per token) & finite
@@ -718,7 +816,8 @@ class TeacherPair2:
         logits, ws = [], []
         for net, bev, objs in ((self.det, bev_det, objs_det), (self.map, bev_map, None)):
             with ac:
-                s, w = teacher_forward(net, bev.to(dev).float(), cand, ego, objs)
+                s, w = teacher_forward(net, bev.to(dev).float(), cand, ego, objs,
+                                       None if parents is None else parents.detach().float().to(dev))
             logits.append(s.float())
             ws.append(w.float())
         if self.calib is not None:            # KD calibration: Platt on the logits, per teacher and key
@@ -748,7 +847,8 @@ class TeacherPair2:
 
 # ----------------------------------------------------------------------------------------------- student forward
 def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status: torch.Tensor,
-                     extra: Optional[torch.Tensor] = None) -> Dict:
+                     extra: Optional[torch.Tensor] = None, cand_parent: Optional[torch.Tensor] = None,
+                     extra_parent: Optional[torch.Tensor] = None) -> Dict:
     """One trunk.scene + ONE trunk.candidates over cat(cand, extra) (candidates are processed independently) ->
     score_logit [B,K,5] f32, extra_score_logit [B,K2,5] | None, w_lat [B,K,6], w_lat_extra [B,K2,6] | None,
     score_all / w_lat_all (every candidate), ego.  No decode here (callers use lateral_decode, z_lon = 0)."""
@@ -760,6 +860,8 @@ def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status
     allc = cand.float() if extra is None else torch.cat([cand.float(), extra.float()], 1)
     KA = allc.shape[1]
     feat, mem = student.trunk.scene(bev_grid, B)
+    if getattr(student, "v4_readout", None) is not None or getattr(student, "pref_head", None) is not None:
+        return _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra_parent)
     o = student.trunk.candidates(feat, mem, allc, v0, a0, eds, cmd)
     sc = student.score(o, B, KA)
     w = o["w_lat"].float()
@@ -977,7 +1079,10 @@ class CKE2E2:
         wu = W["wu_ok"].bool()
         B = cand.shape[0]
         vv = targets["ck2_var_valid"].reshape(B, K16, NV)
+        par = _keep_parent(cand, self.sampler().anchors_t(dev)[W["parent_anchor"].to(dev).long()],
+                           W["teacher_ok"] & fin)
         return {"cand": cand, "cand_ok": W["teacher_ok"] & fin, "extra": None, "y": W["y"],
+                "cand_parent": par, "extra_parent": None, "vtype_kd": W["vtype"].to(dev).long(),
                 "ok_lab": W["ok"] & fin, "vtype_lab": W["vtype"], "grp": grp, "sur_pos": sur_pos,
                 "sur_tok_ok": wu, "lat_mask": lat_mask, "kd_tok_ok": wu, "wu_ok": wu,
                 "var_valid_frac": float(vv[:, :, 1:].float().mean()),
@@ -1015,7 +1120,13 @@ class CKE2E2:
         G = self.label_set(rows, toks, targets, dev)
         G_traj, G_fin = _sanitize_traj(G["G_traj"].float(), fallback, G["G_ok"].bool())
         B, Kc = cand.shape[:2]
+        tc = top["cand"].float()
+        kd_par = torch.gather(tc, 1, P["parent"].to(dev).long()[..., None, None].expand(-1, -1, *tc.shape[2:]))
         return {"cand": cand, "cand_ok": P["ok"] & fin, "extra": G_traj, "y": G["G_y"].float(),
+                "cand_parent": _keep_parent(cand, kd_par, P["ok"] & fin),
+                "extra_parent": _keep_parent(G_traj, label_set_parents(G, targets, self.sampler(), dev),
+                                             G["G_ok"].bool() & G_fin),
+                "vtype_kd": P["vtype"].to(dev).long(),
                 "ok_lab": G["G_ok"].bool() & G_fin, "vtype_lab": G["G_vtype"].long(),
                 "sur_pos": torch.arange(K16, device=dev)[None].expand(B, -1),
                 "sur_tok_ok": torch.ones(B, dtype=torch.bool, device=dev),
@@ -1023,6 +1134,24 @@ class CKE2E2:
                 "kd_tok_ok": torch.ones(B, dtype=torch.bool, device=dev), "src": G["G_src"].long(),
                 "var_valid_frac": float(V["valid96"].reshape(B, K16, NV)[:, :, 1:].float().mean()),
                 "top": top, "V": V}
+
+    # -------------------------------------------------------------------------------------- refiner v4 terms
+    def _v4_terms(self, inner: torch.Tensor, out: Dict, S: Dict, logs: Dict[str, float]) -> torch.Tensor:
+        """+ lambda_pref * Huber(log1p P_ref) (out pref_logp, S 'pref' [B] m) and + lambda_station * censored station
+        BCE on the label set (out extra_haz (on-policy) / haz (warm-up), S 'tidx_lab' [B, KL, 3]); absent inputs ->
+        unchanged.  Logs v4/*."""
+        from .v4 import losses as V4L
+        q = self.cfg.v4
+        if out.get("pref_logp") is not None and S.get("pref") is not None and q["lambda_pref"] > 0:
+            lp = V4L.pref_loss(out["pref_logp"], S["pref"].float().reshape(-1), S.get("kd_tok_ok"))
+            logs["v4/pref_huber"] = _f(lp)
+            inner = inner + q["lambda_pref"] * lp
+        haz = out.get("extra_haz") if S.get("extra") is not None else out.get("haz")
+        if haz is not None and S.get("tidx_lab") is not None and q["lambda_station"] > 0:
+            l_st, st = V4L.station_bce(haz, S["tidx_lab"].long(), S["y"].float(), S["ok_lab"].bool())
+            logs.update({f"v4/{k}": float(v) for k, v in st.items()})
+            inner = inner + q["lambda_station"] * l_st
+        return inner
 
     # -------------------------------------------------------------------------------------- inference
     @torch.no_grad()
@@ -1039,8 +1168,9 @@ class CKE2E2:
         v0 = ego_inputs(status)[0]
         V = C2.online_variants(top["cand"], v0_from_status(status), self.cfg.variants)
         cand, fin = _sanitize_traj(V["traj96"], top["cand"][:, 0])
+        par = _keep_parent(cand, top["cand"].float().repeat_interleave(NV, 1), fin)      # c = k * 6 + v -> parent k
         with torch.autocast(device_type=dev.type, enabled=False):
-            out = student_forward2(student, bev_sgrid(bev.float()), cand, status)
+            out = student_forward2(student, bev_sgrid(bev.float()), cand, status, cand_parent=par)
         lat = lateral_decode(cand, out["w_lat"], v0, 0.0)
         res = {"ck2_cand_idx": top["idx"], "ck2_v2_final": top["final"], "ck2_v2_im": top["im"],
                "ck2_v2_sim": top["sim"], "ck2_cand96": V["traj96"], "ck2_valid96": V["valid96"] & fin,
@@ -1111,13 +1241,14 @@ class CKE2E2:
             objs_det, obj_ok_det = kd_objs_of(targets, dev)
             tkw = {"objs_det": objs_det, "obj_ok_det": obj_ok_det}
         T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
-                   cand_ok=S["cand_ok"], **tkw)
+                   cand_ok=S["cand_ok"], parents=S.get("cand_parent"), **tkw)
         t_teacher = time.time() - tt
 
         # ---- student forward (one pass over KD candidates + label set)
         ts = time.time()
         with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=bool(c.amp and dev.type == "cuda")):
-            out = student_forward2(student, bev_sgrid(bev), S["cand"], status, extra=S["extra"])
+            out = student_forward2(student, bev_sgrid(bev), S["cand"], status, extra=S["extra"],
+                                   cand_parent=S.get("cand_parent"), extra_parent=S.get("extra_parent"))
         s_kd = out["score_logit"].float()
         s_lab = s_kd if S["extra"] is None else out["extra_score_logit"].float()
         corr = lateral_decode(S["cand"], out["w_lat"], v0, c.lon_st_slope)
@@ -1146,7 +1277,10 @@ class CKE2E2:
         l_sur_val = _f(l_sur)
         kd_ok = T["kd_ok"].bool() & S["kd_tok_ok"][:, None]
         ki = [CK_KEYS.index(k) for k in c.kd_score_keys]      # user 2026-10-08: comfort excluded from score KD
-        l_ks = L.score_kd_bce(s_kd[..., ki], T["kd_score_prob"][..., ki], kd_ok)
+        kd_ok_s = kd_ok
+        if c.v4["kd_parent_only"]:                            # refiner v4 I2: score KD on the parent columns only
+            kd_ok_s = kd_ok & (S["vtype_kd"] == 0)
+        l_ks = L.score_kd_bce(s_kd[..., ki], T["kd_score_prob"][..., ki], kd_ok_s)
         inner = inner + (r * c.lambda_kd_score) * l_ks
         m_lat = kd_ok & S["lat_mask"]
         l_lat = _masked_l1(e_s, T["kd_e_lat"], m_lat)
@@ -1162,8 +1296,11 @@ class CKE2E2:
             self.ema.update(ema_sur, ema_kd)
             w = float(self.ema.weight(self.mb))
         inner = inner + (r * w) * l_lat
+        inner = self._v4_terms(inner, out, S, logs)
         loss = c.loss_weight * inner
         loss = loss + 0.0 * (out["score_all"].sum() + out["w_lat_all"].sum())
+        if out.get("pref_logp") is not None:
+            loss = loss + 0.0 * out["pref_logp"].sum()
         loss_val = _f(loss)
         bad_loss = not math.isfinite(loss_val)
         if bad_loss:

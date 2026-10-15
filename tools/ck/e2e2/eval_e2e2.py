@@ -252,7 +252,8 @@ def extract_ck2(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, Any]
     from navsim.agents.para_ssr.ck.model import load_ck
     if not ck_cfg or not str(ck_cfg.get("enabled", "")).lower() in ("true", "1"):
         log(f"warning: training config has no enabled ck_e2e2 ({ck_cfg and ck_cfg.get('enabled')})")
-    cfg = E1.extract_ck(ckpt, out_dir, run_name, {"seed": int((ck_cfg or {}).get("seed", 0) or 0)})
+    cfg = E1.extract_ck(ckpt, out_dir, run_name, {"seed": int((ck_cfg or {}).get("seed", 0) or 0),
+                                                  **({"v4": dict(ck_cfg["v4"])} if (ck_cfg or {}).get("v4") else {})})
     net, _ = load_ck(out_dir, "last", "cpu")
     lw = net.trunk.lon_head[-1]
     lon_max = max(float(lw.weight.abs().max()), float(lw.bias.abs().max()))

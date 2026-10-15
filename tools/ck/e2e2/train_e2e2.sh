@@ -30,7 +30,8 @@
 #       --which last      (-> .../ck/ck2/kd_calib/<run>__last.json; recorded with its sha16 in launch/teachers.json)
 # -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (32 workers, --world-size 2, --max-epoch
 #   MAX_EPOCHS-2, --exit-when-done --train-pid-file) -> watchdog (restart a dead / hung labeler while training lives).
-# ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
+# ARM=bevkd (refiner-v4 default: ck_e2e2.yaml = the bevkd setting; also adds bevkd_arm.set) | main (main_arm.set: BEV KD
+#   off) | v4 (v4_arm.set: refiner v4 student); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
 #   after the arm file.  Never pkill / pgrep -f: processes are found through the pid files only.
 # refiner-v3 temporal DET teacher (docs/refiner_v3/STEP2_E2E.md): E2E_CK_SET=$REPO/tools/ck/e2e2/v3teacher_arm.set
 #   (teacher_det_run = v3T10_a_learned + its kd_calib.det); launch_util2 accepts a temporal teacher only when it is the
@@ -61,7 +62,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 RUN=${RUN:?RUN=<run name> is required}
-ARM=${ARM:-main}
+ARM=${ARM:-bevkd}
 E2E_ROOT=${E2E_ROOT:-/home/external-user/ssd/yongjae_refiner/ck/ck2/e2e}
 R="$E2E_ROOT/$RUN"
 L="$R/launch"; LB="$R/labeler"; IO="$R/ck_e2e2"
@@ -104,7 +105,7 @@ grp_kill() {  # grp_kill <pgid_file> <pid_file> <needle> <name>: TERM the group,
 need_gpus() { [ -n "$GPUS" ] || die "--gpus <2 GPUs of 0-3> is required (e.g. --gpus 0,1)"; }
 
 case "$R" in *=*) die "run dir $R contains '='";; esac
-case "$ARM" in main|bevkd) ;; *) die "ARM must be main | bevkd (got $ARM)";; esac
+case "$ARM" in main|bevkd|v4) ;; *) die "ARM must be main | bevkd | v4 (got $ARM)";; esac
 
 start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   if [ "${E2E_NO_LABELER:-0}" = 1 ]; then log "labeler disabled (E2E_NO_LABELER=1)"; return 0; fi
@@ -197,6 +198,8 @@ do_start() {
   local OA=(overrides --run-dir "$R" --gpus "$GPUS" --workers "${TRAIN_WORKERS:-6}" --max-epochs "${MAX_EPOCHS:-30}"
             --wandb "$WB" --teacher-check "$TMODE" --out "$OUTD/overrides.txt")
   [ "$ARM" = bevkd ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/bevkd_arm.set")
+  [ "$ARM" = main ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/main_arm.set")
+  [ "$ARM" = v4 ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/v4_arm.set")
   [ -n "${E2E_CK_SET:-}" ] && OA+=(--ck-set-file "$E2E_CK_SET")
   [ -n "${E2E_EXTRA:-}" ] && OA+=(--extra-file "$E2E_EXTRA")
   [ -n "$CKPT" ] && OA+=(--resume-ckpt "$CKPT")

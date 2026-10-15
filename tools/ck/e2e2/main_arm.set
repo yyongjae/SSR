@@ -1,0 +1,4 @@
+# refiner-v4 branch: the old ck2e2e_main arm (no BEV KD).  ck_e2e2.yaml's default is the ck2e2e_bevkd setting
+# (user 2026-10-15 "전에 v2에서 bevkd세팅햇던것도 v4에 같이 반영해둬"); ARM=main applies this file to get main back.
+bev_kd.enabled=false
+bev_kd.teachers=[det]

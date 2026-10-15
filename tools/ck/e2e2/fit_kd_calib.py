@@ -158,7 +158,7 @@ def teacher_logits(net, bev, cand, status, amp: bool, objs=None):
     B, K = cand.shape[:2]
     ego = ego_inputs(status.detach().float().to(dev))
     ac = torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=bool(amp) and dev.type == "cuda")
-    if objs is not None or getattr(net, "temporal", None) is not None:
+    if objs is not None or getattr(net, "temporal", None) is not None or getattr(net, "v4_readout", None) is not None:
         from navsim.agents.para_ssr.ck.online2 import teacher_forward
         with torch.no_grad(), ac:
             s, _ = teacher_forward(net, bev.to(dev).float(), cand.float(), ego, objs)

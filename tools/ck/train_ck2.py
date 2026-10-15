@@ -209,6 +209,22 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--corridor-version", type=int, choices=(1, 2), default=1,
                     help="refiner corridor geometry (refiner/corridor.py 'Version'): 1 = original (default), "
                          "2 = refiner-fix B1 (arc ends at S_look, straight beyond; straight below 3 m/s)")
+    # refiner v4 (navsim/agents/para_ssr/ck/v4): every default = off (the CK2 / v3 teacher, unchanged)
+    ap.add_argument("--v4-readout", choices=("mean", "hazard"), default="mean",
+                    help="mean = CK2 readout (default); hazard = v4 station x arrival-time hazard + noisy-OR on the "
+                         "parent corridor (variants read their parent anchor's stations)")
+    ap.add_argument("--v4-pref-head", type=int, choices=(0, 1), default=0,
+                    help="1 = supervised P_ref scene query (labels pdm_progress_eff; needs the dataset 'pref' key)")
+    ap.add_argument("--v4-time-free", type=int, choices=(0, 1), default=1,
+                    help="hazard: zero the parent's arrival-time / speed geo channels (default 1)")
+    ap.add_argument("--v4-lat-haz", type=int, choices=(0, 1), default=1, help="hazard: hazard-localised lateral head")
+    ap.add_argument("--v4-horizon", type=float, default=4.0, help="hazard: stations read up to this arrival time [s]")
+    ap.add_argument("--lambda-pref", type=float, default=0.1, help="P_ref Huber weight (only with --v4-pref-head 1)")
+    ap.add_argument("--lambda-station", type=float, default=0.5,
+                    help="censored station BCE weight (hazard readout + first-failure time indices in the batch)")
+    ap.add_argument("--time-idx-root", default="",
+                    help="first-failure time-index sidecars (tools/ck/v4/build_time_idx.py) for the station loss; "
+                         "'' = none (no station loss)")
     # refiner-v3 temporal branch (SPEC 5.3); every default = off / the TemporalCfg default
     from navsim.agents.para_ssr.ck.temporal import config as TCF
     d = TCF.TemporalCfg()
@@ -297,7 +313,30 @@ def resolve_args(a):
         raise SystemExit("--workers <= 16 per rank")
     parse_best(a.best_metric)
     a.temporal_cfg = resolve_temporal(a)
+    a.v4_cfg = resolve_v4(a)
     return a
+
+
+def resolve_v4(a):
+    """-> V4Cfg from the --v4-* flags (off unless --v4-readout hazard or --v4-pref-head 1)."""
+    from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+    ro = str(getattr(a, "v4_readout", "mean") or "mean")
+    ph = bool(int(getattr(a, "v4_pref_head", 0) or 0))
+    if ro == "mean" and not ph:
+        return V4Cfg()
+    try:
+        return V4Cfg(readout=ro, pref_head=ph, time_free=bool(int(getattr(a, "v4_time_free", 1))),
+                     lat_haz=bool(int(getattr(a, "v4_lat_haz", 1))),
+                     horizon=float(getattr(a, "v4_horizon", 4.0))).validate(temporal_cfg_of(a).on)
+    except ValueError as e:
+        raise SystemExit(f"--v4-*: {e}") from None
+
+
+def v4_cfg_of(a):
+    """V4Cfg of resolved args (absent attribute = off, e.g. args built by older tests)."""
+    from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+    v = getattr(a, "v4_cfg", None)
+    return v if v is not None else V4Cfg()
 
 
 def parse_best(s: Optional[str]) -> Optional[Tuple[str, str, str]]:
@@ -570,6 +609,8 @@ def setup_model(a, run: Path, train_ds, D: Dist, norm_override=None):
     kw = {"temporal": tcfg} if tcfg.on else {}                     # OFF: the CK2 call, unchanged
     if int(getattr(a, "corridor_version", 1)) != 1:                # refiner-fix B1 (default 1: the call unchanged)
         kw["corridor_version"] = int(a.corridor_version)
+    if v4_cfg_of(a).on:                                            # refiner v4 (off: the call unchanged)
+        kw["v4"] = v4_cfg_of(a)
     net = build_ck(a.arm, seed=a.seed, norm=(mean, std), init_from=init, lead_aux=False, **kw)
     rep = getattr(net, "init_report", None)
     rep = dict(rep) if isinstance(rep, dict) else {"report": str(rep)}
@@ -601,11 +642,28 @@ def mask_bev_ok(batch: Dict) -> Dict:
     return b
 
 
+_ANCHORS_T: Dict[str, torch.Tensor] = {}
+
+
+def anchors_on(dev) -> "torch.Tensor":
+    """The AnchorSampler anchor table [256, 8, 3] f32 on `dev` (cached; refiner v4 variant parents)."""
+    key = str(dev)
+    if key not in _ANCHORS_T:
+        from navsim.agents.para_ssr.ck import anchor_sampler as AS
+        _ANCHORS_T[key] = torch.from_numpy(np.asarray(AS.load_anchors(), np.float32)).to(dev)
+    return _ANCHORS_T[key]
+
+
 def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool, tcfg=None) -> Dict:
     """CKNet forward on the model inputs only (bev, cand, status, var_traj; + OBJ_INPUT_KEYS (+ the oracle's
-    PRIV_INPUT_KEYS) when the temporal branch is on); no decode (done with z_lon = 0)."""
+    PRIV_INPUT_KEYS) when the temporal branch is on); no decode (done with z_lon = 0).
+    refiner v4 hazard readout: the raw anchors are their own parents, a variant's parent is its anchor
+    (batch var_anchor -> anchor table)."""
     extra = batch["var_traj"].float() if with_var and "var_traj" in batch else None
     kw = {}
+    core = getattr(net, "module", net)
+    if getattr(core, "v4_readout", None) is not None and extra is not None:
+        kw["extra_parent"] = anchors_on(extra.device)[batch["var_anchor"].to(extra.device).long()]
     if tcfg is not None and tcfg.on:
         from navsim.agents.para_ssr.ck.temporal.branch import objs_from_batch
         kw["objs"] = objs_from_batch(batch, tcfg, dev)
@@ -686,6 +744,7 @@ def compute_loss(out: Dict, corr: Dict, batch: Dict, a) -> Tuple[torch.Tensor, D
         st["sur_nonfinite"] = float(nonfin)
         st.update({f"t_{k}": float(v) for k, v in (terms or {}).items()})
     loss = loss + 0.0 * out["w_lat"].float().sum()          # lateral head always in the graph (DDP)
+    loss = add_v4_losses(loss, st, out, batch, a)
     st["e_abs"] = float(corr["e_lat"].detach()[..., 2:].abs().mean())
     st["w_lat_abs"] = float(out["w_lat"].detach().float().abs().mean())
     st["z_lon_absmax"] = float(out["z_lon"].detach().float().abs().max())
@@ -707,11 +766,41 @@ def compute_loss(out: Dict, corr: Dict, batch: Dict, a) -> Tuple[torch.Tensor, D
     return loss, st
 
 
+def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
+    """refiner v4 terms (absent outputs / batch keys -> unchanged loss and stats):
+      + lambda_pref * Huber(log1p P_ref) (out 'pref_logp', batch 'pref' [T] m, NaN = no target);
+      + lambda_station * censored station BCE (hazard readout 'haz' / 'extra_haz', batch 'anc_tidx' [T, K, 3] /
+        'var_tidx' [T, V, 3], same masks as the score BCE)."""
+    from navsim.agents.para_ssr.ck.v4 import losses as V4L
+    if "pref_logp" in out:
+        if "pref" in batch:
+            ok = batch["bev_ok"].bool().reshape(-1) if "bev_ok" in batch else None
+            lp = V4L.pref_loss(out["pref_logp"], batch["pref"].float().reshape(-1), ok)
+            st["pref_huber"] = float(lp.detach())
+            loss = loss + float(getattr(a, "lambda_pref", 0.1)) * lp
+        else:
+            loss = loss + 0.0 * out["pref_logp"].sum()
+    if "haz" in out and float(getattr(a, "lambda_station", 0.0) or 0.0) > 0 and "anc_tidx" in batch:
+        sets = [(out["haz"], batch["anc_tidx"], batch["y"], batch["y_ok"])]
+        if "extra_haz" in out and "var_tidx" in batch:
+            sets.append((out["extra_haz"], batch["var_tidx"], batch["var_y"], batch["var_ok"]))
+        haz = {k: torch.cat([s[0][k] for s in sets], 1) for k in sets[0][0]}
+        tidx = torch.cat([s[1].to(haz["t_arr"].device).long() for s in sets], 1)
+        y5 = torch.cat([s[2].float() for s in sets], 1)
+        ok = torch.cat([s[3].bool() for s in sets], 1)
+        l_st, s_st = V4L.station_bce(haz, tidx, y5, ok)
+        st.update(s_st)
+        with torch.no_grad():
+            st.update(V4L.localisation_hit({k: v.detach() for k, v in haz.items()}, tidx, y5, ok))
+        loss = loss + float(a.lambda_station) * l_st
+    return loss
+
+
 def dummy_backward(out: Dict) -> None:
     """DDP: when the step is skipped (non-finite loss on some rank) every rank still runs one backward over the same
     graph (zero-weighted outputs), so the reducer stays in step; the gradients are discarded."""
     terms = [out[k].float().nan_to_num(0.0, 0.0, 0.0).sum() * 0.0 for k in ("score_logit", "extra_score_logit",
-                                                                            "w_lat") if k in out]
+                                                                            "w_lat", "pref_logp") if k in out]
     if out.get("fc") is not None and out["fc"].mu.requires_grad:   # learned forecaster outputs (not frozen)
         from navsim.agents.para_ssr.ck.temporal.loss import forecast_touch
         terms.append(forecast_touch(out["fc"]).nan_to_num(0.0, 0.0, 0.0))
@@ -1001,6 +1090,9 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                score_hidden=256, lead_aux=0, param_count=int(sum(p.numel() for p in net.parameters())),
                param_count_trainable=int(sum(p.numel() for p in params)),
                temporal=tcfg.to_dict(), privileged=int(tcfg.privileged),
+               **({"v4": v4_cfg_of(a).to_dict(), "lambda_pref": float(a.lambda_pref),
+                   "lambda_station": float(a.lambda_station), "time_idx_root": str(a.time_idx_root or "")}
+                  if v4_cfg_of(a).on else {}),
                param_count_temporal_shared=int(pc.get("temporal_shared", 0)),
                param_count_forecaster=int(pc.get("forecaster", 0)),
                provenance=run_provenance(a, tcfg))
@@ -1017,6 +1109,9 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
         ot = TemporalCfg.from_dict(old.get("temporal")).normalised().to_dict()   # old config without the key = off
         if ot != tcfg.normalised().to_dict():
             raise SystemExit(f"{run}: resume with temporal={cfg['temporal']!r} but config.json has {ot!r}")
+        from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+        if V4Cfg.from_dict(old.get("v4")) != v4_cfg_of(a):           # old config without the key = off
+            raise SystemExit(f"{run}: resume with v4={v4_cfg_of(a).to_dict()!r} but config.json has {old.get('v4')!r}")
         if tcfg.on and old.get("provenance"):      # review fix D5: a resumed arm must keep its code and data
             from tools.ck.v3 import provenance as PV
             cmp = PV.compare({"config.json": old["provenance"], "now": cfg["provenance"]})

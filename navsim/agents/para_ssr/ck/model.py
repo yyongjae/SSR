@@ -44,9 +44,12 @@ from ..refiner.refiner_net import ADAPTER_SEED_OFFSET, RefinerNet, draft_feature
 from .constants import CK_KEYS, NORM_FILE, SCORE_SEED_OFFSET
 from .correct import correct
 from .temporal.config import TemporalCfg
+from .v4.config import V4Cfg
 
 ARMS = ("T", "M", "S", "none")
 N_KEYS = len(CK_KEYS)
+V4_SEED_OFFSET = 40414      # refiner v4 heads: own seeded RNG, built after every CK2 / v3 module
+GEO_T_ARR, GEO_V_ARR = 64 + 4, 64 + 5    # corridor_tensor channels of t_arr / v_arr (64 features + GEO_CHANNELS)
 
 
 # ----------------------------------------------------------------------------------------------- adapter (student)
@@ -105,6 +108,32 @@ class CKTrunk(RefinerNet):
         return {"h": h, "gate_logit": gate.reshape(T, K), "z_lon": self.lon_head(h).reshape(T, K, N_FREE),
                 "w_lat": self.lat_head(h).reshape(T, K, N_FREE), "ud": ud, "geom": geom}
 
+    def stations(self, feat: torch.Tensor, mem: torch.Tensor, tau: torch.Tensor, v0: torch.Tensor,
+                 a0: torch.Tensor, eds: torch.Tensor, cmd: torch.Tensor, time_free: bool = True
+                 ) -> Dict[str, torch.Tensor]:
+        """refiner v4 parent pass: tau [T, K, 8, 3] (parent drafts) -> x [T*K, 49, d] (draft token + 48 station tokens
+        after the 4 layers and norm_out), Hc [T*K, 128, 48, 17] (corridor conv features), ud, geom.  time_free zeroes
+        the t_arr / v_arr geo channels (the station features then carry no schedule; candidates add their own).
+        Same modules as candidates() (no heads)."""
+        T, K = tau.shape[:2]
+        B = T * K
+        with torch.autocast(device_type=tau.device.type, enabled=False):
+            flat = tau.reshape(B, N_POSE, 3).float()
+            geom = corridor_geometry(flat, version=self.corridor_version)
+            rep = lambda x: x.reshape(T, *x.shape[1:]).repeat_interleave(K, 0)
+            ud = draft_features(flat, rep(v0.float()), rep(a0.float()), rep(eds.float()), rep(cmd), geom)
+        X = corridor_tensor(feat, geom, T, K)                                         # [B, 70, 48, 17]
+        if time_free:
+            X = X.clone()
+            X[:, GEO_T_ARR] = 0
+            X[:, GEO_V_ARR] = 0
+        Hc = self.enc(X)                                                              # [B, 128, 48, 17]
+        st = self.station(Hc.permute(0, 2, 1, 3).reshape(B, N_ST, -1))               # [B, 48, d]
+        x = torch.cat([self.draft_mlp(ud.to(st.dtype))[:, None], st], 1)              # [B, 49, d]
+        for layer in self.layers:
+            x = layer(x, mem, T, K)
+        return {"x": self.norm_out(x), "Hc": Hc, "ud": ud, "geom": geom}
+
     def forward(self, bev, tau0, v0, a0, eds, cmd) -> Dict[str, torch.Tensor]:
         feat, mem = self.scene(bev, tau0.shape[0])
         return self.candidates(feat, mem, tau0, v0, a0, eds, cmd)
@@ -136,7 +165,7 @@ class CKNet(nn.Module):
 
     def __init__(self, arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                  score_hidden: int = 256, lead_aux: bool = False, temporal: Optional[TemporalCfg] = None,
-                 ca_b: Optional[torch.Tensor] = None, corridor_version: int = 1):
+                 ca_b: Optional[torch.Tensor] = None, corridor_version: int = 1, v4: Optional[V4Cfg] = None):
         super().__init__()
         self.arm = arm
         self.seed = int(seed)
@@ -162,6 +191,26 @@ class CKNet(nn.Module):
             self.trunk._temporal_required = True                       # plain attribute, not state
         else:
             self.temporal = None
+        # refiner v4 (ck/v4): built AFTER every CK2 / v3 module under its own seed (V4Cfg() = off: nothing is built,
+        # the state dict and every output are the CK2 / v3 ones)
+        self.v4 = (v4 if v4 is not None else V4Cfg()).validate(self.temporal_cfg.on)
+        self.v4_readout = None
+        self.pref_head = None
+        if self.v4.on:
+            from .v4.readout import HazardReadout, PRefHead
+            if self.v4.hazard and self.lead_aux:
+                raise ValueError("v4 hazard readout: lead_aux is not supported")
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed + V4_SEED_OFFSET)
+                if self.v4.hazard:
+                    self.v4_readout = HazardReadout(self.v4, self.trunk.d_model)
+                if self.v4.pref_head:
+                    self.pref_head = PRefHead(self.trunk.d_model)
+            if self.v4.hazard:
+                # the CK2 heads the hazard readout replaces: kept in the state dict (loaders stay uniform) but frozen,
+                # so DDP / optimisers never expect a gradient for them
+                for mod in (self.score_head, self.trunk.lat_head, self.trunk.lon_head, self.trunk.gate_head):
+                    mod.requires_grad_(False)
 
     # ------------------------------------------------------------------------------------------ helpers
     def param_counts(self) -> Dict[str, int]:
@@ -173,6 +222,10 @@ class CKNet(nn.Module):
             tc = self.temporal.param_counts()
             c.update(tc)
             c["total"] = c["total"] + tc["temporal_shared"] + tc["forecaster"]
+        for name, mod in (("v4_readout", self.v4_readout), ("pref_head", self.pref_head)):
+            if mod is not None:                                         # keys only when on
+                c[name] = sum(p.numel() for p in mod.parameters())
+                c["total"] = c["total"] + c[name]
         return c
 
     @torch.no_grad()
@@ -180,14 +233,71 @@ class CKNet(nn.Module):
         """Set the score head's output bias to logit(prior) per key (CK_KEYS order), e.g. label means."""
         p = torch.as_tensor(np.asarray(prior, np.float64)).clamp(1e-4, 1 - 1e-4)
         self.score_head[-1].bias.copy_(torch.log(p / (1 - p)).to(self.score_head[-1].bias))
+        if self.v4_readout is not None:
+            self.v4_readout.set_prior(np.asarray(prior, np.float64))
 
     def score(self, cand_out: Dict[str, torch.Tensor], T: int, K: int) -> torch.Tensor:
         return self.score_head(cand_out["h"]).float().reshape(T, K, N_KEYS)
 
+    def scene_pref(self, mem: torch.Tensor, ego) -> Optional[torch.Tensor]:
+        """v4 pref_head: log1p(P_ref) [T] (None when the head is off)."""
+        if self.pref_head is None:
+            return None
+        v0, a0, _, cmd = ego
+        return self.pref_head(mem, v0, a0, cmd)
+
+    def score_set(self, feat: torch.Tensor, mem: torch.Tensor, ego, cand: torch.Tensor,
+                  parents: Optional[torch.Tensor] = None, tfeat=None, pref: Optional[torch.Tensor] = None) -> Dict:
+        """Score one candidate set with the token's scene (feat, mem from trunk.scene):
+        cand [T, K, 8, 3] -> score_logit [T, K, 5] f32, w_lat / z_lon [T, K, 6] f32, gate_logit [T, K]
+        (+ hazard readout: a_nc / a_ttc / a_dac / haz_mask / t_arr [T, K, 48], d_lat [T, K, 48]).
+        readout 'mean': exactly trunk.candidates + score (the CK2 / v3 ops; parents ignored).
+        readout 'hazard': parents [T, K, 8, 3] = each candidate's parent draft (None: every candidate is its own
+        parent); the scene is read on the parent's corridor, the candidate reads it at its own schedule."""
+        T, K = cand.shape[:2]
+        v0, a0, eds, cmd = ego
+        if self.v4_readout is None:
+            o = self.trunk.candidates(feat, mem, cand, v0, a0, eds, cmd, tfeat=tfeat)
+            return {"score_logit": self.score(o, T, K), "w_lat": o["w_lat"].float(), "z_lon": o["z_lon"].float(),
+                    "gate_logit": o["gate_logit"].float(), "h": o["h"]}
+        if tfeat is not None:
+            raise ValueError("v4 hazard readout has no temporal hook")
+        from .v4.sibling import on_parent
+        B = T * K
+        cand = cand.float()
+        par = cand if parents is None else parents.float()
+        if tuple(par.shape) != tuple(cand.shape):
+            raise ValueError(f"score_set: parents {tuple(par.shape)} vs cand {tuple(cand.shape)}")
+        P = self.trunk.stations(feat, mem, par, v0, a0, eds, cmd, time_free=self.v4.time_free)
+        flat = cand.reshape(B, N_POSE, 3)
+        rep = lambda x: x.reshape(T, *x.shape[1:]).repeat_interleave(K, 0)
+        with torch.autocast(device_type=cand.device.type, enabled=False):
+            is_self = (flat == par.reshape(B, N_POSE, 3)).flatten(1).all(1)
+            sib = on_parent(P["geom"], flat, is_self)
+            cgeom = P["geom"] if parents is None else corridor_geometry(flat, version=self.corridor_version)
+            ud = P["ud"] if parents is None else draft_features(flat, rep(v0.float()), rep(a0.float()),
+                                                               rep(eds.float()), rep(cmd), cgeom)
+        x = P["x"]
+        g = self.trunk.draft_mlp(ud.to(x.dtype))
+        pr = None if pref is None else rep(pref.reshape(T, 1).float())[:, 0]
+        r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, sib["t"], sib["v"], sib["d"], cgeom.S[:, -1], pr)
+        sh = lambda a: a.reshape(T, K, *a.shape[1:])
+        return {"score_logit": sh(r["score_logit"]), "w_lat": sh(r["w_lat"]),
+                "z_lon": torch.zeros(T, K, N_FREE, dtype=torch.float32, device=cand.device),
+                "gate_logit": torch.zeros(T, K, dtype=torch.float32, device=cand.device),
+                "a_nc": sh(r["a_nc"]), "a_ttc": sh(r["a_ttc"]), "a_dac": sh(r["a_dac"]), "haz_mask": sh(r["mask"]),
+                "t_arr": sh(sib["t"]), "d_lat": sh(sib["d"])}
+
     # ------------------------------------------------------------------------------------------ forward
     def forward(self, bev: Optional[torch.Tensor], cand: torch.Tensor, status: torch.Tensor,
                 extra: Optional[torch.Tensor] = None, decode: bool = True, slope: float = 0.0,
-                rescore_corr: bool = False, objs: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
+                rescore_corr: bool = False, objs: Optional[Dict[str, torch.Tensor]] = None,
+                cand_parent: Optional[torch.Tensor] = None, extra_parent: Optional[torch.Tensor] = None) -> Dict:
+        """cand_parent / extra_parent [T, K(2), 8, 3]: refiner v4 hazard readout only (each candidate's parent draft;
+        None = itself); ignored by the mean readout."""
+        if self.v4_readout is not None:
+            return self._forward_v4(bev, cand, status, extra, decode, slope, rescore_corr, objs, cand_parent,
+                                    extra_parent)
         T, K = cand.shape[:2]
         if status.shape[0] != T:
             raise ValueError(f"status {tuple(status.shape)} vs cand {tuple(cand.shape)}")
@@ -222,6 +332,41 @@ class CKNet(nn.Module):
             if ctx.fc_raw is not None:
                 out["fc"] = ctx.fc_raw                                      # learned forecast (forecast loss)
             out["t_stats"] = {"n_obj": ctx.n_obj, "n_valid": ctx.n_valid}
+        if self.pref_head is not None:
+            out["pref_logp"] = self.scene_pref(mem, ego)
+        return out
+
+    def _forward_v4(self, bev, cand, status, extra, decode, slope, rescore_corr, objs, cand_parent,
+                    extra_parent) -> Dict:
+        """forward() with the v4 hazard readout (same output keys; + 'haz' (per set: a_nc / a_ttc / a_dac / haz_mask /
+        t_arr / d_lat) and 'pref_logp' [T] when the P_ref head is on)."""
+        T, K = cand.shape[:2]
+        if status.shape[0] != T:
+            raise ValueError(f"status {tuple(status.shape)} vs cand {tuple(cand.shape)}")
+        if objs is not None:
+            raise ValueError("objs given to a CK net without a temporal branch")
+        ego = ego_inputs(status)
+        v0 = ego[0]
+        cand = cand.float()
+        feat, mem = self.trunk.scene(bev, T)
+        pref = self.scene_pref(mem, ego)
+        o = self.score_set(feat, mem, ego, cand, cand_parent, pref=pref)
+        hk = ("a_nc", "a_ttc", "a_dac", "haz_mask", "t_arr", "d_lat")
+        out = {"score_logit": o["score_logit"], "z_lon": o["z_lon"], "w_lat": o["w_lat"],
+               "gate_logit": o["gate_logit"], "ego": ego, "haz": {k: o[k] for k in hk}}
+        if pref is not None:
+            out["pref_logp"] = pref
+        if decode or rescore_corr:
+            out["corr"] = correct(cand, out["z_lon"], out["w_lat"], v0, slope)
+        if rescore_corr:
+            ct = out["corr"]["traj"].detach()
+            out["corr_score_logit"] = self.score_set(feat, mem, ego, ct, cand, pref=pref)["score_logit"]
+        if extra is not None:
+            if extra.shape[0] != T:
+                raise ValueError(f"extra {tuple(extra.shape)} vs cand {tuple(cand.shape)}")
+            oe = self.score_set(feat, mem, ego, extra.float(), extra_parent, pref=pref)
+            out["extra_score_logit"] = oe["score_logit"]
+            out["extra_haz"] = {k: oe[k] for k in hk}
         return out
 
 
@@ -258,7 +403,7 @@ def _torch_load(p: Path) -> Dict:
 
 def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarray]] = None,
              init_from: Optional[Union[str, Path]] = None, lead_aux: bool = False, score_hidden: int = 256,
-             temporal: Optional[TemporalCfg] = None, corridor_version: int = 1) -> CKNet:
+             temporal: Optional[TemporalCfg] = None, corridor_version: int = 1, v4: Optional[V4Cfg] = None) -> CKNet:
     """CKNet, optionally initialised from
       * a v1 stage-T run dir (config.json + ckpt_best.pt (else ckpt_last.pt) with RefinerNet keys): loaded into
         net.trunk; the source arm must equal the target arm, except target 'S', for which every adapter.* key is
@@ -280,7 +425,7 @@ def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarra
         if norm is None and arm in NORM_FILE and src_arm == arm and (src / NORM_FILE[arm]).is_file():
             norm = load_arm_norm(src, arm)
     net = CKNet(arm, seed, norm, score_hidden=score_hidden, lead_aux=lead_aux, temporal=temporal,
-                corridor_version=corridor_version)
+                corridor_version=corridor_version, v4=v4)
     if init_from is None:
         net.init_report = report
         return net
@@ -346,7 +491,8 @@ def load_ck(run_dir: Union[str, Path], which: str = "last", device="cpu",
     net = CKNet(arm, int(cfg.get("seed", 0)), norm,
                 score_hidden=int(cfg.get("score_hidden", 256)), lead_aux=bool(int(cfg.get("lead_aux", 0) or 0)),
                 temporal=tcfg, ca_b=(torch.ones(2, 10) if tcfg.on and tcfg.forecaster != "learned" else None),
-                corridor_version=1 if cfg.get("corridor_version") is None else int(cfg["corridor_version"]))
+                corridor_version=1 if cfg.get("corridor_version") is None else int(cfg["corridor_version"]),
+                v4=V4Cfg.from_dict(cfg.get("v4")))
     # (ca_b placeholder: the checkpoint's persistent buffer overwrites it in the strict load below)
     p = _ckpt_path(run_dir, which)
     net.load_state_dict(_torch_load(p)["model"], strict=True)

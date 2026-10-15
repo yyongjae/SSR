@@ -395,7 +395,8 @@ def test_e2e_step_with_v3_teacher_set_and_cpu_calibration(tmp_path, kdobjs):
     arm = LU.apply_sets(base, lines)
     diff = {k for (k, v), (k2, v2) in zip(LU.flatten(base), LU.flatten(arm)) if k == k2 and v != v2}
     assert diff == {"teacher_det_run", "kd_calib.det"} and len(LU.flatten(base)) == len(LU.flatten(arm))
-    assert arm["teacher_det_run"] == str(V3) and arm["bev_kd"]["enabled"] is False
+    # refiner-v4 branch: the yaml default is the bevkd arm (v3T itself ran on refiner-v3 with BEV KD off)
+    assert arm["teacher_det_run"] == str(V3) and arm["bev_kd"]["enabled"] is True
     assert arm["kd_calib"]["det"].endswith("/ck2/kd_calib/v3T10_a_learned__last.json")
     # calibration of the temporal teacher (CPU dry fit, tiny; the real fit runs on GPU 0, STEP2_E2E.md)
     cal = tmp_path / "kd_calib" / "v3T10_a_learned__last.json"

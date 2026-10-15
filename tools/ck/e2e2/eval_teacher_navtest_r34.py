@@ -204,6 +204,12 @@ def teacher_forward(net, bev, cand, status, var):
     ego = ego_inputs(status)
     v0, a0, eds, cmd = ego
     feat, mem = net.trunk.scene(bev, T)
+    if getattr(net, "v4_readout", None) is not None:      # refiner v4 teacher: variants read their parent's corridor
+        pref = net.scene_pref(mem, ego)
+        o16 = net.score_set(feat, mem, ego, cand.float(), pref=pref)
+        o80 = net.score_set(feat, mem, ego, var.float(), cand.float().repeat_interleave(NVAR, 1), pref=pref)
+        return {"s16": o16["score_logit"], "s80": o80["score_logit"], "w16": o16["w_lat"], "w80": o80["w_lat"],
+                "z16": o16["z_lon"], "z80": o80["z_lon"], "v0": v0}
     o16 = net.trunk.candidates(feat, mem, cand.float(), v0, a0, eds, cmd)
     o80 = net.trunk.candidates(feat, mem, var.float(), v0, a0, eds, cmd)
     return {"s16": net.score(o16, T, cand.shape[1]), "s80": net.score(o80, T, var.shape[1]),

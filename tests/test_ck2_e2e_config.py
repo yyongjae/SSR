@@ -45,10 +45,15 @@ def test_defaults_are_the_user_decisions():
     assert c.warmup["var_dir"].endswith("var_separate_sampler16_accstraight")
     assert c.warmup["raw_labels"].endswith("labels/navtrain_train/raw256")
     assert c.onpolicy_label == {"n_orig": 16, "n_var": 32, "fallback": "warmup"}
-    assert c.bev_kd["enabled"] is False and c.bev_kd["teachers"] == ["det"] and c.bev_kd["ratio"] == 0.1 \
+    # refiner-v4 branch (user 2026-10-15): the default is the ck2e2e_bevkd setting (main = tools/ck/e2e2/main_arm.set)
+    assert c.bev_kd["enabled"] is True and c.bev_kd["teachers"] == ["det", "map"] and c.bev_kd["ratio"] == 0.1 \
         and c.bev_kd["cap"] == 0.25 and c.bev_kd["init"] == "zero" and c.bev_kd["distance"] == "mse"
     assert all(c.bev_kd[k] is None for k in ("ratio_det", "ratio_map", "cap_det", "cap_map"))   # shared by default
     assert c.infer_select is None and c.kd_ramp_epochs == 0.0 and c.bev_grad_scale == 1.0
+    # refiner v4 block: everything off by default (the CK2 / v3 student network)
+    assert c.v4 == {"readout": "mean", "pref_head": False, "time_free": True, "lat_haz": True, "horizon": 4.0,
+                    "lambda_pref": 0.1, "lambda_station": 0.5, "corridor_version": 1, "kd_parent_only": False}
+    assert not c.v4_net().on
     assert O.CKE2E2Config.from_any(c.to_dict()) == c
     assert O.CKE2E2Config.from_any(c) == c
 

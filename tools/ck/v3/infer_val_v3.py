@@ -143,8 +143,9 @@ def save_npy(path: Path, arr) -> None:
 def device_guard(device: str) -> None:
     if device.startswith("cuda"):
         cv = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if cv not in ("0", "1", "4", "5"):        # 4 / 5: user 2026-10-12, short jobs only and only when idle
-            raise SystemExit(f"cuda inference only on GPU 0, 1, 4 or 5 (CUDA_VISIBLE_DEVICES one of them), got {cv!r}")
+        # 0-3 are ours (2 / 3 once the e2e runs there are done); 4 / 5: user 2026-10-12, short jobs, idle only
+        if cv not in ("0", "1", "2", "3", "4", "5"):
+            raise SystemExit(f"cuda inference only on one of GPUs 0-5 (CUDA_VISIBLE_DEVICES one of them), got {cv!r}")
     elif device != "cpu":
         raise SystemExit(f"--device {device!r}: cuda | cpu")
 

@@ -722,14 +722,14 @@ def test_real_reproduce_check_on_ck2T_dump():
 
 def test_infer_guards(monkeypatch):
     from tools.ck.v3 import infer_val_v3 as IV
-    for cv in ("2", "3", "6", "7", "0,1", "4,5", None):
+    for cv in ("6", "7", "0,1", "4,5", "2,3", None):
         if cv is None:
             monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         else:
             monkeypatch.setenv("CUDA_VISIBLE_DEVICES", cv)
         with pytest.raises(SystemExit):
             IV.device_guard("cuda")
-    for cv in ("0", "1", "4", "5"):                       # 4 / 5: user 2026-10-12 (short jobs, idle only)
+    for cv in ("0", "1", "2", "3", "4", "5"):             # 4 / 5: user 2026-10-12 (short jobs, idle only)
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", cv)
         IV.device_guard("cuda")
     IV.device_guard("cpu")

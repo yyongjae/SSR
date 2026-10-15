@@ -206,6 +206,9 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dist-timeout-min", type=float, default=60.0)
     ap.add_argument("--resume", action="store_true", help="continue from ckpt_last.pt if present")
     ap.add_argument("--restart", action="store_true", help="wipe the run dir outputs and start over")
+    ap.add_argument("--corridor-version", type=int, choices=(1, 2), default=1,
+                    help="refiner corridor geometry (refiner/corridor.py 'Version'): 1 = original (default), "
+                         "2 = refiner-fix B1 (arc ends at S_look, straight beyond; straight below 3 m/s)")
     # refiner-v3 temporal branch (SPEC 5.3); every default = off / the TemporalCfg default
     from navsim.agents.para_ssr.ck.temporal import config as TCF
     d = TCF.TemporalCfg()
@@ -565,6 +568,8 @@ def setup_model(a, run: Path, train_ds, D: Dist, norm_override=None):
     init = None if a.init_from in (None, "", "none") else a.init_from
     tcfg = temporal_cfg_of(a)
     kw = {"temporal": tcfg} if tcfg.on else {}                     # OFF: the CK2 call, unchanged
+    if int(getattr(a, "corridor_version", 1)) != 1:                # refiner-fix B1 (default 1: the call unchanged)
+        kw["corridor_version"] = int(a.corridor_version)
     net = build_ck(a.arm, seed=a.seed, norm=(mean, std), init_from=init, lead_aux=False, **kw)
     rep = getattr(net, "init_report", None)
     rep = dict(rep) if isinstance(rep, dict) else {"report": str(rep)}
@@ -1001,9 +1006,10 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                provenance=run_provenance(a, tcfg))
     old = U.read_json(run / "config.json")
     if old is not None and a.resume:
-        old_default = {"sur_groups": "all", "score_keys": list(Cn.CK_KEYS), "ep_target": "official"}
+        old_default = {"sur_groups": "all", "score_keys": list(Cn.CK_KEYS), "ep_target": "official",
+                       "corridor_version": 1}
         for k in ("arm", "seed", "split", "n_var", "var_name", "sampler_seed", "tokens_per_batch", "init_from",
-                  "lambda_score", "lambda_sur", "sur_groups", "score_keys", "ep_target"):
+                  "lambda_score", "lambda_sur", "sur_groups", "score_keys", "ep_target", "corridor_version"):
             ov = old.get(k, old_default.get(k))
             if ov != cfg.get(k):
                 raise SystemExit(f"{run}: resume with {k}={cfg.get(k)!r} but config.json has {ov!r}")

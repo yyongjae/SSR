@@ -210,9 +210,10 @@ def get_parser() -> argparse.ArgumentParser:
                     help="refiner corridor geometry (refiner/corridor.py 'Version'): 1 = original (default), "
                          "2 = refiner-fix B1 (arc ends at S_look, straight beyond; straight below 3 m/s)")
     # refiner v4 (navsim/agents/para_ssr/ck/v4): every default = off (the CK2 / v3 teacher, unchanged)
-    ap.add_argument("--v4-readout", choices=("mean", "hazard"), default="mean",
+    ap.add_argument("--v4-readout", choices=("mean", "hazard", "evidence"), default="mean",
                     help="mean = CK2 readout (default); hazard = v4 station x arrival-time hazard + noisy-OR on the "
-                         "parent corridor (variants read their parent anchor's stations)")
+                         "parent corridor (variants read their parent anchor's stations); evidence = predicted "
+                         "occupancy / drivable margin on the parent grid + the official rules (report 77)")
     ap.add_argument("--v4-pref-head", type=int, choices=(0, 1), default=0,
                     help="1 = supervised P_ref scene query (labels pdm_progress_eff; needs the dataset 'pref' key)")
     ap.add_argument("--v4-time-free", type=int, choices=(0, 1), default=1,
@@ -222,6 +223,8 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lambda-pref", type=float, default=0.1, help="P_ref Huber weight (only with --v4-pref-head 1)")
     ap.add_argument("--lambda-station", type=float, default=0.5,
                     help="censored station BCE weight (hazard readout + first-failure time indices in the batch)")
+    ap.add_argument("--lambda-ev", type=float, default=0.5,
+                    help="evidence readout: weight of the occupancy BCE + margin Huber aux losses (GT-ok tokens)")
     ap.add_argument("--time-idx-root", default="",
                     help="first-failure time-index sidecars (tools/ck/v4/build_time_idx.py) for the station loss; "
                          "'' = none (no station loss)")
@@ -773,14 +776,28 @@ def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
         'var_tidx' [T, V, 3], same masks as the score BCE)."""
     from navsim.agents.para_ssr.ck.v4 import losses as V4L
     if "pref_logp" in out:
+        tgt, ok = None, batch["bev_ok"].bool().reshape(-1) if "bev_ok" in batch else None
         if "pref" in batch:
-            ok = batch["bev_ok"].bool().reshape(-1) if "bev_ok" in batch else None
-            lp = V4L.pref_loss(out["pref_logp"], batch["pref"].float().reshape(-1), ok)
+            tgt = batch["pref"].float().reshape(-1)
+        elif "ref_p_pdm" in batch and "ref_gt_ok" in batch:                # GT loader: pdm_progress_eff
+            tgt = batch["ref_p_pdm"].float().reshape(-1)
+            g = batch["ref_gt_ok"].bool().reshape(-1)
+            ok = g if ok is None else ok & g
+        if tgt is not None:
+            lp = V4L.pref_loss(out["pref_logp"], tgt, ok)
             st["pref_huber"] = float(lp.detach())
             loss = loss + float(getattr(a, "lambda_pref", 0.1)) * lp
         else:
             loss = loss + 0.0 * out["pref_logp"].sum()
-    if "haz" in out and float(getattr(a, "lambda_station", 0.0) or 0.0) > 0 and "anc_tidx" in batch:
+    if "haz" in out and "occ_logit" in out["haz"] and float(getattr(a, "lambda_ev", 0.0) or 0.0) > 0:
+        ref = {k: batch[k] for k in V4L.EV_REF_KEYS if k in batch}
+        if "bev_ok" in batch and "ref_gt_ok" in ref:
+            ref["ref_gt_ok"] = ref["ref_gt_ok"].bool() & batch["bev_ok"].bool().reshape(-1)
+        l_occ, l_m, s_ev = V4L.evidence_aux(out["haz"], ref)
+        st.update(s_ev)
+        loss = loss + float(a.lambda_ev) * (l_occ + l_m)
+    if "haz" in out and "a_nc" in out["haz"] and float(getattr(a, "lambda_station", 0.0) or 0.0) > 0 \
+            and "anc_tidx" in batch:
         sets = [(out["haz"], batch["anc_tidx"], batch["y"], batch["y_ok"])]
         if "extra_haz" in out and "var_tidx" in batch:
             sets.append((out["extra_haz"], batch["var_tidx"], batch["var_y"], batch["var_ok"]))
@@ -1091,7 +1108,8 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                param_count_trainable=int(sum(p.numel() for p in params)),
                temporal=tcfg.to_dict(), privileged=int(tcfg.privileged),
                **({"v4": v4_cfg_of(a).to_dict(), "lambda_pref": float(a.lambda_pref),
-                   "lambda_station": float(a.lambda_station), "time_idx_root": str(a.time_idx_root or "")}
+                   "lambda_station": float(a.lambda_station), "lambda_ev": float(a.lambda_ev),
+                   "time_idx_root": str(a.time_idx_root or "")}
                   if v4_cfg_of(a).on else {}),
                param_count_temporal_shared=int(pc.get("temporal_shared", 0)),
                param_count_forecaster=int(pc.get("forecaster", 0)),

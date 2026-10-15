@@ -52,7 +52,8 @@ def test_defaults_are_the_user_decisions():
     assert c.infer_select is None and c.kd_ramp_epochs == 0.0 and c.bev_grad_scale == 1.0
     # refiner v4 block: everything off by default (the CK2 / v3 student network)
     assert c.v4 == {"readout": "mean", "pref_head": False, "time_free": True, "lat_haz": True, "horizon": 4.0,
-                    "lambda_pref": 0.1, "lambda_station": 0.5, "corridor_version": 1, "kd_parent_only": False}
+                    "lambda_pref": 0.1, "lambda_station": 0.5, "lambda_ev": 0.5, "corridor_version": 1,
+                    "kd_parent_only": False}
     assert not c.v4_net().on
     assert O.CKE2E2Config.from_any(c.to_dict()) == c
     assert O.CKE2E2Config.from_any(c) == c

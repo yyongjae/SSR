@@ -259,3 +259,57 @@ def test_arm_sets_and_tags():
     assert L2.arm_of(v4) == "v4" and v4["bev_kd"]["enabled"] is True
     c = O.CKE2E2Config.from_any(dict(v4, enabled=False))
     assert c.v4_net().hazard and c.v4["corridor_version"] == 2 and c.v4["kd_parent_only"]
+
+
+# ----------------------------------------------------------------------------------------------- evidence readout
+EVI = V4Cfg(readout="evidence", pref_head=True)
+
+
+def test_grid_read_and_points_in_boxes():
+    from navsim.agents.para_ssr.ck.v4.evidence import grid_read
+    from navsim.agents.para_ssr.ck.v4.losses import _points_in_boxes
+    G = torch.arange(48 * 17, dtype=torch.float32).reshape(1, 48, 17, 1)
+    s_st = ((torch.arange(48) + 0.5) * 1.0)[None]
+    # station 10 (s = 10.5), lateral offset index 8 (d = 0) -> the cell value exactly; half way -> the mean
+    v, ok = grid_read(G, s_st, torch.tensor([[10.5, 11.0, 200.0]]), torch.tensor([[0.0, 0.3, 0.0]]))
+    assert bool(ok[0, 0]) and float(v[0, 0, 0]) == 10 * 17 + 8
+    assert abs(float(v[0, 1, 0]) - 0.25 * (G[0, 10, 8, 0] + G[0, 11, 8, 0] + G[0, 10, 9, 0] + G[0, 11, 9, 0])) < 1e-4
+    assert not bool(ok[0, 2]) and float(v[0, 2, 0]) == 0.0
+    p = torch.tensor([[[5.0, 0.0], [5.0, 1.5], [9.0, 0.0]]], dtype=torch.float64)
+    boxes = torch.tensor([[[[5.0, 0.0, 0.0, 4.0, 2.0]], [[5.0, 0.0, math.pi / 2, 4.0, 2.0]]]], dtype=torch.float64)
+    obs = torch.tensor([[[True], [False]]])
+    occ = _points_in_boxes(p, boxes, obs)
+    assert occ.shape == (1, 3, 1) and occ[0, :, 0].tolist() == [True, False, False]
+    occ2 = _points_in_boxes(p, boxes, torch.tensor([[[False], [True]]]))          # rotated box covers (5, 1.5)
+    assert occ2[0, :, 0].tolist() == [True, True, False]
+
+
+def test_evidence_forward_backward_and_aux(data):
+    net = CKNet("S", seed=0, v4=EVI)
+    net.set_score_prior([0.97, 0.97, 0.9, 0.95, 0.99])
+    o = net(data["bev"], data["traj96"], data["status"], decode=False, cand_parent=data["par96"])
+    h = o["haz"]
+    assert o["score_logit"].shape == (T, 96, 5) and torch.isfinite(o["score_logit"]).all()
+    assert h["occ_logit"].shape == (T, 96, 48, 17, 8) and h["margin"].shape == (T, 96, 48, 17)
+    assert h["pts"].shape == (T, 96, 48, 17, 2) and int(h["is_self"].sum()) == T * 16
+    p = torch.sigmoid(o["score_logit"])
+    assert float(p[..., 0].min()) > 0.5                          # sparse occupancy prior -> NC mostly passes
+    # siblings read the same scene field as their parent (identical parent pass)
+    assert torch.equal(h["occ_logit"][:, 1], h["occ_logit"][:, 0]) and torch.equal(h["margin"][:, 5], h["margin"][:, 0])
+    # aux targets from a synthetic GT scene: one parked box 6 m ahead on the parent path, a flat +3 m SDF
+    A = 2
+    kf = torch.zeros(T, A, 11, 6)
+    kf[:, 0, :, 0], kf[:, 0, :, 5] = 6.0, 1.0
+    first = torch.zeros(T, A, 6)
+    first[:, :, 0], first[:, :, 1] = 4.6, 1.9                         # L, W (gt_future FI_L / FI_W = 0 / 1)
+    meta = torch.zeros(T, A, 5, dtype=torch.long)
+    meta[:, :, 3] = 10                                                # MT_LAST: last keyframe (MT_FIRST 0)
+    ref = {"ref_obj_kf": kf, "ref_obj_first": first, "ref_obj_meta": meta, "ref_obj_n": torch.tensor([1, 1]),
+           "ref_obj_n_kf": torch.tensor([11, 11]), "ref_sdf": torch.full((T, 320, 256), 3.0, dtype=torch.float16),
+           "ref_gt_ok": torch.tensor([True, False])}
+    l_occ, l_m, st = V4L.evidence_aux(h, ref, max_parents=2)
+    assert st["ev_n"] == 2.0 and st["ev_occ_rate"] > 0 and torch.isfinite(l_occ) and torch.isfinite(l_m)
+    assert st["ev_sdf_valid"] > 0.9                                # strongly curved test drafts leave the E grid
+    (o["score_logit"].sum() + o["w_lat"].sum() + o["pref_logp"].sum() + l_occ + l_m).backward()
+    nog = [n for n, q in net.named_parameters() if q.requires_grad and q.grad is None]
+    assert not nog, nog

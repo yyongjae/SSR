@@ -19,6 +19,15 @@ readout
               hazard over the reached stations), zero-initialised last layer (identity decode at init).
             score_logit keeps the CK_KEYS layout [.., 5] (nc, dac, ep, ttc, comfort), so every loss / selection / eval
             path is unchanged.
+  'evidence' v4 report 77 Q4-2 (evidence-decomposed critic): the same parent pass; the readout first predicts SCENE
+            quantities on the parent's station grid -- occupancy logits O[j, i, m] (other objects at station j, lateral
+            offset i, time bin m = 0.5 (m + 1) s) and the drivable margin D[j, i] (signed distance to the DAC boundary,
+            m) -- then turns them into per-candidate evidence with the official rules: NC = noisy-OR of O over the ego
+            footprint (9 points) at the candidate's knots, TTC = the same over the footprint projected v * {0.3, 0.6,
+            0.9} s ahead at t + delta, DAC = noisy-OR of sigmoid(-D / eps) over the 4 corners; + a zero-initialised
+            residual MLP per key (what the rules do not explain); EP / comfort / lateral heads as 'hazard' (the
+            lateral weights from the margin along the path).  Outputs O / D for the auxiliary losses (GT objects /
+            the official drivable SDF on the parent grid points) and as the per-candidate 'reason'.
 pref_head   one learned query over the 200 scene tokens + ego (v0, a0, command) -> log1p(P_ref) per token, P_ref =
             labels 'pdm_progress_eff' (token constant).  Used by the hazard EP head (detached); its own loss is
             lambda_pref * Huber (callers).
@@ -29,7 +38,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Optional
 
-READOUTS = ("mean", "hazard")
+READOUTS = ("mean", "hazard", "evidence")
 CONFIG_VERSION = "v4_1"
 
 
@@ -44,6 +53,9 @@ class V4Cfg:
     haz_hidden: int = 128
     ep_hidden: int = 256
     prior_n_eff: float = 24.0          # set_score_prior: per-station hazard prior = 1 - p^(1 / n_eff)
+    ev_tbins: int = 8                  # evidence: occupancy time bins t = 0.5 (m + 1) s, m = 0..ev_tbins-1
+    ev_eps: float = 0.3                # evidence: initial margin temperature [m] of p_out = sigmoid(-D / eps)
+    ev_resid: bool = True              # evidence: zero-initialised residual MLP per key
     version: str = CONFIG_VERSION
 
     @property
@@ -54,11 +66,22 @@ class V4Cfg:
     def hazard(self) -> bool:
         return self.readout == "hazard"
 
+    @property
+    def evidence(self) -> bool:
+        return self.readout == "evidence"
+
+    @property
+    def parent_pass(self) -> bool:
+        """readouts that read the scene on each candidate's parent corridor (CKNet.score_set's v4 path)."""
+        return self.readout in ("hazard", "evidence")
+
     def validate(self, temporal_on: bool = False) -> "V4Cfg":
         if self.readout not in READOUTS:
             raise ValueError(f"v4.readout {self.readout!r} not in {READOUTS}")
-        if self.hazard and temporal_on:
-            raise ValueError("v4.readout 'hazard' is not combined with the refiner-v3 temporal branch")
+        if self.parent_pass and temporal_on:
+            raise ValueError(f"v4.readout {self.readout!r} is not combined with the refiner-v3 temporal branch")
+        if not (1 <= int(self.ev_tbins) <= 8) or not (0.01 <= float(self.ev_eps) <= 5.0):
+            raise ValueError(f"v4: ev_tbins {self.ev_tbins} must be in [1, 8], ev_eps {self.ev_eps} in [0.01, 5]")
         if not (0.5 <= float(self.horizon) <= 8.0):
             raise ValueError(f"v4.horizon {self.horizon} outside [0.5, 8] s")
         if int(self.n_freq) < 0 or int(self.haz_hidden) < 8 or int(self.ep_hidden) < 8:

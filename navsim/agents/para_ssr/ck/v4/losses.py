@@ -96,3 +96,74 @@ def localisation_hit(haz: Dict[str, torch.Tensor], tidx: torch.Tensor, y5: torch
         out[f"loc_hit_{key}"] = float(hit.sum()) / float(fail.sum())
         out[f"loc_chance_{key}"] = float((3.0 / m.sum(-1).clamp(min=1).float())[fail].mean())
     return out
+
+
+# ----------------------------------------------------------------------------------------------- evidence aux
+EV_REF_KEYS = ("ref_obj_kf", "ref_obj_first", "ref_obj_meta", "ref_obj_n", "ref_obj_n_kf", "ref_sdf", "ref_gt_ok")
+
+
+def _points_in_boxes(p: torch.Tensor, boxes: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+    """p [N, Q, 2], boxes [N, A, M, 5] (cx, cy, h, L, W), obs [N, A, M] bool -> occupied [N, Q, M] (any OBS box
+    contains the point; box edges inclusive)."""
+    c = boxes[..., :2][:, :, :, None, :]                                            # [N, A, M, 1, 2]
+    h = boxes[..., 2][..., None]
+    rel = p[:, None, None, :, :] - c                                               # [N, A, M, Q, 2]
+    ch, sh = torch.cos(h), torch.sin(h)
+    x = rel[..., 0] * ch + rel[..., 1] * sh
+    y = -rel[..., 0] * sh + rel[..., 1] * ch
+    inside = (x.abs() <= 0.5 * boxes[..., 3][..., None]) & (y.abs() <= 0.5 * boxes[..., 4][..., None])
+    inside = inside & obs[..., None]
+    return inside.any(1).permute(0, 2, 1)                                          # [N, Q, M]
+
+
+def evidence_aux(haz: Dict[str, torch.Tensor], ref: Dict[str, torch.Tensor], max_parents: int = 4,
+                 margin_clip: float = 5.0) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """Auxiliary targets of the evidence readout on the parent grid points (GT-ok tokens only, the candidates that
+    are their own parents, at most max_parents per token):
+      occupancy: GT future objects (gt_future.query_torch, metric-cache rule; OBS only) cover the grid point at
+                 t_m = 0.5 (m + 1) s (m < M) -> BCE with the occ logits (times after the token's annotated span are
+                 masked);
+      margin:    the official DAC SDF (ref_sdf, sdf.sample_sdf) at the grid point, clipped to +-margin_clip m ->
+                 Huber (delta 1 m) with the predicted margin (points outside the SDF grid masked).
+    haz: score_set 'haz' of the evidence readout ([T, K, ...]); ref: the batch's ref_* GT tensors ([T, ...]).
+    -> (occ_loss, margin_loss, stats); zeros (graph-connected) when nothing is selected."""
+    from ...refiner import gt_future as GF
+    from ...refiner.sdf import sample_sdf
+    O, D, pts = haz["occ_logit"], haz["margin"], haz["pts"]
+    T, K = O.shape[:2]
+    M = O.shape[-1]
+    zero = O.sum() * 0.0 + D.sum() * 0.0
+    if any(k not in ref for k in EV_REF_KEYS):
+        return zero, zero, {"ev_n": 0.0}
+    gt_ok = ref["ref_gt_ok"].reshape(-1).bool().to(O.device)
+    sel = haz["is_self"].bool() & gt_ok[:, None]
+    rank = torch.cumsum(sel.long(), 1)
+    sel = sel & (rank <= int(max_parents))
+    tok, col = torch.nonzero(sel, as_tuple=True)
+    if tok.numel() == 0:
+        return zero, zero, {"ev_n": 0.0}
+    dev = O.device
+    n_obj = int(max(int(ref["ref_obj_n"][tok].max()), 1))
+    kf = ref["ref_obj_kf"][tok][:, :n_obj].to(dev)
+    first = ref["ref_obj_first"][tok][:, :n_obj].to(dev)
+    meta = ref["ref_obj_meta"][tok][:, :n_obj].to(dev).long()
+    valid = torch.arange(n_obj, device=dev)[None] < ref["ref_obj_n"][tok].to(dev).long()[:, None]
+    tm = (torch.arange(M, device=dev, dtype=torch.float64) + 1) * 0.5
+    with torch.no_grad():
+        boxes, st = GF.query_torch(kf, first, meta, tm, valid=valid, n_kf=ref["ref_obj_n_kf"][tok].to(dev))
+        obs = st.bool() & (st.to(torch.int64) == 1)
+        p = pts[tok, col].reshape(len(tok), -1, 2).to(torch.float64)                # [N, 816, 2]
+        occ = _points_in_boxes(p, boxes.to(torch.float64), obs).float()            # [N, 816, M]
+        t_av = ((ref["ref_obj_n_kf"][tok].to(dev).double() - 1) * 0.5).clamp(max=5.0)
+        known = (tm[None] <= t_av[:, None] + 1e-6)[:, None, :].expand_as(occ)
+        sv, sval = sample_sdf(ref["ref_sdf"][tok].to(dev), p.float())
+    ol = O[tok, col].reshape(len(tok), -1, M)
+    l_occ = (F.binary_cross_entropy_with_logits(ol, occ, reduction="none") * known.float()).sum() / \
+        known.float().sum().clamp(min=1.0)
+    dm = D[tok, col].reshape(len(tok), -1)
+    tgt = sv.float().clamp(-margin_clip, margin_clip)
+    l_m = (F.huber_loss(dm, tgt, delta=1.0, reduction="none") * sval.float()).sum() / sval.float().sum().clamp(min=1.0)
+    st_ = {"ev_n": float(len(tok)), "ev_occ_rate": float((occ * known).sum() / known.float().sum().clamp(min=1.0)),
+           "ev_occ_bce": float(l_occ.detach()), "ev_margin_huber": float(l_m.detach()),
+           "ev_sdf_valid": float(sval.float().mean())}
+    return l_occ, l_m, st_

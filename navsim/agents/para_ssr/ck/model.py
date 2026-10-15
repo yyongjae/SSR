@@ -197,16 +197,19 @@ class CKNet(nn.Module):
         self.v4_readout = None
         self.pref_head = None
         if self.v4.on:
+            from .v4.evidence import EvidenceReadout
             from .v4.readout import HazardReadout, PRefHead
-            if self.v4.hazard and self.lead_aux:
-                raise ValueError("v4 hazard readout: lead_aux is not supported")
+            if self.v4.parent_pass and self.lead_aux:
+                raise ValueError(f"v4 {self.v4.readout} readout: lead_aux is not supported")
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(seed + V4_SEED_OFFSET)
                 if self.v4.hazard:
                     self.v4_readout = HazardReadout(self.v4, self.trunk.d_model)
+                elif self.v4.evidence:
+                    self.v4_readout = EvidenceReadout(self.v4, self.trunk.d_model)
                 if self.v4.pref_head:
                     self.pref_head = PRefHead(self.trunk.d_model)
-            if self.v4.hazard:
+            if self.v4.parent_pass:
                 # the CK2 heads the hazard readout replaces: kept in the state dict (loaders stay uniform) but frozen,
                 # so DDP / optimisers never expect a gradient for them
                 for mod in (self.score_head, self.trunk.lat_head, self.trunk.lon_head, self.trunk.gate_head):
@@ -249,8 +252,10 @@ class CKNet(nn.Module):
     def score_set(self, feat: torch.Tensor, mem: torch.Tensor, ego, cand: torch.Tensor,
                   parents: Optional[torch.Tensor] = None, tfeat=None, pref: Optional[torch.Tensor] = None) -> Dict:
         """Score one candidate set with the token's scene (feat, mem from trunk.scene):
-        cand [T, K, 8, 3] -> score_logit [T, K, 5] f32, w_lat / z_lon [T, K, 6] f32, gate_logit [T, K]
-        (+ hazard readout: a_nc / a_ttc / a_dac / haz_mask / t_arr [T, K, 48], d_lat [T, K, 48]).
+        cand [T, K, 8, 3] -> score_logit [T, K, 5] f32, w_lat / z_lon [T, K, 6] f32, gate_logit [T, K], and for the v4
+        parent-pass readouts 'haz' = {t_arr, d_lat, haz_mask [T, K, 48], is_self [T, K]; hazard: a_nc / a_ttc / a_dac
+        [T, K, 48]; evidence: occ_logit [T, K, 48, 17, M], margin [T, K, 48, 17], pts [T, K, 48, 17, 2] (parent grid
+        points, N frame), lp_nc / lp_ttc / lp_dac / min_margin [T, K]}.
         readout 'mean': exactly trunk.candidates + score (the CK2 / v3 ops; parents ignored).
         readout 'hazard': parents [T, K, 8, 3] = each candidate's parent draft (None: every candidate is its own
         parent); the scene is read on the parent's corridor, the candidate reads it at its own schedule."""
@@ -280,13 +285,19 @@ class CKNet(nn.Module):
         x = P["x"]
         g = self.trunk.draft_mlp(ud.to(x.dtype))
         pr = None if pref is None else rep(pref.reshape(T, 1).float())[:, 0]
-        r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, sib["t"], sib["v"], sib["d"], cgeom.S[:, -1], pr)
         sh = lambda a: a.reshape(T, K, *a.shape[1:])
+        if self.v4.hazard:
+            r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, sib["t"], sib["v"], sib["d"], cgeom.S[:, -1], pr)
+            haz = {k: sh(r[k]) for k in ("a_nc", "a_ttc", "a_dac")}
+        else:
+            r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, P["geom"].s, sib["s_knots"], sib["d_knots"], sib["d"],
+                                sib["t"], cgeom.S[:, -1], pr)
+            haz = {k: sh(r[k]) for k in ("occ_logit", "margin", "lp_nc", "lp_ttc", "lp_dac", "min_margin")}
+            haz["pts"] = sh(P["geom"].points.detach().float())
+        haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), d_lat=sh(sib["d"]), is_self=sh(is_self))
         return {"score_logit": sh(r["score_logit"]), "w_lat": sh(r["w_lat"]),
                 "z_lon": torch.zeros(T, K, N_FREE, dtype=torch.float32, device=cand.device),
-                "gate_logit": torch.zeros(T, K, dtype=torch.float32, device=cand.device),
-                "a_nc": sh(r["a_nc"]), "a_ttc": sh(r["a_ttc"]), "a_dac": sh(r["a_dac"]), "haz_mask": sh(r["mask"]),
-                "t_arr": sh(sib["t"]), "d_lat": sh(sib["d"])}
+                "gate_logit": torch.zeros(T, K, dtype=torch.float32, device=cand.device), "haz": haz}
 
     # ------------------------------------------------------------------------------------------ forward
     def forward(self, bev: Optional[torch.Tensor], cand: torch.Tensor, status: torch.Tensor,
@@ -351,9 +362,8 @@ class CKNet(nn.Module):
         feat, mem = self.trunk.scene(bev, T)
         pref = self.scene_pref(mem, ego)
         o = self.score_set(feat, mem, ego, cand, cand_parent, pref=pref)
-        hk = ("a_nc", "a_ttc", "a_dac", "haz_mask", "t_arr", "d_lat")
         out = {"score_logit": o["score_logit"], "z_lon": o["z_lon"], "w_lat": o["w_lat"],
-               "gate_logit": o["gate_logit"], "ego": ego, "haz": {k: o[k] for k in hk}}
+               "gate_logit": o["gate_logit"], "ego": ego, "haz": o["haz"]}
         if pref is not None:
             out["pref_logp"] = pref
         if decode or rescore_corr:
@@ -366,7 +376,7 @@ class CKNet(nn.Module):
                 raise ValueError(f"extra {tuple(extra.shape)} vs cand {tuple(cand.shape)}")
             oe = self.score_set(feat, mem, ego, extra.float(), extra_parent, pref=pref)
             out["extra_score_logit"] = oe["score_logit"]
-            out["extra_haz"] = {k: oe[k] for k in hk}
+            out["extra_haz"] = oe["haz"]
         return out
 
 

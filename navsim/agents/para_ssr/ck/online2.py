@@ -144,7 +144,8 @@ def _d_v4() -> Dict[str, Any]:
     # refiner v4 (ck/v4): network readout (V4Cfg keys) + student loss weights + corridor version + KD routing.
     # Defaults = off (the CK2 / refiner-v3 student, bit for bit); tools/ck/e2e2/v4_arm.set turns the v4 design on.
     return {"readout": "mean", "pref_head": False, "time_free": True, "lat_haz": True, "horizon": 4.0,
-            "lambda_pref": 0.1, "lambda_station": 0.5, "corridor_version": 1, "kd_parent_only": False}
+            "lambda_pref": 0.1, "lambda_station": 0.5, "lambda_ev": 0.5, "corridor_version": 1,
+            "kd_parent_only": False}
 
 
 V4_NET_KEYS = ("readout", "pref_head", "time_free", "lat_haz", "horizon")
@@ -320,7 +321,8 @@ class CKE2E2Config:
         q = dict(self.v4)
         self.v4 = {"readout": str(q["readout"]), "pref_head": _b(q["pref_head"]), "time_free": _b(q["time_free"]),
                    "lat_haz": _b(q["lat_haz"]), "horizon": float(q["horizon"]), "lambda_pref": float(q["lambda_pref"]),
-                   "lambda_station": float(q["lambda_station"]), "corridor_version": int(q["corridor_version"]),
+                   "lambda_station": float(q["lambda_station"]), "lambda_ev": float(q["lambda_ev"]),
+                   "corridor_version": int(q["corridor_version"]),
                    "kd_parent_only": _b(q["kd_parent_only"])}
         if self.infer_select is not None:
             s = dict(self.infer_select)
@@ -436,7 +438,7 @@ class CKE2E2Config:
         from ..refiner.corridor import CORRIDOR_VERSIONS
         if q["corridor_version"] not in CORRIDOR_VERSIONS:
             raise ValueError(f"ck_e2e2.v4.corridor_version must be in {CORRIDOR_VERSIONS}, got {q['corridor_version']}")
-        if q["lambda_pref"] < 0 or q["lambda_station"] < 0:
+        if q["lambda_pref"] < 0 or q["lambda_station"] < 0 or q["lambda_ev"] < 0:
             raise ValueError(f"ck_e2e2.v4 lambda_pref / lambda_station must be >= 0, got {q}")
         kc = self.kd_calib
         if kc["enabled"]:
@@ -568,10 +570,9 @@ def _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra
     out = {"score_logit": sc[:, :K], "extra_score_logit": None if extra is None else sc[:, K:],
            "w_lat": w[:, :K], "w_lat_extra": None if extra is None else w[:, K:], "score_all": sc, "w_lat_all": w,
            "ego": ego, "pref_logp": pref}
-    if "a_nc" in o:
-        hk = ("a_nc", "a_ttc", "a_dac", "haz_mask", "t_arr", "d_lat")
-        out["haz"] = {k: o[k][:, :K] for k in hk}
-        out["extra_haz"] = None if extra is None else {k: o[k][:, K:] for k in hk}
+    if "haz" in o:
+        out["haz"] = {k: v[:, :K] for k, v in o["haz"].items()}
+        out["extra_haz"] = None if extra is None else {k: v[:, K:] for k, v in o["haz"].items()}
     return out
 
 
@@ -1145,18 +1146,38 @@ class CKE2E2:
                 "top": top, "V": V}
 
     # -------------------------------------------------------------------------------------- refiner v4 terms
-    def _v4_terms(self, inner: torch.Tensor, out: Dict, S: Dict, logs: Dict[str, float]) -> torch.Tensor:
-        """+ lambda_pref * Huber(log1p P_ref) (out pref_logp, S 'pref' [B] m) and + lambda_station * censored station
-        BCE on the label set (out extra_haz (on-policy) / haz (warm-up), S 'tidx_lab' [B, KL, 3]); absent inputs ->
-        unchanged.  Logs v4/*."""
+    def _v4_terms(self, inner: torch.Tensor, out: Dict, S: Dict, logs: Dict[str, float], targets=None
+                  ) -> torch.Tensor:
+        """+ lambda_pref * Huber(log1p P_ref) (out pref_logp; target S 'pref' [B] m, else the GT loader's ref_p_pdm on
+        ref_gt_ok tokens), + lambda_ev * (occupancy BCE + margin Huber) of the evidence readout on the KD set's own-
+        parent candidates (GT-ok tokens), + lambda_station * censored station BCE of the hazard readout on the label set
+        (out extra_haz (on-policy) / haz (warm-up), S 'tidx_lab' [B, KL, 3]); absent inputs -> unchanged.
+        Logs v4/*."""
         from .v4 import losses as V4L
         q = self.cfg.v4
-        if out.get("pref_logp") is not None and S.get("pref") is not None and q["lambda_pref"] > 0:
-            lp = V4L.pref_loss(out["pref_logp"], S["pref"].float().reshape(-1), S.get("kd_tok_ok"))
-            logs["v4/pref_huber"] = _f(lp)
-            inner = inner + q["lambda_pref"] * lp
+        targets = targets or {}
+        if out.get("pref_logp") is not None and q["lambda_pref"] > 0:
+            tgt, ok = None, S.get("kd_tok_ok")
+            if S.get("pref") is not None:
+                tgt = S["pref"].float().reshape(-1)
+            elif "ref_p_pdm" in targets and "ref_gt_ok" in targets:
+                dev = out["pref_logp"].device
+                tgt = targets["ref_p_pdm"].float().reshape(-1).to(dev)
+                g = targets["ref_gt_ok"].bool().reshape(-1).to(dev)
+                ok = g if ok is None else ok.bool() & g
+            if tgt is not None:
+                lp = V4L.pref_loss(out["pref_logp"], tgt, ok)
+                logs["v4/pref_huber"] = _f(lp)
+                inner = inner + q["lambda_pref"] * lp
+        hk = out.get("haz")
+        if hk is not None and "occ_logit" in hk and q["lambda_ev"] > 0:
+            dev = hk["occ_logit"].device
+            ref = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in targets.items() if k in V4L.EV_REF_KEYS}
+            l_occ, l_m, s_ev = V4L.evidence_aux(hk, ref)
+            logs.update({f"v4/{k}": float(v) for k, v in s_ev.items()})
+            inner = inner + q["lambda_ev"] * (l_occ + l_m)
         haz = out.get("extra_haz") if S.get("extra") is not None else out.get("haz")
-        if haz is not None and S.get("tidx_lab") is not None and q["lambda_station"] > 0:
+        if haz is not None and "a_nc" in haz and S.get("tidx_lab") is not None and q["lambda_station"] > 0:
             l_st, st = V4L.station_bce(haz, S["tidx_lab"].long(), S["y"].float(), S["ok_lab"].bool())
             logs.update({f"v4/{k}": float(v) for k, v in st.items()})
             inner = inner + q["lambda_station"] * l_st
@@ -1305,7 +1326,7 @@ class CKE2E2:
             self.ema.update(ema_sur, ema_kd)
             w = float(self.ema.weight(self.mb))
         inner = inner + (r * w) * l_lat
-        inner = self._v4_terms(inner, out, S, logs)
+        inner = self._v4_terms(inner, out, S, logs, targets)
         loss = c.loss_weight * inner
         loss = loss + 0.0 * (out["score_all"].sum() + out["w_lat_all"].sum())
         if out.get("pref_logp") is not None:

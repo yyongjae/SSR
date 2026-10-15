@@ -47,8 +47,9 @@ def _spy_kd(monkeypatch):
     return seen
 
 
-def test_v4_warmup_step(tmp_path, monkeypatch):
-    c = TL.cfg2(tmp_path, v4=V4)
+@pytest.mark.parametrize("readout", ["hazard", "evidence"])
+def test_v4_warmup_step(tmp_path, monkeypatch, readout):
+    c = TL.cfg2(tmp_path, v4=dict(V4, readout=readout))
     ck = O.CKE2E2(c)
     st = TLOSS._student(c)
     assert st.v4_readout is not None and st.corridor_version == 2
@@ -59,6 +60,10 @@ def test_v4_warmup_step(tmp_path, monkeypatch):
     pred = TL.fake_predictions(2, seed=0)
     loss, logs = ck.loss(st, f, t, pred)
     assert torch.isfinite(loss) and float(logs["ck2/n_cand"]) == 64.0
+    if readout == "evidence" and bool(t.get("ref_gt_ok", torch.zeros(1)).any()):
+        assert float(logs["v4/ev_n"]) > 0 and "v4/ev_occ_bce" in logs
+    if bool(t.get("ref_gt_ok", torch.zeros(1)).any()):
+        assert "v4/pref_huber" in logs                                 # P_ref target from the GT loader
     S = ck._spy["warmup_batch"]
     # raw anchors are their own parents; every variant's parent is an anchor of the table
     assert torch.equal(S["cand_parent"][:, :32], S["cand"][:, :32])
@@ -73,8 +78,9 @@ def test_v4_warmup_step(tmp_path, monkeypatch):
     _check_grads_v4(st, pred["bev_embed"])
 
 
-def test_v4_onpolicy_step(tmp_path, monkeypatch):
-    c, ck, gtraj, glab = TLOSS._onpolicy(tmp_path, lat_kd={"start_mb": 0}, v4=V4)
+@pytest.mark.parametrize("readout", ["hazard", "evidence"])
+def test_v4_onpolicy_step(tmp_path, monkeypatch, readout):
+    c, ck, gtraj, glab = TLOSS._onpolicy(tmp_path, lat_kd={"start_mb": 0}, v4=dict(V4, readout=readout))
     st = TLOSS._student(c)
     ck.epoch, ck.epoch_frac, ck.gstep = 5, 5.5, 3
     TLOSS._spy(ck, "current_batch")

@@ -1,7 +1,8 @@
 """CK2 teacher dataset: one item = one navtrain token with K = 32 sampled raw anchors + a subset of rule variants.
 
 CK2Dataset(split, bev in {'T', 'M', 'none'}, n_var=32, var_name='var_separate_sampler16', gt=False, epoch=0, seed=0,
-           sampler_seed=0, rows=None, limit=0, root=None, ck2_root=None, ep_target='official')
+           sampler_seed=0, rows=None, limit=0, root=None, ck2_root=None, ep_target='official', time_idx_root=None,
+           with_pref=False, time_idx_partial_ok=False)
 
   root       CK data root (default CK_DATA, env CK_DATA_ROOT honoured): packed/<split>/{tokens.parquet, gt_traj.npy,
              status.npy, ok.npy} and labels/<split>/raw256/{labels.npy [N, 256, 9], ok.npy [N, 256]} (official
@@ -22,6 +23,15 @@ CK2Dataset(split, bev in {'T', 'M', 'none'}, n_var=32, var_name='var_separate_sa
              seed, cfg) on stream token_rng(token, epoch, seed, 'objaug') (training only); forecaster 'oracle_gt' ->
              priv_fc_xyh / priv_fc_state (copies of the targets: PRIVILEGED inputs of the oracle arm).  Only
              OBJ_INPUT_KEYS (+ PRIV_INPUT_KEYS for the oracle) may reach the model (MODEL_INPUT_KEYS_TEMPORAL).
+  time_idx_root  refiner v4 (default None = no key, no file opened, items bit-identical): root of the time-index
+             sidecars (tools/ck/v4/build_time_idx.py; layout <time_idx_root>/<split>/{raw256, <var_name>}/time_idx.npy
+             int8 [N, 256 | 96, 3] + meta.json, navsim/agents/para_ssr/ck/time_idx.py conventions: cols nc, ttc, dac,
+             n = 0..40 at 0.1 s on the LQR grid, -1 none, -2 unknown).  Each sidecar is checked against the labels.npy
+             it is read with (shape + probe sha16, time_idx.load_time_idx); a partial (test) sidecar is refused unless
+             time_idx_partial_ok.  Items gain anc_tidx int8 [K, 3] / var_tidx int8 [n_var, 3] (-2 where y_ok / var_ok
+             is False).  Training-time metadata (label-derived): never a model input.
+  with_pref  refiner v4 (default False): items gain pref f32 [] = P_ref = first finite pdm_progress_eff (LABEL_COLS[8],
+             PDM-Closed progress x multiplier, token-level) of the raw256 labels row, NaN if none (label-derived).
   ep_target  'official' (default: y / var_y EP = the official label column, old behaviour bit-identical) | 'decoupled'
              (EP = clip(raw_progress / max(pdm_progress_eff, raw_progress), 0, 1) if max > 5 m else 1, i.e. official EP
              without the NC * DAC * DDC factor; user 2026-10-08): navsim.agents.para_ssr.ck.ep_target.ck_targets turns
@@ -49,7 +59,8 @@ Item keys
     anc_idx int64 [K] anchor ids, anc_group int8 [K] (0 near / 1 mid / 2 strat), anc_pi f64 [K] inclusion
     probability, anc_w f32 [K] = 1 / pi (Sum = 256), var_anchor int64 [V] parent anchor id, var_v int8 [V] variant
     index 1..5, var_col int64 [V] column in the variant files, var_pi f32 [V] = n_var / n_valid (inclusion
-    probability of a valid variant), gt_traj f32 [8, 3] (surrogate human-overlap mask only), ref_* (gt=True).
+    probability of a valid variant), gt_traj f32 [8, 3] (surrogate human-overlap mask only), ref_* (gt=True);
+    anc_tidx int8 [K, 3] / var_tidx int8 [V, 3] (time_idx_root), pref f32 [] (with_pref).
 collate: tools.ck.data.ck_dataset.collate_ck (stacks every key; 'tokens' list, 'rows' int64).
 Arrays are memory-mapped lazily per process (fork or spawn workers).
 """
@@ -69,6 +80,7 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 
 from navsim.agents.para_ssr.ck import anchor_sampler as AS  # noqa: E402
+from navsim.agents.para_ssr.ck import time_idx as TI  # noqa: E402
 from navsim.agents.para_ssr.ck.ep_target import check_ep_target, ck_targets  # noqa: E402
 
 BEV_SHAPE = (256, 50, 100)
@@ -77,6 +89,8 @@ PDMS_IDX = CM.LABEL_COLS.index("pdms")
 VAR_NAME = "var_separate_sampler16"
 RAW_LABELS = "raw256"
 MODEL_INPUT_KEYS = ("bev", "cand", "status", "var_traj")
+TIDX_KEYS = ("anc_tidx", "var_tidx")                                 # refiner v4 optional item keys (time_idx_root)
+PREF_KEY = "pref"                                                    # refiner v4 optional item key (with_pref)
 VAR_STREAM = "var"
 OBJ_INPUT_KEYS = ("obj_in", "obj_mask", "frame_valid")                # == ck.temporal.config.OBJ_INPUT_KEYS
 MODEL_INPUT_KEYS_TEMPORAL = MODEL_INPUT_KEYS + OBJ_INPUT_KEYS
@@ -151,7 +165,8 @@ class CK2Dataset(torch.utils.data.Dataset):
     def __init__(self, split: str, bev: str = "T", n_var: int = 32, var_name: str = VAR_NAME, gt: bool = False,
                  epoch: int = 0, seed: int = 0, sampler_seed: int = 0, rows: Optional[np.ndarray] = None,
                  limit: int = 0, root=None, ck2_root=None, anchors: Optional[np.ndarray] = None,
-                 ep_target: str = "official", objects: Optional[Dict] = None):
+                 ep_target: str = "official", objects: Optional[Dict] = None, time_idx_root=None,
+                 with_pref: bool = False, time_idx_partial_ok: bool = False):
         assert bev in ("T", "M", "none"), bev
         self.split, self.bev, self.n_var = split, bev, int(n_var)
         self.ep_target = check_ep_target(ep_target)
@@ -206,6 +221,24 @@ class CK2Dataset(torch.utils.data.Dataset):
             raise ValueError(f"{int((~keep[r]).sum())} requested rows lack GT / raw256 labels / variants")
         self.rows = r[: int(limit)] if limit else r
         self.objects = None if objects is None else ObjectRows(split, objects, self.tokens, self.rows)
+        # refiner v4 optional label-derived extras (off: nothing opened, no key)
+        self.with_pref = bool(with_pref)
+        self.time_idx_root = None if time_idx_root is None else Path(time_idx_root)
+        self.tidx_meta: Optional[Dict] = None
+        if self.time_idx_root is not None:
+            self.tidx_meta = {}
+            todo = [("raw_tidx", RAW_LABELS, "raw_labels")]
+            if self.n_var > 0:
+                todo.append(("var_tidx", var_name, "var_labels"))
+            for key, name, lab_key in todo:
+                d = TI.default_dir(split, name, self.time_idx_root)
+                a, m = TI.load_time_idx(d, labels=self._paths[lab_key])
+                if m.get("partial") and not time_idx_partial_ok:
+                    raise TI.TimeIdxError(f"{d}: partial (test) sidecar (rows_built {m.get('rows_built')}); pass "
+                                          f"time_idx_partial_ok=True to use it")
+                self._paths[key] = d / TI.FILE
+                self.tidx_meta[key] = {"dir": str(d), "labels_sha16": m.get("labels_sha16"),
+                                       "partial": bool(m.get("partial")), "built_kst": m.get("built_kst")}
 
     # ------------------------------------------------------------------------------------------- lazy per process
     def _arr(self, name: str) -> np.ndarray:
@@ -229,7 +262,9 @@ class CK2Dataset(torch.utils.data.Dataset):
                 "ep_target": self.ep_target,
                 "K": self.K, "n_var": self.n_var, "seed": self.seed, "sampler": self.sampler.config(),
                 "raw_labels": str(self._paths["raw_labels"]), "var_dir": str(self.var_dir) if self.var_dir else None,
-                "var_meta": self.var_meta, **({"objects": self.objects.describe()} if self.objects else {})}
+                "var_meta": self.var_meta, **({"objects": self.objects.describe()} if self.objects else {}),
+                **({"time_idx": self.tidx_meta} if self.tidx_meta is not None else {}),
+                **({"with_pref": True} if self.with_pref else {})}
 
     def _bev_cache(self):
         if self._cache is None:
@@ -298,6 +333,10 @@ class CK2Dataset(torch.utils.data.Dataset):
                   y_ok=np.asarray(A("raw_ok")[r, idx], bool) & np.isfinite(y).all(1),
                   anc_idx=idx.astype(np.int64), anc_group=s["group"].astype(np.int8),
                   anc_pi=s["pi"].astype(np.float64), anc_w=s["w"].astype(np.float32))
+        if self.time_idx_root is not None:
+            it["anc_tidx"] = TI.sanitize(np.asarray(A("raw_tidx")[r])[idx], it["y_ok"])
+        if self.with_pref:
+            it[PREF_KEY] = np.float32(TI.pref_of(lab))
         if self.n_var > 0:
             cols, okp, nv = self.variant_cols(r, epoch)
             srt = np.argsort(cols, kind="stable")             # sorted mmap read, then back to the random order
@@ -314,6 +353,9 @@ class CK2Dataset(torch.utils.data.Dataset):
                       var_anchor=self._var_anchor[r, k].astype(np.int64), var_v=v.astype(np.int8),
                       var_col=cols.astype(np.int64),
                       var_pi=np.full(self.n_var, min(1.0, self.n_var / nv) if nv else 0.0, np.float32))
+            if self.time_idx_root is not None:
+                vti = np.asarray(A("var_tidx")[r, cols[srt]])[inv]
+                it["var_tidx"] = TI.sanitize(vti, it["var_ok"])
         return it
 
     def __getitem__(self, i: int) -> Dict:

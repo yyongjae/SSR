@@ -20,6 +20,19 @@ Contents
                                 variants of the newest generation <= max_epoch (one-epoch lag, option B); rows without
                                 one -> has False (the caller fills them with the warm-up fallback set, cands2.fill_fallback)
   ck2_warmup_prior              expected label mean of the student's warm-up mix (= ck2_dataset.ck2_label_prior, n_var 32)
+  refiner v4 optional extras    (off by default: no key, no file opened, batches / generations bit-identical)
+                                first-failure time indices (ck/time_idx.py: int8 [.., 3] cols nc, ttc, dac; n = 0..40 at
+                                0.1 s, -1 none, -2 unknown) and P_ref (pdm_progress_eff, LABEL_COLS[8], float32, NaN =
+                                unavailable):
+                                  warm-up   warmup.raw_tidx / warmup.var_tidx = sidecar dirs (tools/ck/v4/build_time_idx.py)
+                                            of raw_labels / var_dir -> targets ck2_raw_tidx [256, 3] / ck2_var_tidx
+                                            [96, 3] (both keys when either is set; -2 where the ok flag is False);
+                                            warmup.pref True -> ck2_pref [] (first finite pdm_progress_eff of the raw256
+                                            row, else of the variant row)
+                                  on-policy generation file time_idx.npy int8 [N, 96, 3] (GEN2_OPT_FILES, listed in
+                                            meta.json optional_files; labeler2 writes it unless --no-time-idx; a
+                                            generation without it reads as -2); LabelStore2(with_tidx, with_pref) ->
+                                            lookup G_tidx int8 [B, 48, 3] / G_pref f32 [B]
   KDObjRows / teacher_temporal  refiner-v3 temporal DET teacher (docs/refiner_v3/STEP2_E2E.md): the teacher's CLEAN causal
                                 object rows per packed row (object pack, ObjPack.item; no augmentation, no fc_* targets)
                                 -> target keys kd_obj_in_0 / kd_obj_mask_0 / kd_frame_valid_0 / kd_obj_ok_0.  Only built
@@ -56,6 +69,7 @@ import torch
 
 from . import e2e_data as ED
 from .anchor_sampler import GROUP_MID, GROUP_NEAR, GROUP_STRAT, AnchorSampler, load_anchors, token_rng
+from . import time_idx as TI
 from .constants import CK_LABEL_IDX, LABEL_COLS
 from .ep_target import EP_TARGETS, check_ep_target, ck_targets  # noqa: F401
 
@@ -93,6 +107,12 @@ EP_TARGET_DEFAULT = "official"                           # ck_e2e2.ep_target def
 REF_DATA_ROOT = ED.REF_DATA_ROOT
 WU_TARGET_KEYS = ("ck2_wu_ok", "ck2_gt", "ck2_raw_y", "ck2_raw_ok", "ck2_var_traj", "ck2_var_y", "ck2_var_ok",
                   "ck2_var_valid", "ck2_var_anchor")
+# refiner v4 optional warm-up target keys (emitted only when configured: warmup raw_tidx / var_tidx / pref)
+WU_TIDX_KEYS = ("ck2_raw_tidx", "ck2_var_tidx")      # int8 [256, 3] / [96, 3] (time_idx.TIDX_COLS), -2 = unknown
+WU_PREF_KEY = "ck2_pref"                             # f32 [] P_ref = pdm_progress_eff, NaN = unavailable
+WU_OPT_PATH_KEYS = ("raw_tidx", "var_tidx")          # warmup sub-config: sidecar dirs (None = off)
+N_TIDX = TI.N_TIDX
+TIDX_UNKNOWN = TI.UNKNOWN
 
 
 def _np(x) -> np.ndarray:
@@ -140,6 +160,14 @@ def warmup_cfg(x=None) -> Dict[str, Any]:
     d["sampler_seed"], d["n_var"] = int(d["sampler_seed"]), int(d["n_var"])
     for k in ("packed", "raw_labels", "var_dir"):
         d[k] = str(d[k])
+    # refiner v4 optional keys: normalised only when given (absent -> the dict is the old one exactly)
+    for k in WU_OPT_PATH_KEYS:
+        if k in d:
+            v = d[k]
+            d[k] = None if v is None or str(v).strip().lower() in ("", "none", "null", "false") else str(v)
+    if "pref" in d:
+        v = d["pref"]
+        d["pref"] = v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
     return d
 
 
@@ -232,7 +260,10 @@ class WUSourceError(ValueError):
 class _WUArrays:
     """Lazy per-process memmaps of the warm-up sources (packed ok / gt, raw256 labels / ok, variant traj / labels /
     ok) + the index.npz members (valid, anchor_idx, built; npz members are loaded, ~11 MB).  ep_target: the EP of the
-    CK targets wu_row derives from the 9 label columns (EP_TARGET_DEFAULT when not given)."""
+    CK targets wu_row derives from the 9 label columns (EP_TARGET_DEFAULT when not given).
+    refiner v4 (optional, wcfg keys absent / None = off, nothing opened): raw_tidx / var_tidx = time-index sidecar
+    dirs of raw_labels / var_dir (time_idx.npy int8 [N, 256 | 96, 3]; aligned with those labels.npy, checked in
+    check()) -> self.tidx True; pref True -> self.pref True (P_ref from the label rows already read)."""
 
     def __init__(self, wcfg: Dict[str, Any], ep_target: str = EP_TARGET_DEFAULT):
         self.cfg = dict(wcfg)
@@ -241,6 +272,11 @@ class _WUArrays:
         self.paths = {"p_ok": pk / "ok.npy", "gt": pk / "gt_traj.npy", "raw_y": rl / "labels.npy",
                       "raw_ok": rl / "ok.npy", "v_traj": vd / "traj.npy", "v_y": vd / "labels.npy",
                       "v_ok": vd / "ok.npy", "index": vd / "index.npz"}
+        self.tidx_dirs = {k: str(wcfg[k]) for k in WU_OPT_PATH_KEYS if wcfg.get(k)}
+        for k, d in self.tidx_dirs.items():
+            self.paths[k] = Path(d) / TI.FILE
+        self.tidx = bool(self.tidx_dirs)
+        self.pref = bool(wcfg.get("pref", False))
         self._pid, self._mm = None, {}
 
     def __getstate__(self):
@@ -250,6 +286,8 @@ class _WUArrays:
 
     SHAPES = {"p_ok": (), "gt": (8, 3), "raw_y": (256, N_LAB), "raw_ok": (256,), "v_traj": (G_K, 8, 3),
               "v_y": (G_K, N_LAB), "v_ok": (G_K,), "valid": (K16, NV), "anchor_idx": (K16,), "built": ()}
+    OPT_SHAPES = {"raw_tidx": (256, N_TIDX), "var_tidx": (G_K, N_TIDX)}       # refiner v4 sidecars (configured only)
+    OPT_LABELS = {"raw_tidx": "raw_y", "var_tidx": "v_y"}                      # the labels.npy each one is aligned to
 
     def arr(self, name: str) -> np.ndarray:
         if self._pid != os.getpid():
@@ -263,7 +301,7 @@ class _WUArrays:
                 a = self._mm[name]
             else:
                 a = self._mm[name] = np.load(self.paths[name], mmap_mode="r")
-            want = self.SHAPES[name]
+            want = self.SHAPES[name] if name in self.SHAPES else self.OPT_SHAPES[name]
             if a.shape[1:] != want:
                 raise WUSourceError(f"warm-up source {name} ({self.paths.get(name, self.paths['index'])}): shape "
                                  f"{a.shape}, expected [N, {', '.join(map(str, want))}]")
@@ -283,9 +321,30 @@ class _WUArrays:
         if list(b.get("names", [])) != list(VNAMES) or int(b.get("n_anchors", -1)) != K16:
             raise WUSourceError(f"{self.cfg['var_dir']}/build.json: names {b.get('names')} / n_anchors "
                              f"{b.get('n_anchors')} != {list(VNAMES)} / {K16}")
-        return {"n_rows": n, "var_build": {k: b.get(k) for k in ("speeds", "lats", "combine", "s_on_frac", "names",
-                                                                   "cfg_sha16", "traj_sha16", "merged")},
-                "provenance": self.provenance(b)}
+        out = {"n_rows": n, "var_build": {k: b.get(k) for k in ("speeds", "lats", "combine", "s_on_frac", "names",
+                                                                  "cfg_sha16", "traj_sha16", "merged")},
+               "provenance": self.provenance(b)}
+        if self.tidx:
+            out["time_idx"] = self.check_tidx(n)
+        return out
+
+    def check_tidx(self, n_rows: Optional[int] = None) -> Dict[str, Any]:
+        """refiner v4 sidecars: time_idx.load_time_idx(dir, labels = the warm-up labels.npy it must be aligned with:
+        shape + probe sha16) and N rows; WUSourceError on a mismatch.  -> per sidecar {dir, labels_sha16, partial,
+        built_kst}."""
+        n = self.n_rows() if n_rows is None else int(n_rows)
+        out = {}
+        for k, d in self.tidx_dirs.items():
+            try:
+                a, meta = TI.load_time_idx(d, labels=self.paths[self.OPT_LABELS[k]])
+            except (TI.TimeIdxError, FileNotFoundError) as e:
+                raise WUSourceError(f"warm-up time-index sidecar {k} ({d}): {e}") from None
+            if a.shape != (n,) + self.OPT_SHAPES[k]:
+                raise WUSourceError(f"warm-up time-index sidecar {k} ({d}): {a.shape} != ({n}, "
+                                    f"{', '.join(map(str, self.OPT_SHAPES[k]))})")
+            out[k] = {"dir": d, "labels_sha16": meta.get("labels_sha16"), "partial": bool(meta.get("partial")),
+                      "built_kst": meta.get("built_kst")}
+        return out
 
     def provenance(self, b: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Cheap row-identity guard (report 48 S56-5; the shape checks above cannot see a re-pack that keeps N but
@@ -352,12 +411,19 @@ class _WUArrays:
         return k
 
 
-def empty_wu_row() -> Dict[str, np.ndarray]:
-    return {"ck2_wu_ok": np.bool_(False), "ck2_gt": np.zeros((8, 3), np.float32),
-            "ck2_raw_y": np.zeros((256, 5), np.float32), "ck2_raw_ok": np.zeros(256, bool),
-            "ck2_var_traj": np.zeros((G_K, 8, 3), np.float32), "ck2_var_y": np.zeros((G_K, 5), np.float32),
-            "ck2_var_ok": np.zeros(G_K, bool), "ck2_var_valid": np.zeros(G_K, bool),
-            "ck2_var_anchor": np.zeros(K16, np.int64)}
+def empty_wu_row(tidx: bool = False, pref: bool = False) -> Dict[str, np.ndarray]:
+    """wu_ok False row; tidx / pref (refiner v4, _WUArrays.tidx / .pref) add ck2_raw_tidx / ck2_var_tidx (-2) /
+    ck2_pref (NaN)."""
+    out = {"ck2_wu_ok": np.bool_(False), "ck2_gt": np.zeros((8, 3), np.float32),
+           "ck2_raw_y": np.zeros((256, 5), np.float32), "ck2_raw_ok": np.zeros(256, bool),
+           "ck2_var_traj": np.zeros((G_K, 8, 3), np.float32), "ck2_var_y": np.zeros((G_K, 5), np.float32),
+           "ck2_var_ok": np.zeros(G_K, bool), "ck2_var_valid": np.zeros(G_K, bool),
+           "ck2_var_anchor": np.zeros(K16, np.int64)}
+    if tidx:
+        out["ck2_raw_tidx"], out["ck2_var_tidx"] = TI.unknown((256,)), TI.unknown((G_K,))
+    if pref:
+        out[WU_PREF_KEY] = np.float32(np.nan)
+    return out
 
 
 def _targets_wu(lab9: np.ndarray, ep_target: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -376,18 +442,23 @@ def _targets_wu(lab9: np.ndarray, ep_target: str) -> Tuple[np.ndarray, np.ndarra
 def wu_row(src: _WUArrays, r: int) -> Dict[str, np.ndarray]:
     """Warm-up arrays of one packed row (numpy); r < 0 or an unreadable row -> empty_wu_row() (wu_ok False).
     Non-finite values are zeroed; their ok flags are False.  ck2_raw_y / ck2_var_y = ck_targets(labels, src.ep_target)
-    (_targets_wu)."""
+    (_targets_wu).  refiner v4 (configured only): ck2_raw_tidx / ck2_var_tidx int8 = the sidecar rows with -2 where
+    ck2_raw_ok / ck2_var_ok is False (an unconfigured one of the two: all -2); ck2_pref f32 = first finite
+    pdm_progress_eff of the raw256 row (else of the variant row; NaN if none)."""
+    opt = (getattr(src, "tidx", False), getattr(src, "pref", False))
     if r < 0:
-        return empty_wu_row()
+        return empty_wu_row(*opt)
     A = src.arr
     try:
         if r >= src.n_rows():
-            return empty_wu_row()
+            return empty_wu_row(*opt)
         gt = np.array(A("gt")[r], np.float32)
         ep = getattr(src, "ep_target", EP_TARGET_DEFAULT)
-        raw, raw_fin = _targets_wu(np.array(A("raw_y")[r], np.float32), ep)
+        raw9 = np.array(A("raw_y")[r], np.float32)
+        raw, raw_fin = _targets_wu(raw9, ep)
         vt = np.array(A("v_traj")[r], np.float32)
-        vy, vy_fin = _targets_wu(np.array(A("v_y")[r], np.float32), ep)
+        v9 = np.array(A("v_y")[r], np.float32)
+        vy, vy_fin = _targets_wu(v9, ep)
         v_fin = vy_fin & np.isfinite(vt).all((-1, -2))
         out = {"ck2_wu_ok": np.bool_(src.keep(r)),
                "ck2_gt": np.nan_to_num(gt, nan=0.0, posinf=0.0, neginf=0.0),
@@ -400,11 +471,19 @@ def wu_row(src: _WUArrays, r: int) -> Dict[str, np.ndarray]:
                "ck2_var_anchor": np.asarray(A("anchor_idx")[r], np.int64)}
         if out["ck2_wu_ok"] and not np.isfinite(gt).all():          # pragma: no cover (keep() checks it)
             out["ck2_wu_ok"] = np.bool_(False)
+        if opt[0]:
+            for key, name, okk, kk in (("ck2_raw_tidx", "raw_tidx", "ck2_raw_ok", 256),
+                                       ("ck2_var_tidx", "var_tidx", "ck2_var_ok", G_K)):
+                t = TI.sanitize(np.asarray(A(name)[r]), out[okk]) if name in src.tidx_dirs else TI.unknown((kk,))
+                out[key] = t
+        if opt[1]:
+            p = TI.pref_of(raw9)
+            out[WU_PREF_KEY] = np.float32(p if np.isfinite(p) else TI.pref_of(v9))
         return out
     except WUSourceError:
         raise                                       # structural (shape) error: configuration, not a row problem
     except Exception:
-        return empty_wu_row()
+        return empty_wu_row(*opt)
 
 
 # ----------------------------------------------------------------------------------------------- KD object rows (v3)
@@ -540,6 +619,8 @@ class CK2E2ETargetBuilder(_ATB):
         labels as CK targets, CK_KEYS, EP per ck_e2e2.ep_target), ck2_raw_ok bool [256], ck2_var_traj f32 [96,8,3],
         ck2_var_y f32 [96,5] (same rule), ck2_var_ok bool [96],
         ck2_var_valid bool [96] (index.npz valid, k-major), ck2_var_anchor int64 [16]
+      ONLY when configured (refiner v4, ck_e2e2.warmup raw_tidx / var_tidx / pref; wu_row): ck2_raw_tidx int8 [256,3],
+        ck2_var_tidx int8 [96,3] (time_idx.TIDX_COLS, -2 unknown), ck2_pref f32 [] (P_ref, NaN unavailable)
       ONLY with a temporal DET teacher (its config.json temporal.on; refiner-v3): kd_obj_in_0 f32 [3,96,17],
         kd_obj_mask_0 bool [3,96], kd_frame_valid_0 bool [3], kd_obj_ok_0 bool [] (KDObjRows of ck_row; CLEAN
         causal rows of the train object pack).  A CK2 (non-temporal) DET teacher: none of these keys, nothing opened.
@@ -822,6 +903,12 @@ GEN2_FILES = {"traj": ((G_K, 8, 3), np.float32, np.nan), "labels": ((G_K, N_LAB)
               "cand_ok": ((G_K,), np.bool_, False), "valid": ((G_K,), np.bool_, False),
               "row_state": ((), np.uint8, 0)}
 GEN2_KEYS = tuple(GEN2_FILES)
+# refiner v4 optional generation files: created only when a writer asks (open_generation2 optional=...), listed in
+# meta.json 'optional_files'; a generation without one reads as its fill value (time_idx: -2 = unknown)
+GEN2_OPT_FILES = {"time_idx": ((G_K, N_TIDX), np.int8, TIDX_UNKNOWN)}
+GEN2_OPT_KEYS = tuple(GEN2_OPT_FILES)
+GEN2_OPT_NOTE = {"time_idx": "first-failure state index n (t = 0.1 n s) cols " + ", ".join(TI.TIDX_COLS)
+                             + "; -1 none, -2 unknown (not scored / not ok / row written before the file existed)"}
 
 
 def _gen2_meta_ok(meta: Dict[str, Any], d: Path) -> None:
@@ -830,15 +917,45 @@ def _gen2_meta_ok(meta: Dict[str, Any], d: Path) -> None:
                          f"{GEN2_FORMAT!r} / {G_K} (a CK1 generation in a CK2 io_dir?)")
 
 
-def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: str = "r") -> Dict[str, Any]:
+def _check_optional2(optional) -> Tuple[str, ...]:
+    opt = tuple(optional or ())
+    bad = [o for o in opt if o not in GEN2_OPT_FILES]
+    if bad:
+        raise ValueError(f"unknown optional generation file(s) {bad}; known {list(GEN2_OPT_FILES)}")
+    return opt
+
+
+def _opt_meta2(name: str) -> List[Any]:
+    shape, dt, fill = GEN2_OPT_FILES[name]
+    return [list(shape), np.dtype(dt).name, int(fill), GEN2_OPT_NOTE.get(name, "")]
+
+
+def _create_opt_file2(d: Path, name: str, n_rows: int) -> None:
+    """fill-valued optional file via tmp + os.replace (a reader never sees a half-initialised file)."""
+    shape, dt, fill = GEN2_OPT_FILES[name]
+    tmp = d / f".{name}.npy.tmp{os.getpid()}"
+    mm = np.lib.format.open_memmap(tmp, mode="w+", dtype=dt, shape=(int(n_rows),) + shape)
+    mm[...] = fill
+    mm.flush()
+    del mm
+    os.replace(tmp, d / f"{name}.npy")
+
+
+def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: str = "r",
+                     optional: Sequence[str] = ()) -> Dict[str, Any]:
     """Generation memmaps {traj f32 [N,96,8,3], labels f32 [N,96,9] (LABEL_COLS), cand_ok bool [N,96], valid bool
     [N,96], row_state uint8 [N], meta, dir} (as e2e_data.open_generation):
       'w+' labeler: creates the files under a FileLock (NaN / False / 0 filled, flushed; meta.json written LAST =
            ready marker, format 'ck2_96'); an existing generation is reopened 'r+' (idempotent restart).
       'r+' labeler restart (must exist).   'r' reader (must exist).
-    A generation whose meta lacks format == 'ck2_96' is refused (ValueError)."""
+    A generation whose meta lacks format == 'ck2_96' is refused (ValueError).
+    optional (refiner v4; default () = the old behaviour exactly) = names of GEN2_OPT_FILES (time_idx int8 [N,96,3]):
+      'w+' / 'r+'  missing ones are created under the FileLock (fill value, tmp + rename; rows already done keep the
+                   fill = unknown) and recorded in meta.json 'optional_files' -> always in the result;
+      'r'          opened when the file exists (shape / dtype checked), else absent from the result (= fill)."""
     if mode not in ("w+", "r+", "r"):
         raise ValueError(f"open_generation2 mode {mode!r}")
+    opt = _check_optional2(optional)
     d = ED.gen_dir(io_dir, epoch)
     meta_p = d / "meta.json"
     if mode == "w+":
@@ -850,12 +967,17 @@ def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: s
                     mm[...] = fill
                     mm.flush()
                     del mm
-                ED._atomic_write_json(meta_p, {
+                for name in opt:
+                    _create_opt_file2(d, name, n_rows)
+                meta0 = {
                     "epoch": int(epoch), "n_rows": int(n_rows), "k": G_K, "format": GEN2_FORMAT, "order": GEN2_ORDER,
                     "vnames": list(VNAMES), "label_cols": list(LABEL_COLS),
                     "files": {n: [list(s), np.dtype(t).name] for n, (s, t, _) in GEN2_FILES.items()},
                     "row_state": "0 none, 1 done (written after traj/labels/cand_ok/valid)",
-                    "created": time.time(), "utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())})
+                    "created": time.time(), "utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}
+                if opt:
+                    meta0["optional_files"] = {n: _opt_meta2(n) for n in opt}
+                ED._atomic_write_json(meta_p, meta0)
         mode = "r+"
     if not meta_p.is_file():
         raise FileNotFoundError(f"generation {d} not ready (no meta.json)")
@@ -863,26 +985,57 @@ def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: s
     _gen2_meta_ok(meta, d)
     if int(meta["n_rows"]) != int(n_rows):
         raise ValueError(f"{d}: n_rows {meta['n_rows']} != {n_rows}")
+    if mode == "r+" and opt and any(not (d / f"{n}.npy").is_file() or n not in (meta.get("optional_files") or {})
+                                    for n in opt):
+        with ED._FileLock(d / ".lock"):
+            meta = json.loads(meta_p.read_text())
+            of = dict(meta.get("optional_files") or {})
+            for name in opt:
+                if not (d / f"{name}.npy").is_file():
+                    _create_opt_file2(d, name, int(n_rows))
+                of.setdefault(name, _opt_meta2(name))
+            if of != (meta.get("optional_files") or {}):
+                meta["optional_files"] = of
+                ED._atomic_write_json(meta_p, meta)
     out: Dict[str, Any] = {"meta": meta, "dir": d}
     for name, (shape, dt, _) in GEN2_FILES.items():
         a = np.load(d / f"{name}.npy", mmap_mode=mode)
         if a.shape != (int(n_rows),) + shape or a.dtype != dt:
             raise ValueError(f"{d}/{name}.npy: {a.shape} {a.dtype}")
         out[name] = a
+    for name in opt:
+        f = d / f"{name}.npy"
+        if not f.is_file():                          # mode 'r' only (w+ / r+ created it above)
+            continue
+        shape, dt, _ = GEN2_OPT_FILES[name]
+        a = np.load(f, mmap_mode=mode)
+        if a.shape != (int(n_rows),) + shape or a.dtype != dt:
+            raise ValueError(f"{f}: {a.shape} {a.dtype} != {(int(n_rows),) + shape} {np.dtype(dt).name}")
+        out[name] = a
     return out
 
 
-def write_generation_rows2(gen: Dict[str, Any], rows, traj, labels, cand_ok, valid, overwrite: bool = False
-                           ) -> np.ndarray:
+def write_generation_rows2(gen: Dict[str, Any], rows, traj, labels, cand_ok, valid, overwrite: bool = False,
+                           time_idx=None) -> np.ndarray:
     """Single-writer helper for the labeler: for rows not yet done (row_state != 1, unless overwrite) write traj
-    [n,96,8,3], labels [n,96,9], cand_ok [n,96], valid [n,96]; flush; then row_state = 1; flush.  Duplicate rows in one
-    call: the first occurrence wins.  -> bool [n] mask of the entries actually written."""
+    [n,96,8,3], labels [n,96,9], cand_ok [n,96], valid [n,96] (and, when the generation was opened with the optional
+    time_idx file, time_idx int8 [n,96,3]; None -> -2 = unknown for those rows); flush; then row_state = 1; flush.
+    Duplicate rows in one call: the first occurrence wins.  -> bool [n] mask of the entries actually written.
+    time_idx given for a generation opened without the file -> ValueError."""
     rows = np.asarray(rows, np.int64).reshape(-1)
     traj, labels = np.asarray(traj, np.float32), np.asarray(labels, np.float32)
     cand_ok, valid = np.asarray(cand_ok, bool), np.asarray(valid, bool)
     n = len(rows)
     assert traj.shape == (n, G_K, 8, 3) and labels.shape == (n, G_K, N_LAB) and cand_ok.shape == (n, G_K) \
         and valid.shape == (n, G_K), (traj.shape, labels.shape, cand_ok.shape, valid.shape)
+    has_t = "time_idx" in gen
+    if time_idx is not None:
+        if not has_t:
+            raise ValueError("write_generation_rows2: time_idx given but the generation was opened without the "
+                             "optional time_idx file (open_generation2(..., optional=('time_idx',)))")
+        time_idx = np.asarray(time_idx)
+        assert time_idx.shape == (n, G_K, N_TIDX), time_idx.shape
+        time_idx = TI.sanitize(time_idx)
     st = gen["row_state"]
     _, first = np.unique(rows, return_index=True)
     w = np.zeros(n, bool)
@@ -898,7 +1051,11 @@ def write_generation_rows2(gen: Dict[str, Any], rows, traj, labels, cand_ok, val
     gen["labels"][r] = labels[sel]
     gen["cand_ok"][r] = cand_ok[sel]
     gen["valid"][r] = valid[sel]
-    for name in ("traj", "labels", "cand_ok", "valid"):
+    names = ("traj", "labels", "cand_ok", "valid")
+    if has_t:
+        gen["time_idx"][r] = time_idx[sel] if time_idx is not None else TIDX_UNKNOWN
+        names += ("time_idx",)
+    for name in names:
         gen[name].flush()
     st[r] = 1
     st.flush()
@@ -922,14 +1079,21 @@ class LabelStore2:
       token_rng(token, epoch, seed, 'ck2e2e.lab')) (NU11).  Rows without a generation (or row < 0, or out of range):
       has False, zeros, ok False -> the caller fills them (cands2.fill_fallback, NU12).  Non-finite values are zeroed
       (ok False).  tokens None -> taken from the packed RowMap.
+      refiner v4 extras (constructor flags; default off = no key, no file opened):
+        with_tidx -> G_tidx int8 [B,48,3] = the generation's optional time_idx.npy gathered by G_col (time_idx.TIDX_COLS),
+                     -2 where G_ok is False, for rows without a generation and for generations without the file;
+        with_pref -> G_pref f32 [B] = first finite pdm_progress_eff of the generation labels row (time_idx.pref_of),
+                     NaN for rows without a generation.  (The draw, G_* values and stats are unchanged by either flag.)
     Lazy per-process memmaps; pickling drops them and the src index (re-read on first use after a pid change).
     """
 
     def __init__(self, io_dir: PathLike, n_rows: int = N_ROWS, packed: PathLike = WARMUP_DEFAULT["packed"],
-                 var_sampling: str = "type_balanced", ep_target: str = EP_TARGET_DEFAULT):
+                 var_sampling: str = "type_balanced", ep_target: str = EP_TARGET_DEFAULT, with_tidx: bool = False,
+                 with_pref: bool = False):
         if var_sampling not in VAR_SAMPLING:
             raise ValueError(f"var_sampling must be one of {VAR_SAMPLING}")
         self.ep_target = check_ep_target(ep_target)
+        self.with_tidx, self.with_pref = bool(with_tidx), bool(with_pref)
         self.io_dir = Path(io_dir)
         self.n_rows = int(n_rows)
         self.packed = str(packed)
@@ -960,7 +1124,8 @@ class LabelStore2:
     def _gen(self, epoch: int) -> Dict[str, Any]:
         g = self._gens.get(epoch)
         if g is None:
-            g = self._gens[epoch] = open_generation2(self.io_dir, epoch, self.n_rows, "r")
+            g = self._gens[epoch] = open_generation2(self.io_dir, epoch, self.n_rows, "r",
+                                                     optional=("time_idx",) if self.with_tidx else ())
         return g
 
     def refresh(self, max_epoch: int) -> Dict[str, Any]:
@@ -1025,6 +1190,8 @@ class LabelStore2:
         src = np.full(B, SRC_FALLBACK, np.int8)
         gep = np.full(B, -1, np.int16)
         has = np.zeros(B, bool)
+        tid = TI.unknown((B, KG)) if self.with_tidx else None
+        pref = np.full(B, np.nan, np.float32) if self.with_pref else None
         se = self.src_epoch
         ident = np.arange(K16, dtype=np.int64) * NV
         for b, rr in enumerate(r):
@@ -1039,7 +1206,8 @@ class LabelStore2:
                 continue
             g = self._gen(e)
             t = np.asarray(g["traj"][rr], np.float32)                       # [96, 8, 3]
-            lab = ck_targets(np.asarray(g["labels"][rr], np.float32), self.ep_target)     # [96, 5]
+            lab9 = np.asarray(g["labels"][rr], np.float32)                  # [96, 9]
+            lab = ck_targets(lab9, self.ep_target)                           # [96, 5]
             cok = np.asarray(g["cand_ok"][rr], bool)
             val = np.asarray(g["valid"][rr], bool)
             cols, pad = draw_cols((val & cok).reshape(K16, NV), int(n_var),
@@ -1058,9 +1226,17 @@ class LabelStore2:
             gep[b] = e
             has[b] = True
             self.cum["src_prev" if e == self.max_epoch else "src_older"] += 1
+            if tid is not None and "time_idx" in g:
+                tid[b] = TI.sanitize(np.asarray(g["time_idx"][rr])[c], ok[b])
+            if pref is not None:
+                pref[b] = TI.pref_of(lab9)
         out = {"G_traj": torch.from_numpy(traj), "G_y": torch.from_numpy(y), "G_ok": torch.from_numpy(ok),
                "G_vtype": torch.from_numpy(vt), "G_col": torch.from_numpy(col), "G_src": torch.from_numpy(src),
                "G_epoch": torch.from_numpy(gep), "has": torch.from_numpy(has)}
+        if tid is not None:
+            out["G_tidx"] = torch.from_numpy(tid)
+        if pref is not None:
+            out["G_pref"] = torch.from_numpy(pref)
         if device is not None:
             out = {k: v.to(device, non_blocking=True) for k, v in out.items()}
         return out

@@ -18,6 +18,11 @@
                                       = LabelStore2.lookup + fill_fallback + device move (the BCE set G of §2-2)
 
 All candidate trajectories returned here are detached inputs (no grad), finite (non-finite -> 0 with ok False).
+refiner v4 extras (present only when the inputs carry them; otherwise every output is the old one exactly):
+  warmup_cands   targets ck2_raw_tidx / ck2_var_tidx -> 'tidx' int8 [B,64,3] (time_idx.TIDX_COLS of the 64 columns,
+                 -2 where ok is False); targets ck2_pref -> 'pref' f32 [B]
+  fill_fallback  G with G_tidx / G_pref (LabelStore2(with_tidx / with_pref)) -> the fallback rows get the warm-up
+                 values (ck2_raw_tidx / ck2_var_tidx gathered like G, -2 where G_ok is False; ck2_pref), else -2 / NaN
 """
 from __future__ import annotations
 
@@ -27,8 +32,8 @@ import numpy as np
 import torch
 
 from . import e2e_data2 as D2
-from .e2e_data2 import (G_K, GROUP_VAR, K16, N_NEAR_MID, N_WU_ANCHORS, NV, SRC_FALLBACK, SRC_NODATA, STREAM_LAB,
-                        STREAM_NOW, VNAMES)
+from .e2e_data2 import (G_K, GROUP_VAR, K16, N_NEAR_MID, N_TIDX, N_WU_ANCHORS, NV, SRC_FALLBACK, SRC_NODATA, STREAM_LAB,
+                        STREAM_NOW, TIDX_UNKNOWN, VNAMES, WU_PREF_KEY, WU_TIDX_KEYS)
 
 VARIANTS_DEFAULT: Dict[str, Any] = {"speeds": [-1.0, -0.5, 0.5], "lats": [-0.5, 0.5], "combine": "separate",
                                     "s_on_frac": 0.2, "ext": "straight", "compute_dtype": "float64"}
@@ -145,7 +150,9 @@ def warmup_cands(targets: Dict[str, torch.Tensor], tokens: Sequence[str], epoch:
       parent_anchor int64 [B,64] (anchor id; for a variant its parent anchor), anc_idx [B,32], var_cols [B,n],
       var_pad_ok [B,n], sur_pos int64 [B,16] (slot positions of the 8 near + 8 mid anchors, slot order),
       lat_mask bool [B,64] (near / mid anchors and variants, NU16), teacher_ok bool [B,64] (finite & ck2_wu_ok &
-      (anchor | valid & not padding), NU25 / NU44), wu_ok bool [B], n_valid int64 [B]."""
+      (anchor | valid & not padding), NU25 / NU44), wu_ok bool [B], n_valid int64 [B].
+      refiner v4, only when the targets carry them: tidx int8 [B,64,3] (ck2_raw_tidx[anc_idx] | ck2_var_tidx[var_cols];
+      a missing one of the two -> -2; -2 where ok is False), pref f32 [B] (= ck2_pref)."""
     dev = torch.device(device) if device is not None else targets["ck2_raw_y"].device
     B = len(tokens)
     S = sampler.sample(tokens, _wu_arrays_np(targets), epoch)
@@ -174,9 +181,21 @@ def warmup_cands(targets: Dict[str, torch.Tensor], tokens: Sequence[str], epoch:
     sur_pos = torch.sort((grp_a > 1).long(), dim=1, stable=True).indices[:, :N_NEAR_MID]
     lat_mask = (group <= 1) | (group == GROUP_VAR)
     teacher_ok = fin & wu[:, None] & torch.cat([torch.ones_like(ok_a), val_v], 1)
-    return {"cand": cand, "y": y, "ok": ok, "group": group, "vtype": vtype, "parent_anchor": par, "anc_idx": ai,
-            "var_cols": vc, "var_pad_ok": pad, "sur_pos": sur_pos, "lat_mask": lat_mask, "teacher_ok": teacher_ok,
-            "wu_ok": wu, "n_valid": torch.from_numpy(S["n_valid"]).to(dev)}
+    out = {"cand": cand, "y": y, "ok": ok, "group": group, "vtype": vtype, "parent_anchor": par, "anc_idx": ai,
+           "var_cols": vc, "var_pad_ok": pad, "sur_pos": sur_pos, "lat_mask": lat_mask, "teacher_ok": teacher_ok,
+           "wu_ok": wu, "n_valid": torch.from_numpy(S["n_valid"]).to(dev)}
+    if any(k in targets for k in WU_TIDX_KEYS):                                 # refiner v4 (configured only)
+        parts = []
+        for key, idx in zip(WU_TIDX_KEYS, (ai, vc)):
+            if key in targets:
+                parts.append(_gather_k(targets[key].to(dev).long(), idx))
+            else:
+                parts.append(torch.full(idx.shape + (N_TIDX,), TIDX_UNKNOWN, dtype=torch.long, device=dev))
+        t = torch.cat(parts, 1)
+        out["tidx"] = torch.where(ok[..., None], t, torch.full_like(t, TIDX_UNKNOWN)).to(torch.int8)
+    if WU_PREF_KEY in targets:
+        out["pref"] = targets[WU_PREF_KEY].to(dev).float().reshape(B)
+    return out
 
 
 def onpolicy_cands(top_cand: torch.Tensor, v0, tokens: Sequence[str], epoch: int, seed: int, n_var: int = 32,
@@ -215,7 +234,9 @@ def fill_fallback(G: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
     mid anchors of this epoch's AnchorSampler draw (slot order) + n_var variants of the fixed variant files
     (sampler.var_sampling, stream 'ck2e2e.lab'), G_src 0; a token without warm-up data (ck2_wu_ok False, row -1):
     G_ok all False, G_src 3.  G (CPU tensors) is updated in place and returned; G_col = variant-file column for the
-    variant slots, -1 for the anchors."""
+    variant slots, -1 for the anchors.
+    refiner v4: G_tidx (if in G) of a fallback row = cat(ck2_raw_tidx[16 anchors], ck2_var_tidx[cols]) with -2 where
+    G_ok is False (all -2 without those targets / for G_src 3); G_pref (if in G) = ck2_pref (NaN without it)."""
     has = G["has"].cpu().numpy().astype(bool)
     need = np.flatnonzero(~has)
     if len(need) == 0:
@@ -226,12 +247,19 @@ def fill_fallback(G: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
         raise ValueError(f"fill_fallback: G has {KG} columns, fallback set is {N_NEAR_MID} + {nv}")
     toks = [str(tokens[i]) for i in need]
     S = sampler.sample(toks, _wu_arrays_np(targets, need), epoch, stream=STREAM_LAB, n_var=nv)
-    t = {k: targets[k][torch.as_tensor(need, device=targets[k].device)].detach().cpu()
-         for k in ("ck2_wu_ok", "ck2_raw_y", "ck2_raw_ok", "ck2_var_traj", "ck2_var_y", "ck2_var_ok", "ck2_var_valid")}
+    want_t, want_p = "G_tidx" in G, "G_pref" in G
+    keys = ["ck2_wu_ok", "ck2_raw_y", "ck2_raw_ok", "ck2_var_traj", "ck2_var_y", "ck2_var_ok", "ck2_var_valid"]
+    keys += [k for k in WU_TIDX_KEYS if want_t and k in targets] + ([WU_PREF_KEY] if want_p and WU_PREF_KEY in targets
+                                                                      else [])
+    t = {k: targets[k][torch.as_tensor(need, device=targets[k].device)].detach().cpu() for k in keys}
     anc = sampler.anchors
     for j, b in enumerate(need):
         wu = bool(t["ck2_wu_ok"][j]) and bool(S["ok"][j])
         G["G_epoch"][b] = -1
+        if want_p:
+            G["G_pref"][b] = float(t[WU_PREF_KEY][j]) if WU_PREF_KEY in t else float("nan")
+        if want_t:
+            G["G_tidx"][b] = TIDX_UNKNOWN
         if not wu:
             G["G_traj"][b] = 0.0
             G["G_y"][b] = 0.0
@@ -257,6 +285,11 @@ def fill_fallback(G: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
         G["G_vtype"][b] = torch.cat([torch.zeros(N_NEAR_MID, dtype=torch.int8), (cols % NV).to(torch.int8)])
         G["G_col"][b] = torch.cat([torch.full((N_NEAR_MID,), -1, dtype=torch.int16), cols.to(torch.int16)])
         G["G_src"][b] = SRC_FALLBACK
+        if want_t:
+            ra = t[WU_TIDX_KEYS[0]][j][a16t] if WU_TIDX_KEYS[0] in t else torch.full((N_NEAR_MID, N_TIDX), TIDX_UNKNOWN)
+            va = t[WU_TIDX_KEYS[1]][j][cols] if WU_TIDX_KEYS[1] in t else torch.full((nv, N_TIDX), TIDX_UNKNOWN)
+            tt = torch.cat([ra.long(), va.long()], 0)
+            G["G_tidx"][b] = torch.where(G["G_ok"][b][:, None], tt, torch.full_like(tt, TIDX_UNKNOWN)).to(torch.int8)
     return G
 
 

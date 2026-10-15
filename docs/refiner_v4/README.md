@@ -42,22 +42,26 @@ Student:
     # E2E_CK_SET=<file> to point teacher_det_run / teacher_map_run / kd_calib at v4 teachers / family files,
     # v4.readout=evidence, v4.corrector=true
 
+## Corrector A data path
+
+on-policy step: KD set (top-16 + sampled variants) -> critic-only score -> top 8 -> corrector samples 12 controls ->
+decoder mode B -> edits recorded with the 96 (rec2 edit block) -> labeler2 scores 96 + 8 in one official call ->
+generation edit_* files -> next epoch: LabelStore2(with_edits) -> the edits join the critic's BCE label set (parents =
+their source's identity) and the corrector gets AWR with the report-61 credit (A_sel over the label set + edits with the
+current critic scores, A_loc = edit PDMS - source PDMS).  Inference: shortlist of the 96 -> mu edits -> re-scored ->
+eval_e2e2 dumps / labels them, tools/ck/v4/eval_edits.py compares selection over 96 + 8 with 96.
+
 ## Not yet done
 
-* Corrector A training signal: the edits are produced and re-scored at inference, the credit / AWR loss exist and
-  are tested, but the on-policy recorder / labeler / LabelStore2 do not yet carry the K edits (official labels of the
-  edits are needed for the credit), and the eval tools (eval_e2e2 / eval_ck2) do not yet label / select over 96 + K.
-  Until then a corrector student behaves as the rule pool (mu = 0 -> every edit is its source).
 * Evidence-level KD (DET -> occupancy, MAP -> margin) needs v4 teachers with the evidence readout; KD is still on the
   final scores.
-* The first-failure time-index sidecars (station BCE) are built by tools/ck/v4/build_time_idx.py (no re-scoring:
-  the indices are in the existing label shards); the full builds are not run yet.
 * I4 (one extension rule): the a+0.5 variant is still extended straight while the parent corridor follows its end
   curvature; on curved parents the sibling leaves the parent grid by up to ~0.4 m beyond S_8 (measured in
   tests/test_v4_model.py).
+* Navtest time-index sidecars (train / val are built: CK/v4/time_idx, 0 consistency violations).
 
 ## Tests (CPU)
 
     nice -n 10 env PYTHONPATH=$PWD OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES= /venv/ssr/bin/python -m pytest -q \
       -p no:cacheprovider tests/test_v4_model.py tests/test_v4_e2e_loss.py tests/test_v4_kd_family.py \
-      tests/test_v4_time_idx.py
+      tests/test_v4_time_idx.py tests/test_v4_eval_edits.py tests/test_v4_corrector_plumbing.py

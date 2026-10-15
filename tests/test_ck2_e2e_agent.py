@@ -44,8 +44,13 @@ def ck2_cfg(tmp: Path, **over):
     d = {"enabled": True, "io_dir": str(Path(tmp) / "ck_e2e2"), "teacher_det_run": str(SMOKE_T),
          "teacher_map_run": str(SMOKE_M), "teacher_amp": False, "score_prior_rows": 200,
          "teacher_ep_check": False,      # smoke teachers are 'official' (predate --ep-target), the student 'decoupled'
-         "kd_calib": {"enabled": False}}  # no KD calibration files for the smoke teachers
+         "kd_calib": {"enabled": False},  # no KD calibration files for the smoke teachers
+         # refiner-v4: the default is the bevkd arm; this harness pins the ck2e2e_main arm (partial bev_kd merged on top)
+         "bev_kd": {"enabled": False, "teachers": ["det"]}}
+    bk = over.pop("bev_kd", None)
     d.update(over)
+    if bk is not None:
+        d["bev_kd"] = {**d["bev_kd"], **bk}
     return d
 
 

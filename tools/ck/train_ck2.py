@@ -335,6 +335,10 @@ def resolve_v4(a):
         raise SystemExit(f"--v4-*: {e}") from None
 
 
+V4_ARG_KEYS = ("v4_readout", "v4_pref_head", "v4_time_free", "v4_lat_haz", "v4_horizon", "lambda_pref",
+               "lambda_station", "lambda_ev", "time_idx_root", "v4_cfg")
+
+
 def v4_cfg_of(a):
     """V4Cfg of resolved args (absent attribute = off, e.g. args built by older tests)."""
     from navsim.agents.para_ssr.ck.v4.config import V4Cfg
@@ -1098,6 +1102,9 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
     ck_root = U.ck_data()
     var_names = (getattr(train_ds, "var_meta", None) or {}).get("names")
     targs = {k: v for k, v in vars(a).items() if k != "temporal_cfg"}
+    # refiner v4 flags: recorded only when v4 is on (off: the CK2 / v3 config.json keys exactly; the v4 block and
+    # weights are added below)
+    targs = {k: v for k, v in targs.items() if k not in V4_ARG_KEYS or v4_cfg_of(a).on}
     cfg = dict(targs, arm=a.arm, seed=a.seed, trainer="train_ck2", git_head=U.git_head(), run_dir=str(run),
                device_resolved=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), world_size=D.world,
                tokens_per_rank=b_local, global_batch=a.tokens_per_batch,

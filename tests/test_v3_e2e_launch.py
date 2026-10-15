@@ -115,12 +115,15 @@ def test_overrides_differ_from_main_only_in_teacher_keys(tmp_path, cal):
     assert ko["same_as_teacher_training"] and ko["build_sha256"] == ko["teacher_train_pack_sha256"]
     assert ko["split"] == "navtrain_train" and ko["n"] == 85109 and ko["targets_opened"] is False
     assert te1["det"]["temporal"]["cfg"]["on"]
-    # the ck2e2e_main effective config (when present) = ck0 apart from io_dir
+    # the ck2e2e_main effective config (when present) = the main arm of this branch apart from io_dir and the
+    # refiner-v4 keys (which must be at their off defaults); refiner-v4: main = main_arm.set (default = bevkd)
     eff = MAIN_RUN / "launch/ck_e2e2_effective.json"
     if eff.is_file():
+        _, ckm, _ = L2.build_overrides2(str(tmp_path / "ck2e2e_v3T"), ["0", "1"],
+                                        ck_sets=LU.read_lines(str(L2.MAIN_SET)), wandb="online", teacher_deep=False)
         e = {k: v for k, v in json.loads(eff.read_text()).items() if not k.startswith("_")}
         e.pop("io_dir")
-        assert e == {k: v for k, v in ck0.items() if k != "io_dir"}
+        assert e == _strip_v4({k: v for k, v in ckm.items() if k != "io_dir"})
 
 
 def test_kd_objects_refusals(tmp_path):
@@ -155,6 +158,19 @@ def test_kd_objects_refusals(tmp_path):
         L2.teacher_check(str(MAIN_T), str(V3), "last", "strict", False, ep_target="official")
 
 
+V4_WARMUP_KEYS = {"raw_tidx": None, "var_tidx": None, "pref": False}
+
+
+def _strip_v4(ck):
+    """the refiner-v4 additions of a ck_e2e2 config, asserted at their off defaults, then removed."""
+    from navsim.agents.para_ssr.ck.online2 import _d_v4
+    ck = json.loads(json.dumps(ck))
+    assert ck.pop("v4") == _d_v4()
+    for k, v in V4_WARMUP_KEYS.items():
+        assert ck["warmup"].pop(k) == v
+    return ck
+
+
 # ----------------------------------------------------------------------------------------------- shell dry run
 def test_train_e2e2_dry_run_matches_main_overrides(tmp_path, cal):
     sets = tmp_path / "v3teacher_tmpcal.set"
@@ -165,6 +181,7 @@ def test_train_e2e2_dry_run_matches_main_overrides(tmp_path, cal):
                E2E_CK_SET=str(sets))
     for k in ("ARM", "E2E_SMOKE", "E2E_EXTRA", "E2E_NO_DEEP_TEACHER_CHECK"):
         env.pop(k, None)
+    env["ARM"] = "main"                                  # refiner-v4: the default arm is bevkd
     r = subprocess.run(["bash", str(SH), "start", "--gpus", "0,1"], env=env, capture_output=True, text=True,
                        timeout=900)
     assert r.returncode == 0, r.stderr[-3000:]
@@ -183,7 +200,8 @@ def test_train_e2e2_dry_run_matches_main_overrides(tmp_path, cal):
         return [ln.replace(str(run_dir), "<R>").replace(run, "<RUN>") for ln in lines]
 
     a = norm(main_ov.read_text().splitlines(), MAIN_RUN, "ck2e2e_main")
-    b = norm(ov, R, "ck2e2e_v3T")
+    v4p = ("++agent.config.ck_e2e2.v4.",) + tuple(f"++agent.config.ck_e2e2.warmup.{k}=" for k in V4_WARMUP_KEYS)
+    b = norm([ln for ln in ov if not ln.startswith(v4p)], R, "ck2e2e_v3T")      # refiner-v4 keys (off defaults)
     assert len(a) == len(b)
     diff = [(x, y) for x, y in zip(a, b) if x != y]
     assert [x.split("=", 1)[0] for x, _ in diff] == ["++agent.config.ck_e2e2.teacher_det_run",

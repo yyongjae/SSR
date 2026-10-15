@@ -59,6 +59,14 @@ eval_e2e2 dumps / labels them, tools/ck/v4/eval_edits.py compares selection over
   curvature; on curved parents the sibling leaves the parent grid by up to ~0.4 m beyond S_8 (measured in
   tests/test_v4_model.py).
 * Navtest time-index sidecars (train / val are built: CK/v4/time_idx, 0 consistency violations).
+* Parent dedupe: `score_set` reads every candidate's parent corridor separately (96 rows for 16 parents in
+  inference); a dedupe is exact (max diff 0) and would cut the parent-pass cost ~5x.  Cost today = CK2 (1.02x).
+* Corrector edits are not in the headline eval (eval_e2e2 summary is 96-only); `tools/ck/v4/eval_edits.py` has no
+  val-frozen beta for navtest.
+* Open review items (SSR/report 79, verified 2026-10-16): empty station mask of near-stop candidates (pass ~1, no
+  gradient), `stage_infer_check` / r34 sanity check without parents, unstable leave-one-out in `credit`, A credit
+  scored critic-only while deployment blends v2_final / im, evidence bins end at 4.0 s (official TTC reads to 4.9 s),
+  AWR outside autocast with amp, v4 station / evidence aux losses ignore `--score-keys`.
 
 ## Tests (CPU)
 

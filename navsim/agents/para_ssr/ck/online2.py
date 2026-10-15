@@ -112,7 +112,10 @@ def _d_lat_kd() -> Dict[str, Any]:
 def _d_warmup() -> Dict[str, Any]:
     return {"packed": f"{_CK}/packed/navtrain_train", "raw_labels": f"{_CK}/labels/navtrain_train/raw256",
             "var_dir": f"{_CK}/ck2/labels/navtrain_train/var_separate_sampler16_accstraight", "sampler_seed": 0,
-            "n_var": 32, "sur_groups": "near_mid", "lat_kd_groups": "near_mid"}
+            "n_var": 32, "sur_groups": "near_mid", "lat_kd_groups": "near_mid",
+            # refiner v4 (optional): first-failure time-index sidecars of raw_labels / var_dir
+            # (tools/ck/v4/build_time_idx.py) and the label-derived P_ref of the warm-up rows
+            "raw_tidx": None, "var_tidx": None, "pref": False}
 
 
 def _d_onpolicy_label() -> Dict[str, Any]:
@@ -305,7 +308,9 @@ class CKE2E2Config:
         w = dict(self.warmup)
         self.warmup = {"packed": str(w["packed"]), "raw_labels": str(w["raw_labels"]), "var_dir": str(w["var_dir"]),
                        "sampler_seed": int(w["sampler_seed"]), "n_var": int(w["n_var"]),
-                       "sur_groups": str(w["sur_groups"]), "lat_kd_groups": str(w["lat_kd_groups"])}
+                       "sur_groups": str(w["sur_groups"]), "lat_kd_groups": str(w["lat_kd_groups"]),
+                       "raw_tidx": _opt_str(w.get("raw_tidx")), "var_tidx": _opt_str(w.get("var_tidx")),
+                       "pref": _b(w.get("pref", False))}
         o = dict(self.onpolicy_label)
         self.onpolicy_label = {"n_orig": int(o["n_orig"]), "n_var": int(o["n_var"]), "fallback": str(o["fallback"])}
         b = dict(self.bev_kd)
@@ -1015,8 +1020,14 @@ class CKE2E2:
     def labels(self):
         if self._labels is None:
             from .e2e_data2 import LabelStore2
+            q = self.cfg.v4
+            kw = {}                                   # refiner v4 extras (off: the CK2 store, unchanged)
+            if q["readout"] == "hazard" and q["lambda_station"] > 0:
+                kw["with_tidx"] = True
+            if q["pref_head"]:
+                kw["with_pref"] = True
             self._labels = LabelStore2(self.cfg.io_dir, n_rows=N_ROWS, packed=self.cfg.warmup["packed"],
-                                       var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target)
+                                       var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target, **kw)
         return self._labels
 
     def sampler(self):
@@ -1094,6 +1105,7 @@ class CKE2E2:
                            W["teacher_ok"] & fin)
         return {"cand": cand, "cand_ok": W["teacher_ok"] & fin, "extra": None, "y": W["y"],
                 "cand_parent": par, "extra_parent": None, "vtype_kd": W["vtype"].to(dev).long(),
+                "tidx_lab": W.get("tidx"), "pref": W.get("pref"),
                 "ok_lab": W["ok"] & fin, "vtype_lab": W["vtype"], "grp": grp, "sur_pos": sur_pos,
                 "sur_tok_ok": wu, "lat_mask": lat_mask, "kd_tok_ok": wu, "wu_ok": wu,
                 "var_valid_frac": float(vv[:, :, 1:].float().mean()),
@@ -1138,6 +1150,7 @@ class CKE2E2:
                 "extra_parent": _keep_parent(G_traj, label_set_parents(G, targets, self.sampler(), dev),
                                              G["G_ok"].bool() & G_fin),
                 "vtype_kd": P["vtype"].to(dev).long(),
+                "tidx_lab": G.get("G_tidx"), "pref": G.get("G_pref"),
                 "ok_lab": G["G_ok"].bool() & G_fin, "vtype_lab": G["G_vtype"].long(),
                 "sur_pos": torch.arange(K16, device=dev)[None].expand(B, -1),
                 "sur_tok_ok": torch.ones(B, dtype=torch.bool, device=dev),

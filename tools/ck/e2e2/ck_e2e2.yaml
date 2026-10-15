@@ -57,6 +57,9 @@ warmup:
   n_var: 32                                  # NU07
   sur_groups: near_mid                       # NU15
   lat_kd_groups: near_mid                    # NU16
+  raw_tidx: null                             # refiner v4: time-index sidecar dir of raw_labels (build_time_idx.py)
+  var_tidx: null                             # refiner v4: time-index sidecar dir of var_dir (--merge-accstraight)
+  pref: false                                # refiner v4: label-derived P_ref of the warm-up rows
 record_from_epoch: 4                         # NU21 (old; epoch 4 recorded so epoch 5 has gen 4)
 record_until_epoch: null                     # -> max_epochs - 2 (28)
 onpolicy_from_epoch: 5                       # user (5 warm-up epochs 0-4)

@@ -100,6 +100,11 @@ PRED_TO_PACKED = {"ck2_cand96": "cand96", "ck2_valid96": "valid96", "ck2_cand_id
                   "ck2_v2_final": "v2_final", "ck2_v2_im": "v2_im", "ck2_v2_sim": "v2_sim"}
 PRED_TO_INFER = {"ck2_score_logit": "score_logit", "ck2_w_lat": "w_lat", "ck2_e_lat": "e_lat",
                  "ck2_lat_traj": "lat_traj"}
+# refiner v4 corrector A (a student with v4.corrector): the K edits of the critic's top-K, written next to the 96
+EDIT_SPECS = {"edit_traj": ((8, 3), np.float32, np.nan), "edit_src": ((), np.int16, -1),
+              "edit_u": ((12,), np.float32, np.nan), "edit_score_logit": ((5,), np.float32, np.nan)}
+PRED_TO_EDIT = {"ck2_edit_traj": "edit_traj", "ck2_edit_src": "edit_src", "ck2_edit_u": "edit_u",
+                "ck2_edit_score_logit": "edit_score_logit"}
 
 
 def log(msg: str) -> None:
@@ -296,10 +301,22 @@ class EvalRootWriter2(E1.EvalRootWriter):
             self.I = {k: U.open_memmap(P.infer / f"{k}.npy", (n,) + s, d, fill=f) for k, (s, d, f) in
                       INFER_SPECS.items()}
         self.ck_run = ck_run
+        self.E: Optional[Dict[str, np.ndarray]] = None              # refiner v4 edits (opened on first use)
+
+    def _edits(self, K: int) -> Dict[str, np.ndarray]:
+        if self.E is None:
+            with U.FileLock(self.P.packed / ".lock"):
+                self.E = {k: U.open_memmap(self.P.infer / f"{k}.npy", (self.n, K) + s, d, fill=f)
+                          for k, (s, d, f) in EDIT_SPECS.items()}
+        return self.E
 
     def write(self, rows, pred, status, gt, traj):
         rows = np.asarray(rows, np.int64)
         B = len(rows)
+        if "ck2_edit_traj" in pred:
+            E = self._edits(int(np.asarray(pred["ck2_edit_traj"]).shape[1]))
+            for src, dst in PRED_TO_EDIT.items():
+                E[dst][rows] = np.asarray(pred[src]).astype(E[dst].dtype)
         ok = np.isfinite(pred["ck2_cand96"]).reshape(B, -1).all(1)
         ok &= np.isfinite(pred["ck2_score_logit"]).reshape(B, -1).all(1)
         ok &= np.isfinite(pred["ck2_lat_traj"]).reshape(B, -1).all(1)
@@ -313,6 +330,11 @@ class EvalRootWriter2(E1.EvalRootWriter):
         self.A["ok"][rows] = ok
         self.I["done"][rows] = ok
         return ok
+
+    def flush(self) -> None:
+        super().flush()
+        for a in (self.E or {}).values():
+            a.flush()
 
     def finalize_meta(self, extra: Dict[str, Any]) -> None:
         self.flush()
@@ -497,6 +519,9 @@ def stage_label(P: Paths, a) -> None:
              P.packed / "cand96.npy"),
             (f"lat96_{P.name}", lab + ["--name", f"lat96_{P.name}", "--traj", str(P.infer / "lat_traj.npy")],
              P.infer / "lat_traj.npy")]
+    if (P.infer / "edit_traj.npy").is_file():           # refiner v4 corrector A: the K edits (K from the file shape)
+        jobs.append((f"edit_{P.name}", lab + ["--name", f"edit_{P.name}", "--traj", str(P.infer / "edit_traj.npy")],
+                     P.infer / "edit_traj.npy"))
     for name, cmd, traj in jobs:
         if (P.labels / name / "labels.npy").is_file() and (P.labels / name / "meta.json").is_file():
             from tools.ck.data import common as CM

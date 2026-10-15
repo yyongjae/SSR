@@ -5,11 +5,14 @@
 #   * P_ref scene query (Huber on log1p pdm_progress_eff, weight 0.1, detached input of the EP head);
 #   * corridor version 2 (refiner-fix B1: the extension arc ends at S_look);
 #   * score KD on the parent (identity) columns only (report 72 I2; the KD calibration stays the teachers' files).
-# The censored station BCE (v4.lambda_station 0.5) is active only when the label sets carry first-failure time indices
-# (tools/ck/v4/build_time_idx.py sidecars + the on-policy labeler's time_idx.npy); without them it is absent.
+# The censored station BCE (v4.lambda_station 0.5) reads first-failure time indices: the warm-up sidecars below
+# (tools/ck/v4/build_time_idx.py, built 2026-10-15 from the existing label shards, 0 consistency violations) and the
+# on-policy labeler's time_idx.npy (labeler2 writes it by default).
 # Teachers: the defaults (ck2T10 / ck2M10) unless E2E_CK_SET points teacher_det_run / teacher_map_run (+ kd_calib) to
 # v4 teacher runs (train_ck2.py --v4-readout hazard --v4-pref-head 1 --corridor-version 2).
 v4.readout=hazard
 v4.pref_head=true
 v4.corridor_version=2
 v4.kd_parent_only=true
+warmup.raw_tidx=/home/external-user/ssd/yongjae_refiner/ck/v4/time_idx/navtrain_train/raw256
+warmup.var_tidx=/home/external-user/ssd/yongjae_refiner/ck/v4/time_idx/navtrain_train/var_separate_sampler16_accstraight

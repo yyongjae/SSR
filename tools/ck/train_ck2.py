@@ -489,8 +489,13 @@ def build_datasets(a) -> Dict:
     def ob(split, train=False):                    # the objects kwarg only when the branch is on (OFF: no kwarg)
         return {"objects": objects_spec(a, split, train)} if on else {}
 
+    v4kw = {}                                      # refiner v4 extras (off: the CK2 dataset call, unchanged)
+    if getattr(a, "time_idx_root", ""):
+        v4kw["time_idx_root"] = a.time_idx_root
+    if v4_cfg_of(a).pref_head:
+        v4kw["with_pref"] = True
     train = CK2Dataset(a.split, bev=a.arm, n_var=a.n_var, gt=True, limit=a.limit_tokens or 0, **ck2,
-                       **ob(a.split, True))
+                       **ob(a.split, True), **v4kw)
     evals = []
     if a.val_split and a.val_split != "none":
         evals.append((a.val_split, "r34", CKDataset(a.val_split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,

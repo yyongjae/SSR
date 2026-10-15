@@ -764,7 +764,7 @@ class TeacherPair2:
                 try:
                     a, b, info = load_teacher_calib(path, run=self.runs[name], which=which,
                                                     ckpt_sha16=self.ckpt[name], ep_target=eps[name], arm=arm,
-                                                    kd_keys=kd_keys)
+                                                    kd_keys=kd_keys, family=True)
                 except (ValueError, FileNotFoundError) as e:
                     raise ValueError(f"teacher {name} {self.runs[name]}: KD calibration refused: {e}") from None
                 cal[name] = (torch.from_numpy(a).to(self.device), torch.from_numpy(b).to(self.device))
@@ -786,7 +786,8 @@ class TeacherPair2:
 
     @torch.no_grad()
     def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None, objs_det=None,
-            obj_ok_det=None, parents: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+            obj_ok_det=None, parents: Optional[torch.Tensor] = None,
+            family: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """bev_* [B, 256, 50, 100] (f16 cache), ok_* [B], cand [B, K, 8, 3] (finite), status [B, 8], cand_ok [B, K]
         -> kd_score_prob f32 [B,K,5] (combine_teacher: nc/ttc DET, dac MAP, ep/comfort mean), kd_e_lat f32 [B,K,6]
         = 0.5 (e_DET + e_MAP) (decode z_lon = 0, slope 0), kd_ok bool [B,K] = DET ok & MAP ok (per token) & finite
@@ -823,7 +824,15 @@ class TeacherPair2:
         if self.calib is not None:            # KD calibration: Platt on the logits, per teacher and key
             for i, name in enumerate(("det", "map")):
                 ab = self.calib.get(name)
-                if ab is not None:
+                if ab is None:
+                    continue
+                if ab[0].dim() == 2:          # refiner v4 I2: per variant family (rows KD_FAMILIES) [6, 5]
+                    if family is None:
+                        raise ValueError(f"TeacherPair2.run: teacher {name} has a per-family KD calibration; the "
+                                         f"candidates' family (vtype 0..5) is required")
+                    f = family.to(dev).long().clamp(0, ab[0].shape[0] - 1)
+                    logits[i] = logits[i] * ab[0][f] + ab[1][f]
+                else:
                     logits[i] = logits[i] * ab[0] + ab[1]
         # ONE batched decode for both teachers (correct() is launch-bound; candidates decode independently)
         dec = lateral_decode(torch.cat([cand, cand], 1), torch.cat(ws, 1), v0, 0.0)
@@ -1241,7 +1250,7 @@ class CKE2E2:
             objs_det, obj_ok_det = kd_objs_of(targets, dev)
             tkw = {"objs_det": objs_det, "obj_ok_det": obj_ok_det}
         T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
-                   cand_ok=S["cand_ok"], parents=S.get("cand_parent"), **tkw)
+                   cand_ok=S["cand_ok"], parents=S.get("cand_parent"), family=S.get("vtype_kd"), **tkw)
         t_teacher = time.time() - tt
 
         # ---- student forward (one pass over KD candidates + label set)

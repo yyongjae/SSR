@@ -31,8 +31,8 @@ mkdir -p "$OUT"
 cd "$V4"
 COMMON="--epochs 10 --tokens-per-batch 16 --lr 6e-4 --sur-groups near_mid --eval-every 2 --best-metric none \
 --v4-readout hazard --v4-pref-head 1 --corridor-version 2 --time-idx-root $TI --out-root $OUT --resume"
-DET="--arm T --run v4T10_haz --score-keys nc,ttc,ep,comfort $COMMON"
-MAP="--arm M --run v4M10_haz --score-keys dac,ep $COMMON"
+DET="--arm T --run-name v4T10_haz --score-keys nc,ttc,ep,comfort $COMMON"
+MAP="--arm M --run-name v4M10_haz --score-keys dac,ep $COMMON"
 TGZ="$OUT/teachers.code.tgz"
 tar czf "$TGZ" --exclude=__pycache__ navsim tools docs/refiner_v4
 /venv/ssr/bin/python -B - "$OUT/teachers.launch.json" "$TGZ" "$WHICH" "$CVD" "$DET" "$MAP" <<'EOF'

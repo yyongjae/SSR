@@ -109,3 +109,18 @@ v4:                                          # refiner v4 (navsim/agents/para_ss
   corrector: false                           # learned corrector A on the critic's top-corr_k (hazard / evidence readout)
   corr_k: 8                                  # = e2e_data2.EDIT_K (the recorded edit block)
   lambda_awr: 0.1                            # corrector AWR weight (official labels of the recorded edits)
+  # refiner v4_3 OPTIONAL v4 keys (online2._d_v4_opt; not listed here so the older arms' effective configs and
+  # override lists stay unchanged; a set file naming one adds it at this default, launch_util2.apply_sets2 --
+  # tools/ck/e2e2/v4_3_arm.set):
+  #   exec_model: plan                 range readout candidate states: plan (8 knots) | lqr (the official tracker port)
+  #   ev_tbins: 10, ev_tbin_s: 0.25    time bins (range: ev_tbins x ev_tbin_s = 5.0 s, e.g. 20 x 0.25)
+  #   ep_evidence: false               range: EP head on the detached evidence + executed progress ratio
+  #   vmax: "off"                      range: off | feature (executed curvature overspeed as a residual input)
+  #   edits: "off"                     off | computed (v4_3 M5 rule edits of the critic's top-edit_k parents)
+  #   edit_k: 8, edit_dt: 0.2, edit_dlat: 0.3   (edit_k = e2e_data2.EDIT_K, the recorded edit block)
+  #   kd_score_scope: all              all | near (NC KD where the lead's ttc0 < 4 s, DAC KD where the parent's min
+  #                                    executed corner SDF < 1 m; ref_* GT, train only)
+  #   kd_constraint: {enabled: false, lambda_occ: 0.5, lambda_margin: 0.5, map_range_m: 32.0, occ_channels: B}
+  #                                    M6 constraint KD: DET sigmoid(B) BCE (occ_channels BU: + U, unconfirmed
+  #                                    option) + MAP D Huber (s <= 32 m) on the
+  #                                    student's unique parents of the KD set (range student + range teachers)

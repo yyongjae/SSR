@@ -22,6 +22,9 @@ Model: navsim.agents.para_ssr.ck.model.load_ck(<CK_DATA>/ck2/train/<teacher>, 'l
   ops as CKNet.forward (trunk.scene once per token, trunk.candidates on the 16 candidates and, with the same scene
   features, on the 80 variants), fp16 autocast as train_ck2 eval; lateral decode = ck/correct.correct(cand,
   z_lon = 0 (forced), w_lat, v0 = |(vx, vy)|, slope 0) for every candidate and variant.
+  refiner v4 teachers (config.json 'v4': hazard / evidence / the v4_3 'range' readout): CKNet.score_set with the
+  variants reading their parent candidate's corridor (parents = the 16 repeated, deduplicated by score_set; the range
+  readout reads each candidate at its executed LQR states); infer_meta.json records the teacher's v4 cfg.
 Variants: ck/variants.make_variants(cand16, v0 = hypot(status[4], status[5]) NaN -> 0, speeds (-1, -0.5, 0.5),
   lats (-0.5, 0.5), combine 'separate', ext 'straight', float64 decode) -> traj80 [N,80,8,3], column j = k * 5 + (v - 1),
   v = 1..5 = a-1.0, a-0.5, a+0.5, l-0.5, l+0.5 (select2.VNAMES[1:]); valid80 [N,80] (False = lateral variant of a
@@ -297,7 +300,8 @@ def stage_infer(a) -> Dict:
                 device=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), batch=a.batch,
                 workers=a.workers, amp="fp16 autocast (as train_ck2 eval)", z_lon="forced 0 in the lateral decode",
                 lat_slope=0.0, bev_norm=str(run / ("norm.npz" if arm == "T" else "norm_map.npz")),
-                variants=str(vd / "traj80.npy"), started=kst(t0))
+                variants=str(vd / "traj80.npy"), v4=cfg.get("v4"), corridor_version=cfg.get("corridor_version"),
+                started=kst(t0))
     print(f"[infer] {a.teacher} arm {arm} ({ck_file.name}) -> {td}: todo {len(rr)} of {len(rows)}", flush=True)
     sanity = None
     n, n_bad = 0, 0

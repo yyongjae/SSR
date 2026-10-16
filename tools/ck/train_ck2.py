@@ -87,6 +87,15 @@ refiner-v3 temporal branch (docs/refiner_v3/SPEC.md 5.3; --temporal 0 = default 
   config.json: temporal (TemporalCfg dict, resume guard), privileged, param_count_temporal_shared /
   param_count_forecaster.  PRIVILEGED runs (oracle_gt) must be named *_PRIV and tag every val_metrics row.
   Val rows of a learned run add the forecast metrics fc_nll / fc_minade / fc_minfde (+ fc_* detail).
+
+refiner v4_3 range teachers (docs/refiner_v4/V4_3_SPEC.md M4 / M6; --v4-readout range, every other default unchanged):
+  V4Cfg.range_arm (executed states of the official LQR tracker port, 20 bins of 0.25 s, EP head on the detached
+  evidence; --v4-exec-model / --v4-ev-tbin-s / --v4-ep-evidence / --v4-vmax override it, --v4-pref-head 1 adds the
+  P_ref query).  Loss += lambda_ev * range_gt_aux: GT fields computed online from the batch's ref_* on the anchors' own
+  parent grids (<= --rg-max-parents per GT-ok token) -- DET: blocked field B (not-behind proxy) + the TTC channel U
+  (any overlap), BCE on the known bins; MAP: the official SDF margin, Huber -- with the specialist key masking of v4_2
+  (blocked field for nc / ttc, margin for dac); score BCE on --score-keys as before; the station BCE reads hazard
+  readouts only.  tools/ck/v4/run_teachers.sh READOUT=range launches the pair.
 """
 from __future__ import annotations
 
@@ -210,10 +219,23 @@ def get_parser() -> argparse.ArgumentParser:
                     help="refiner corridor geometry (refiner/corridor.py 'Version'): 1 = original (default), "
                          "2 = refiner-fix B1 (arc ends at S_look, straight beyond; straight below 3 m/s)")
     # refiner v4 (navsim/agents/para_ssr/ck/v4): every default = off (the CK2 / v3 teacher, unchanged)
-    ap.add_argument("--v4-readout", choices=("mean", "hazard", "evidence"), default="mean",
+    ap.add_argument("--v4-readout", choices=("mean", "hazard", "evidence", "range"), default="mean",
                     help="mean = CK2 readout (default); hazard = v4 station x arrival-time hazard + noisy-OR on the "
                          "parent corridor (variants read their parent anchor's stations); evidence = predicted "
-                         "occupancy / drivable margin on the parent grid + the official rules (report 77)")
+                         "occupancy / drivable margin on the parent grid + the official rules (report 77); range = "
+                         "v4_3 allowed-range critic (blocked field B / U + margin D per parent, read at the executed "
+                         "states; docs/refiner_v4/V4_3_SPEC.md M4; defaults = V4Cfg.range_arm)")
+    ap.add_argument("--v4-exec-model", choices=("plan", "lqr"), default=None,
+                    help="range: candidate states read (default lqr = the official tracker port, ck/v4/lqr.py)")
+    ap.add_argument("--v4-ev-tbin-s", type=float, default=None,
+                    help="range: time bin width [s] (default 0.25; ev_tbins = 5.0 s / bin)")
+    ap.add_argument("--v4-ep-evidence", type=int, choices=(0, 1), default=None,
+                    help="range: EP head on the detached evidence + executed progress ratio (default 1)")
+    ap.add_argument("--v4-vmax", choices=("off", "feature"), default=None,
+                    help="range: executed curvature overspeed as a residual input (default off)")
+    ap.add_argument("--rg-max-parents", type=int, default=8,
+                    help="range: own-parent anchors per GT-ok token in the GT field aux (blocked field BCE / margin "
+                         "Huber, weight --lambda-ev)")
     ap.add_argument("--v4-pref-head", type=int, choices=(0, 1), default=0,
                     help="1 = supervised P_ref scene query (labels pdm_progress_eff; needs the dataset 'pref' key)")
     ap.add_argument("--v4-time-free", type=int, choices=(0, 1), default=1,
@@ -224,7 +246,8 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lambda-station", type=float, default=0.5,
                     help="censored station BCE weight (hazard readout + first-failure time indices in the batch)")
     ap.add_argument("--lambda-ev", type=float, default=0.5,
-                    help="evidence readout: weight of the occupancy BCE + margin Huber aux losses (GT-ok tokens)")
+                    help="evidence readout: weight of the occupancy BCE + margin Huber aux losses (GT-ok tokens); "
+                         "range readout: of its GT field aux (blocked field B / U BCE, SDF margin Huber)")
     ap.add_argument("--time-idx-root", default="",
                     help="first-failure time-index sidecars (tools/ck/v4/build_time_idx.py) for the station loss; "
                          "'' = none (no station loss)")
@@ -320,14 +343,32 @@ def resolve_args(a):
     return a
 
 
+V4_3_FLAGS = ("v4_exec_model", "v4_ev_tbin_s", "v4_ep_evidence", "v4_vmax")     # range readout only (None = default)
+
+
 def resolve_v4(a):
-    """-> V4Cfg from the --v4-* flags (off unless --v4-readout hazard or --v4-pref-head 1)."""
-    from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+    """-> V4Cfg from the --v4-* flags (off unless --v4-readout hazard or --v4-pref-head 1).  --v4-readout range: the
+    spec arm V4Cfg.range_arm (exec 'lqr', 20 bins of 0.25 s, ep_evidence) with --v4-exec-model / --v4-ev-tbin-s /
+    --v4-ep-evidence / --v4-vmax overriding it and the P_ref head from --v4-pref-head; those four flags are refused with
+    another readout (the older readouts' V4Cfg call is unchanged)."""
+    from navsim.agents.para_ssr.ck.v4.config import RANGE_T_END, V4Cfg
     ro = str(getattr(a, "v4_readout", "mean") or "mean")
     ph = bool(int(getattr(a, "v4_pref_head", 0) or 0))
+    given = [k for k in V4_3_FLAGS if getattr(a, k, None) is not None]
+    if ro != "range" and given:
+        raise SystemExit(f"--v4-*: {['--' + k.replace('_', '-') for k in given]} only apply to --v4-readout range")
     if ro == "mean" and not ph:
         return V4Cfg()
     try:
+        if ro == "range":
+            tb = 0.25 if getattr(a, "v4_ev_tbin_s", None) is None else float(a.v4_ev_tbin_s)
+            nb = int(round(RANGE_T_END / tb))
+            epe = getattr(a, "v4_ep_evidence", None)
+            kw = dict(exec_model=getattr(a, "v4_exec_model", None) or "lqr", ev_tbins=nb, ev_tbin_s=tb,
+                      ep_evidence=True if epe is None else bool(int(epe)), vmax=getattr(a, "v4_vmax", None) or "off")
+            return V4Cfg(readout=ro, pref_head=ph, time_free=bool(int(getattr(a, "v4_time_free", 1))),
+                         lat_haz=bool(int(getattr(a, "v4_lat_haz", 1))), horizon=float(getattr(a, "v4_horizon", 4.0)),
+                         **kw).validate(temporal_cfg_of(a).on)
         return V4Cfg(readout=ro, pref_head=ph, time_free=bool(int(getattr(a, "v4_time_free", 1))),
                      lat_haz=bool(int(getattr(a, "v4_lat_haz", 1))),
                      horizon=float(getattr(a, "v4_horizon", 4.0))).validate(temporal_cfg_of(a).on)
@@ -336,7 +377,7 @@ def resolve_v4(a):
 
 
 V4_ARG_KEYS = ("v4_readout", "v4_pref_head", "v4_time_free", "v4_lat_haz", "v4_horizon", "lambda_pref",
-               "lambda_station", "lambda_ev", "time_idx_root", "v4_cfg")
+               "lambda_station", "lambda_ev", "time_idx_root", "v4_cfg") + V4_3_FLAGS + ("rg_max_parents",)
 
 
 def v4_cfg_of(a):
@@ -788,10 +829,11 @@ def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
       + lambda_pref * Huber(log1p P_ref) (out 'pref_logp', batch 'pref' [T] m, NaN = no target);
       + lambda_station * censored station BCE (hazard readout 'haz' / 'extra_haz', batch 'anc_tidx' [T, K, 3] /
         'var_tidx' [T, V, 3], same masks as the score BCE);
-      + lambda_ev * evidence aux (evidence readout: occupancy BCE / drivable-margin Huber).
+      + lambda_ev * evidence aux (evidence readout: occupancy BCE / drivable-margin Huber);
+      + lambda_ev * range GT field aux (range readout, range_gt_aux: blocked field B / U BCE, SDF margin Huber).
     Specialist teachers (--score-keys, user 2026-10-08): the station terms are restricted to the hazard keys in
-    score_keys (DET nc,ttc,ep,comfort -> nc, ttc; MAP dac,ep -> dac), the occupancy aux needs nc or ttc and the margin
-    aux dac (review 79 D(c))."""
+    score_keys (DET nc,ttc,ep,comfort -> nc, ttc; MAP dac,ep -> dac), the occupancy / blocked-field aux needs nc or ttc
+    and the margin aux dac (review 79 D(c)).  The station BCE reads the hazard readout's a_* only (range: none)."""
     from navsim.agents.para_ssr.ck.v4 import losses as V4L
     keys = set(getattr(a, "score_keys", None) or _all_ck_keys())
     if "pref_logp" in out:
@@ -808,14 +850,18 @@ def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
             loss = loss + float(getattr(a, "lambda_pref", 0.1)) * lp
         else:
             loss = loss + 0.0 * out["pref_logp"].sum()
-    if "haz" in out and "occ_logit" in out["haz"] and float(getattr(a, "lambda_ev", 0.0) or 0.0) > 0:
+    ev_on = "haz" in out and "occ_logit" in out["haz"] and float(getattr(a, "lambda_ev", 0.0) or 0.0) > 0
+    if ev_on:
         ref = {k: batch[k] for k in V4L.EV_REF_KEYS if k in batch}
         if "bev_ok" in batch and "ref_gt_ok" in ref:
             ref["ref_gt_ok"] = ref["ref_gt_ok"].bool() & batch["bev_ok"].bool().reshape(-1)
-        l_occ, l_m, s_ev = V4L.evidence_aux(out["haz"], ref)
-        st.update(s_ev)
         w_occ = 1.0 if keys & {"nc", "ttc"} else 0.0
         w_m = 1.0 if "dac" in keys else 0.0
+        if "occ_logit_u" in out["haz"]:                     # refiner v4_3 range readout: its own GT field aux
+            l_occ, l_m, s_ev = range_gt_aux(out["haz"], batch["cand"], ref, a, need_occ=w_occ > 0, need_margin=w_m > 0)
+        else:                                               # evidence readout (unchanged)
+            l_occ, l_m, s_ev = V4L.evidence_aux(out["haz"], ref)
+        st.update(s_ev)
         loss = loss + float(a.lambda_ev) * (w_occ * l_occ + w_m * l_m)
     if "haz" in out and "a_nc" in out["haz"] and float(getattr(a, "lambda_station", 0.0) or 0.0) > 0 \
             and "anc_tidx" in batch:
@@ -832,6 +878,86 @@ def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
             st.update(V4L.localisation_hit({k: v.detach() for k, v in haz.items()}, tidx, y5, ok))
         loss = loss + float(a.lambda_station) * l_st
     return loss
+
+
+def range_gt_aux(haz: Dict, cand: torch.Tensor, ref: Dict, a, need_occ: bool = True, need_margin: bool = True
+                 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """refiner v4_3 range teachers (--v4-readout range; spec V4_3 M4 / M6 'Teachers'): GT field aux on the parent rows of
+    the own-parent candidates (the raw anchors: haz is_self; rows = haz parent_index), the first --rg-max-parents
+    distinct rows per GT-ok token in slot order (the sampler's random order):
+      occ (DET, nc / ttc in --score-keys): range_targets.blocked_field of the GT objects (ref_obj_*, gt_future metric-
+          cache rule, 0.1 s samples max-pooled into the readout's M bins of ev_tbin_s) on each parent's grid (corridor
+          --corridor-version, heading 'parent') with lon_max: target B = LON >= BEHIND_M (the not-behind at-fault proxy)
+          for the logits occ_logit_u, U = LON > -inf (any overlap: the TTC channel) for ovl_logit_u; BCE over every
+          cell and the KNOWN bins (a bin holding a sample after the token's annotated horizon t_avail is masked);
+      margin (MAP, dac in --score-keys): the official DAC SDF (ref_sdf, sdf.sample_sdf) at the parent grid points,
+          clipped to +-5 m, Huber (delta 1 m) with margin_u; points outside the SDF grid masked (= the margin term of
+          losses.evidence_aux).
+    haz: forward 'haz' of the anchor set ([T, K, ...] + the per-row occ_logit_u / ovl_logit_u [T, U, 48, 17, M],
+    margin_u [T, U, 48, 17]); cand [T, K, 8, 3]; ref: the batch's ref_* GT (losses.EV_REF_KEYS).  -> (l_occ, l_margin,
+    stats rg_*); zeros (graph-connected) when a term is not needed or nothing is selected.  BCE / Huber only."""
+    import torch.nn.functional as F
+    from navsim.agents.para_ssr.ck.v4 import losses as V4L
+    from navsim.agents.para_ssr.ck.v4 import range_targets as RT
+    from navsim.agents.para_ssr.refiner.corridor import corridor_geometry
+    from navsim.agents.para_ssr.refiner.sdf import sample_sdf
+    Bo, Bu, D = haz["occ_logit_u"], haz["ovl_logit_u"], haz["margin_u"]
+    T, U = Bo.shape[:2]
+    M = Bo.shape[-1]
+    dev = Bo.device
+    zero = Bo.sum() * 0.0 + Bu.sum() * 0.0 + D.sum() * 0.0
+    if any(k not in ref for k in V4L.EV_REF_KEYS) or not (need_occ or need_margin):
+        return zero, zero, {"rg_n": 0.0}
+    K = cand.shape[1]
+    gt = ref["ref_gt_ok"].reshape(-1).bool().to(dev)
+    pidx = haz["parent_index"].long().to(dev)
+    sel = haz["is_self"].bool().to(dev) & gt[:, None]
+    kk = torch.where(sel, torch.arange(K, device=dev)[None].expand(T, K), torch.full((T, K), K, device=dev))
+    rep = torch.full((T, U), K, dtype=torch.long, device=dev).scatter_reduce(1, pidx, kk, reduce="amin",
+                                                                              include_self=True)
+    first = sel & (torch.gather(rep, 1, pidx) == torch.arange(K, device=dev)[None])   # first candidate of its row
+    keep = first & (torch.cumsum(first.long(), 1) <= int(getattr(a, "rg_max_parents", 8)))
+    tok, col = torch.nonzero(keep, as_tuple=True)
+    if tok.numel() == 0:
+        return zero, zero, {"rg_n": 0.0}
+    rows = pidx[tok, col]
+    with torch.no_grad():
+        geom = corridor_geometry(cand[tok, col].float(), version=int(getattr(a, "corridor_version", 1)))
+        fr = RT.parent_frame(geom)
+    st: Dict[str, float] = {"rg_n": float(tok.numel())}
+    l_occ = l_m = zero
+    if need_occ:
+        tbin = float(v4_cfg_of(a).ev_tbin_s)
+        ut, inv = torch.unique(tok, return_inverse=True)
+        with torch.no_grad():
+            boxes, obs, _, t_av = RT.gt_boxes_from_ref(ref, ut, device=dev)           # [S, A, 50, 5], 0 .. 4.9 s
+            B_t, lon = RT.blocked_field(fr, boxes, obs, index=inv, tbin_s=tbin, n_bins=M, lon_max=True)
+            U_t = lon > -math.inf                                                    # any overlap (no not-behind)
+            tn = torch.as_tensor(RT.fine_times(), dtype=torch.float64, device=dev)
+            mt = torch.floor(tn / tbin + RT.T_EPS).long()
+            late = (tn[None] > t_av.to(dev).double()[inv][:, None] + RT.T_EPS) & (mt < M)[None]
+            known = torch.ones(len(tok), M, dtype=torch.bool, device=dev)
+            pp, tt = torch.nonzero(late, as_tuple=True)
+            known[pp, mt[tt]] = False
+            tgt = torch.cat([B_t, U_t], -1).float()                                   # [P, 48, 17, 2M]
+            w = torch.cat([known, known], -1).float()[:, None, None, :].expand_as(tgt)
+        lg = torch.cat([Bo[tok, rows], Bu[tok, rows]], -1).float()
+        bce = F.binary_cross_entropy_with_logits(lg, tgt, reduction="none")
+        l_occ = (bce * w).sum() / w.sum().clamp(min=1.0)
+        st.update(rg_occ_bce=float(l_occ.detach()), rg_rate_B=float((B_t.float() * w[..., :M]).sum()
+                                                                      / w[..., :M].sum().clamp(min=1.0)),
+                  rg_rate_U=float((U_t.float() * w[..., M:]).sum() / w[..., M:].sum().clamp(min=1.0)),
+                  rg_known=float(known.float().mean()))
+    if need_margin:
+        with torch.no_grad():
+            P = tok.numel()
+            sv, sval = sample_sdf(ref["ref_sdf"].to(dev), fr["pts"].reshape(P, -1, 2).float(), tok)
+            tgt_d = sv.float().clamp(-5.0, 5.0).reshape(P, *D.shape[2:])
+            wd = sval.float().reshape(P, *D.shape[2:])
+        hub = F.huber_loss(D[tok, rows].float(), tgt_d, delta=1.0, reduction="none")
+        l_m = (hub * wd).sum() / wd.sum().clamp(min=1.0)
+        st.update(rg_margin_huber=float(l_m.detach()), rg_sdf_valid=float(wd.mean()))
+    return l_occ, l_m, st
 
 
 def dummy_backward(out: Dict) -> None:

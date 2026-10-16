@@ -40,6 +40,11 @@ build.json sha256 differs from the one the teacher was trained on (config.json p
 as teachers.json 'kd_objects' (pack record + equality).  CK2 teachers: no new key, nothing opened (records unchanged).
 smoke-check2 with a temporal DET teacher (effective teacher_det_run temporal.on) adds the gate temporal_smoke_checks:
 teachers.json det.temporal + kd_objects recorded and ck2/kd_obj_ok_frac logged with mean >= 0.999 (CK2: unchanged).
+refiner v4_3 (tools/ck/e2e2/v4_3_arm.set, ARM=v4_3; arm_of 'v4_3' for a range readout): apply_sets2 declares the
+optional v4 keys a set line names (absent from ck_e2e2.yaml: older arms unchanged); placeholder_check refuses any
+ck_e2e2 value still holding the arm file's /PLACEHOLDER/ (teacher runs / KD calibration files of the range teachers,
+set by the user's E2E_CK_SET file); kd_constraint_check (v4.kd_constraint.enabled) refuses non-range teachers or teachers on
+another grid (corridor version, time bins) than the student and records them as teachers.json 'kd_constraint'.
 """
 from __future__ import annotations
 
@@ -64,6 +69,8 @@ CK2_YAML = HERE / "ck_e2e2.yaml"
 BEVKD_SET = HERE / "bevkd_arm.set"
 MAIN_SET = HERE / "main_arm.set"          # refiner-v4: the ck2e2e_main arm (BEV KD off; the yaml default is bevkd)
 V4_SET = HERE / "v4_arm.set"              # refiner v4 student
+V4_3_SET = HERE / "v4_3_arm.set"          # refiner v4_3 student (range critic + computed edits + constraint KD)
+PLACEHOLDER = "/PLACEHOLDER/"             # an arm-file value that must be replaced before a launch (refused)
 CK_DATA = "/home/external-user/ssd/yongjae_refiner/ck"
 E2E_ROOT = f"{CK_DATA}/ck2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/ck2/e2e_smoke"
@@ -108,6 +115,8 @@ def check_paths(ck: Dict[str, Any]) -> None:
 
 def arm_of(ck: Dict[str, Any]) -> str:
     v4 = ck.get("v4") or {}
+    if str(v4.get("readout", "mean")) == "range":
+        return "v4_3"
     if str(v4.get("readout", "mean")) != "mean" or str(v4.get("pref_head", False)).lower() in ("true", "1"):
         return "v4"
     return "bevkd" if bool((ck.get("bev_kd") or {}).get("enabled")) else "main"
@@ -376,6 +385,65 @@ def kd_calib_record(kd_calib: Optional[Dict[str, Any]], teachers: Dict[str, Any]
     return out
 
 
+def apply_sets2(ck: Dict[str, Any], sets: Sequence[str]) -> Dict[str, Any]:
+    """launch_util.apply_sets with the OPTIONAL v4_3 keys of the v4 block (online2._d_v4_opt): a set line naming one
+    (v4.<key>=..., v4.kd_constraint.<key>=...) first declares it at its default -- they are absent from ck_e2e2.yaml so
+    the older arms' effective dicts / override lists stay unchanged -- then the lines are applied as before."""
+    import copy
+    from navsim.agents.para_ssr.ck.online2 import _d_v4_opt
+    opt = _d_v4_opt()
+    out = copy.deepcopy(ck)
+    for ln in sets:
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        parts = ln.split("=", 1)[0].strip().split(".")
+        if len(parts) >= 2 and parts[0] == "v4" and parts[1] in opt and isinstance(out.get("v4"), dict):
+            out["v4"].setdefault(parts[1], copy.deepcopy(opt[parts[1]]))
+    return LU.apply_sets(out, sets)
+
+
+def placeholder_check(ck: Dict[str, Any]) -> None:
+    """Refuse an effective ck_e2e2 dict that still holds an arm file's PLACEHOLDER value (v4_3_arm.set: the range
+    teacher runs and their KD calibration files are set by the user's E2E_CK_SET file once those teachers exist)."""
+    kc_on = str((ck.get("kd_calib") or {}).get("enabled", True)).lower() in ("true", "1")
+    bad = [k for k, v in LU.flatten(ck) if isinstance(v, str) and PLACEHOLDER in v
+           and (kc_on or not k.startswith("kd_calib."))]               # unused calibration paths when it is off
+    if bad:
+        raise LaunchError(f"ck_e2e2 {bad} still hold the arm file's placeholder ({PLACEHOLDER}...): set them (e.g. "
+                          f"E2E_CK_SET=<file> with teacher_det_run=<range DET run> / teacher_map_run=<range MAP run> / "
+                          f"kd_calib.det|map=<their calibration files> or kd_calib.enabled=false) before a launch")
+
+
+def kd_constraint_check(c) -> Dict[str, Any]:
+    """refiner v4_3 constraint KD (ck_e2e2.v4.kd_constraint.enabled; {} when off): both teacher runs must have the 'range'
+    readout (config.json v4) on the student's grid -- corridor_version, ev_tbins and ev_tbin_s equal (the fields are
+    distilled cell by cell) -- else LaunchError.  -> record (teachers.json 'kd_constraint')."""
+    if not c.kd_constraint["enabled"]:
+        return {}
+    from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+    sn = c.v4_net()
+    want = {"corridor_version": int(c.v4["corridor_version"]), "ev_tbins": int(sn.ev_tbins),
+            "ev_tbin_s": float(sn.ev_tbin_s)}
+    rec: Dict[str, Any] = {"cfg": dict(c.kd_constraint), "student_grid": want}
+    for name, run in (("det", c.teacher_det_run), ("map", c.teacher_map_run)):
+        cfg = json.loads((Path(run) / "config.json").read_text())
+        try:
+            v4 = V4Cfg.from_dict(cfg.get("v4"))
+        except ValueError as e:
+            raise LaunchError(f"teacher {name} {run}: config.json v4: {e}") from None
+        got = {"corridor_version": int(cfg.get("corridor_version") or 1), "ev_tbins": int(v4.ev_tbins),
+               "ev_tbin_s": float(v4.ev_tbin_s)}
+        if not v4.range:
+            raise LaunchError(f"teacher {name} {run}: v4.readout {v4.readout!r}; ck_e2e2.v4.kd_constraint needs range "
+                              f"teachers (train_ck2.py --v4-readout range, tools/ck/v4/run_teachers.sh READOUT=range)")
+        if got != want:
+            raise LaunchError(f"teacher {name} {run}: grid {got} != the student's {want} (constraint KD distils the "
+                              f"fields cell by cell)")
+        rec[name] = dict(got, readout=v4.readout, exec_model=v4.exec_model)
+    return rec
+
+
 def kd_calib_check(c, teachers: Dict[str, Any]) -> Dict[str, Any]:
     """kd_calib_record for a CKE2E2Config (its kd_calib, teacher runs / which and kd_score_keys)."""
     return kd_calib_record(c.kd_calib, teachers, c.teacher_det_run, c.teacher_map_run, c.teacher_which,
@@ -431,8 +499,9 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
     run = Path(run_dir).name
     ck = load_ck2_yaml(ck_yaml)
     ck["io_dir"] = f"{run_dir}/{IO_SUB}"
-    ck = LU.apply_sets(ck, ck_sets)
+    ck = apply_sets2(ck, ck_sets)
     check_paths(ck)
+    placeholder_check(ck)
     c = ck2_from_any(ck)
     if not c.enabled:
         raise LaunchError("ck_e2e2.enabled is false")
@@ -445,6 +514,9 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
     bk = bevkd_norms(c)
     if bk:
         teachers["bev_kd"] = bk
+    kq = kd_constraint_check(c)                        # refiner v4_3 constraint KD only (off: no key)
+    if kq:
+        teachers["kd_constraint"] = kq
     ko = kd_objects_check(c, teachers)                 # temporal DET teacher only (refiner-v3)
     if ko:
         teachers["kd_objects"] = ko

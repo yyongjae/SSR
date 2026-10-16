@@ -214,6 +214,9 @@ class CKNet(nn.Module):
                     self.v4_readout = HazardReadout(self.v4, self.trunk.d_model)
                 elif self.v4.evidence:
                     self.v4_readout = EvidenceReadout(self.v4, self.trunk.d_model)
+                elif self.v4.range:
+                    from .v4.range_readout import RangeReadout
+                    self.v4_readout = RangeReadout(self.v4, self.trunk.d_model)
                 if self.v4.pref_head:
                     self.pref_head = PRefHead(self.trunk.d_model, kdim=self.v4.pref_kdim, hidden=self.v4.pref_hidden)
                 if self.v4.corrector:
@@ -299,10 +302,17 @@ class CKNet(nn.Module):
         parent-pass readouts 'haz' = {t_arr (bin-centre first arrival), t_in / t_out (entry / min(leave, horizon) of
         the station bins), d_lat, haz_mask [T, K, 48], is_self [T, K]; hazard: a_nc / a_ttc / a_dac
         [T, K, 48]; evidence: occ_logit [T, K, 48, 17, M], margin [T, K, 48, 17], pts [T, K, 48, 17, 2] (parent grid
-        points, N frame), lp_nc / lp_ttc / lp_dac / min_margin [T, K]}.
+        points, N frame), lp_nc / lp_ttc / lp_dac / min_margin [T, K]; range (V4_3 M4, ck/v4/range_readout.py):
+        occ_logit [T, K, 48, 17, M] (B of the candidate's parent), margin [T, K, 48, 17] (D), the same once per
+        parent row occ_logit_u / ovl_logit_u (U) [T, U, 48, 17, M], margin_u [T, U, 48, 17] with parent_index
+        [T, K] (row of each candidate; U = K and index k without dedupe), exec_states [T, K, Q, 6] (Q 41 'lqr' / 9
+        'plan'), lp_nc / lp_ttc / lp_dac, slack_nc / slack_ttc [s] / slack_dac (= min_margin) [m], exec_ratio,
+        S_exec [m], overspeed [m/s] [T, K], crit_station / crit_lat (long) / crit_time [T, K, 3] (nc, ttc, dac),
+        crit_chan [T, K], pts}.
         readout 'mean': exactly trunk.candidates + score (the CK2 / v3 ops; parents and every v4 argument ignored).
-        readout 'hazard' / 'evidence': parents [T, K, 8, 3] = each candidate's parent draft (None: every candidate is
-        its own parent); the scene is read on the parent's corridor, the candidate reads it at its own schedule.
+        readout 'hazard' / 'evidence' / 'range': parents [T, K, 8, 3] = each candidate's parent draft (None: every
+        candidate is its own parent); the scene is read on the parent's corridor, the candidate reads it at its own
+        schedule (range: at its executed states).
         Parent dedupe (spec V4_3 M3): trunk.stations (the parent pass: corridor conv + 4 layers, ~0.64 GFLOP per row;
         99 % of the repeated hazard score_set FLOPs, 91 % of evidence, whose O / D scene head still runs per candidate)
         runs once per UNIQUE parent of each token and its x / Hc rows are gathered back to the candidates; the
@@ -320,7 +330,8 @@ class CKNet(nn.Module):
             edits re-scored on their sources' parents, correct_topk / corrector_logp).  Gradients flow into that
             earlier graph (none if it ran under no_grad).
         return_pctx -> + 'pctx' = {parents [T, U, 8, 3] f32, x [T*U, 49, d], Hc [T*U, 128, 48, 17], ud [T*U, 69],
-        geom (corridor_geometry of the T*U rows)} and 'parent_index' [T, K] (U = K, index = k without dedupe)."""
+        geom (corridor_geometry of the T*U rows); range: + rg_fields (RangeReadout.scene of the rows), rg_frame
+        (range_targets.parent_frame of the rows)} and 'parent_index' [T, K] (U = K, index = k without dedupe)."""
         T, K = cand.shape[:2]
         v0, a0, eds, cmd = ego
         if self.v4_readout is None:
@@ -367,11 +378,14 @@ class CKNet(nn.Module):
         if pidx is None:                                                # the repeated per-candidate parent pass
             P = self.trunk.stations(feat, mem, par, v0, a0, eds, cmd, time_free=self.v4.time_free)
             x, Hc, pgeom = P["x"], P["Hc"], P["geom"]
+            rows = None                                                 # P row b = candidate b
         else:                                                           # once per unique parent, gathered back
             if P is None:
                 P = self.trunk.stations(feat, mem, par_u, v0, a0, eds, cmd, time_free=self.v4.time_free)
             rows = (torch.arange(T, device=dev)[:, None] * par_u.shape[1] + pidx).reshape(B)
-            x, Hc = P["x"].index_select(0, rows), P["Hc"].index_select(0, rows)
+            x = P["x"].index_select(0, rows)
+            # range: Hc is read on the parent rows (range_readout.lateral_read_rows), no per-candidate copy
+            Hc = None if self.v4.range else P["Hc"].index_select(0, rows)
             with torch.autocast(device_type=dev.type, enabled=False):  # = the repeated pass's parent geometry
                 pgeom = corridor_geometry(par.reshape(B, N_POSE, 3), version=self.corridor_version)
         flat = cand.reshape(B, N_POSE, 3)
@@ -385,15 +399,19 @@ class CKNet(nn.Module):
         g = self.trunk.draft_mlp(ud.to(x.dtype))
         pr = None if pref is None else rep(pref.reshape(T, 1).float())[:, 0]
         sh = lambda a: a.reshape(T, K, *a.shape[1:])
+        rg = None
         if self.v4.hazard:
             e = feasibility(cgeom.S, rep(v0.float().reshape(T, 1))[:, 0])
             r = self.v4_readout(x[:, 1:], x[:, 0], Hc, g, sib["t_in"], sib["t_leave"], sib["v"], sib["d"],
                                 cgeom.S[:, -1], e, pr)
             haz = {k: sh(r[k]) for k in ("a_nc", "a_ttc", "a_dac")}
-        else:
+        elif self.v4.evidence:
             r = self.v4_readout(x[:, 1:], x[:, 0], Hc, g, pgeom.s, sib["s_knots"], sib["d_knots"], sib["d"],
                                 sib["t_in"], sib["t_leave"], cgeom.S[:, -1], pr)
             haz = {k: sh(r[k]) for k in ("occ_logit", "margin", "lp_nc", "lp_ttc", "lp_dac", "min_margin")}
+            haz["pts"] = sh(pgeom.points.detach().float())
+        else:                                                           # range (V4_3 M4): fields once per parent row
+            r, haz, rg = self._range_read(P, rows, pidx, T, K, flat, ego, x, g, cgeom, sib, pr)
             haz["pts"] = sh(pgeom.points.detach().float())
         haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), t_in=sh(sib["t_in"]), t_out=sh(r["t_out"]),
                    d_lat=sh(sib["d"]), is_self=sh(is_self))
@@ -410,8 +428,48 @@ class CKNet(nn.Module):
                 par_u = par
             out["pctx"] = P if pctx is not None else {"parents": par_u, "x": P["x"], "Hc": P["Hc"], "ud": P["ud"],
                                                       "geom": P["geom"]}
+            if rg is not None and "rg_fields" not in out["pctx"]:       # range: the scene fields of the same rows
+                out["pctx"] = dict(out["pctx"], rg_fields=rg[0], rg_frame=rg[1])
             out["parent_index"] = pidx
         return out
+
+    def _range_read(self, P: Dict, rows: Optional[torch.Tensor], pidx: Optional[torch.Tensor], T: int, K: int,
+                    flat: torch.Tensor, ego, x: torch.Tensor, g: torch.Tensor, cgeom, sib: Dict, pr):
+        """score_set's readout 'range' (spec V4_3 M4; ck/v4/range_readout.py): scene fields on the R rows of the parent
+        pass P (R = T * U unique parents, or T * K without dedupe; reused from P['rg_fields'] / P['rg_frame'] when P is
+        a range pctx), the candidates' states (exec_model; ego (vx, ax) = eds[:, 0], eds[:, 2], i.e. status[..., 4] /
+        status[..., 6], lqr docstring) read on their parent's row.  -> (readout dict, haz dict [T, K, ...],
+        (fields, frame) of the R rows)."""
+        from .v4 import range_targets as RT
+        from .v4.range_readout import candidate_states
+        B = T * K
+        dev = flat.device
+        prow = torch.arange(B, device=dev) if rows is None else rows
+        if "rg_fields" in P:
+            Fs, fr_u = P["rg_fields"], P["rg_frame"]
+        else:
+            Fs = self.v4_readout.scene(P["x"][:, 1:], P["Hc"])
+            fr_u = RT.parent_frame(P["geom"])
+        eds = ego[2].float()
+        rep = lambda a: a.reshape(T, 1).repeat_interleave(K, 0)[:, 0]
+        with torch.autocast(device_type=dev.type, enabled=False):
+            states, tq = candidate_states(flat, rep(eds[:, 0]), rep(eds[:, 2]), self.v4.exec_model)
+        r = self.v4_readout(Fs, prow, fr_u, states, tq, x[:, 1:], x[:, 0], P["Hc"], g, cgeom.S[:, -1], sib["d"],
+                            sib["t_in"], sib["t_leave"], pr)
+        M = self.v4_readout.M
+        sh = lambda a: a.reshape(T, K, *a.shape[1:])
+        R = Fs["blk"].shape[0]
+        uq = lambda a: a.reshape(T, R // T, *a.shape[1:])
+        per = lambda a: a if rows is None else a.index_select(0, rows)
+        haz = {"occ_logit": sh(per(Fs["blk"][..., :M])), "margin": sh(per(Fs["margin"])),
+               "occ_logit_u": uq(Fs["blk"][..., :M]), "ovl_logit_u": uq(Fs["blk"][..., M:]),
+               "margin_u": uq(Fs["margin"]),
+               "parent_index": (torch.arange(K, device=dev)[None].expand(T, K) if pidx is None else pidx),
+               "exec_states": sh(states)}
+        haz.update({k: sh(r[k]) for k in ("lp_nc", "lp_ttc", "lp_dac", "slack_nc", "slack_ttc", "slack_dac",
+                                           "min_margin", "crit_station", "crit_lat", "crit_time", "crit_chan",
+                                           "exec_ratio", "S_exec", "overspeed")})
+        return r, haz, (Fs, fr_u)
 
     def correct_topk(self, feat: torch.Tensor, mem: torch.Tensor, ego, pool: torch.Tensor, parents: torch.Tensor,
                      pool_out: Dict, pref: Optional[torch.Tensor] = None, sample: bool = False,
@@ -448,6 +506,29 @@ class CKNet(nn.Module):
         return {"src_idx": idx, "u": a["u"], "mu": a["mu"], "log_sig": a["log_sig"], "logp": a["logp"],
                 "edit_traj": edits, "edit_score_logit": oe["score_logit"], "edit_w_lat": oe["w_lat"],
                 "edit_haz": oe.get("haz"), "ctx": ctx}
+
+    def computed_edits(self, feat: torch.Tensor, mem: torch.Tensor, ego, pool: torch.Tensor, parents: torch.Tensor,
+                       pool_out: Dict, k: Optional[int] = None, valid: Optional[torch.Tensor] = None,
+                       sel_score: Optional[torch.Tensor] = None, pref: Optional[torch.Tensor] = None,
+                       sample: bool = False, generator: Optional[torch.Generator] = None) -> Dict:
+        """refiner v4_3 M5 computed edits (ck/v4/edits.py; V4Cfg.edits 'computed', readout 'range'): the top-k
+        (edit_k) PARENT columns of pool [T, N, 8, 3] (parents [T, N, 8, 3]; the columns equal to their parent, one per
+        distinct parent, edits.parent_columns) by sel_score [T, N] (the deployment selection score) or the critic-only
+        selection score of pool_out['score_logit'] (invalid columns excluded), each edited by the 0-parameter rule on
+        the PREDICTED fields of pool_out = score_set(..., return_pctx=True) of the pool (bisection with the LQR
+        executed states; no edit -> the slot holds the source itself), re-scored on the source's parent corridor.
+        Extra candidates only (never a gate).  -> the correct_topk keys with their shapes src_idx [T, k], edit_traj
+        [T, k, 8, 3], edit_score_logit [T, k, 5], edit_w_lat [T, k, 6], edit_haz, u [T, k, 12] (the corrector's
+        controls on edit_base; 0 without the corrector), + edit_base [T, k, 8, 3] (the computed edit), u_rule
+        [T, k, 2] (a_lon m/s^2, d_lat m), edit_kind [T, k] (0 none / 1 lon / 2 lat / 3 both), edit_need (keys outside
+        the predicted tube, same code), a_lon / d_lat / src_valid (False = a filler slot) / edit_clear / src_score
+        [T, k]; with V4Cfg.corrector also its zero-init residual on the edit (mu / log_sig / logp / ctx; pool_out then
+        needs return_ctx=True)."""
+        if not self.v4.computed_edits:
+            raise ValueError("computed_edits: this CK net has V4Cfg.edits != 'computed'")
+        from .v4.edits import computed_edits
+        return computed_edits(self, feat, mem, ego, pool, parents, pool_out, k=k, valid=valid, sel_score=sel_score,
+                              pref=pref, sample=sample, generator=generator)
 
     def corrector_logp(self, feat: torch.Tensor, mem: torch.Tensor, ego, src: torch.Tensor,
                        src_par: Optional[torch.Tensor], u: torch.Tensor, pref: Optional[torch.Tensor] = None,

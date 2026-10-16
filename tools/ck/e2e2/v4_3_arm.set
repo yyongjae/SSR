@@ -1,0 +1,41 @@
+# refiner v4_3 student (docs/refiner_v4/V4_3_SPEC.md, user decisions 2026-10-16 KST; ARM=v4_3): BEV KD stays on (yaml
+# default = the ck2e2e_bevkd setting) and
+#   * readout 'range' (M4): B / U blocked-field logits + margin D per unique parent, read at each candidate's EXECUTED
+#     states (exec_model lqr = the official tracker port), 20 bins of 0.25 s, EP head on the detached evidence, P_ref
+#     scene query, corridor version 2;
+#   * computed edits (M5): the rule edits of the critic's top-8 parents on the predicted fields, EXTRA candidates only
+#     (never a gate; selection over 96 + 8); recorded with the 96 and labelled by labeler2 (critic BCE on their
+#     official labels); corrector A off (its zero-init residual on the edit is the optional next step);
+#   * KD routing (M6): score KD on nc (<- DET) and dac (<- MAP) only, on the parent columns (kd_parent_only as v4_arm),
+#     scope 'all' ('near' = option); constraint KD: DET blocked field B BCE (spec M6; occ_channels=BU adds the TTC
+#     channel U -- an option the user has not confirmed) + MAP margin Huber (s <= 32 m) on the student's unique parents
+#     of the KD set.
+# Teachers: RANGE teachers (train_ck2.py --v4-readout range, tools/ck/v4/run_teachers.sh READOUT=range); the four paths
+# below are PLACEHOLDERS -- launch_util2 refuses a launch until an E2E_CK_SET file sets teacher_det_run / teacher_map_run
+# and kd_calib.det / kd_calib.map (KD calibration of the range teachers on nc / dac, fit_kd_calib(_family).py) or
+# kd_calib.enabled=false.  kd_constraint also refuses teachers on another grid (corridor version / time bins).
+# Not trained without the user's approval (GPUs 0-3 only); the oracle (spec Phase 0) gates this run.
+# The v4.exec_model .. v4.kd_constraint keys are OPTIONAL v4 keys (online2._d_v4_opt; launch_util2.apply_sets2
+# declares them), absent from ck_e2e2.yaml so the older arms are unchanged.
+v4.readout=range
+v4.exec_model=lqr
+v4.ev_tbins=20
+v4.ev_tbin_s=0.25
+v4.ep_evidence=true
+v4.pref_head=true
+v4.corridor_version=2
+v4.edits=computed
+v4.edit_k=8
+v4.corrector=false
+v4.kd_parent_only=true
+kd_score_keys=[nc,dac]
+v4.kd_score_scope=all
+v4.kd_constraint.enabled=true
+v4.kd_constraint.lambda_occ=0.5
+v4.kd_constraint.lambda_margin=0.5
+v4.kd_constraint.map_range_m=32.0
+v4.kd_constraint.occ_channels=B
+teacher_det_run=/PLACEHOLDER/v4_3/teacher_det_run
+teacher_map_run=/PLACEHOLDER/v4_3/teacher_map_run
+kd_calib.det=/PLACEHOLDER/v4_3/kd_calib_det.json
+kd_calib.map=/PLACEHOLDER/v4_3/kd_calib_map.json

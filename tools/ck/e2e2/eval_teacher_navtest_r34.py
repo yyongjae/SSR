@@ -191,9 +191,9 @@ def resolve_run(teacher: str) -> Path:
     p = Path(teacher)
     if p.is_dir():
         return p
-    q = CK_DATA / "ck2" / "train" / teacher
-    if q.is_dir():
-        return q
+    for q in (CK_DATA / "ck2" / "train" / teacher, CK_DATA / "v4" / "train" / teacher):   # CK2 / refiner v4 teachers
+        if q.is_dir():
+            return q
     raise SystemExit(f"teacher run not found: {teacher}")
 
 
@@ -631,7 +631,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="CK2 teacher navtest reference A (v2 r34 top-16)",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--stage", default="infer,select", help=f"comma list of {STAGES}")
-    ap.add_argument("--teacher", default=None, help="ck2T | ck2M | run dir (stages infer / select / eval)")
+    ap.add_argument("--teacher", default=None,
+                    help="run name under CK_DATA/ck2/train or CK_DATA/v4/train (stages infer / select / eval)")
     ap.add_argument("--which", default="last", help="checkpoint (user: last epoch)")
     ap.add_argument("--out-root", default=str(OUT_ROOT))
     ap.add_argument("--limit", type=int, default=0, help="first N packed rows -> <out-root>/smoke<N> (sanity)")

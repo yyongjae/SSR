@@ -30,6 +30,14 @@ Fields
       lon_max=True (opt-in) also returns LON [P, 48, 17, M] = the max over the SAT-overlapping OBS objects (no
       not-behind filter) of lon = (c_obj - c_cell) . e(h_j), -inf where nothing overlaps; B == (LON >= BEHIND_M)
       exactly.  B alone fixes the not-behind reference at the CELL's box; LON lets executed_slack move it (TTC below).
+      Stopped-aware B (stopped_aware=True, opt-in; docs/refiner_v4/V4_3_SPEC.md 'Phase 0b' representation R2 (1)):
+      the official collision classification calls a collision with a STOPPED track at fault before its rear test
+      (pdm_scorer_utils get_collision_type: is_track_stopped), so the not-behind proxy drops real NC failures behind
+      the box.  With stopped [S, A] (stopped_from_ref / stopped_mask_np: not an agent (static object), or
+      first-appearance speed hypot(vx, vy) <= STOP_TRACK = 0.05 m/s) the stopped objects block on every SAT overlap
+      and the moving ones keep the not-behind filter:  B_sa = OR(B(stopped subset, behind_m None), B(moving subset,
+      BEHIND_M)) = exactly tools/ck/v4/oracle/oracle_common.stopped_aware_B01 (two calls on the object subsets there,
+      one pass here; bitwise equal, tests/test_v4_r2.py on real navtrain_val tokens).  LON is unchanged.
   margins(D or sdf, parent_geom) -> m_left, m_right [P, 48] (m), L [P] (m)
       f_j(delta) = min over the 4 corners of the ego box with rear axle at Gamma(s_j) + delta n_j, heading h_j, of the
       field: 'grid' D [P, 48, 17] (a predicted / GT margin on the parent grid points; corners mapped to the grid by the
@@ -100,6 +108,10 @@ Fields
       crit_station / crit_time [B, 3] (nc, ttc, dac) of the minimising state (-1 / -1.0 when slack_nc / slack_ttc =
       slack_cap: nothing blocked was ever near, or when no DAC corner is readable; the DAC station is -1 for a state
       off the parent grid); slack_* clamped to [-slack_cap, slack_cap] (5 s) for NC / TTC.
+  gt_field_aux(haz, cand, ref, tbin_s, ...) -> (l_occ, l_margin, stats): the training aux of a range readout's own
+      per-parent fields against these GT fields (BCE on B / U, Huber on the SDF margin; stopped_aware for the R2 B);
+      shared by the range teachers (tools/ck/train_ck2.py range_gt_aux) and the student (online2 v4.rg_gt_aux).
+      GT here is a training TARGET only: no GT quantity ever enters the network's input.
 
 What the field does NOT model (official exceptions; the oracle reports them separately)
   * at-fault classification beyond 'not behind': lateral contacts count only when the ego is in multiple lanes or off
@@ -202,6 +214,7 @@ CHUNK = {"cpu": 1 << 16, "cuda": 1 << 22}       # blocked_field elements per tem
 TTC_DELTAS = (0.0, 0.3, 0.6, 0.9)               # official future_time_idcs (0, 3, 6, 9) x 0.1 s
 STOP_NC = 5e-2                   # [m/s] get_collision_type stopped ego (not at fault)
 STOP_TTC = 5e-3                  # [m/s] default_scoring_parameters stopped_speed_threshold (TTC skip)
+STOP_TRACK = 5e-2                # [m/s] is_track_stopped (first-appearance speed): stopped-aware B (Phase 0b R2)
 SLACK_CAP = 5.0                  # [s] NC / TTC slack clamp
 SCAN_STEP = 0.05                 # [m] margins lateral scan step
 PROJ_STEP = 0.3                  # [m] margins 'grid': Frenet projection of the scan corners every 0.3 m, linear between
@@ -290,6 +303,27 @@ def gt_boxes_from_ref(ref: Dict[str, Tensor], tok: Tensor, t_grid=None, device=N
     return boxes, st.to(torch.int64) == OBS, (meta[..., GF.MT_AGENT] > 0) & valid, t_av
 
 
+def stopped_mask_np(is_agent: np.ndarray, vfirst: np.ndarray) -> np.ndarray:
+    """[A] bool: the official is_track_stopped of the collision classification -- not an agent (static object), or
+    first-appearance speed vfirst <= STOP_TRACK (= tools/ck/v4/oracle/oracle_common.stopped_mask)."""
+    return (~np.asarray(is_agent, bool)) | (np.asarray(vfirst, np.float64) <= STOP_TRACK)
+
+
+def stopped_from_ref(ref: Dict[str, Tensor], tok: Tensor, device=None) -> Tensor:
+    """stopped mask [N, A] bool of tokens tok from the batch's ref_obj_* (the objects of gt_boxes_from_ref, same A):
+    stopped_mask_np on (meta MT_AGENT > 0, hypot of the first-appearance velocity, float64); padding rows False."""
+    from ...refiner import gt_future as GF
+    dev = device if device is not None else ref["ref_obj_kf"].device
+    tok = torch.as_tensor(tok, device=ref["ref_obj_kf"].device).long()
+    n = ref["ref_obj_n"][tok].long()
+    a = int(max(int(n.max()) if n.numel() else 0, 1))
+    first = ref["ref_obj_first"][tok][:, :a].to(dev).double()
+    meta = ref["ref_obj_meta"][tok][:, :a].to(dev).long()
+    valid = torch.arange(a, device=dev)[None] < n.to(dev)[:, None]
+    vfirst = torch.hypot(first[..., GF.FI_VX], first[..., GF.FI_VY])
+    return valid & ((meta[..., GF.MT_AGENT] <= 0) | (vfirst <= STOP_TRACK))
+
+
 # ----------------------------------------------------------------------------------------------- blocked field
 def _cull_bbox(c0: Tensor, n: Tensor) -> Tuple[Tensor, Tensor]:
     """bounding box [P, 2] lo / hi of the ego box centres of all cells (segment end points c0 +- 4.8 n)."""
@@ -297,11 +331,25 @@ def _cull_bbox(c0: Tensor, n: Tensor) -> Tuple[Tensor, Tensor]:
     return e.min(1).values, e.max(1).values
 
 
+def _check_stopped(stopped_aware: bool, stopped, shape: Tuple[int, ...]):
+    """stopped mask of the stopped-aware B (None when off); shape = the objects' leading dims ([S, A] / [A])."""
+    if not stopped_aware:
+        if stopped is not None:
+            raise ValueError("blocked_field: `stopped` is only read with stopped_aware=True")
+        return None
+    if stopped is None:
+        raise ValueError("blocked_field(stopped_aware=True) needs the stopped mask (stopped_mask_np / stopped_from_ref)")
+    if tuple(stopped.shape) != tuple(shape):
+        raise ValueError(f"stopped mask {tuple(stopped.shape)} != objects {tuple(shape)}")
+    return stopped
+
+
 @torch.no_grad()
 def blocked_field(parent_geom, boxes: Tensor, state: Tensor, t_grid=None, index=None, tbin_s: float = TBIN_S,
                   n_bins: Optional[int] = None, heading: str = "parent", behind_m: Optional[float] = BEHIND_M,
                   obj_mask: Optional[Tensor] = None, t_avail: Optional[Tensor] = None, details: bool = False,
-                  chunk: Optional[int] = None, lon_max: bool = False):
+                  chunk: Optional[int] = None, lon_max: bool = False, stopped_aware: bool = False,
+                  stopped: Optional[Tensor] = None):
     """Blocked field B [P, 48, 17, M] bool of P parents (module docstring 'Fields').
 
     parent_geom : CorridorGeom of the P parents (or a parent_frame dict).
@@ -321,12 +369,19 @@ def blocked_field(parent_geom, boxes: Tensor, state: Tensor, t_grid=None, index=
                   B == (LON >= behind_m) exactly (B == LON > -inf for behind_m None), and the not-behind test can be
                   re-read from another reference point (executed_slack(lon_field=): TTC from the CURRENT ego).
                   Returned as (B, LON) (details: dict key 'lon_max').
+    stopped_aware: opt-in (default off: outputs unchanged) the stopped-aware B of Phase 0b R2 (module docstring
+                  'Stopped-aware B'): the objects of `stopped` [S, A] bool (stopped_from_ref / stopped_mask_np: not an
+                  agent, or first-appearance speed <= STOP_TRACK) block WITHOUT the not-behind filter, the others with
+                  it.  LON is unchanged (no filter by construction), so B == (LON >= behind_m) no longer holds for
+                  the stopped objects' cells.  No effect with behind_m None.
     """
     fr = parent_frame(parent_geom, heading)
     pts, n_, h = fr["pts"], fr["n"], fr["h"]
     P = pts.shape[0]
     dev, dt = pts.device, pts.dtype
     S, A, T = boxes.shape[:3]
+    stp = _check_stopped(stopped_aware, stopped, (S, A))
+    stp = None if stp is None else torch.as_tensor(stp, device=dev).bool()
     chunk = int(CHUNK.get(dev.type, CHUNK["cpu"]) if chunk is None else chunk)
     idx = _index(index, P, S, dev)
     t = torch.as_tensor(fine_times() if t_grid is None else t_grid, dtype=torch.float64, device=dev).reshape(-1)
@@ -386,7 +441,10 @@ def blocked_field(parent_geom, boxes: Tensor, state: Tensor, t_grid=None, index=
                     ce = ra + RA2C * eh[pq, jq][:, None, :]
                     lon = ((obq[:, None, :2] - ce) * eh[pq, jq][:, None, :]).sum(-1)
                     if behind_m is not None:
-                        hit = sat & (lon >= behind_m)
+                        nb = lon >= behind_m
+                        if stp is not None:                                   # stopped / static: no not-behind
+                            nb = nb | stp[idx[pq], ak[kq]][:, None]
+                        hit = sat & nb
                     if lon_max:
                         qs, is_ = torch.nonzero(sat, as_tuple=True)
                         if qs.numel():
@@ -445,14 +503,18 @@ def frame_np(fr: Dict[str, Tensor]) -> Dict[str, np.ndarray]:
 
 def blocked_field_np(fr: Dict[str, np.ndarray], boxes: np.ndarray, obs: np.ndarray, t_grid=None,
                      tbin_s: float = TBIN_S, n_bins: Optional[int] = None, behind_m: Optional[float] = BEHIND_M,
-                     fine: bool = False, lon_max: bool = False):
+                     fine: bool = False, lon_max: bool = False, stopped_aware: bool = False,
+                     stopped: Optional[np.ndarray] = None):
     """float64 numpy twin of blocked_field for P parents of ONE scene (oracle): fr = frame_np(parent_frame(...)),
     boxes [A, T, 5], obs [A, T] bool at t_grid [T] (default fine_times()) -> B [P, 48, 17, M] bool.  fine=True adds the
     per sample field [P, 48, 17, T], lon_max=True the LON field [P, 48, 17, M] float64 (blocked_field 'lon_max'); with
-    either, a tuple (B, [fine], [LON]) in that order."""
+    either, a tuple (B, [fine], [LON]) in that order.  stopped_aware / stopped [A] bool: blocked_field's stopped-aware
+    B (= tools/ck/v4/oracle/oracle_common.stopped_aware_B01 at tbin_s 0.1, bitwise)."""
     pts, n_, h, p = fr["pts"], fr["n"], fr["h"], fr["p"]
     P = pts.shape[0]
     A, T = boxes.shape[:2]
+    stp = _check_stopped(stopped_aware, stopped, (A,))
+    stp = None if stp is None else np.asarray(stp, bool)
     t = fine_times() if t_grid is None else np.asarray(t_grid, np.float64).reshape(-1)
     M = n_bins_of(tbin_s) if n_bins is None else int(n_bins)
     mt = time_bins(t, tbin_s)
@@ -489,7 +551,10 @@ def blocked_field_np(fr: Dict[str, np.ndarray], boxes: np.ndarray, obs: np.ndarr
             ce = ra + RA2C * eh[pp, jj][:, None, :]
             lon = ((obq[:, None, :2] - ce) * eh[pp, jj][:, None, :]).sum(-1)
             if behind_m is not None:
-                hit = sat & (lon >= behind_m)
+                nb = lon >= behind_m
+                if stp is not None:                                           # stopped / static: no not-behind
+                    nb = nb | stp[ai[kk]][:, None]
+                hit = sat & nb
             if lon_max:
                 qs, is_ = np.nonzero(sat)
                 np.maximum.at(out_l, (np.full(qs.shape, pp), jj[qs], is_, mt[ti[kk[qs]]]), lon[qs, is_])
@@ -903,3 +968,101 @@ def executed_slack(states: Tensor, parent_geom, B_field: Optional[Tensor], field
     out["crit_station"] = crit_s
     out["crit_time"] = crit_t
     return out
+
+
+# ----------------------------------------------------------------------------------------------- training aux
+MARGIN_CLIP = 5.0                # [m] SDF margin targets clipped (= losses.evidence_aux, online2.CK_MARGIN_CLIP)
+
+
+def gt_field_aux(haz: Dict[str, Tensor], cand: Tensor, ref: Dict[str, Tensor], tbin_s: float, max_parents: int = 8,
+                 corridor_version: int = 1, need_occ: bool = True, need_margin: bool = True,
+                 stopped_aware: bool = False) -> Tuple[Tensor, Tensor, Dict[str, float]]:
+    """GT field aux of a range readout (train time only; GT is a TARGET here, never an input): the BCE / Huber of the
+    readout's own per-parent fields against the GT fields of the same parent grids (the logic of the range teachers'
+    train_ck2.range_gt_aux, which calls this; also the student's ck_e2e2.v4.rg_gt_aux).
+      rows: the own-parent candidates of cand [T, K, 8, 3] (haz 'is_self'; row = haz 'parent_index') of GT-ok tokens
+          (ref_gt_ok), the first max_parents distinct rows per token in slot order;
+      occ: blocked_field of the GT objects (ref_obj_*, gt_boxes_from_ref: metric-cache rule, 0.1 s samples max-pooled
+          into the readout's M bins of tbin_s) on each parent's grid (corridor_version, heading 'parent') with lon_max:
+          target B = the not-behind at-fault proxy (stopped_aware=True: the Phase 0b R2 stopped-aware B, stopped /
+          static objects without the not-behind filter, stopped_from_ref) for the logits occ_logit_u, U = LON > -inf
+          (any overlap: the TTC channel) for ovl_logit_u, and with stopped_aware the plain not-behind B
+          Bp = LON >= BEHIND_M (the B without R2, which the readout's TTC reads) for bp_logit_u (required then: an
+          rg_stopped_aware readout has it); BCE over every cell and the KNOWN bins (a bin holding a sample after the
+          token's annotated horizon t_avail is masked), mean over the B | U (| Bp) groups;
+      margin: the official DAC SDF (ref_sdf, sdf.sample_sdf) at the parent grid points clipped to +-MARGIN_CLIP m,
+          Huber (delta 1 m) with margin_u; points outside the SDF grid masked.
+    haz: score_set 'haz' of the candidate set ([T, K, ...] + the per-row occ_logit_u / ovl_logit_u [T, U, 48, 17, M]
+    (+ bp_logit_u with stopped_aware), margin_u [T, U, 48, 17]); ref: losses.EV_REF_KEYS.  -> (l_occ, l_margin, stats rg_*); zeros (graph-connected)
+    when a term is not needed, a ref key is missing or nothing is selected.  BCE / Huber only."""
+    import torch.nn.functional as F
+    from ...refiner.corridor import corridor_geometry
+    from .losses import EV_REF_KEYS
+    Bo, Bu, D = haz["occ_logit_u"], haz["ovl_logit_u"], haz["margin_u"]
+    Bp = haz.get("bp_logit_u")
+    if bool(stopped_aware) != (Bp is not None):
+        raise ValueError(f"gt_field_aux: stopped_aware={bool(stopped_aware)} but the readout "
+                         f"{'has' if Bp is not None else 'has no'} Bp group (bp_logit_u): the target rule must be the "
+                         f"readout's V4Cfg.rg_stopped_aware")
+    T, U = Bo.shape[:2]
+    M = Bo.shape[-1]
+    dev = Bo.device
+    zero = Bo.sum() * 0.0 + Bu.sum() * 0.0 + D.sum() * 0.0
+    if Bp is not None:
+        zero = zero + Bp.sum() * 0.0
+    if any(k not in ref for k in EV_REF_KEYS) or not (need_occ or need_margin):
+        return zero, zero, {"rg_n": 0.0}
+    K = cand.shape[1]
+    gt = ref["ref_gt_ok"].reshape(-1).bool().to(dev)
+    pidx = haz["parent_index"].long().to(dev)
+    sel = haz["is_self"].bool().to(dev) & gt[:, None]
+    kk = torch.where(sel, torch.arange(K, device=dev)[None].expand(T, K), torch.full((T, K), K, device=dev))
+    rep = torch.full((T, U), K, dtype=torch.long, device=dev).scatter_reduce(1, pidx, kk, reduce="amin",
+                                                                              include_self=True)
+    first = sel & (torch.gather(rep, 1, pidx) == torch.arange(K, device=dev)[None])   # first candidate of its row
+    keep = first & (torch.cumsum(first.long(), 1) <= int(max_parents))
+    tok, col = torch.nonzero(keep, as_tuple=True)
+    if tok.numel() == 0:
+        return zero, zero, {"rg_n": 0.0}
+    rows = pidx[tok, col]
+    with torch.no_grad():
+        geom = corridor_geometry(cand[tok, col].float(), version=int(corridor_version))
+        fr = parent_frame(geom)
+    st: Dict[str, float] = {"rg_n": float(tok.numel())}
+    l_occ = l_m = zero
+    if need_occ:
+        tbin = float(tbin_s)
+        ut, inv = torch.unique(tok, return_inverse=True)
+        with torch.no_grad():
+            boxes, obs, _, t_av = gt_boxes_from_ref(ref, ut, device=dev)               # [S, A, 50, 5], 0 .. 4.9 s
+            skw = {"stopped_aware": True, "stopped": stopped_from_ref(ref, ut, device=dev)} if stopped_aware else {}
+            B_t, lon = blocked_field(fr, boxes, obs, index=inv, tbin_s=tbin, n_bins=M, lon_max=True, **skw)
+            U_t = lon > -math.inf                                                      # any overlap (no not-behind)
+            tn = torch.as_tensor(fine_times(), dtype=torch.float64, device=dev)
+            mt = torch.floor(tn / tbin + T_EPS).long()
+            late = (tn[None] > t_av.to(dev).double()[inv][:, None] + T_EPS) & (mt < M)[None]
+            known = torch.ones(len(tok), M, dtype=torch.bool, device=dev)
+            pp, tt = torch.nonzero(late, as_tuple=True)
+            known[pp, mt[tt]] = False
+            parts = [B_t, U_t] + ([lon >= BEHIND_M] if Bp is not None else [])          # Bp: the plain B
+            tgt = torch.cat(parts, -1).float()                                         # [P, 48, 17, 2M | 3M]
+            w = torch.cat([known] * len(parts), -1).float()[:, None, None, :].expand_as(tgt)
+        lg = torch.cat([Bo[tok, rows], Bu[tok, rows]] + ([Bp[tok, rows]] if Bp is not None else []), -1).float()
+        bce = F.binary_cross_entropy_with_logits(lg, tgt, reduction="none")
+        l_occ = (bce * w).sum() / w.sum().clamp(min=1.0)
+        rate = lambda g: float((tgt[..., g * M:(g + 1) * M] * w[..., g * M:(g + 1) * M]).sum()
+                               / w[..., g * M:(g + 1) * M].sum().clamp(min=1.0))
+        st.update(rg_occ_bce=float(l_occ.detach()), rg_rate_B=rate(0), rg_rate_U=rate(1),
+                  rg_known=float(known.float().mean()))
+        if Bp is not None:
+            st["rg_rate_Bp"] = rate(2)
+    if need_margin:
+        with torch.no_grad():
+            P = tok.numel()
+            sv, sval = sample_sdf(ref["ref_sdf"].to(dev), fr["pts"].reshape(P, -1, 2).float(), tok)
+            tgt_d = sv.float().clamp(-MARGIN_CLIP, MARGIN_CLIP).reshape(P, *D.shape[2:])
+            wd = sval.float().reshape(P, *D.shape[2:])
+        hub = F.huber_loss(D[tok, rows].float(), tgt_d, delta=1.0, reduction="none")
+        l_m = (hub * wd).sum() / wd.sum().clamp(min=1.0)
+        st.update(rg_margin_huber=float(l_m.detach()), rg_sdf_valid=float(wd.mean()))
+    return l_occ, l_m, st

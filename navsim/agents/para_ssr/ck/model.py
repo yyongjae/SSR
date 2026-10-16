@@ -304,7 +304,8 @@ class CKNet(nn.Module):
         [T, K, 48]; evidence: occ_logit [T, K, 48, 17, M], margin [T, K, 48, 17], pts [T, K, 48, 17, 2] (parent grid
         points, N frame), lp_nc / lp_ttc / lp_dac / min_margin [T, K]; range (V4_3 M4, ck/v4/range_readout.py):
         occ_logit [T, K, 48, 17, M] (B of the candidate's parent), margin [T, K, 48, 17] (D), the same once per
-        parent row occ_logit_u / ovl_logit_u (U) [T, U, 48, 17, M], margin_u [T, U, 48, 17] with parent_index
+        parent row occ_logit_u / ovl_logit_u (U) [T, U, 48, 17, M] (+ bp_logit_u (Bp, the plain not-behind B that
+        TTC reads) with v4.rg_stopped_aware), margin_u [T, U, 48, 17] with parent_index
         [T, K] (row of each candidate; U = K and index k without dedupe), exec_states [T, K, Q, 6] (Q 41 'lqr' / 9
         'plan'), lp_nc / lp_ttc / lp_dac, slack_nc / slack_ttc [s] / slack_dac (= min_margin) [m], exec_ratio,
         S_exec [m], overspeed [m/s] [T, K], crit_station / crit_lat (long) / crit_time [T, K, 3] (nc, ttc, dac),
@@ -462,10 +463,12 @@ class CKNet(nn.Module):
         uq = lambda a: a.reshape(T, R // T, *a.shape[1:])
         per = lambda a: a if rows is None else a.index_select(0, rows)
         haz = {"occ_logit": sh(per(Fs["blk"][..., :M])), "margin": sh(per(Fs["margin"])),
-               "occ_logit_u": uq(Fs["blk"][..., :M]), "ovl_logit_u": uq(Fs["blk"][..., M:]),
+               "occ_logit_u": uq(Fs["blk"][..., :M]), "ovl_logit_u": uq(Fs["blk"][..., M:2 * M]),
                "margin_u": uq(Fs["margin"]),
                "parent_index": (torch.arange(K, device=dev)[None].expand(T, K) if pidx is None else pidx),
                "exec_states": sh(states)}
+        if Fs["blk"].shape[-1] == 3 * M:            # rg_stopped_aware: the plain not-behind B (TTC's B read)
+            haz["bp_logit_u"] = uq(Fs["blk"][..., 2 * M:])
         haz.update({k: sh(r[k]) for k in ("lp_nc", "lp_ttc", "lp_dac", "slack_nc", "slack_ttc", "slack_dac",
                                            "min_margin", "crit_station", "crit_lat", "crit_time", "crit_chan",
                                            "exec_ratio", "S_exec", "overspeed")})

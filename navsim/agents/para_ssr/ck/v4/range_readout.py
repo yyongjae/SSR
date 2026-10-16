@@ -6,7 +6,7 @@ d_i = -4.8 + 0.6 i; a cell (j, i) holds the official ego box with its REAR AXLE 
 parent path.  Time bins m = [m tbin, (m + 1) tbin), tbin = V4Cfg.ev_tbin_s, M = ev_tbins (M tbin = 5.0 s).
 
 Scene fields (learned, candidate-free, once per UNIQUE parent: CKNet.score_set's parent dedupe rows R = T * U):
-  blk [R, 48, 17, 2M] logits, channels [0, M) = B, [M, 2M) = U:
+  blk [R, 48, 17, 2M] logits, channels [0, M) = B, [M, 2M) = U (+ [2M, 3M) = Bp with rg_stopped_aware, below):
       B[j, i, m]  the box at cell (j, i) overlaps a GT object at a time of bin m that is NOT behind the box (object
                   centre >= BEHIND_M = -1.3 m along the cell heading from the box centre) -- target
                   range_targets.blocked_field (the at-fault proxy; NC and TTC delta 0 read it);
@@ -31,6 +31,16 @@ Scene fields (learned, candidate-free, once per UNIQUE parent: CKNet.score_set's
         5 channels (1 m steps, round)  all-16 0.8719 / 0.9653                         0.99942
       (top-1 identical to exact for every two-channel switch >= 1 m; cell rates B 12.3 %, U 16.9 %).  The 2 m switch
       is the exact rule up to 0.24 % of the candidates at 2 x M outputs; more LON bins gain <= 0.19 %.
+  With V4Cfg.rg_stopped_aware (Phase 0b R2 (1)) blk has a THIRD group, channels [2M, 3M) = Bp:
+      B[j, i, m]  is then the stopped-aware B (target range_targets.blocked_field(stopped_aware=True): stopped /
+                  static objects block without the not-behind filter) -- read by NC only;
+      Bp[j, i, m] the plain not-behind B (target LON >= BEHIND_M of the same lon_max call = the B above without R2):
+                  every TTC read that would read B (delta 0, and |v| delta < U_SWITCH_M) reads Bp.
+      Why: R2 changes NC only (the official TTC rule has no stopped-track exception, tools/ck/v4/oracle/heldout_common
+      'U / LON unchanged'), so a TTC read of the stopped-aware B learns an exception the scorer does not have (review
+      of cprep, 1,500 F1 tokens on GT fields: TTC pass recall 0.8422 vs 0.8525 for the R2 GT tube, joint NC | TTC
+      disagreement with the tube 0.90 % vs 0.59 % with the plain B; NC identical).  With Bp the TTC reads are those of
+      the readout without R2 (bitwise on the same fields, tests/test_v4_r2.py) and NC is the R2 GT reduction.
   margin [R, 48, 17] (m): signed distance of the grid point to the official DAC boundary (+ inside; target the
       official SDF at the grid points, as evidence 'D').
   Heads: per-cell MLPs on [Hc (128 corridor conv channels), x'_j (station token)] (the evidence readout's inputs),
@@ -48,10 +58,16 @@ Candidate states (no parameters, no gradient; candidate_states):
   its target reproduces the oracle; a bilinear read bleeds a blocked region half a cell into its free neighbours), D
   bilinearly in (s, d) with s clamped to [s_0, s_47] (as read_field; D is a continuous distance); the time bin is
   floor(t / tbin + 1e-6) (float64).
+  V4Cfg.rg_read 'any4' (Phase 0b R2 (2), opt-in): B / U are read at the 2 x 2 grid points around each point
+  (range_targets._cells 'any4'; any4_cells): the thresholded slacks OR the 4 cells' profiles (hard_slack; = range_targets
+  .executed_slack(read='any4') on the same fields) and the soft evidence below runs its soft max over the points x
+  their distinct cells (soft_read: a soft OR of the 4 cells inside the soft max over the states; set_prior then
+  subtracts tau ln(4 Q)); D stays bilinear.
 Evidence (all differentiable in the fields; spec M4):
   NC   z_nc  = smax over the states with |v| > 0.05 m/s (official stopped-ego skip) of B(s_n, d_n, bin(t_n))
-  TTC  z_ttc = smax over states with |v| >= 5e-3 m/s and delta in (0, 0.3, 0.6, 0.9) s of B-or-U (rule above) at the
-       rear axle projected |v_n| delta along the executed heading h_n, bin(t_n + delta)
+  TTC  z_ttc = smax over states with |v| >= 5e-3 m/s and delta in (0, 0.3, 0.6, 0.9) s of B-or-U (rule above; Bp in
+       place of B with rg_stopped_aware) at the rear axle projected |v_n| delta along the executed heading h_n,
+       bin(t_n + delta)
   DAC  z_dac = smax over states x the 4 official corners (executed heading) of -D(corner) / eps, eps = exp(log_eps)
        (init ev_eps, >= 0.01 m)
   smax = evidence.smax (tau 0.5 logsumexp; no readable point -> -20), lp_k = log P_pass,k = logsigmoid(-z_k), score
@@ -65,7 +81,7 @@ Evidence (all differentiable in the fields; spec M4):
   corner through the residual input r_in and the haz output, as the evidence readout's min_marg -- hard_evidence's
   slack_dac, used by the edits, is the no-grad twin on the detached D), crit_station / crit_lat / crit_time [B, 3]
   (columns nc, ttc, dac; -1 / -1.0 none; TTC: the projected cell, the EGO time of the state), crit_chan [B] (channel
-  the TTC critical read used: 0 B, 1 U).
+  group the TTC critical read used: 0 B, 1 U, 2 Bp (rg_stopped_aware)).
   vmax 'feature': overspeed = max over the moving on-grid states of relu(|v_n| - v_max(station of s_n)), v_max =
   range_targets.v_max(parent curvature, outside margin) with the margins of grid_margins on the predicted D (detached).
 EP / comfort / lateral heads: as the evidence readout (stations read = readout.read_mask on the candidate's PLANNED
@@ -101,6 +117,7 @@ from .readout import EP_MIN_DIST, HC_CH, I_C, I_DAC, I_EP, I_NC, I_TTC, LAT_STEP
 Tensor = torch.Tensor
 TTC_DELTAS = RT.TTC_DELTAS                       # (0, 0.3, 0.6, 0.9) s, official future_time_idcs x 0.1 s
 U_SWITCH_M = 2.0                                 # [m] TTC reads U where |v| delta >= this (module docstring)
+CH_B, CH_U, CH_BP = 0, 1, 2                      # blk channel groups [g M, (g + 1) M): B | U | Bp (rg_stopped_aware)
 STOP_NC, STOP_TTC = RT.STOP_NC, RT.STOP_TTC      # [m/s] official stopped-ego skips (NC 0.05, TTC 5e-3)
 SLACK_CAP = RT.SLACK_CAP                         # [s]
 T_EPS = RT.T_EPS
@@ -194,6 +211,38 @@ def read_nearest(G: Tensor, rows: Tensor, j: Tensor, i: Tensor, ch) -> Tensor:
     return G.reshape(-1)[idx]
 
 
+def any4_cells(gc: Dict[str, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+    """the 2 x 2 grid points around grid_coords points (range_targets._cells 'any4': j0 = floor(s / ds - 0.5), i0 =
+    floor((d + 4.8) / 0.6), points (j0, i0), (j0 + 1, i0), (j0, i0 + 1), (j0 + 1, i0 + 1), clamped to the grid) ->
+    jn, in_ [B, P, 4] long, distinct [B, P, 4] bool (False for a clamped duplicate of an earlier point: the soft-OR
+    counts each cell once; the hard OR does not care)."""
+    us, ud = gc["us"], gc["ud"]                                          # zeroed where not ok (_domain)
+    j0, i0 = torch.floor(us).long(), torch.floor(ud).long()
+    jn = torch.stack([j0, j0 + 1, j0, j0 + 1], -1).clamp(0, N_ST - 1)
+    in_ = torch.stack([i0, i0, i0 + 1, i0 + 1], -1).clamp(0, N_LAT - 1)
+    dj, di = jn[..., 1] != jn[..., 0], in_[..., 2] != in_[..., 0]
+    distinct = torch.stack([torch.ones_like(dj), dj, di, dj & di], -1)
+    return jn, in_, distinct
+
+
+def soft_read(G: Tensor, rows: Tensor, gc: Dict[str, Tensor], ch: Tensor, valid: Tensor, read: str = "nearest",
+              tau: float = SMAX_TAU) -> Tensor:
+    """Differentiable read of the parent-row logits G [R, 48, 17, C] at the points gc [B, P] (channel ch [B, P]) and
+    soft maximum over the valid points (valid [B, P]) -> z [B]: 'nearest' = smax over the points of the nearest cell;
+    'any4' = smax over the points x their distinct 2 x 2 cells (a soft OR of the 4 cells, nested in the soft max over
+    the states: one tau-logsumexp over both)."""
+    if read == "nearest":
+        return smax(read_nearest(G, rows, *nearest_cells(gc), ch), valid, tau)
+    if read != "any4":
+        raise ValueError(f"read {read!r} not in ('nearest', 'any4')")
+    jn, in_, distinct = any4_cells(gc)
+    Bn, P = valid.shape
+    chx = ch[..., None].expand(Bn, P, 4) if torch.is_tensor(ch) else ch
+    v = read_nearest(G, rows, jn.reshape(Bn, P * 4), in_.reshape(Bn, P * 4),
+                     chx.reshape(Bn, P * 4) if torch.is_tensor(chx) else chx)
+    return smax(v, (valid[..., None] & distinct).reshape(Bn, P * 4), tau)
+
+
 def lateral_read_rows(Hc: Tensor, rows: Tensor, d: Tensor) -> Tensor:
     """readout.lateral_read on parent rows without gathering Hc per candidate: Hc [R, C, 48, 17], rows [B], d [B, 48]
     (m, clamped +-4.8) -> [B, 48, C] (linear between the two lateral offsets around d; differentiable in Hc)."""
@@ -216,18 +265,36 @@ def time_bin(t: Tensor, tbin: float) -> Tensor:
 
 @torch.no_grad()
 def hard_slack(blk_b: Tensor, rows: Tensor, gc: Dict[str, Tensor], t: Tensor, chan, use: Tensor, M: int, tbin: float,
-               cap: float = SLACK_CAP) -> Tuple[Tensor, Tensor, Tensor]:
-    """Per-point signed time slack on the thresholded fields (range_targets._time_slack, nearest cell): blk_b
-    [R, 48, 17, 2M] bool (B | U), points gc (grid_coords, [B, P]), read times t [P] or [B, P] (float64), chan [B, P]
-    (0 B, 1 U) or an int, use [B, P] -> (slack [B, P] f32 (cap where not read), station j, lateral i [B, P] long)."""
+               cap: float = SLACK_CAP, read: str = "nearest") -> Tuple[Tensor, Tensor, Tensor]:
+    """Per-point signed time slack on the thresholded fields (range_targets._time_slack): blk_b [R, 48, 17, G M] bool
+    (B | U [| Bp], G = 2 or 3 channel groups), points gc (grid_coords, [B, P]), read times t [P] or [B, P] (float64),
+    chan [B, P] (group: 0 B, 1 U, 2 Bp) or an int, use [B, P]; read 'nearest' (the nearest cell's profile) | 'any4' (the
+    OR of the 2 x 2 cells' profiles, = range_targets.executed_slack(read='any4')) -> (slack [B, P] f32 (cap where not
+    read), station j, lateral i [B, P] long: the NEAREST cell in both modes, as executed_slack's crit_station)."""
     Bn, P = gc["s"].shape
     ok = gc["ok"]
     j, i = nearest_cells(gc)
-    prof2 = blk_b[rows.reshape(Bn, 1).expand(Bn, P), j, i]                            # [B, P, 2M]
-    if torch.is_tensor(chan):
-        prof = torch.where(chan.bool()[..., None], prof2[..., M:], prof2[..., :M])
+    rr = rows.reshape(Bn, 1).expand(Bn, P)
+    G = blk_b.shape[-1] // M
+    if G * M != blk_b.shape[-1] or G not in (2, 3):
+        raise ValueError(f"hard_slack: blk has {blk_b.shape[-1]} channels, not 2 or 3 groups of M = {M}")
+    if read == "nearest":
+        prof2 = blk_b[rr, j, i]                                                         # [B, P, G M]
+    elif read == "any4":
+        jn, in_, _ = any4_cells(gc)
+        prof2 = blk_b[rr[..., None].expand(Bn, P, 4), jn, in_]                          # [B, P, 4, G M]
     else:
-        prof = prof2[..., M:] if int(chan) else prof2[..., :M]
+        raise ValueError(f"read {read!r} not in ('nearest', 'any4')")
+    if torch.is_tensor(chan):
+        c_ = chan.long()[..., None] if read == "nearest" else chan.long()[..., None, None]
+        prof = prof2[..., :M]
+        for g in range(1, G):                                                           # group g where chan == g
+            prof = torch.where(c_ == g, prof2[..., g * M:(g + 1) * M], prof)
+    else:
+        g = int(chan)
+        prof = prof2[..., g * M:(g + 1) * M]
+    if read == "any4":
+        prof = prof.any(-2)                                                             # OR over the 4 cells
     tt = t.double().expand(Bn, P) if t.dim() == 1 else t.double()
     sl = RT._time_slack(prof, tt, tbin, cap).float()
     return torch.where(ok & use, sl, torch.full_like(sl, float(cap))), j, i
@@ -290,11 +357,15 @@ def _ttc_points(st: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
 
 
 @torch.no_grad()
-def read_geometry(fr_rows: Dict[str, Tensor], states: Tensor, t: Tensor, M: int, tbin: float) -> Dict[str, Tensor]:
+def read_geometry(fr_rows: Dict[str, Tensor], states: Tensor, t: Tensor, M: int, tbin: float,
+                  ttc_b_chan: int = CH_B) -> Dict[str, Tensor]:
     """Every point the range readout reads for B candidates (rows of fr_rows = their parents' frames): states
     [B, Q, 6] at t [Q] (float64) -> grid coordinates of the NC points (rear axles, [B, Q]), the TTC points ([B, Q * 4],
     state-major, delta-minor), the DAC corners ([B, Q * 4], FL RL RR FR), their time bins, read masks (stopped-ego
-    skips, on grid, time bin in [0, M)) and the TTC channel (1 = U where delta > 0 and |v| delta >= U_SWITCH_M)."""
+    skips, on grid, time bin in [0, M)) and the TTC channel group (CH_U = 1 where delta > 0 and |v| delta >= U_SWITCH_M,
+    else ttc_b_chan: CH_B = 0 (default) or CH_BP = 2, the plain not-behind B of an rg_stopped_aware readout)."""
+    if int(ttc_b_chan) not in (CH_B, CH_BP):
+        raise ValueError(f"ttc_b_chan {ttc_b_chan} not in ({CH_B}, {CH_BP})")
     B, Q = states.shape[:2]
     st = states.float()
     pr, shift, spd = _ttc_points(st)
@@ -312,7 +383,8 @@ def read_geometry(fr_rows: Dict[str, Tensor], states: Tensor, t: Tensor, M: int,
     in_nc, in_tt = (m_nc >= 0) & (m_nc < M), (m_tt >= 0) & (m_tt < M)
     use_nc = spd > STOP_NC
     use_tt = (spd >= STOP_TTC)[..., None].expand(B, Q, nd).reshape(B, -1)
-    chan = ((shift >= U_SWITCH_M) & (dl.to(st.dtype) > 0)).reshape(B, -1).long()
+    use_u = ((shift >= U_SWITCH_M) & (dl.to(st.dtype) > 0)).reshape(B, -1)
+    chan = use_u.long() if int(ttc_b_chan) == CH_B else torch.where(use_u, CH_U, int(ttc_b_chan)).long()
     return {"nc": g_nc, "ttc": g_tt, "dac": g_dc, "t_nc": t.double(), "t_ttc": t_tt,
             "m_nc": m_nc.clamp(0, M - 1), "m_ttc": m_tt.clamp(0, M - 1),
             "rd_nc": g_nc["ok"] & use_nc & in_nc[None], "use_nc": use_nc & in_nc[None],
@@ -320,11 +392,14 @@ def read_geometry(fr_rows: Dict[str, Tensor], states: Tensor, t: Tensor, M: int,
 
 
 @torch.no_grad()
-def hard_evidence(blk_b: Tensor, D: Tensor, rows: Tensor, geo: Dict[str, Tensor], M: int, tbin: float) -> Dict:
+def hard_evidence(blk_b: Tensor, D: Tensor, rows: Tensor, geo: Dict[str, Tensor], M: int, tbin: float,
+                  read: str = "nearest") -> Dict:
     """Slacks and critical points of B candidates on the thresholded parent fields (module docstring): blk_b
-    [R, 48, 17, 2M] bool, D [R, 48, 17] margin (m), rows [B], geo = read_geometry(...) -> slack_nc, slack_ttc [B] (s),
-    slack_dac [B] (m; +10 if no readable corner), crit_station / crit_lat [B, 3] long, crit_time [B, 3] (s),
-    crit_chan [B] long, state_dac [B, Q] (min readable corner margin per state, +inf none)."""
+    [R, 48, 17, 2M | 3M] bool (B | U [| Bp]; NC reads group 0, TTC the groups of geo 'chan'), D [R, 48, 17] margin (m),
+    rows [B], geo = read_geometry(...) (ttc_b_chan CH_BP for a 3-group field), read (hard_slack: B / U / Bp read
+    'nearest' | 'any4'; D is bilinear in both) -> slack_nc, slack_ttc [B] (s), slack_dac [B] (m; +10 if no readable
+    corner), crit_station / crit_lat [B, 3] long, crit_time [B, 3] (s), crit_chan [B] long, state_dac [B, Q] (min
+    readable corner margin per state, +inf none)."""
     Bn = rows.shape[0]
     Q = geo["nc"]["s"].shape[1]
     nd = len(TTC_DELTAS)
@@ -334,13 +409,13 @@ def hard_evidence(blk_b: Tensor, D: Tensor, rows: Tensor, geo: Dict[str, Tensor]
     crit_s = torch.full((Bn, 3), -1, dtype=torch.long, device=dev)
     crit_i = torch.full((Bn, 3), -1, dtype=torch.long, device=dev)
     crit_t = torch.full((Bn, 3), -1.0, dtype=torch.float32, device=dev)
-    sn, jn, in_ = hard_slack(blk_b, rows, geo["nc"], geo["t_nc"], 0, geo["use_nc"], M, tbin)
+    sn, jn, in_ = hard_slack(blk_b, rows, geo["nc"], geo["t_nc"], 0, geo["use_nc"], M, tbin, read=read)
     s_nc, q_nc = sn.min(-1)
     has = s_nc < SLACK_CAP
     crit_s[:, I_CNC] = torch.where(has, jn[bidx, q_nc], crit_s[:, I_CNC])
     crit_i[:, I_CNC] = torch.where(has, in_[bidx, q_nc], crit_i[:, I_CNC])
     crit_t[:, I_CNC] = torch.where(has, tq[q_nc], crit_t[:, I_CNC])
-    stt, jt, it = hard_slack(blk_b, rows, geo["ttc"], geo["t_ttc"], geo["chan"], geo["use_ttc"], M, tbin)
+    stt, jt, it = hard_slack(blk_b, rows, geo["ttc"], geo["t_ttc"], geo["chan"], geo["use_ttc"], M, tbin, read=read)
     s_tt, q_tt = stt.min(-1)
     has = s_tt < SLACK_CAP
     crit_s[:, I_CTTC] = torch.where(has, jt[bidx, q_tt], crit_s[:, I_CTTC])
@@ -360,6 +435,23 @@ def hard_evidence(blk_b: Tensor, D: Tensor, rows: Tensor, geo: Dict[str, Tensor]
             "crit_station": crit_s, "crit_lat": crit_i, "crit_time": crit_t, "crit_chan": chan, "state_dac": Dv}
 
 
+@torch.no_grad()
+def field_hits(blk_b: Tensor, D: Tensor, fr: Dict[str, Tensor], rows: Tensor, states: Tensor, t: Tensor, M: int,
+               tbin: float, read: str = "nearest", ttc_b_chan: Optional[int] = None) -> Dict[str, Tensor]:
+    """The readout's own thresholded rule on GIVEN fields (e.g. GT fields: the 'readout-rule perfect-field' tube of a
+    teacher whose fields equal their targets): blk_b [R, 48, 17, 2M | 3M] bool (B | U [| Bp]), D [R, 48, 17] (m), fr =
+    range_targets.parent_frame of the R rows (read in float32, as RangeReadout.forward), rows [B] (candidate -> row),
+    states [B, Q, 6] at t [Q] (float64 s; candidate_states), read 'nearest' | 'any4', ttc_b_chan (None: CH_BP for a
+    3-group field, else CH_B) -> hard_evidence(...) + hit_nc / hit_ttc / hit_dac [B] bool (slack < 0)."""
+    G = blk_b.shape[-1] // int(M)
+    ch = (CH_BP if G == 3 else CH_B) if ttc_b_chan is None else int(ttc_b_chan)
+    fr_rows = RT.gather_frame({k: fr[k].float() for k in ("p", "u", "n", "s", "ds")}, rows)
+    geo = read_geometry(fr_rows, states.float(), t, int(M), float(tbin), ttc_b_chan=ch)
+    h = hard_evidence(blk_b.bool(), D.float(), rows, geo, int(M), float(tbin), read=read)
+    h.update(hit_nc=h["slack_nc"] < 0, hit_ttc=h["slack_ttc"] < 0, hit_dac=h["slack_dac"] < 0)
+    return h
+
+
 # ----------------------------------------------------------------------------------------------- readout
 class RangeReadout(nn.Module):
     """V4Cfg.readout == 'range' heads (module docstring).  Built under the caller's seeded RNG."""
@@ -372,7 +464,10 @@ class RangeReadout(nn.Module):
         h = int(cfg.rg_hidden)
         self.M = M
         self.tbin = float(cfg.ev_tbin_s)
-        self.blk_head = _mlp(HC_CH + d, h, 2 * M)               # [B bins | U bins] logits per cell
+        # channel groups: B | U, + Bp (the plain not-behind B, TTC's B read) with rg_stopped_aware (module docstring)
+        self.n_groups = 3 if cfg.rg_stopped_aware else 2
+        self.ttc_b_chan = CH_BP if cfg.rg_stopped_aware else CH_B
+        self.blk_head = _mlp(HC_CH + d, h, self.n_groups * M)   # [B bins | U bins (| Bp bins)] logits per cell
         self.marg_head = _mlp(HC_CH + d, h, 1)                  # D [m]
         self.log_eps = nn.Parameter(torch.tensor(math.log(float(cfg.ev_eps))))
         self.resid = _mlp(N_RES + d, h, 3, zero_last=True) if cfg.ev_resid else None
@@ -388,6 +483,8 @@ class RangeReadout(nn.Module):
         logit(prior); NC / TTC / DAC pass rates then follow from the evidence (the residual starts at 0)."""
         p = np.clip(np.asarray(prior, np.float64), 1e-4, 1 - 1e-4)
         q = LQR.NT if self.cfg.exec_model == "lqr" else 9
+        if self.cfg.rg_read == "any4":                  # the soft max also runs over the 4 cells of each read
+            q *= 4
         self.blk_head[-1].bias.fill_(-math.log(p[I_NC] / (1 - p[I_NC])) - SMAX_TAU * math.log(q))
         self.marg_head[-1].bias.fill_(2.0)
         for head, i in ((self.ep_head, I_EP), (self.comfort_head, I_C)):
@@ -404,8 +501,8 @@ class RangeReadout(nn.Module):
         return F.conv2d(z, W2[:, :, None, None], b2).permute(0, 2, 3, 1).float().contiguous()
 
     def scene(self, xs: Tensor, Hc: Tensor) -> Dict[str, Tensor]:
-        """xs [R, 48, d], Hc [R, 128, 48, 17] (parent rows) -> blk [R, 48, 17, 2M] logits (B | U), margin
-        [R, 48, 17] (m), both f32 contiguous."""
+        """xs [R, 48, d], Hc [R, 128, 48, 17] (parent rows) -> blk [R, 48, 17, 2M] logits (B | U; [R, 48, 17, 3M]
+        B | U | Bp with rg_stopped_aware), margin [R, 48, 17] (m), both f32 contiguous."""
         return {"blk": self._cell_mlp(self.blk_head, xs, Hc), "margin": self._cell_mlp(self.marg_head, xs, Hc)[..., 0]}
 
     def forward(self, fields: Dict[str, Tensor], rows: Tensor, fr: Dict[str, Tensor], states: Tensor, t: Tensor,
@@ -423,16 +520,18 @@ class RangeReadout(nn.Module):
         dev = xs.device
         M = self.M
         blk, D = fields["blk"], fields["margin"]
+        if blk.shape[-1] != self.n_groups * M:
+            raise ValueError(f"range readout: blk has {blk.shape[-1]} channels, expected {self.n_groups} x {M} "
+                             f"(rg_stopped_aware {bool(self.cfg.rg_stopped_aware)})")
         with torch.autocast(device_type=dev.type, enabled=False):
             fr_rows = RT.gather_frame({k: fr[k].float() for k in ("p", "u", "n", "s", "ds")}, rows)
             st = states.float()
-            geo = read_geometry(fr_rows, st, t, M, self.tbin)
+            geo = read_geometry(fr_rows, st, t, M, self.tbin, ttc_b_chan=self.ttc_b_chan)
             # ---- differentiable evidence on the fields
             gn, gt_, gd = geo["nc"], geo["ttc"], geo["dac"]
-            z_nc = smax(read_nearest(blk, rows, *nearest_cells(gn), geo["m_nc"][None].expand_as(gn["us"])),
-                        geo["rd_nc"])
-            z_ttc = smax(read_nearest(blk, rows, *nearest_cells(gt_), geo["m_ttc"][None] + M * geo["chan"]),
-                         geo["rd_ttc"])
+            rd = self.cfg.rg_read
+            z_nc = soft_read(blk, rows, gn, geo["m_nc"][None].expand_as(gn["us"]), geo["rd_nc"], rd)
+            z_ttc = soft_read(blk, rows, gt_, geo["m_ttc"][None] + M * geo["chan"], geo["rd_ttc"], rd)
             Dc = read_cells(D[..., None], rows, gd["us"], gd["ud"], 0)                       # [B, 4Q]
             eps = torch.exp(self.log_eps.float()).clamp(min=0.01)
             z_dac = smax(-Dc / eps, gd["ok"])
@@ -440,7 +539,7 @@ class RangeReadout(nn.Module):
             slack_dac = torch.where(gd["ok"], Dc, torch.full_like(Dc, math.inf)).min(-1).values
             slack_dac = torch.where(torch.isfinite(slack_dac), slack_dac, torch.full_like(slack_dac, SDF_CLIP))
             # ---- thresholded fields: slacks / critical points (no gradient)
-            hard = hard_evidence(blk.detach() > 0, D.detach(), rows, geo, M, self.tbin)
+            hard = hard_evidence(blk.detach() > 0, D.detach(), rows, geo, M, self.tbin, read=rd)
             S_exec = LQR.executed_progress(st)[0]
             overspeed = torch.zeros(B, dtype=torch.float32, device=dev)
             if self.cfg.vmax == "feature":

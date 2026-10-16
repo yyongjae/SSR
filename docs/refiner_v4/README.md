@@ -114,6 +114,58 @@ Evaluation: `tools/ck/e2e2/eval_e2e2.py --stage all` on navtrain_val, then navte
 metrics.json): metrics.json `best` (96), `best_edits` (96 + K, the headline / representative row), `edits` (K, usable /
 unlabelled edits, the paired difference vs the 96 row of the same beta / set / lateral mode and vs the 96 choice).
 
+## v4_3 Phase 0b R2 and (c): range teachers as selection evidence (prepared, nothing launched)
+
+Spec: V4_3_SPEC.md 'Phase 0b' (user 2026-10-17: "b->c로 해봐").  R2 = the corrected representation (stopped-aware B +
+any4 read); (c) = retrain the DET / MAP range teachers with R2 targets and measure how much of the GT-tube selection gain
+their learned fields recover.  Every option below defaults OFF (outputs / state dicts / configs of the older arms
+unchanged: the default nearest readout and the refactored teacher aux are bit-identical to the previous code incl.
+gradients, checked against the pre-change files).
+
+| Piece | Where | Switch |
+|---|---|---|
+| Stopped-aware B (R2 (1)): stopped / static objects (not an agent, or first-appearance speed <= 0.05 m/s) block without the not-behind filter, moving ones with it; = oracle_common.stopped_aware_B01 bitwise (numpy twin, torch, and the training ref_* path on real navtrain_val tokens) | `range_targets.blocked_field[_np](stopped_aware=, stopped=)`, `stopped_mask_np`, `stopped_from_ref` | `V4Cfg.rg_stopped_aware` (target side; provenance) |
+| any4 read (R2 (2)): B / U read as the OR of the 2 x 2 cells around each executed point -- hard slacks / critical points = `range_targets.executed_slack(read='any4')`, the soft evidence a soft OR (the distinct cells join the soft max over the states; the prior subtracts tau ln 4Q) | `range_readout.any4_cells / soft_read / hard_slack(read=)` | `V4Cfg.rg_read='any4'` (not combined with `edits=computed` yet: edits.py reads the nearest cell; refused) |
+| Bp group (review of cprep): R2 makes only NC stopped-aware (the official TTC rule has no stopped-track exception; Phase 0b's tube reads TTC on LON >= -1.3 - \|v\| delta). With `rg_stopped_aware` the readout has a third field group Bp = the plain not-behind B (target LON >= -1.3 m of the same GT call); every TTC read of B (delta 0 and \|v\| delta < 2 m) reads Bp, NC reads the stopped-aware B, U unchanged. blk_head 2M -> 3M outputs (+1,100 parameters, inside the CK2 budget); constraint KD still distils B (\| U) | `range_readout` (CH_BP, `read_geometry(ttc_b_chan=)`, `field_hits`), `gt_field_aux` (bp_logit_u target), `CKNet.score_set` haz `bp_logit_u` | `V4Cfg.rg_stopped_aware` (now also a network change; not combined with `edits=computed`: edits.py reads B \| U only; refused) |
+| GT field aux shared by teachers and student (GT = training TARGET only, never an input) | `range_targets.gt_field_aux` (train_ck2.range_gt_aux calls it) | -- |
+| Teachers with R2 | `train_ck2 --v4-rg-read any4 --v4-rg-stopped-aware 1` (range only; stored in config.json v4, part of the --resume check) | `run_teachers.sh READOUT=range R2=1` -> `v4T10_rng2` / `v4M10_rng2` |
+| WAIT launcher: polls the GPUs every minute, launches only after they were continuously idle (< 1 GB and 0 % util, failed query = busy) for N minutes; still needs approval, GPUs 0,1 / 2,3 only, a launch refused by the memory check keeps waiting, gives up after 72 h; one waiter per tag (the foreground waiter writes its pid too); neither WAIT nor a normal launch starts while a chain of the tag is alive (exit 6) | `run_teachers.sh` | `V4_WAIT_IDLE_MIN=N` (log `teachers_rng2.wait.log`, stop `kill -TERM -- -$(cat <out>/teachers_rng2.wait.pgid)`) |
+| Student's own GT range aux: its B / U (BCE, R2 target rule = its rg_stopped_aware) and D (Huber) on its first 8 unique own-parent rows of the KD set, GT from the batch ref_obj_* / ref_sdf, tokens without GT masked, independent of kd_constraint | `online2._rg_gt_aux` | `ck_e2e2.v4.rg_gt_aux {enabled, lambda 0.5, max_parents 8}` (+ `v4.rg_read`, `v4.rg_stopped_aware`); constraint KD refuses a DET teacher whose B rule differs |
+| Selection-evidence evaluation: (i) learned-tube fidelity vs official labels, (ii) criterion S with the LEARNED tube (switch rule, ties in the Phase 0b pool order; deployment blend pool96_old_b1 on ck2T10 for val = Phase 0b, on the ck2T10 + ck2M10 pair for navtest + the ck2T10-only 'Phase 0b convention' rows) + the fraction of the R2 GT-tube gain and of the readout-rule ceiling (the R2 teacher's own rule on the GT fields: rule16 / rule80 of gttube), (iii) fixed-pool critic-only selection vs ck2T10/ck2M10 and v4T10_haz/v4M10_haz; gtcheck = the GT rows without a teacher + the Phase 0b reproduction check (on the held-out set the R2-tube criterion S must equal HO/results.json: a mismatch exits non-zero) | `tools/ck/v4/eval_range_teacher.py` (stages infer / gttube / gtcheck / eval) | -- |
+
+Launch (needs the user's approval; GPUs 0-3):
+
+    V4_USER_APPROVED=1 V4_GPUS=2,3 READOUT=range R2=1 bash tools/ck/v4/run_teachers.sh both          # now (idle GPUs)
+    V4_USER_APPROVED=1 V4_GPUS=2,3 READOUT=range R2=1 V4_WAIT_IDLE_MIN=30 bash tools/ck/v4/run_teachers.sh both
+    V4_DRY_RUN=1 READOUT=range R2=1 bash tools/ck/v4/run_teachers.sh both                             # arguments only
+
+Evaluation after the teachers (val decides: DET only, held-out tokens = outside the F1 6,000; navtest reported).
+**No (c) decision rule is registered yet** (V4_3_SPEC.md 'Phase 0b' says only "val decides"): the user fixes it before
+the val infer; until then the eval md marks its numbers descriptive.  Stage infer on CUDA refuses without approval
+(V4_USER_APPROVED=1 or --approved) and on a GPU using >= 1024 MiB (nvidia-smi of CUDA_VISIBLE_DEVICES, one of 0-3):
+
+    CUDA_VISIBLE_DEVICES= PYTHONPATH=$PWD OMP_NUM_THREADS=1 nice -n 10 /venv/ssr/bin/python \
+      tools/ck/v4/eval_range_teacher.py --split navtrain_val --stage gttube,gtcheck --workers 24   # CPU, before training
+    V4_USER_APPROVED=1 CUDA_VISIBLE_DEVICES=<idle 0-3> ... --split navtrain_val --det v4T10_rng2 --stage infer --device cuda
+    CUDA_VISIBLE_DEVICES= ... --split navtrain_val --det v4T10_rng2 --stage eval
+    # navtest: --split navtest --det v4T10_rng2 --map v4M10_rng2 (infer on one idle GPU per teacher run, then gttube,
+    # eval; blend default ck2T10,ck2M10 + the ck2T10-only rows).  --gt-tube DIR (eval / gtcheck only): another run's
+    # tube in this format (meta.json split + representation_id R2, packed-row arrays), opened read-only.
+
+Verified (CPU, 2026-10-17 KST): stopped-aware B bitwise vs oracle_common on real navtrain_val tokens (numpy, torch, GT
+loader path); the tool's R2 GT tube bitwise vs oracle_common.grid_eval ('grid stopped-aware NC + read any4') on F1
+tokens; its LQR states from the packed status within 1.3e-5 m of the official F1 states; CPU smokes of every stage on
+3 navtest / 2 navtrain_val tokens with random R2 teachers; train_ck2 R2 1-step CPU run + resume refusal / continuation.
+Bp group (CPU, 2026-10-17 KST): the readout's thresholded rule on the GT R2 fields at the official executed states of
+1,500 F1 tokens (141,954 rows of the 96): NC = executed_slack(any4) on the stopped-aware B bitwise on every token; TTC
+bitwise = the readout without R2 on [Bp, U]; TTC pass recall 0.8537 (R2 GT tube 0.8525; before the fix, TTC on the
+stopped-aware B: 0.8422), NC | TTC disagreement with the R2 tube 0.59 % (before 0.90 %; what remains is the 2 m TTC
+switch).  Default (nearest / any4 / plan, rg_stopped_aware off) outputs, 535 parameter gradients and gt_field_aux values
+/ gradients bit-identical to the code before the fix.  gtcheck on the 12,179 held-out navtrain_val tokens (gttube 207 s
+on 24 CPU workers): R2-tube criterion S = Phase 0b exactly (+1.9088 [+1.42, +2.42], break 35 / 11594, the same CI
+bounds; criterion-1 recalls as HO/summary.md); the readout-rule ceiling +1.91 [+1.43, +2.42], break 34 / 11594, flag
+agreement with the R2 tube TTC 0.9949, joint 0.9961.
+
 ## Not yet done
 
 * Evidence-level KD (DET -> occupancy, MAP -> margin) needs v4 teachers with the evidence readout; KD is still on the
@@ -122,7 +174,10 @@ unlabelled edits, the paired difference vs the 96 row of the same beta / set / l
   curvature; on curved parents the sibling leaves the parent grid by up to ~0.4 m beyond S_8 (measured in
   tests/test_v4_model.py).
 * Navtest time-index sidecars (train / val are built: CK/v4/time_idx, 0 consistency violations).
-* v4_3: the range student has no GT field aux of its own (its fields learn from the constraint KD and the label BCE);
+* v4_3: the range student's own GT field aux is opt-in (`v4.rg_gt_aux`, off in tools/ck/e2e2/v4_3_arm.set: its fields
+  learn from the constraint KD and the label BCE unless it is enabled); `rg_read=any4` and `rg_stopped_aware` are not wired
+  into the computed edits (ck/v4/edits.py reads the nearest cell of the B | U groups; V4Cfg refuses both combinations); launch_util2.kd_constraint_check does not
+  compare the teachers' rg_stopped_aware (the runtime online2.check_constraint_teachers does);
   the computed-edit shortlist is critic-only in training and at the dump (the val beta is not known then);
   ck_e2e2.infer_select.edits true selects over 96 + K, but a standard NAVSIM submission still submits
   predictions['trajectory'] (v2's, eval_e2e2 docstring); tools/ck/v4/eval_edits.py does not read edit_valid and
@@ -142,3 +197,4 @@ unlabelled edits, the paired difference vs the 96 row of the same beta / set / l
       tests/test_v4_time_idx.py tests/test_v4_eval_edits.py tests/test_v4_corrector_plumbing.py
     # v4_3 (M1-M6): + tests/test_v4_lqr.py tests/test_v4_range_targets.py tests/test_v4_dedupe.py \
     #   tests/test_v4_range_readout.py tests/test_v4_edits.py tests/test_v4_gt_splits.py tests/test_v4_wiring.py
+    # Phase 0b R2 / (c): + tests/test_v4_r2.py tests/test_v4_eval_range_teacher.py

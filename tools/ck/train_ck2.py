@@ -96,6 +96,11 @@ refiner v4_3 range teachers (docs/refiner_v4/V4_3_SPEC.md M4 / M6; --v4-readout 
   (any overlap), BCE on the known bins; MAP: the official SDF margin, Huber -- with the specialist key masking of v4_2
   (blocked field for nc / ttc, margin for dac); score BCE on --score-keys as before; the station BCE reads hazard
   readouts only.  tools/ck/v4/run_teachers.sh READOUT=range launches the pair.
+  Phase 0b representation R2 (docs/refiner_v4/V4_3_SPEC.md; opt-in, defaults unchanged): --v4-rg-read any4 (B / U read
+  as the OR over the 2 x 2 cells around each executed point) and --v4-rg-stopped-aware 1 (the B target of the GT field
+  aux = the stopped-aware blocked field, + a third field group Bp = the plain not-behind B, trained on LON >= -1.3 m,
+  that the readout's TTC reads: R2 changes NC only); both are stored in config.json 'v4' (rg_read / rg_stopped_aware)
+  and part of the --resume check.  run_teachers.sh READOUT=range R2=1 launches v4T10_rng2 / v4M10_rng2 with both.
 """
 from __future__ import annotations
 
@@ -233,6 +238,13 @@ def get_parser() -> argparse.ArgumentParser:
                     help="range: EP head on the detached evidence + executed progress ratio (default 1)")
     ap.add_argument("--v4-vmax", choices=("off", "feature"), default=None,
                     help="range: executed curvature overspeed as a residual input (default off)")
+    ap.add_argument("--v4-rg-read", choices=("nearest", "any4"), default=None,
+                    help="range: B / U read at the executed points (default nearest; any4 = OR over the 2 x 2 cells, "
+                         "Phase 0b R2)")
+    ap.add_argument("--v4-rg-stopped-aware", type=int, choices=(0, 1), default=None,
+                    help="range: 1 = the GT field aux trains B on the stopped-aware blocked field (stopped / static "
+                         "objects without the not-behind filter, Phase 0b R2) and adds the Bp group (plain not-behind "
+                         "B) that TTC reads; default 0")
     ap.add_argument("--rg-max-parents", type=int, default=8,
                     help="range: own-parent anchors per GT-ok token in the GT field aux (blocked field BCE / margin "
                          "Huber, weight --lambda-ev)")
@@ -343,14 +355,15 @@ def resolve_args(a):
     return a
 
 
-V4_3_FLAGS = ("v4_exec_model", "v4_ev_tbin_s", "v4_ep_evidence", "v4_vmax")     # range readout only (None = default)
+V4_3_FLAGS = ("v4_exec_model", "v4_ev_tbin_s", "v4_ep_evidence", "v4_vmax", "v4_rg_read",
+              "v4_rg_stopped_aware")                                            # range readout only (None = default)
 
 
 def resolve_v4(a):
     """-> V4Cfg from the --v4-* flags (off unless --v4-readout hazard or --v4-pref-head 1).  --v4-readout range: the
     spec arm V4Cfg.range_arm (exec 'lqr', 20 bins of 0.25 s, ep_evidence) with --v4-exec-model / --v4-ev-tbin-s /
-    --v4-ep-evidence / --v4-vmax overriding it and the P_ref head from --v4-pref-head; those four flags are refused with
-    another readout (the older readouts' V4Cfg call is unchanged)."""
+    --v4-ep-evidence / --v4-vmax / --v4-rg-read / --v4-rg-stopped-aware overriding it and the P_ref head from
+    --v4-pref-head; those flags are refused with another readout (the older readouts' V4Cfg call is unchanged)."""
     from navsim.agents.para_ssr.ck.v4.config import RANGE_T_END, V4Cfg
     ro = str(getattr(a, "v4_readout", "mean") or "mean")
     ph = bool(int(getattr(a, "v4_pref_head", 0) or 0))
@@ -364,8 +377,11 @@ def resolve_v4(a):
             tb = 0.25 if getattr(a, "v4_ev_tbin_s", None) is None else float(a.v4_ev_tbin_s)
             nb = int(round(RANGE_T_END / tb))
             epe = getattr(a, "v4_ep_evidence", None)
+            sa = getattr(a, "v4_rg_stopped_aware", None)
             kw = dict(exec_model=getattr(a, "v4_exec_model", None) or "lqr", ev_tbins=nb, ev_tbin_s=tb,
-                      ep_evidence=True if epe is None else bool(int(epe)), vmax=getattr(a, "v4_vmax", None) or "off")
+                      ep_evidence=True if epe is None else bool(int(epe)), vmax=getattr(a, "v4_vmax", None) or "off",
+                      rg_read=getattr(a, "v4_rg_read", None) or "nearest",
+                      rg_stopped_aware=False if sa is None else bool(int(sa)))
             return V4Cfg(readout=ro, pref_head=ph, time_free=bool(int(getattr(a, "v4_time_free", 1))),
                          lat_haz=bool(int(getattr(a, "v4_lat_haz", 1))), horizon=float(getattr(a, "v4_horizon", 4.0)),
                          **kw).validate(temporal_cfg_of(a).on)
@@ -884,80 +900,28 @@ def range_gt_aux(haz: Dict, cand: torch.Tensor, ref: Dict, a, need_occ: bool = T
                  ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """refiner v4_3 range teachers (--v4-readout range; spec V4_3 M4 / M6 'Teachers'): GT field aux on the parent rows of
     the own-parent candidates (the raw anchors: haz is_self; rows = haz parent_index), the first --rg-max-parents
-    distinct rows per GT-ok token in slot order (the sampler's random order):
-      occ (DET, nc / ttc in --score-keys): range_targets.blocked_field of the GT objects (ref_obj_*, gt_future metric-
-          cache rule, 0.1 s samples max-pooled into the readout's M bins of ev_tbin_s) on each parent's grid (corridor
-          --corridor-version, heading 'parent') with lon_max: target B = LON >= BEHIND_M (the not-behind at-fault proxy)
-          for the logits occ_logit_u, U = LON > -inf (any overlap: the TTC channel) for ovl_logit_u; BCE over every
-          cell and the KNOWN bins (a bin holding a sample after the token's annotated horizon t_avail is masked);
+    distinct rows per GT-ok token in slot order (the sampler's random order) = range_targets.gt_field_aux (the shared
+    implementation, also the student's ck_e2e2.v4.rg_gt_aux) with the readout's bins (ev_tbin_s), --corridor-version
+    and the target rule of the run's V4Cfg:
+      occ (DET, nc / ttc in --score-keys): blocked field of the GT objects (ref_obj_*, gt_future metric-cache rule,
+          0.1 s samples max-pooled into the readout's M bins) on each parent's grid (heading 'parent') with lon_max:
+          target B = the not-behind at-fault proxy (--v4-rg-stopped-aware 1: the stopped-aware B of Phase 0b R2,
+          stopped / static objects without the not-behind filter; + Bp = LON >= BEHIND_M, the plain B that TTC reads,
+          for bp_logit_u) for occ_logit_u, U = LON > -inf (any overlap: the TTC channel) for ovl_logit_u; BCE over
+          every cell and the KNOWN bins (a bin holding a sample after the
+          token's annotated horizon t_avail is masked);
       margin (MAP, dac in --score-keys): the official DAC SDF (ref_sdf, sdf.sample_sdf) at the parent grid points,
           clipped to +-5 m, Huber (delta 1 m) with margin_u; points outside the SDF grid masked (= the margin term of
           losses.evidence_aux).
-    haz: forward 'haz' of the anchor set ([T, K, ...] + the per-row occ_logit_u / ovl_logit_u [T, U, 48, 17, M],
-    margin_u [T, U, 48, 17]); cand [T, K, 8, 3]; ref: the batch's ref_* GT (losses.EV_REF_KEYS).  -> (l_occ, l_margin,
-    stats rg_*); zeros (graph-connected) when a term is not needed or nothing is selected.  BCE / Huber only."""
-    import torch.nn.functional as F
-    from navsim.agents.para_ssr.ck.v4 import losses as V4L
+    GT is the TARGET only (never a network input).  haz: forward 'haz' of the anchor set ([T, K, ...] + the per-row
+    occ_logit_u / ovl_logit_u [T, U, 48, 17, M], margin_u [T, U, 48, 17]); cand [T, K, 8, 3]; ref: the batch's ref_*
+    GT (losses.EV_REF_KEYS).  -> (l_occ, l_margin, stats rg_*); zeros (graph-connected) when a term is not needed or
+    nothing is selected.  BCE / Huber only."""
     from navsim.agents.para_ssr.ck.v4 import range_targets as RT
-    from navsim.agents.para_ssr.refiner.corridor import corridor_geometry
-    from navsim.agents.para_ssr.refiner.sdf import sample_sdf
-    Bo, Bu, D = haz["occ_logit_u"], haz["ovl_logit_u"], haz["margin_u"]
-    T, U = Bo.shape[:2]
-    M = Bo.shape[-1]
-    dev = Bo.device
-    zero = Bo.sum() * 0.0 + Bu.sum() * 0.0 + D.sum() * 0.0
-    if any(k not in ref for k in V4L.EV_REF_KEYS) or not (need_occ or need_margin):
-        return zero, zero, {"rg_n": 0.0}
-    K = cand.shape[1]
-    gt = ref["ref_gt_ok"].reshape(-1).bool().to(dev)
-    pidx = haz["parent_index"].long().to(dev)
-    sel = haz["is_self"].bool().to(dev) & gt[:, None]
-    kk = torch.where(sel, torch.arange(K, device=dev)[None].expand(T, K), torch.full((T, K), K, device=dev))
-    rep = torch.full((T, U), K, dtype=torch.long, device=dev).scatter_reduce(1, pidx, kk, reduce="amin",
-                                                                              include_self=True)
-    first = sel & (torch.gather(rep, 1, pidx) == torch.arange(K, device=dev)[None])   # first candidate of its row
-    keep = first & (torch.cumsum(first.long(), 1) <= int(getattr(a, "rg_max_parents", 8)))
-    tok, col = torch.nonzero(keep, as_tuple=True)
-    if tok.numel() == 0:
-        return zero, zero, {"rg_n": 0.0}
-    rows = pidx[tok, col]
-    with torch.no_grad():
-        geom = corridor_geometry(cand[tok, col].float(), version=int(getattr(a, "corridor_version", 1)))
-        fr = RT.parent_frame(geom)
-    st: Dict[str, float] = {"rg_n": float(tok.numel())}
-    l_occ = l_m = zero
-    if need_occ:
-        tbin = float(v4_cfg_of(a).ev_tbin_s)
-        ut, inv = torch.unique(tok, return_inverse=True)
-        with torch.no_grad():
-            boxes, obs, _, t_av = RT.gt_boxes_from_ref(ref, ut, device=dev)           # [S, A, 50, 5], 0 .. 4.9 s
-            B_t, lon = RT.blocked_field(fr, boxes, obs, index=inv, tbin_s=tbin, n_bins=M, lon_max=True)
-            U_t = lon > -math.inf                                                    # any overlap (no not-behind)
-            tn = torch.as_tensor(RT.fine_times(), dtype=torch.float64, device=dev)
-            mt = torch.floor(tn / tbin + RT.T_EPS).long()
-            late = (tn[None] > t_av.to(dev).double()[inv][:, None] + RT.T_EPS) & (mt < M)[None]
-            known = torch.ones(len(tok), M, dtype=torch.bool, device=dev)
-            pp, tt = torch.nonzero(late, as_tuple=True)
-            known[pp, mt[tt]] = False
-            tgt = torch.cat([B_t, U_t], -1).float()                                   # [P, 48, 17, 2M]
-            w = torch.cat([known, known], -1).float()[:, None, None, :].expand_as(tgt)
-        lg = torch.cat([Bo[tok, rows], Bu[tok, rows]], -1).float()
-        bce = F.binary_cross_entropy_with_logits(lg, tgt, reduction="none")
-        l_occ = (bce * w).sum() / w.sum().clamp(min=1.0)
-        st.update(rg_occ_bce=float(l_occ.detach()), rg_rate_B=float((B_t.float() * w[..., :M]).sum()
-                                                                      / w[..., :M].sum().clamp(min=1.0)),
-                  rg_rate_U=float((U_t.float() * w[..., M:]).sum() / w[..., M:].sum().clamp(min=1.0)),
-                  rg_known=float(known.float().mean()))
-    if need_margin:
-        with torch.no_grad():
-            P = tok.numel()
-            sv, sval = sample_sdf(ref["ref_sdf"].to(dev), fr["pts"].reshape(P, -1, 2).float(), tok)
-            tgt_d = sv.float().clamp(-5.0, 5.0).reshape(P, *D.shape[2:])
-            wd = sval.float().reshape(P, *D.shape[2:])
-        hub = F.huber_loss(D[tok, rows].float(), tgt_d, delta=1.0, reduction="none")
-        l_m = (hub * wd).sum() / wd.sum().clamp(min=1.0)
-        st.update(rg_margin_huber=float(l_m.detach()), rg_sdf_valid=float(wd.mean()))
-    return l_occ, l_m, st
+    v4 = v4_cfg_of(a)
+    return RT.gt_field_aux(haz, cand, ref, tbin_s=float(v4.ev_tbin_s), max_parents=int(getattr(a, "rg_max_parents", 8)),
+                           corridor_version=int(getattr(a, "corridor_version", 1)), need_occ=need_occ,
+                           need_margin=need_margin, stopped_aware=bool(v4.rg_stopped_aware))
 
 
 def dummy_backward(out: Dict) -> None:

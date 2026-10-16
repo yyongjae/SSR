@@ -64,6 +64,22 @@ range critic should use:
                               critic's top-edit_k parents, lon edit until the executed arrival at the critical station
                               is >= t_out_block + edit_dt, lat edit (either side, the smaller shift) until the executed
                               min corner margin >= edit_dlat (m).
+  rg_read 'nearest' | 'any4'  how the range readout reads B / U at an executed point (Phase 0b R2 (2)): 'nearest' (the
+                              v4_3 default) = the nearest cell; 'any4' = OR over the 2 x 2 grid points around the read
+                              point (range_targets._cells 'any4'): the thresholded slacks / critical points OR the 4
+                              cells' profiles (= range_targets.executed_slack(read='any4')), the differentiable
+                              evidence soft-ORs them (the 4 distinct cells join the soft max over the states).  Not
+                              combined with edits 'computed' (ck/v4/edits.py reads the nearest cell; validate refuses).
+  rg_stopped_aware            Phase 0b R2 (1): the GT field aux of this readout trains B on the stopped-aware B
+                              (range_targets.blocked_field stopped_aware: stopped / static objects without the
+                              not-behind filter; read by tools/ck/train_ck2.py (teachers) and online2 v4.rg_gt_aux
+                              (student)), and the readout gets a THIRD field group Bp = the plain not-behind B (target
+                              LON >= BEHIND_M of the same GT call) that every TTC read of B uses (delta 0 and
+                              |v| delta < 2 m; NC reads the stopped-aware B, U unchanged): R2 changes NC only, the
+                              official TTC rule has no stopped-track exception (range_readout docstring).  blk_head
+                              then outputs 3 x ev_tbins (+ rg_hidden * ev_tbins + ev_tbins parameters, 1,100 at the
+                              spec sizes; inside the CK2 budget).  Not combined with edits 'computed' (ck/v4/edits.py
+                              reads the B | U groups only; validate refuses).
 Head sizes (haz_hidden, ep_hidden, comfort_hidden, lat_hidden, pref_kdim, pref_hidden, ev_hidden, rg_hidden,
 ep_ev_hidden): the defaults give the hazard + P_ref (the evidence + P_ref, the range + P_ref with or without
 ep_evidence) critic the trainable parameter count of the CK2 critic it replaces (CK2 as trained: 3,391,755 = the
@@ -73,6 +89,7 @@ a v4 vs CK2 comparison is not a capacity comparison (report 74, review 79 F7).  
 ep_evidence: its 906 inputs then take the parameters of the 579-input, 96-wide head (55,389 vs 55,777).
 Versions: 'v4_3' (this code) adds the options above; from_dict also reads 'v4_2' dicts (the trained v4T10_haz /
 v4M10_haz teachers), whose missing v4_3 keys take the defaults = the v4_2 network bit for bit, as a 'v4_3' config.
+v4_3 dicts written before rg_read / rg_stopped_aware existed load with their defaults (nearest, False) = unchanged.
 """
 from __future__ import annotations
 
@@ -87,6 +104,7 @@ READ_VERSIONS = ("v4_2", CONFIG_VERSION)        # from_dict accepts these (and u
 EXEC_MODELS = ("plan", "lqr")
 VMAX_MODES = ("off", "feature")
 EDIT_MODES = ("off", "computed")
+RG_READS = ("nearest", "any4")
 RANGE_T_END = 5.0                # [s] range time bins cover [0, 5.0 s) (= range_targets.T_END, the GT field's horizon)
 MAX_TBINS = 20
 
@@ -125,6 +143,8 @@ class V4Cfg:
     edit_dlat: float = 0.3             # [m] lat edit: executed min corner margin >= edit_dlat
     rg_hidden: int = 54                # range: hidden width of the B / U, D and residual MLPs
     ep_ev_hidden: int = 61             # range: EP head width when ep_evidence (budget-matched, docstring)
+    rg_read: str = "nearest"           # range: B / U read at the executed points ('nearest' | 'any4', Phase 0b R2)
+    rg_stopped_aware: bool = False     # range: B target = the stopped-aware B (R2) + a Bp group for TTC (docstring)
     version: str = CONFIG_VERSION
 
     @property
@@ -185,9 +205,15 @@ class V4Cfg:
         if not (0.5 <= float(self.horizon) <= 8.0):
             raise ValueError(f"v4.horizon {self.horizon} outside [0.5, 8] s")
         for name, val, allowed in (("exec_model", self.exec_model, EXEC_MODELS), ("vmax", self.vmax, VMAX_MODES),
-                                   ("edits", self.edits, EDIT_MODES)):
+                                   ("edits", self.edits, EDIT_MODES), ("rg_read", self.rg_read, RG_READS)):
             if val not in allowed:
                 raise ValueError(f"v4.{name} {val!r} not in {allowed}")
+        if self.edits == "computed" and self.rg_read != "nearest":
+            raise ValueError(f"v4: edits 'computed' reads the nearest cell (ck/v4/edits.py hard_evidence call); "
+                             f"rg_read {self.rg_read!r} is not wired there yet")
+        if self.edits == "computed" and self.rg_stopped_aware:
+            raise ValueError("v4: edits 'computed' reads the B | U groups only (ck/v4/edits.py _gather_sources / "
+                             "hard_evidence); rg_stopped_aware (TTC on the Bp group) is not wired there yet")
         if self.readout != "range":     # every v4_3 field is range-only: a non-default value elsewhere is an error
             dflt = {f.name: f.default for f in dataclasses.fields(V4Cfg)}
             on = [k for k in V43_KEYS if getattr(self, k) != dflt[k]]
@@ -252,4 +278,4 @@ class V4Cfg:
 
 # keys a 'v4_2' config.json never carries (from_dict); the size fields are listed too (v4_2 had no range heads)
 V43_KEYS = ("exec_model", "ev_tbin_s", "ep_evidence", "vmax", "edits", "edit_k", "edit_dt", "edit_dlat", "rg_hidden",
-            "ep_ev_hidden")
+            "ep_ev_hidden", "rg_read", "rg_stopped_aware")

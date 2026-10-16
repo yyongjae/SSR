@@ -81,7 +81,14 @@ refiner v4_3 (docs/refiner_v4/V4_3_SPEC.md M5 / M6; every option OFF by default 
   v4.kd_constraint: + r * (lambda_occ * BCE(student B, sigmoid(DET teacher B)) (occ_channels 'BU': + the U channel) +
     lambda_margin * Huber(student D, MAP teacher D) on s <= map_range_m) on the student's unique parents of the KD set
     (constraint_kd), teacher fields
-    from TeacherPair2.run(fields=True) (range teachers on the student's grid only, check_constraint_teachers).
+    from TeacherPair2.run(fields=True) (range teachers on the student's grid only, check_constraint_teachers);
+  v4.rg_read / v4.rg_stopped_aware (Phase 0b R2): V4Cfg keys of the student's range readout (any4 read; the B target
+    rule of its GT field aux + the Bp group that its TTC reads (V4Cfg docstring), also checked against the DET
+    teacher's for the constraint KD, which distils the B (| U) groups);
+  v4.rg_gt_aux {enabled, lambda, max_parents}: + lambda * (BCE(student B / U (/ Bp), GT) + Huber(student D, GT SDF)) on the
+    student's first max_parents unique own-parent rows of the KD set (range_targets.gt_field_aux, the range teachers'
+    aux), GT computed online from the batch's ref_obj_* / ref_sdf: a training TARGET only (never an input), tokens
+    without GT masked, independent of kd_constraint.
 """
 from __future__ import annotations
 
@@ -180,15 +187,19 @@ def _d_v4_opt() -> Dict[str, Any]:
     #   exec_model .. edit_dlat: V4Cfg v4_3 keys (read by the 'range' readout only; defaults = V4Cfg's);
     #   kd_score_scope 'all' (old) | 'near' (NC score KD on tokens whose nearest lead has ttc0 < NEAR_TTC_S, DAC score
     #     KD on candidates whose parent's min executed corner SDF < NEAR_SDF_M; both from the ref_* GT, train only);
-    #   kd_constraint: the constraint KD block (_d_kd_constraint).
+    #   kd_constraint: the constraint KD block (_d_kd_constraint);
+    #   rg_read / rg_stopped_aware: V4Cfg's Phase 0b R2 keys (range readout: B / U read 'nearest' | 'any4'; the B
+    #     target of the student's own GT field aux = the stopped-aware blocked field);
+    #   rg_gt_aux: the student's own GT field aux block (_d_rg_gt_aux).
     return {"exec_model": "plan", "ev_tbins": 10, "ev_tbin_s": 0.25, "ep_evidence": False, "vmax": "off",
             "edits": "off", "edit_k": 8, "edit_dt": 0.2, "edit_dlat": 0.3, "kd_score_scope": "all",
-            "kd_constraint": _d_kd_constraint()}
+            "kd_constraint": _d_kd_constraint(), "rg_read": "nearest", "rg_stopped_aware": False,
+            "rg_gt_aux": _d_rg_gt_aux()}
 
 
 V4_NET_KEYS = ("readout", "pref_head", "time_free", "lat_haz", "horizon", "corrector", "corr_k")
 V4_NET_OPT_KEYS = ("exec_model", "ev_tbins", "ev_tbin_s", "ep_evidence", "vmax", "edits", "edit_k", "edit_dt",
-                   "edit_dlat")                   # optional v4 keys passed to V4Cfg when present
+                   "edit_dlat", "rg_read", "rg_stopped_aware")   # optional v4 keys passed to V4Cfg when present
 
 
 def _d_kd_constraint() -> Dict[str, Any]:
@@ -202,6 +213,16 @@ def _d_kd_constraint() -> Dict[str, Any]:
     return {"enabled": False, "lambda_occ": 0.5, "lambda_margin": 0.5, "map_range_m": 32.0, "occ_channels": "B"}
 
 
+def _d_rg_gt_aux() -> Dict[str, Any]:
+    # refiner v4_3 (c) student GT range aux (ck_e2e2.v4.rg_gt_aux; range_targets.gt_field_aux, the range teachers'
+    # train_ck2.range_gt_aux): the student's OWN B / U logits (BCE) and margin D (Huber) on its first max_parents unique
+    # own-parent rows of the KD set, against the GT fields computed online from the batch's ref_obj_* / ref_sdf (the
+    # B target rule = v4.rg_stopped_aware); train time only, tokens without GT (ref_gt_ok False) masked, weight lambda
+    # (not ramped: a GT term, not KD), independent of kd_constraint.  The GT objects / SDF are TARGETS only, never an
+    # input of the student.  enabled false = no term (the old loss exactly).
+    return {"enabled": False, "lambda": 0.5, "max_parents": 8}
+
+
 KD_SCORE_SCOPES = ("all", "near")
 OCC_CHANNELS = ("B", "BU")
 NEAR_TTC_S = 4.0                   # [s] kd_score_scope 'near': NC KD where the nearest lead's ttc0 < this
@@ -213,7 +234,8 @@ LEAD_CLASSES = (0, 2)              # refiner.gt_future.CLASS_NAMES: vehicle, bic
 LEAD_LAT_M, LEAD_DH_RAD, LEAD_GAP_MAX, LEAD_EGO_FRONT = 1.8, math.radians(60.0), 80.0, 4.049
 TTC0_NONE = 99.0                   # [s] ttc0 without a closing lead (lead_split.py convention)
 CK_MARGIN_CLIP = 5.0               # [m] margin targets clipped like losses.evidence_aux / train_ck2's range aux
-RANGE_U_KEYS = ("occ_logit_u", "ovl_logit_u", "margin_u")   # score_set range haz keys per PARENT row (not per candidate)
+RANGE_U_KEYS = ("occ_logit_u", "ovl_logit_u", "margin_u", "bp_logit_u")   # score_set range haz keys per PARENT row
+                                                                           # (not per candidate; bp: rg_stopped_aware)
 
 
 _NESTED2 = {"variants": _d_variants, "lat_kd": _d_lat_kd, "warmup": _d_warmup, "onpolicy_label": _d_onpolicy_label,
@@ -404,7 +426,8 @@ class CKE2E2Config:
                    "kd_parent_only": _b(q["kd_parent_only"]), "corrector": _b(q["corrector"]),
                    "corr_k": int(q["corr_k"]), "lambda_awr": float(q["lambda_awr"])}
         cast = {"exec_model": str, "ev_tbins": int, "ev_tbin_s": float, "ep_evidence": _b, "vmax": _mode_str,
-                "edits": _mode_str, "edit_k": int, "edit_dt": float, "edit_dlat": float, "kd_score_scope": str}
+                "edits": _mode_str, "edit_k": int, "edit_dt": float, "edit_dlat": float, "kd_score_scope": str,
+                "rg_read": str, "rg_stopped_aware": _b}
         for k_, f_ in cast.items():                    # refiner v4_3 optional keys: only those given (_d_v4_opt)
             if k_ in q:
                 self.v4[k_] = f_(q[k_])
@@ -416,6 +439,13 @@ class CKE2E2Config:
             self.v4["kd_constraint"] = {"enabled": _b(kq["enabled"]), "lambda_occ": float(kq["lambda_occ"]),
                                         "lambda_margin": float(kq["lambda_margin"]),
                                         "map_range_m": float(kq["map_range_m"]), "occ_channels": str(kq["occ_channels"])}
+        if "rg_gt_aux" in q:
+            gq = dict(_d_rg_gt_aux(), **dict(q["rg_gt_aux"] or {}))
+            bad = sorted(set(gq) - set(_d_rg_gt_aux()))
+            if bad:
+                raise ValueError(f"ck_e2e2.v4.rg_gt_aux: unknown key(s) {bad}")
+            self.v4["rg_gt_aux"] = {"enabled": _b(gq["enabled"]), "lambda": float(gq["lambda"]),
+                                    "max_parents": int(gq["max_parents"])}
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
@@ -447,6 +477,11 @@ class CKE2E2Config:
     def kd_constraint(self) -> Dict[str, Any]:
         """refiner v4_3 M6 constraint KD block (v4.kd_constraint; off when absent)."""
         return self.v4_opt("kd_constraint")
+
+    @property
+    def rg_gt_aux(self) -> Dict[str, Any]:
+        """refiner v4_3 (c) student GT range aux block (v4.rg_gt_aux; off when absent)."""
+        return self.v4_opt("rg_gt_aux")
 
     def v4_net(self):
         """V4Cfg of the student network (ck/v4/config.py; the v4 block's network keys + the optional v4_3 ones given)."""
@@ -573,6 +608,13 @@ class CKE2E2Config:
             if kq["occ_channels"] not in OCC_CHANNELS:
                 raise ValueError(f"ck_e2e2.v4.kd_constraint.occ_channels must be one of {OCC_CHANNELS}, got "
                                  f"{kq['occ_channels']!r}")
+        gq = self.rg_gt_aux
+        if gq["enabled"]:
+            if q["readout"] != "range":
+                raise ValueError(f"ck_e2e2.v4.rg_gt_aux needs the student readout 'range' (its B / U / D fields), got "
+                                 f"v4.readout {q['readout']!r}")
+            if not (gq["lambda"] >= 0 and gq["max_parents"] >= 1):
+                raise ValueError(f"ck_e2e2.v4.rg_gt_aux needs lambda >= 0 and max_parents >= 1, got {gq}")
         kc = self.kd_calib
         if kc["enabled"]:
             if all(kc[t] is None for t in KD_CALIB_TEACHERS):
@@ -1156,7 +1198,10 @@ def _dist_mean_many(xs: Sequence[float], device) -> List[float]:
 # ----------------------------------------------------------------------------------------------- refiner v4_3 M6
 def check_constraint_teachers(tp: "TeacherPair2", cfg: CKE2E2Config) -> None:
     """Constraint KD reads the teachers' fields cell by cell on the student's parent grid: both teachers must use the
-    student's corridor version (the grid geometry) and its time bins (ev_tbins x ev_tbin_s) -> ValueError otherwise."""
+    student's corridor version (the grid geometry) and its time bins (ev_tbins x ev_tbin_s), and the DET teacher's B
+    must mean what the student's own B means (V4Cfg.rg_stopped_aware: the stopped-aware B of Phase 0b R2 or the plain
+    not-behind B; the student's rg_gt_aux trains B with the same rule) -> ValueError otherwise.  rg_read (how a net
+    reads its fields) is not a field property and may differ."""
     sn = cfg.v4_net()
     want = (int(cfg.v4["corridor_version"]), int(sn.ev_tbins), float(sn.ev_tbin_s))
     bad = []
@@ -1164,6 +1209,9 @@ def check_constraint_teachers(tp: "TeacherPair2", cfg: CKE2E2Config) -> None:
         got = (int(net.corridor_version), int(net.v4.ev_tbins), float(net.v4.ev_tbin_s))
         if got != want:
             bad.append(f"{name} {tp.runs[name]}: corridor_version / ev_tbins / ev_tbin_s {got} != the student's {want}")
+    if bool(tp.det.v4.rg_stopped_aware) != bool(sn.rg_stopped_aware):
+        bad.append(f"det {tp.runs['det']}: rg_stopped_aware {bool(tp.det.v4.rg_stopped_aware)} != the student's "
+                   f"{bool(sn.rg_stopped_aware)} (B semantics)")
     if bad:
         raise ValueError("constraint KD: teacher fields on another grid than the student's: " + "; ".join(bad))
 
@@ -1740,13 +1788,19 @@ class CKE2E2:
                 inner = inner + q["lambda_pref"] * lp
         hk = out.get("haz")
         # evidence readout only: the range readout's occ_logit has other time bins / semantics (its fields are trained
-        # by the constraint KD, kd_constraint; no GT field aux on the student)
+        # by the constraint KD, kd_constraint, and optionally by its own GT field aux, rg_gt_aux below)
         if hk is not None and "occ_logit" in hk and "occ_logit_u" not in hk and q["lambda_ev"] > 0:
             dev = hk["occ_logit"].device
             ref = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in targets.items() if k in V4L.EV_REF_KEYS}
             l_occ, l_m, s_ev = V4L.evidence_aux(hk, ref)
             logs.update({f"v4/{k}": float(v) for k, v in s_ev.items()})
             inner = inner + q["lambda_ev"] * (l_occ + l_m)
+        gq = self.cfg.rg_gt_aux
+        if gq["enabled"] and hk is not None and "occ_logit_u" in hk:      # refiner v4_3 (c): the student's own fields
+            l_go, l_gm, s_g = self._rg_gt_aux(hk, S, targets, student)
+            logs.update({f"v4/{k}": float(v) for k, v in s_g.items()})
+            logs["v4/rg_gt_occ"], logs["v4/rg_gt_margin"] = _f(l_go), _f(l_gm)
+            inner = inner + gq["lambda"] * (l_go + l_gm)
         if S.get("E") is not None and student is not None and getattr(student, "corrector", None) is not None \
                 and q["lambda_awr"] > 0 and s_lab is not None:
             inner = inner + q["lambda_awr"] * self._awr(student, out, S, s_lab, logs)
@@ -1756,6 +1810,22 @@ class CKE2E2:
             logs.update({f"v4/{k}": float(v) for k, v in st.items()})
             inner = inner + q["lambda_station"] * l_st
         return inner
+
+    def _rg_gt_aux(self, haz: Dict[str, torch.Tensor], S: Dict, targets, student
+                   ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+        """ck_e2e2.v4.rg_gt_aux: range_targets.gt_field_aux of the student's KD-set fields (haz = out['haz'], its
+        own-parent rows of S['cand']) against the GT of the batch's ref_* (losses.EV_REF_KEYS; tokens without GT
+        masked; a batch without them -> zero terms and rg_n 0), B target rule = the student's rg_stopped_aware, bins =
+        its ev_tbin_s, grid = v4.corridor_version.  -> (l_occ, l_margin, stats rg_*)."""
+        from .v4 import losses as V4L
+        from .v4 import range_targets as RT
+        v4n = getattr(student, "v4", None) or self.cfg.v4_net()
+        dev = haz["occ_logit_u"].device
+        ref = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in (targets or {}).items() if k in V4L.EV_REF_KEYS}
+        gq = self.cfg.rg_gt_aux
+        return RT.gt_field_aux(haz, S["cand"].to(dev), ref, tbin_s=float(v4n.ev_tbin_s),
+                               max_parents=int(gq["max_parents"]), corridor_version=int(self.cfg.v4["corridor_version"]),
+                               stopped_aware=bool(v4n.rg_stopped_aware))
 
     def _awr(self, student, out: Dict, S: Dict, s_lab: torch.Tensor, logs: Dict[str, float]) -> torch.Tensor:
         """AWR of the corrector on the generation's recorded edits (official labels, report 61 credit): log pi(u) of

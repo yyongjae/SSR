@@ -147,3 +147,27 @@ Everything below is fixed now; the held-out run must not change it.
   S fails -> stop idea 3 and report.  Criterion 1 is reported either way (if it fails, the learned tube is known
   to be an approximate selection signal, not a faithful copy of the official rules).
 * EPDMS: not computed (no navtrain_val v2.2 metric cache; not approved).
+
+### Phase 0b result (2026-10-17, CK/v4/analysis/range_oracle/heldout_r2)
+Criterion S PASS (switch - blend +1.91 [+1.42, +2.42], break 0.30 %); criterion 1 passes on the point estimates
+(NC 0.960 / 0.935, TTC 0.952 / 0.905, DAC 0.931 / 0.998, joint 0.953 / 0.903; TTC / joint pass-recall CIs include
+0.90); criterion 2 +1.51 [+1.02, +2.04], break 0 %.  Decision rule -> (c).  Note: the Phase 0 grid tube gives the same
+S (+1.92) on these tokens, i.e. S does not discriminate the R2 changes; they improve criterion-1 fidelity.
+
+## Phase 1c — decision rule for (c), registered BEFORE any R2 teacher exists (2026-10-17 KST)
+
+* Teachers: v4T10_rng2 (DET) / v4M10_rng2 (MAP), `run_teachers.sh READOUT=range R2=1` (ck2T10 / ck2M10 recipe,
+  10 epochs, R2 targets: stopped-aware B, any4 read, Bp for TTC), evaluated at `--which last`.
+* Decision split: navtrain_val held-out 12,179 tokens (the Phase 0b set), DET teacher only (val has no ReSMap);
+  caveat: the BEVFusion DET backbone is in-sample on navtrain.  Tool: tools/ck/v4/eval_range_teacher.py.
+* **Primary P1** (learned range as selection evidence): criterion S with the LEARNED DET tube on the keys it owns
+  (NC, TTC; DAC not flagged), switch rule and deployment blend (ck2T10, Phase 0b convention) exactly as Phase 0b.
+  Pass iff ALL of: (a) mean dPDMS vs the blend >= +0.30 with the paired log-bootstrap CI lower bound > 0;
+  (b) break <= 1.3 %; (c) the learned tube recovers >= 25 % of the GT R2 tube's gain on the same keys and tokens
+  (point estimate; 25 % = the v3 precedent of a learned forecaster vs its oracle, report 67).
+* Reported, not deciding: (i) learned-tube fidelity (criterion-1 metrics); (iii) fixed-pool critic-only selection
+  (pool96_ck_noim and the blend modes) of the DET range teacher vs ck2T10 and v4T10_haz; navtest (DET + MAP pair):
+  S with the full learned tube, its fraction of the GT gain, critic-only pair selection vs ck2T10+ck2M10 and
+  v4T10_haz+v4M10_haz.
+* Decision: P1 passes -> ask the user about the v4_3 student run (about 52 h on 2 GPUs).  P1 fails -> report; the next
+  candidates are past-frame inputs for forecasting or the student GT range aux (rg_gt_aux), decided with the user.

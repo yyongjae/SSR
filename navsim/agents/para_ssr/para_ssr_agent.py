@@ -667,10 +667,10 @@ class ParaSSRAgent(AbstractAgent):
         """
         if not any(bool(getattr(config, k, False))
                    for k in ("distill_selector_v6", "distill_selector_v7", "distill_selector_v8",
-                             "distill_selector_v9", "distill_selector_v10")):
+                             "distill_selector_v9", "distill_selector_v10", "distill_selector_v11")):
             raise NotImplementedError(
                 "use_distill on this core supports only the trajectory-anchor path "
-                "(distill_selector_v6/v7/v8/v9/v10); the stage-1 adapter / corridor / "
+                "(distill_selector_v6/v7/v8/v9/v10/v11); the stage-1 adapter / corridor / "
                 "register-selector paths need aux_distill's own v2 port")
         anchor_file = getattr(config, "plan_anchor_file", None)
         if not getattr(config, "plan_anchor", False) or not anchor_file or not os.path.isfile(str(anchor_file)):
@@ -683,7 +683,11 @@ class ParaSSRAgent(AbstractAgent):
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(int(getattr(config, "distill_probe_seed", 0)))
             module = build_planning_distillation(config)
-        is_pgp = bool(getattr(config, "distill_selector_v9", False) or getattr(config, "distill_selector_v10", False))
+        is_pgp = bool(
+            getattr(config, "distill_selector_v9", False)
+            or getattr(config, "distill_selector_v10", False)
+            or getattr(config, "distill_selector_v11", False)
+        )
         trainable_prefix = "anchor_distill." if is_pgp else "anchor_distill.student_proj."
         for name, param in module.named_parameters():
             param.requires_grad_(name.startswith(trainable_prefix))
@@ -1108,9 +1112,18 @@ class ParaSSRAgent(AbstractAgent):
                 if p.requires_grad and not n.startswith("anchor_distill.student_proj.")
             ]
             if proj_params:
-                # aux_distill trains student_proj with the base group (lr, lr_scale 1, weight_decay): same AdamW math in
-                # a group of its own, so the distillation-off group layout is unchanged
-                groups.append({"params": proj_params, "lr": self._lr, "lr_scale": 1.0})
+                if bool(getattr(cfg, "distill_selector_v11", False)):
+                    proj_mult = float(getattr(cfg, "distill_proj_lr_mult", 2.0))
+                    groups.append({
+                        "params": proj_params,
+                        "lr": self._lr * proj_mult,
+                        "lr_scale": proj_mult,
+                        "weight_decay": 0.0,
+                    })
+                else:
+                    # aux_distill trains student_proj with the base group (lr, lr_scale 1, weight_decay): same AdamW math in
+                    # a group of its own, so the distillation-off group layout is unchanged
+                    groups.append({"params": proj_params, "lr": self._lr, "lr_scale": 1.0})
             if probe_params:
                 probe_mult = float(getattr(cfg, "distill_probe_lr_mult", 3.0))
                 groups.append({

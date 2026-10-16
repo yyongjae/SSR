@@ -137,6 +137,7 @@ class PlanningDistillation(nn.Module):
         selector_v8: bool = False,
         selector_v9: bool = False,
         selector_v10: bool = False,
+        selector_v11: bool = False,
         spatial_sigma: float = 4.0,
         spatial_sigmas: Optional[Sequence[float]] = None,
         lambda_gt: float = 0.6,
@@ -216,6 +217,7 @@ class PlanningDistillation(nn.Module):
         self.selector_v8 = bool(selector_v8)
         self.selector_v9 = bool(selector_v9)
         self.selector_v10 = bool(selector_v10)
+        self.selector_v11 = bool(selector_v11)
         self.spatial_sigma = float(spatial_sigma)
         self.spatial_sigmas = tuple(float(s) for s in spatial_sigmas) if spatial_sigmas is not None else None
         self.lambda_gt = float(lambda_gt)
@@ -247,7 +249,10 @@ class PlanningDistillation(nn.Module):
         self.teacher_tokens_student_grid: Dict[str, torch.Tensor] = {}
         self.student_tokens_student_grid: Dict[str, torch.Tensor] = {}
 
-        is_anchor = self.selector_v6 or self.selector_v7 or self.selector_v8 or self.selector_v9 or self.selector_v10
+        is_anchor = (
+            self.selector_v6 or self.selector_v7 or self.selector_v8
+            or self.selector_v9 or self.selector_v10 or self.selector_v11
+        )
         if self.selector_mode or is_anchor:
             # Registers / Anchors replace the frozen adapter. Stage-1 checkpoints are not
             # read, so the v4 launcher is the only path that requires them.
@@ -333,7 +338,9 @@ class PlanningDistillation(nn.Module):
         if is_anchor:
             from .anchor_distill import TrajectoryAnchorDistillation
 
-            if self.selector_v10:
+            if self.selector_v11:
+                ver = "v11"
+            elif self.selector_v10:
                 ver = "v10"
             elif self.selector_v9:
                 ver = "v9"
@@ -626,6 +633,7 @@ class PlanningDistillation(nn.Module):
             or self.selector_v8
             or self.selector_v9
             or self.selector_v10
+            or self.selector_v11
         ):
             return self._anchor_forward(
                 student_bev, tokens, trajectory_anchors, trajectories,
@@ -917,6 +925,7 @@ def build_planning_distillation(config):
         selector_v8=bool(getattr(config, "distill_selector_v8", False)),
         selector_v9=bool(getattr(config, "distill_selector_v9", False)),
         selector_v10=bool(getattr(config, "distill_selector_v10", False)),
+        selector_v11=bool(getattr(config, "distill_selector_v11", False)),
         spatial_sigma=float(getattr(config, "distill_spatial_sigma", 4.0)),
         spatial_sigmas=getattr(config, "distill_spatial_sigmas", (2.0, 4.0, 8.0, 16.0)),
         lambda_gt=float(getattr(config, "distill_lambda_gt", 0.6)),

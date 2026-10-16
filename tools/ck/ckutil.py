@@ -18,7 +18,17 @@ from pathlib import Path
 from typing import Dict, Optional
 
 CK_REPO = str(Path(__file__).resolve().parents[2])   # repo root of this worktree
-ALLOWED_GPUS = ("0", "1", "2", "3")
+ALLOWED_GPUS = (
+    ("0", "1", "2", "3", "4", "5", "6", "7")
+    if os.environ.get("CK_ALLOW_GPU45") == "1" or os.environ.get("CK_ALLOW_GPU4567") == "1"
+    else ("0", "1", "2", "3")
+)
+
+
+def _allowed_gpus():
+    if os.environ.get("CK_ALLOW_GPU45") == "1" or os.environ.get("CK_ALLOW_GPU4567") == "1":
+        return ("0", "1", "2", "3", "4", "5", "6", "7")
+    return ALLOWED_GPUS
 
 
 def pin() -> None:
@@ -45,8 +55,9 @@ def gpu_guard(device: str) -> None:
         return
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     ids = [x.strip() for x in vis.split(",") if x.strip()]
-    if len(ids) != 1 or ids[0] not in ALLOWED_GPUS:
-        raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK jobs run on exactly one GPU of {ALLOWED_GPUS}")
+    allowed = _allowed_gpus()
+    if len(ids) != 1 or ids[0] not in allowed:
+        raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK jobs run on exactly one GPU of {allowed}")
 
 
 def gpu_guard_ddp(device: str, world_size: int, max_gpus: int = 2) -> None:
@@ -56,8 +67,9 @@ def gpu_guard_ddp(device: str, world_size: int, max_gpus: int = 2) -> None:
         return
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     ids = [x.strip() for x in vis.split(",") if x.strip()]
-    if not (1 <= len(ids) <= max_gpus) or len(set(ids)) != len(ids) or any(i not in ALLOWED_GPUS for i in ids):
-        raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK2 jobs run on 1..{max_gpus} distinct GPUs of {ALLOWED_GPUS}")
+    allowed = _allowed_gpus()
+    if not (1 <= len(ids) <= max_gpus) or len(set(ids)) != len(ids) or any(i not in allowed for i in ids):
+        raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK2 jobs run on 1..{max_gpus} distinct GPUs of {allowed}")
     if len(ids) != int(world_size):
         raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r} has {len(ids)} GPU(s) but WORLD_SIZE={world_size}: "
                          "launch one process per visible GPU (torchrun --nproc_per_node=<#GPUs>)")

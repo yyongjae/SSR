@@ -19,7 +19,7 @@ from ..modules.transformer_blocks import LearnedPositionalEncoding
 
 
 class TrajectoryAnchorDistillation(nn.Module):
-    """Trajectory-Anchor-Guided Interaction Distillation module (v6, v7, v8, v9, v10)."""
+    """Trajectory-Anchor-Guided Interaction Distillation module (v6, v7, v8, v9, v10, v11)."""
 
     def __init__(
         self,
@@ -98,7 +98,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         # Bank 1: Road Boundary / Map interaction (ReSMap)
         self.probes: Optional[nn.ModuleList] = None
         if self.mode == "cross_attn":
-            if self.version in ("v9", "v10"):
+            if self.version in ("v9", "v10", "v11"):
                 from .planning_probe import PlanningGroundedProbe
 
                 self.probes = nn.ModuleList([
@@ -147,15 +147,21 @@ class TrajectoryAnchorDistillation(nn.Module):
                 nn.Linear(self.channels, self.channels) for _ in range(2)
             ])
             for proj in self.student_proj:
-                nn.init.eye_(proj.weight)
-                nn.init.zeros_(proj.bias)
+                if self.version == "v11":
+                    # v11 Fix 2: Zero-initialize 1x1 projection adapter (matching ck/bev_kd.py init="zero")
+                    # so step-0 gradient into BEV is identically zero and no arbitrary identity channel mapping is forced.
+                    nn.init.zeros_(proj.weight)
+                    nn.init.zeros_(proj.bias)
+                else:
+                    nn.init.eye_(proj.weight)
+                    nn.init.zeros_(proj.bias)
         else:
             self.student_proj = None
 
-        # v10 Fix 5: Per-channel frozen Teacher Z-Score statistics (norm.npz for BEVFusion, norm_map.npz for ReSMap),
+        # v10/v11 Fix 5: Per-channel frozen Teacher Z-Score statistics (norm.npz for BEVFusion, norm_map.npz for ReSMap),
         # matching ck/bev_kd.py TeacherZ so heavy-tailed post-ReLU BEVFusion channels are standardized per channel.
         self.ratio_ctrl = None
-        if self.version == "v10":
+        if self.version in ("v10", "v11"):
             import numpy as np
             from ..ck.bev_kd_arm import TeacherRatioControllers
             default_norms = (
@@ -192,7 +198,7 @@ class TrajectoryAnchorDistillation(nn.Module):
             # bias_anchors records which anchors built it (sync_spatial_bias)
             self.register_buffer("spatial_bias", bias, persistent=False)
             self.register_buffer("bias_anchors", anchors_t.clone(), persistent=False)
-        elif trajectory_anchors_file is not None and str(version).lower() in ("v7", "v8", "v9", "v10"):
+        elif trajectory_anchors_file is not None and str(version).lower() in ("v7", "v8", "v9", "v10", "v11"):
             # fusion_v1: a missing file used to leave a plain attribute and fail at the
             # first forward (register_buffer KeyError); fail at construction instead.
             raise FileNotFoundError(f"trajectory anchors file not found: {trajectory_anchors_file}")
@@ -218,7 +224,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         return True
 
     def _build_spatial_bias(self, anchors: torch.Tensor) -> torch.Tensor:
-        """Compute Gaussian spatial distance bias [K, HW] (v7) or [H, K, HW] (v8/v9/v10) for 256 anchors."""
+        """Compute Gaussian spatial distance bias [K, HW] (v7) or [H, K, HW] (v8/v9/v10/v11) for 256 anchors."""
         device = anchors.device
         r = torch.arange(self.bev_h, dtype=torch.float32, device=device)
         c = torch.arange(self.bev_w, dtype=torch.float32, device=device)
@@ -237,7 +243,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         dists = torch.norm(wp_pts.unsqueeze(2) - grid_pts.unsqueeze(0).unsqueeze(0), dim=-1)  # [K, T, HW]
         min_dist = dists.min(dim=1).values  # [K, HW]
 
-        if self.version in ("v8", "v9", "v10"):
+        if self.version in ("v8", "v9", "v10", "v11"):
             sigmas = list(self.spatial_sigmas)
             if len(sigmas) != self.num_heads:
                 sigmas = [sigmas[i % len(sigmas)] for i in range(self.num_heads)]
@@ -268,13 +274,13 @@ class TrajectoryAnchorDistillation(nn.Module):
             if cmd.dim() == 1:
                 cmd = F.one_hot(cmd, num_classes=4).to(dtype=dtype)
             q = q + self.cmd_mlp(cmd).unsqueeze(1)
-        elif self.version in ("v9", "v10"):
+        elif self.version in ("v9", "v10", "v11"):
             q = q + 0.0 * (self.cmd_mlp.weight.sum() + self.cmd_mlp.bias.sum())
 
         if ego_status is not None:
             stat = ego_status[..., :4].to(device=device, dtype=dtype)
             q = q + self.status_mlp(stat).unsqueeze(1)
-        elif self.version in ("v9", "v10"):
+        elif self.version in ("v9", "v10", "v11"):
             q = q + 0.0 * (self.status_mlp.weight.sum() + self.status_mlp.bias.sum())
 
         return self.query_norm(q)
@@ -284,6 +290,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         anchors: torch.Tensor,
         gt_trajectory: torch.Tensor,
         sim_reward: Optional[torch.Tensor] = None,
+        domain: Optional[str] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute Softmax + Uniform Coverage + Risk importance weights for 256 anchors."""
         bs = gt_trajectory.size(0)
@@ -295,26 +302,38 @@ class TrajectoryAnchorDistillation(nn.Module):
         dist = torch.norm(flat_anchors - flat_gt, dim=-1)  # [B, K]
         winner = dist.argmin(dim=-1)  # [B]
 
-        if self.version in ("v8", "v9", "v10"):
-            # 1. Relaxed GT softmax: tau_gt (v8: 5.0, v9/v10: 2.0)
+        if self.version in ("v8", "v9", "v10", "v11"):
+            # 1. Relaxed GT softmax: tau_gt (v8: 5.0, v9/v10: 2.0, v11: 4.0)
             w_gt = F.softmax(-dist / max(self.tau_gt, 1e-4), dim=-1)  # [B, K]
 
             # 2. Uniform coverage across all 256 anchors
             w_cov = torch.full((bs, k), 1.0 / k, device=dist.device, dtype=dist.dtype)
 
             # 3. Hard negative / Risk exploration term r_k
+            risk_proximity = F.softmax(-dist / max(self.tau_risk, 1e-4), dim=-1)
             if sim_reward is not None and sim_reward.dim() >= 3 and sim_reward.size(-1) == k:
-                # sim_reward: [B, 5, K], channel 0=NC, channel 1=DAC
-                nc = sim_reward[:, 0, :].to(device=dist.device, dtype=dist.dtype)
-                dac = sim_reward[:, 1, :].to(device=dist.device, dtype=dist.dtype)
-                safety = (nc * dac).clamp(0.0, 1.0)
-                risk_factor = 1.0 - safety  # collision or DAC violation
-                risk_proximity = F.softmax(-dist / max(self.tau_risk, 1e-4), dim=-1)
-                r_k = risk_proximity * risk_factor
-                r_k = r_k / r_k.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                # sim_reward: [B, 5, K], 0=NC, 1=DAC, 2=EP, 3=TTC, 4=Comfort
+                nc = sim_reward[:, 0, :].to(device=dist.device, dtype=dist.dtype).clamp(0.0, 1.0)
+                dac = sim_reward[:, 1, :].to(device=dist.device, dtype=dist.dtype).clamp(0.0, 1.0)
+                if self.version == "v11" and domain in ("bevfusion", "resmap"):
+                    ttc = sim_reward[:, 3, :].to(device=dist.device, dtype=dist.dtype).clamp(0.0, 1.0)
+                    if domain == "bevfusion":
+                        # v11 Fix 3 (DET): Explore anchors that collide or have TTC hazard with obstacles,
+                        # prioritizing obstacles inside the drivable road (0.5 + 0.5 * DAC).
+                        risk_factor = (1.0 - (nc * ttc).clamp(0.0, 1.0)) * (0.5 + 0.5 * dac)
+                    else:
+                        # v11 Fix 3 (MAP): Explore anchors that cross road/lane drivable area boundaries (1 - DAC).
+                        risk_factor = 1.0 - dac
+                    r_k = risk_proximity * risk_factor
+                    r_sum = r_k.sum(dim=-1, keepdim=True)
+                    r_k = torch.where(r_sum > 1e-6, r_k / r_sum.clamp_min(1e-6), w_cov)
+                else:
+                    safety = (nc * dac).clamp(0.0, 1.0)
+                    risk_factor = 1.0 - safety  # collision or DAC violation
+                    r_k = risk_proximity * risk_factor
+                    r_k = r_k / r_k.sum(dim=-1, keepdim=True).clamp_min(1e-6)
             else:
                 # Borderline distance-banded risk
-                risk_proximity = F.softmax(-dist / max(self.tau_risk, 1e-4), dim=-1)
                 r_k = risk_proximity * (1.0 - w_gt)
                 r_k = r_k / r_k.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
@@ -441,10 +460,10 @@ class TrajectoryAnchorDistillation(nn.Module):
             if bev_pos is None:
                 raise ValueError("bev_pos must be provided by planner_head for TrajectoryAnchorDistillation")
 
-            if self.version in ("v9", "v10"):
+            if self.version in ("v9", "v10", "v11"):
                 # -------------------------------------------------------------
-                # v9/v10: Domain-Specific Planning-Grounded Probe (PGP) +
-                #         PGP-Weighted Dense 1x1 Cell KD (v10)
+                # v9/v10/v11: Domain-Specific Planning-Grounded Probe (PGP) +
+                #             PGP-Weighted Dense 1x1 Cell KD (v10/v11)
                 # -------------------------------------------------------------
                 if not hasattr(self, "spatial_bias") or self.spatial_bias is None:
                     spatial_bias = self._build_spatial_bias(trajectory_anchors)
@@ -475,13 +494,13 @@ class TrajectoryAnchorDistillation(nn.Module):
                 for bank, name in enumerate(names):
                     probe = self.probes[bank]
                     t_bev = teacher_by_bank[bank].detach()
-                    if self.version == "v10":
+                    if self.version in ("v10", "v11"):
                         zm = getattr(self, f"z_mean_{bank}", None)
                         zs = getattr(self, f"z_std_{bank}", None)
                         if zm is not None and zs is not None:
                             t_bev = ((t_bev.float() - zm.to(device=device)) / zs.to(device=device)).to(dtype=dtype)
                     proj = self.student_proj[bank] if self.use_proj else None
-                    if self.version == "v10":
+                    if self.version in ("v10", "v11"):
                         # Scale-pinned per-cell LayerNorm (no affine) before 1x1 student_proj (matching ck/bev_kd.py)
                         # Put GradScale before student_proj so student_proj always gets 100% unscaled gradients
                         # while bev_embed gradient is gated by ramp * RatioController weight!
@@ -515,53 +534,96 @@ class TrajectoryAnchorDistillation(nn.Module):
                     losses[f"loss_probe_{name}"] = self.probe_loss_weight * probe_loss
                     metrics.update(probe_metrics)
 
-                    # 2. Student Stop-Grad Probe Pass (gradients flow ONLY to student_bev / student_proj)
-                    attn_s, feat_s, preds_s = probe.forward_student(q, s_bev, s_pos, bias)
-
-                    # 3. Subspace Attended Feature KD
-                    feat_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t.detach(), weights)
-
-                    # 4. Confidence-Weighted (Inverse-Entropy) Attention KD (v10 Fix 3)
-                    kl_per_head = F.kl_div(
-                        attn_s.clamp_min(1e-8).log(), attn_t.detach(), reduction="none"
-                    ).sum(dim=-1)  # [B, H, K]
-                    with torch.no_grad():
-                        ent_t = -(attn_t.detach() * attn_t.detach().clamp_min(1e-12).log()).sum(dim=-1)
-                        metrics[f"probe/head_entropy/{name}"] = ent_t.mean().detach()
-                    if self.version == "v10":
+                    domain_scale = self.resmap_scale if name == "resmap" else 1.0
+                    if self.version == "v11":
+                        # v11 Fix 1 + Fix 3: Domain-Specific Risk Exploration Anchor Weighting (w_det vs w_map)
+                        # + Pure PGP-Weighted Pointwise 1x1 Cell KD (pooled feat_loss & attn_loss detached).
                         with torch.no_grad():
+                            if gt_trajectory is not None and gt_trajectory.numel() > 0:
+                                weights_b, _, n_eff_b = self._compute_anchor_weights(
+                                    trajectory_anchors, gt_trajectory, sim_reward=sim_reward, domain=name,
+                                )
+                            else:
+                                weights_b = weights
+                                n_eff_b = n_eff
+                            metrics[f"distill/effective_anchors_{name}"] = n_eff_b.detach()
+                            if name == "bevfusion":
+                                metrics["distill/effective_anchors"] = n_eff_b.detach()
+
+                            ent_t = -(attn_t.detach() * attn_t.detach().clamp_min(1e-12).log()).sum(dim=-1)
+                            metrics[f"probe/head_entropy/{name}"] = ent_t.mean().detach()
                             head_conf = (1.0 - ent_t / max_ent).clamp(0.1, 1.0)
                             head_w = head_conf / head_conf.mean(dim=1, keepdim=True).clamp_min(1e-6)
-                            # PGP Spatial Importance Map w_pgp(u) in [B, HW], spatial mean == 1.0:
-                            # 0.5 uniform baseline (full-grid 1x1 conv KD) + 0.5 PGP anchor-focused importance
                             attn_hw = (head_w.unsqueeze(-1) * attn_t.detach()).mean(dim=1)  # [B, K, HW]
-                            m_spatial = torch.bmm(weights.unsqueeze(1), attn_hw).squeeze(1)  # [B, HW]
+                            m_spatial = torch.bmm(weights_b.unsqueeze(1), attn_hw).squeeze(1)  # [B, HW]
                             m_norm = m_spatial * (float(hw) / m_spatial.sum(dim=-1, keepdim=True).clamp_min(1e-12))
                             w_pgp = 0.5 + 0.5 * m_norm
-                        kl = (head_w * kl_per_head).mean(dim=1)
+                            metrics[f"distill/w_pgp_max/{name}"] = w_pgp.max(dim=-1).values.mean().detach()
+                            metrics[f"distill/w_pgp_std/{name}"] = w_pgp.std(dim=-1).mean().detach()
+
+                            attn_s, feat_s, preds_s = probe.forward_student(q.detach(), s_bev.detach(), s_pos, bias)
+                            feat_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t.detach(), weights_b)
+                            kl_per_head = F.kl_div(
+                                attn_s.clamp_min(1e-8).log(), attn_t.detach(), reduction="none"
+                            ).sum(dim=-1)
+                            kl = (head_w * kl_per_head).mean(dim=1)
+                            attn_loss = (weights_b * kl).sum(dim=-1).mean()
+
                         cell_mse = (s_bev - t_bev).pow(2).mean(dim=-1)
                         cell_loss = (w_pgp * cell_mse).mean()
                         metrics[f"distill_cell_mse/{name}"] = cell_loss.detach()
-                    else:
-                        kl = kl_per_head.mean(dim=1)
-                        cell_loss = feat_loss.new_zeros(())
-                    attn_loss = (weights * kl).sum(dim=-1).mean()
-
-                    domain_scale = self.resmap_scale if name == "resmap" else 1.0
-                    if self.version == "v10":
-                        # In v10, x_unit = GradScale(student_bev, ramp) already gates the gradient into student_bev,
-                        # so student_proj trains at 100% weight even during warm-up (ramp == 0.0)!
-                        raw_bank_loss = domain_scale * (
-                            self.loss_scale * cell_loss
-                            + 0.5 * self.loss_scale * feat_loss
-                            + self.attn_loss_scale * attn_loss
-                        )
+                        metrics[f"distill_uniform_mse/{name}"] = cell_mse.mean().detach()
+                        raw_bank_loss = self.loss_scale * cell_loss
                         bank_loss = raw_bank_loss
                         self.last_unit_inputs[tkey[name]] = x_unit
                         self.last_unit_losses[tkey[name]] = 0.5 * raw_bank_loss
                     else:
-                        raw_bank_loss = domain_scale * (self.loss_scale * feat_loss + self.attn_loss_scale * attn_loss)
-                        bank_loss = ramp * raw_bank_loss + 0.0 * raw_bank_loss
+                        # 2. Student Stop-Grad Probe Pass (gradients flow ONLY to student_bev / student_proj)
+                        attn_s, feat_s, preds_s = probe.forward_student(q, s_bev, s_pos, bias)
+
+                        # 3. Subspace Attended Feature KD
+                        feat_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t.detach(), weights)
+
+                        # 4. Confidence-Weighted (Inverse-Entropy) Attention KD (v10 Fix 3)
+                        kl_per_head = F.kl_div(
+                            attn_s.clamp_min(1e-8).log(), attn_t.detach(), reduction="none"
+                        ).sum(dim=-1)  # [B, H, K]
+                        with torch.no_grad():
+                            ent_t = -(attn_t.detach() * attn_t.detach().clamp_min(1e-12).log()).sum(dim=-1)
+                            metrics[f"probe/head_entropy/{name}"] = ent_t.mean().detach()
+                        if self.version == "v10":
+                            with torch.no_grad():
+                                head_conf = (1.0 - ent_t / max_ent).clamp(0.1, 1.0)
+                                head_w = head_conf / head_conf.mean(dim=1, keepdim=True).clamp_min(1e-6)
+                                # PGP Spatial Importance Map w_pgp(u) in [B, HW], spatial mean == 1.0:
+                                # 0.5 uniform baseline (full-grid 1x1 conv KD) + 0.5 PGP anchor-focused importance
+                                attn_hw = (head_w.unsqueeze(-1) * attn_t.detach()).mean(dim=1)  # [B, K, HW]
+                                m_spatial = torch.bmm(weights.unsqueeze(1), attn_hw).squeeze(1)  # [B, HW]
+                                m_norm = m_spatial * (float(hw) / m_spatial.sum(dim=-1, keepdim=True).clamp_min(1e-12))
+                                w_pgp = 0.5 + 0.5 * m_norm
+                            kl = (head_w * kl_per_head).mean(dim=1)
+                            cell_mse = (s_bev - t_bev).pow(2).mean(dim=-1)
+                            cell_loss = (w_pgp * cell_mse).mean()
+                            metrics[f"distill_cell_mse/{name}"] = cell_loss.detach()
+                        else:
+                            kl = kl_per_head.mean(dim=1)
+                            cell_loss = feat_loss.new_zeros(())
+                        attn_loss = (weights * kl).sum(dim=-1).mean()
+
+                        if self.version == "v10":
+                            # In v10, x_unit = GradScale(student_bev, ramp) already gates the gradient into student_bev,
+                            # so student_proj trains at 100% weight even during warm-up (ramp == 0.0)!
+                            raw_bank_loss = domain_scale * (
+                                self.loss_scale * cell_loss
+                                + 0.5 * self.loss_scale * feat_loss
+                                + self.attn_loss_scale * attn_loss
+                            )
+                            bank_loss = raw_bank_loss
+                            self.last_unit_inputs[tkey[name]] = x_unit
+                            self.last_unit_losses[tkey[name]] = 0.5 * raw_bank_loss
+                        else:
+                            raw_bank_loss = domain_scale * (self.loss_scale * feat_loss + self.attn_loss_scale * attn_loss)
+                            bank_loss = ramp * raw_bank_loss + 0.0 * raw_bank_loss
 
                     losses[f"loss_distill_{name}"] = 0.5 * bank_loss
                     metrics[f"loss_attn_{name}"] = (domain_scale * self.attn_loss_scale * attn_loss).detach()

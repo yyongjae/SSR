@@ -58,7 +58,7 @@ while [ $# -gt 0 ]; do
 done
 RUN=${RUN:?RUN=<run name> is required}
 ARM=${ARM:-main}
-E2E_ROOT=${E2E_ROOT:-/home/external-user/ssd/yongjae_refiner/ck/ck2/e2e}
+E2E_ROOT=${E2E_ROOT:-/workspace/byounggun/ssr_outputs/ck2_e2e}
 R="$E2E_ROOT/$RUN"
 L="$R/launch"; LB="$R/labeler"; IO="$R/ck_e2e2"
 export PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1

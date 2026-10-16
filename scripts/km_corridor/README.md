@@ -40,7 +40,13 @@ navtest (12,146, official, 4th look), `corr30_v2` epoch 30, rule `pred_multiply_
 
 ## Known gaps
 
-- The corridor selection runs on dumped outputs (`tools/corridor/select_npz.py`); it is not yet inside the agent's forward.
+- (km 10/17, fixed) The corridor selection is inside the agent's forward: `agent.config.corridor_select_rule`
+  (`modules/corridor_select.py`; `train.sh` sets `pred_multiply_t0.25`, `SELECT_RULE=v2` for the old behaviour), so the
+  standard NAVSIM scripts score the corridor-selected trajectory.  Same computation as `corr_verdict.py` + `corr_select.py`:
+  `corr30_v31` epoch 5, navtest 1,024 tokens, forward choice == offline `pred_multiply_t0.25` on 99.9 % (the one
+  difference is a 4e-5 score tie from the dump's uint8 / float16 rounding).  The dump records the forward's choice
+  (`msel.npy`), and `corr_select.py` / `select_npz.py` report it as the rule `model` next to every offline rule.
+  Runs whose config has no `corridor_select_rule` keep `v2`.
 - TTC verdict is a simplification of the official rule (no heading / intersection / multi-lane conditions; GT agreement 94%).
 - 64 m: `corr_verdict.py` GT columns still read the 32 m `corridor_dt01` GT (oracle rows only); `max_agents` / `map_max_vec`
   stay at 100 for the doubled range (nearest kept).

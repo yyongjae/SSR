@@ -119,6 +119,8 @@ def main(argv=None) -> int:
     if has_gt:
         rows = rows[np.isfinite(V["gt_sdf_min"][rows]).all(1)]
     var = {"v2": np.asarray(D["final"][rows]).argmax(1)}
+    if (d / "msel.npy").exists():   # km 10/17: what the agent's forward submitted (corridor_select_rule)
+        var["model"] = np.asarray(np.load(d / "msel.npy", mmap_mode="r")[rows], np.int64)
     for mode in ("replace", "multiply"):
         for tau in (0.25, 0.5):
             var[f"pred_{mode}_t{tau}"] = scores(D, V, rows, "pred", mode, tau).argmax(1)

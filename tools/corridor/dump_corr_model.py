@@ -57,6 +57,8 @@ def main(argv=None) -> int:
     ap.add_argument("--route", action="store_true", help="the run predicts route channels (corridor_route_weight > 0)")
     ap.add_argument("--det", action="store_true", help="dump only the det/motion head outputs (see the docstring)")
     ap.add_argument("--traj32", action="store_true", help="traj.npy in float32 (navtest submission; f16 is ~3 cm at 60 m)")
+    ap.add_argument("--select-rule", default=None,
+                    help="override corridor_select_rule of the run config (km 10/17; default: the run's own)")
     a = ap.parse_args(argv)
     global SPEC
     if a.traj32:
@@ -65,6 +67,7 @@ def main(argv=None) -> int:
         SPEC = {"det_box": (np.float16, (64, 10)), "det_cls": (np.float16, (64, 7)),
                 "det_traj": (np.float16, (64, 6, 8, 2)), "det_tcls": (np.float16, (64, 6))}
     if not a.det:
+        SPEC["msel"] = (np.int16, ())          # km 10/17: candidate the forward submitted (corridor_select_rule)
         SPEC["cocc"] = (np.uint8, (a.planes, a.fwd_rows, 200))
         SPEC["csdf"] = (np.float16, (a.fwd_rows, 200))
     if a.route and not a.det:
@@ -103,6 +106,10 @@ def main(argv=None) -> int:
     dev = torch.device("cuda:0")
     agent = RAE._build_agent(Path(a.run_dir) / "train/code/hydra/config.yaml", Path(a.ckpt), dev)
     agent.eval()
+    if a.select_rule is not None:
+        agent.config.corridor_select_rule = a.select_rule
+        agent.para_ssr_model._config.corridor_select_rule = a.select_rule   # the model holds a copy (ckpt load)
+    print(f"forward selection rule: {getattr(agent.para_ssr_model._config, 'corridor_select_rule', 'v2')}", flush=True)
     sp = CM.split(a.split)
     toks = [str(t) for t in tdf.token.to_numpy()[pos]]
     sf = instantiate(OmegaConf.load(CM.resolve_path(sp["scene_filter"])))
@@ -145,8 +152,9 @@ def main(argv=None) -> int:
             pr = agent(fg)
         traj = anchors[None] + pr["trajectory_offset"].float()
         out = {"traj": traj, "sim": pr["sim_rewards"], "im": pr["im_rewards"], "final": pr["plan_final_rewards"],
-               "v2traj": pr["trajectory"], "status": fg["status_feature"][:, ncmd:ncmd + 4],
-               "csdf": pr["corridor_sdf"], "cocc": torch.sigmoid(pr["corridor_occ"].float()) * 255}
+               "v2traj": pr.get("trajectory_v2", pr["trajectory"]), "status": fg["status_feature"][:, ncmd:ncmd + 4],
+               "csdf": pr["corridor_sdf"], "cocc": torch.sigmoid(pr["corridor_occ"].float()) * 255,
+               "msel": pr.get("plan_select_index", pr["plan_final_rewards"].argmax(1))}
         if a.route:
             out["croute"] = pr["corridor_route_s"]
         for k, v in out.items():

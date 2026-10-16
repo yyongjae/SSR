@@ -3,7 +3,7 @@
 dumped token as {tokens, trajectory} npz, for the official PDMS / EPDMS scorers (SSR-v2/data/logs/score_npz.sh).
 
   $PY tools/corridor/select_npz.py --dump <dir> --split navtest --rule pred_multiply_t0.25 --out <npz>
-  rules: v2 | pred_{replace,multiply}_t{0.25,0.5} | v3_veto_ttc* / v3_dacveto_ncsoft_ttc* (pred only)
+  rules: v2 | model (the forward's corridor_select_rule) | pred_{replace,multiply}_t{0.25,0.5} | v3_veto_ttc* / v3_dacveto_ncsoft_ttc* (pred only)
 """
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ def main(argv=None) -> int:
     rows = V["rows"]
     if a.rule == "v2":
         ch = np.asarray(D["final"][rows]).argmax(1)
+    elif a.rule == "model":            # km 10/17: the forward's own choice (corridor_select_rule)
+        ch = np.asarray(np.load(d / "msel.npy", mmap_mode="r")[rows], np.int64)
     elif a.rule.startswith("pred_"):
         _, mode, t = a.rule.split("_")
         ch = scores(D, V, rows, "pred", mode, float(t[1:])).argmax(1)

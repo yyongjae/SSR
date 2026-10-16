@@ -16,7 +16,7 @@ if [ "$SPL" = val ]; then
 else
   $PY tools/corridor/dump_corr_model.py --run-dir $R --ckpt $CKPT --split navtest --out $OUT --workers 4 --planes $P --fwd-rows $FR "${ROUTE[@]}" --traj32 || exit 1
   $PY tools/corridor/corr_verdict.py --dump $OUT --split navtest || exit 1
-  for r in ${RULE:-pred_multiply_t0.25} v2; do
+  for r in ${RULE:-pred_multiply_t0.25} v2 model; do     # model = the forward's own corridor_select_rule (km 10/17)
     $PY tools/corridor/select_npz.py --dump $OUT --split navtest --rule $r --out $OUT/sel_$r.npz || exit 1
     (cd ${V2_REPO:-/home/external-user/kyungmin/SSR-v2} && WORKERS=${WORKERS:-8} bash data/logs/score_npz.sh ${RUN}_${TAG}_${r}_navtest $OUT/sel_$r.npz)
   done

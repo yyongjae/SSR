@@ -355,6 +355,9 @@ class ParaSSRConfig:
     corridor_agent_k: int = 32
     corridor_agent_detach: bool = True     # the corridor loss does not update the det/motion head
     corridor_format: str = "dt01"
+    # km 10/17: trajectory the agent submits (modules/corridor_select.py): v2 = the anchor planner's argmax (no corridor)
+    # | pred_multiply_t<tau> | pred_replace_t<tau> = every candidate tracked and judged on the predicted corridor
+    corridor_select_rule: str = "v2"
     # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
     # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
     # always uses GT.

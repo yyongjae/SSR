@@ -426,6 +426,17 @@ class ParaSSRModel(nn.Module):
                 "trajectory", "plan_topk_trajectory", "plan_topk_reward", "plan_topk_index",
                 "plan_final_rewards", "trajectory_offset", "im_rewards", "sim_rewards", "trajectory_anchors")})
             predictions.update({k: v for k, v in outs.items() if k.startswith("plan_rescore_")})
+        if self.corridor_head is not None:
+            predictions.update(self.corridor_head(bev_embed, det_out))
+            rule = str(getattr(cfg, "corridor_select_rule", "v2"))
+            if not self.training and rule != "v2" and "trajectory_offset" in predictions:
+                # km 10/17: the submitted trajectory is the corridor-selected candidate (modules/corridor_select.py)
+                from .modules.corridor_select import corridor_select
+                sel = corridor_select(predictions, features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4],
+                                      rule)
+                predictions["trajectory_v2"] = predictions["trajectory"]
+                predictions["trajectory"] = sel["trajectory"].to(predictions["trajectory"].dtype)
+                predictions["plan_select_index"] = sel["index"]
         if getattr(cfg, "heading_from_path", False) and not self.training:
             predictions["trajectory"] = heading_from_path(predictions["trajectory"])
         if getattr(cfg, "kinematic_projection", False) and not self.training:
@@ -435,8 +446,6 @@ class ParaSSRModel(nn.Module):
             v0 = features["status_feature"][:, cfg.num_navi_cmd].to(predictions["trajectory"].dtype)
             ctrl = clamp_controls(poses_to_controls(predictions["trajectory"], v0, 0.5))
             predictions["trajectory"], _ = bicycle_rollout(ctrl, v0, 0.5)
-        if self.corridor_head is not None:
-            predictions.update(self.corridor_head(bev_embed, det_out))
         # Training always exposes predictions needed by every supervised loss,
         # even when a caller explicitly passes run_aux=False.
         if self.training or run_aux:

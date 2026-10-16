@@ -6,6 +6,7 @@
 #                   progress reward inside the GT-safe corridor, official-comfort hinge, verdict supervision  == corr30_v31
 #            v31_64 : v31 on the 64 m BEV / GT (NOT smoke-tested yet, see README)
 #   smoke: EPOCHS=1 LIMIT_TRAIN=40 LIMIT_VAL=5 VAL_EVERY=1 WANDB=false
+#   SELECT_RULE (km 10/17): trajectory the agent submits at inference, default pred_multiply_t0.25 (corridor); v2 = no corridor
 set -uo pipefail
 source "$(dirname "$0")/env.sh"; cd $REPO
 VAR=$1; RUN=$2; GPUS=$3; shift 3
@@ -37,6 +38,7 @@ exec $PY navsim/planning/script/run_training.py \
   agent.config.image_architecture=resnet34.tv_in1k agent.config.plan_heading_from_xy=true \
   agent.config.grad_balance_warmup_iters=10600 agent.config.grad_balance_interval=200 agent.config.grad_norm_log_interval=200 \
   ++agent.config.log_sync_dist=false ++agent.config.corridor_weight=1.0 ++agent.config.corridor_tokens_root=$TOKENS_ROOT \
+  ++agent.config.corridor_select_rule=${SELECT_RULE:-pred_multiply_t0.25} \
   "${EXTRA[@]}" \
   wandb.enable=${WANDB:-true} wandb.project=para-ssr-v2 wandb.name=$RUN wandb.mode=online wandb.group=corr30 \
   output_dir=$OUT/train "$@"

@@ -134,6 +134,11 @@ class ParaSSRPlannerHead(nn.Module):
         plan_kinematic: bool = False,
         plan_heading_from_xy: bool = False,
         plan_rescore_refined: bool = False,
+        plan_select_mode: str = "weighted",
+        plan_select_dac_thr: float = 0.5,
+        plan_select_gate: float = 20.0,
+        plan_head_mode: str = "wote",
+        plan_score_sees_offset: bool = False,
     ):
         super().__init__()
         if use_stl:
@@ -211,7 +216,10 @@ class ParaSSRPlannerHead(nn.Module):
         # unused module would fail DDP's unused-parameter check.
         self.anchor_planner = (
             AnchorPlanner(plan_anchor_file, embed_dims, fut_ts, traj_dims, plan_reward_weights, plan_topk,
-                          kinematic=plan_kinematic, heading_from_xy=plan_heading_from_xy)
+                          kinematic=plan_kinematic, heading_from_xy=plan_heading_from_xy,
+                          select_mode=plan_select_mode, select_dac_thr=plan_select_dac_thr,
+                          select_gate=plan_select_gate, head_mode=plan_head_mode,
+                          score_sees_offset=plan_score_sees_offset)
             if plan_anchor_file else None
         )
         self.ego_fut_decoder = nn.Sequential(*reg_layers) if self.anchor_planner is None else None
@@ -403,7 +411,7 @@ class ParaSSRPlannerHead(nn.Module):
         h2 = ap.queries(h_ego, trajectories=refined)
         for layer in self.planner_layers:
             h2 = layer(h2, plan_pos, bev_embed, bev_pos, **memories)
-        _, sim2, final2 = ap.score(self.final_norm(h2))
+        _, sim2, final2, _ = ap.score(self.final_norm(h2))
         k = min(ap.topk, ap.num_anchors)
         top = final2.topk(k, dim=-1).indices
         gather = top[:, :, None, None].expand(-1, -1, ap.fut_ts, ap.traj_dims)

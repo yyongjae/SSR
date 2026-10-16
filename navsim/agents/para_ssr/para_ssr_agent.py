@@ -315,6 +315,18 @@ class ParaSSRAgent(AbstractAgent):
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
+        if bool(getattr(config, "finetune_score_only", False)):
+            n = self.para_ssr_model.freeze_all_but_score_heads()
+            for p in self._loss.parameters():
+                p.requires_grad_(False)
+            logger.info("finetune_score_only: %d trainable parameters (score heads)", n)
+        elif bool(getattr(config, "finetune_refiner_only", False)):
+            if self.para_ssr_model.refiner is None:
+                raise ValueError("finetune_refiner_only needs refine_enable=true")
+            n = self.para_ssr_model.freeze_all_but(self.para_ssr_model.REFINER_PREFIXES)
+            for p in self._loss.parameters():
+                p.requires_grad_(False)
+            logger.info("finetune_refiner_only: %d trainable parameters (stage 2)", n)
 
     @staticmethod
     def _validate_config(config, trajectory_sampling: TrajectorySampling) -> None:
@@ -569,7 +581,7 @@ class ParaSSRAgent(AbstractAgent):
         # The one exception is the distillation adapter (readout/distill.py):
         # it is training-only, so a KD checkpoint must evaluate without it and
         # a KD fine-tune must start from a checkpoint that never had it.
-        kd_prefix = "_loss.distiller."
+        kd_prefix = ("_loss.distiller.", "_loss.v7_distill.")      # + v7 distillation (distill/)
         own = self.state_dict()
         state_dict = {
             k: v for k, v in state_dict.items() if not k.startswith(kd_prefix) or k in own
@@ -589,6 +601,13 @@ class ParaSSRAgent(AbstractAgent):
             if fresh:
                 logger.info("v1 checkpoint: %d anchor-planner tensors start fresh", len(fresh))
             missing = [k for k in missing if not k.startswith(anchor_prefix)]
+        # plan_score_sees_offset added to a checkpoint trained without it: offset_embed's last layer is
+        # zero-initialised, so the fresh module leaves every score exactly as the checkpoint had it.
+        embed_prefix = anchor_prefix + "offset_embed."
+        fresh = [k for k in missing if k.startswith(embed_prefix)]
+        if fresh and not any(k.startswith(embed_prefix) for k in state_dict):
+            logger.info("offset_embed starts fresh (zero output): %d tensors", len(fresh))
+            missing = [k for k in missing if not k.startswith(embed_prefix)]
         if missing or result.unexpected_keys:
             # same wording as torch's strict load, which callers match on
             raise RuntimeError(
@@ -629,9 +648,30 @@ class ParaSSRAgent(AbstractAgent):
             builders.append(ResMapTeacherTargetBuilder(cfg))
         if float(getattr(cfg, "plan_map_weight", 0.0)) > 0:
             builders.append(DrivableAreaTargetBuilder(cfg))
+        if float(getattr(cfg, "bev_seg_weight", 0.0)) > 0:
+            from .bev_seg import DrivableSegTargetBuilder
+
+            builders.append(DrivableSegTargetBuilder(cfg))
+        if float(getattr(cfg, "feas_weight", 0.0)) > 0:
+            from .feasibility import DrivableFieldTargetBuilder
+
+            builders.append(DrivableFieldTargetBuilder(cfg))
+        if (str(getattr(cfg, "feas_ep_target", "anchor")) != "anchor"
+                or float(getattr(cfg, "feas_progress_weight", 0.0)) > 0
+                or float(getattr(cfg, "feas_lateral_weight", 0.0)) > 0
+                or (bool(getattr(cfg, "refine_enable", False))
+                    and (float(getattr(cfg, "refine_progress_weight", 0.0)) > 0
+                         or float(getattr(cfg, "refine_lateral_weight", 0.0)) > 0))):
+            from .feasibility import RouteCenterlineTargetBuilder
+
+            builders.append(RouteCenterlineTargetBuilder(cfg))
         # plan_score_file is training-only: evaluation leaves it null and gets no builder
         if getattr(cfg, "plan_anchor", False) and getattr(cfg, "plan_score_file", None):
             builders.append(AnchorScoreTargetBuilder(cfg))
+        if bool(getattr(cfg, "distill_v7", False)):
+            from .distill.v7_targets import V7TeacherTargetBuilder
+
+            builders.append(V7TeacherTargetBuilder(cfg))
         return builders
 
     # ------------------------------------------------------------------ #

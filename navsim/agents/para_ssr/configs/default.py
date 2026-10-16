@@ -321,6 +321,163 @@ class ParaSSRConfig:
     map_label_source: str = "gt"
     map_pseudo_score_thr: float = 0.3
 
+    # Drivable-area RASTER on the shared BEV grid (bev_seg.py).  The vector map head emits ROAD as
+    # open polylines, which say where an edge is but never which side is legal; DAC is a
+    # point-in-polygon test on the ego footprint.  0 = off: no head, no target, no parameters.
+    bev_seg_weight: float = 0.0
+    bev_seg_hidden: int = 128
+    bev_seg_pos_weight: float = 1.0
+    # vector: the polyline map head (default).  seg: the raster head REPLACES it and its token view
+    # feeds the planner's map memories.  With seg, bev_seg_weight must be > 0.
+    map_head_type: str = "vector"
+    bev_seg_token_pool: int = 5
+
+    # One differentiable feasibility cost on the 256 refined candidates (feasibility.py); 0 = off.
+    # feas_field: "gt" isolates the mechanism from the field's quality, "pred" lets the same
+    # gradient reach the perception path.  margin follows the measured penetration (median 0.32 m):
+    # a generous margin buys DAC by making the planner timid, and EP is the larger gap.
+    feas_weight: float = 0.0
+    feas_field: str = "gt"                 # gt | pred
+    feas_field_head: bool = True           # false + feas_field=gt: no predicted-field head at all
+    feas_to_offset: bool = True
+    feas_to_score: bool = False
+    feas_weighting: str = "softmax"        # softmax | topk | uniform | select
+    # select: uniform over (label top-k) U (model top-k) U (WTA winner), zero elsewhere.  softmax at
+    # temp 1 measured to spread over 198/256 candidates and collapse them (feasibility.select_weights)
+    feas_select_label_k: int = 16
+    feas_select_model_k: int = 16
+    # hold the candidates OUTSIDE the refined set near their anchor: hinge^2 beyond the radius.  The
+    # offset head is shared, so select alone let them drift (B2: |offset| 5.6 -> 7.0 m, epoch 5->10)
+    feas_offset_anchor_weight: float = 0.0
+    feas_offset_anchor_radius: float = 2.0
+    # TTC head target (feasibility.ttc_label): anchor | geometric | band | hybrid.  Measured on 1.5M
+    # navtest candidates: the anchor's label is the more accurate below 2 m of offset and above
+    # 12 m, the geometric one (agent field + velocity projection) in between -- hence "band".
+    feas_ttc_target: str = "anchor"
+    feas_ttc_margin: float = 0.0
+    feas_ttc_band_lo: float = 2.0
+    feas_ttc_band_hi: float = 12.0
+    # EP head target (feasibility.ep_label): anchor | geometric -- progress on the route centerline of
+    # the emitted trajectory, normalised by the human's, times the GT corridor verdict
+    feas_ep_target: str = "anchor"
+    feas_route_file: str = ""              # packed route centerlines, no .npy suffix
+    feas_route_max_offset: float = 5.0     # a route farther than this from the ego is a failed extraction -> no route
+    # driving force on the refined set (feasibility.drive_terms): progress up to the human's along
+    # the route, lane deviation beyond `free` m, first-step speed vs the measured motion
+    feas_progress_weight: float = 0.0
+    feas_lateral_weight: float = 0.0
+    feas_lateral_free: float = 1.0
+    feas_continuity_weight: float = 0.0
+    feas_continuity_tol: float = 0.5
+    # stage 2 (refine.py): refine only the selected candidate; stage 1 keeps a diverse pool
+    feas_field_priors: bool = False        # field head also reads seg + det/motion (feasibility.field_priors)
+    feas_prior_topk: int = 40
+    # listwise top-1 ranking inside the corridor (feasibility.admissible_rank_loss); 0 = off
+    rank_weight: float = 0.0
+    rank_set: str = "gate"                 # gate (deployment set) | corridor (GT set) | all (control: all K)
+    rank_tau: float = 0.05                 # label temperature
+    rank_temp: float = 1.0                 # model-score temperature
+    # fine-tune only the score heads (reward / sim heads, offset_embed); everything else frozen, in eval mode
+    # selection-curse loss (feasibility.selection_curse_loss): pinball on the EP/TTC/C heads of the
+    # deployed rule's top-k candidates, over-estimation weighted (1 - tau) vs tau
+    curse_weight: float = 0.0
+    curse_set: str = "topk"                # topk (would-be picks) | all (control: asymmetry only)
+    curse_topk: int = 8
+    curse_tau: float = 0.2
+    finetune_score_only: bool = False
+    # fine-tune only stage 2 (the refiner); everything else frozen, in eval mode
+    finetune_refiner_only: bool = False
+    refine_enable: bool = False
+    refine_weight: float = 1.0
+    refine_hidden: int = 256
+    refine_margin: float = 0.4
+    refine_dyn_margin: float = 0.2
+    refine_corridor_weight: float = 1.0
+    refine_corridor_hinge: bool = False    # relu(-phi)^2: no push once inside the margin (refine.py)
+    refine_progress_weight: float = 1.0
+    refine_lateral_weight: float = 0.1
+    refine_lateral_free: float = 1.0
+    refine_smooth_weight: float = 1.0
+    refine_trust_weight: float = 0.05
+    refine_continuity_weight: float = 0.5
+    refine_continuity_tol: float = 0.5
+    refine_imitation_weight: float = 1.0
+    refine_ttc_weight: float = 0.0         # do-no-harm on the TTC clearance of the pick (refine.py)
+    refine_ttc_margin: float = 1.0
+    refine_fallback: bool = True
+    refine_apply: bool = True              # evaluation: false emits stage 1's pick (isolates stage 2)
+    # BEV selector v7 distillation (teammate, origin/aux_distill docs/bev_selector_v7.md; distill/):
+    # anchor queries cross-attend BEVFusion + ReSMap teacher BEV and the student BEV with a Gaussian
+    # bias along the 256 anchors; attention KL + feature hybrid loss.  Training only.
+    distill_v7: bool = False
+    distill_v7_weight: float = 1.0         # teammate's distill_loss_weight
+    distill_v7_root: str = "/home/external-user/datasets/teacher_cache"
+    distill_v7_resmap_flip: bool = False   # teammate flips ReSMap L/R; measured wrong (distill/teacher_store.py)
+    distill_v7_heads: int = 4
+    distill_spatial_sigma: float = 4.0
+    distill_attn_loss_scale: float = 5.0
+    distill_resmap_scale: float = 3.0
+    distill_anchor_winner_boost: float = 2.0
+    distill_anchor_tau: float = 1.0
+    distill_anchor_loss_scale: float = 10.0
+    distill_anchor_loss_type: str = "hybrid"
+    distill_anchor_proj: bool = True
+    feas_temp: float = 1.0
+    feas_topk: int = 32
+    feas_margin: float = 0.4
+    feas_beta: float = 0.2
+    feas_clip: float = 8.0
+    feas_offset_weight: float = 1.0
+    feas_score_weight: float = 1.0
+    feas_score_tau: float = 0.5   # measured: separates DAC=0 (c0 median 8.84) from DAC=1 (0.00) best
+    # Dynamic field: one plane per ego step, agents where they will BE.  0 = off (static only).
+    # The margin is small because NC is an overlap test, not a clearance test.
+    feas_dyn_weight: float = 0.0
+    feas_dyn_margin: float = 0.2
+    # INFERENCE gate on the field itself (feasibility.field_gate_select).  feas_to_score puts the
+    # corridor into a sigmoid head and the gate reads the head, so at deployment the geometry
+    # survives only as far as that scalar copied it -- measured, not intact: reading the predicted
+    # field at selection moves realised DAC 95.35 -> 95.90% at margin 0.10, ground-truth ceiling
+    # 96.45% (tools/plan_v2/geo_gate_probe.py).  This makes the field the deployed constraint, so
+    # training's cost and the deployed verdict are the same object.  Selection rule only: it needs
+    # no retraining and applies to any finished v2 anchor checkpoint.
+    feas_select_gate: bool = False
+    feas_select_margin: float = 0.1        # probe optimum for the PREDICTED field (GT's is 0.4)
+    feas_select_dyn_margin: float = 0.0
+    feas_field_weight: float = 1.0
+    feas_hidden: int = 128
+    # TARGET grid only.  Bilinear sampling of an exact SDF errs 0.142 m at 0.64 m cells and 0.035 m
+    # at 0.16 m, against a 0.32 m penetration, so the label is rasterised 4x finer.  The PREDICTED
+    # field stays on the BEV grid: a head finer than every other head would buy accuracy with
+    # resolution instead of with the mechanism.  The resulting gap is a result, not a defect.
+    feas_target_upsample: int = 4
+    # weighted: WoTE's rule.  corridor_first: DAC gates instead of voting -- only meaningful once
+    # feasibility owns the DAC head, since only then does it describe the EMITTED trajectory.
+    # "wote": 5 score heads (NC, DAC, EP, TTC, comfort), WoTE's label set.
+    # "corridor": DAC+NC collapse into ONE "feasible" head fed by the merged corridor field,
+    # which always gates; EP/TTC/comfort keep their WoTE labels and order the admissible set.
+    plan_head_mode: str = "wote"
+    # score heads see the (detached) offset of the candidate they score -- anchor_planner.score
+    plan_score_sees_offset: bool = False
+    # hold the non-winner offsets near their anchor (anchor_planner.anchor_plan_losses): hinge^2 on the
+    # per-step xy offset beyond the radius.  Their score heads learn the ANCHOR's label; the car drives
+    # anchor + offset.  0 = off.
+    plan_offset_hold_weight: float = 0.0
+    plan_offset_hold_radius: float = 1.0
+    plan_select_mode: str = "weighted"
+    plan_select_dac_thr: float = 0.5
+    plan_select_gate: float = 20.0
+    # Grounding weight = the cost's own sensitivity, sigmoid((margin + band - sdf_gt)/band), floored
+    # so deep-interior cells cannot drift down and invent obstacles.
+    feas_ground_band: float = 1.0
+    feas_ground_floor: float = 0.05
+    # Let the field's grounding loss settle before the planner is steered by it.
+    # Does the feasibility cost's gradient reach the predicted field?  Measured to be degenerate
+    # (see feasibility.py); kept only so the collapse can be reproduced as an ablation.
+    feas_cost_grad_to_field: bool = False
+    feas_warmup_iters: int = 0
+    feas_ramp_iters: int = 0
+
     # Eval auxiliary predictions. With interaction on, decoders always run;
     # with it off, evaluation can omit their computation as well.
     test_aux_heads: bool = False

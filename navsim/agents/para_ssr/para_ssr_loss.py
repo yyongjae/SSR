@@ -21,7 +21,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .modules.anchor_planner import anchor_plan_losses
+from .feasibility import DAC_INDEX, NC_INDEX, feasibility_losses
+from .modules.anchor_planner import CORRIDOR_KEYS, LABEL_COLS, anchor_plan_losses
 from .plan_map import plan_map_loss
 from .readout.distill import ReadoutDistiller
 from .modules.grad_balance import (
@@ -101,6 +102,21 @@ class ParaSSRLoss(torch.nn.Module):
         self.distiller: Optional[ReadoutDistiller] = None
         if getattr(config, "kd_mode", "none") != "none":
             self.distiller = ReadoutDistiller(config)
+        # BEV selector v7 distillation (distill/anchor_distill.py): training-only, owned by the loss
+        # so its parameters reach the optimizer (agent.get_optimizers) and leave the eval path alone
+        if bool(getattr(config, "distill_v7", False)):
+            from .distill import TrajectoryAnchorDistillation
+            if not (getattr(config, "plan_anchor", False) and getattr(config, "plan_anchor_file", None)):
+                raise ValueError("distill_v7 needs the anchor planner (plan_anchor, plan_anchor_file)")
+            self.v7_distill = TrajectoryAnchorDistillation(
+                channels=config.embed_dims, num_heads=config.distill_v7_heads, pc_range=config.pc_range,
+                bev_h=config.bev_h, bev_w=config.bev_w, winner_boost=config.distill_anchor_winner_boost,
+                tau=config.distill_anchor_tau, loss_scale=config.distill_anchor_loss_scale,
+                attn_loss_scale=config.distill_attn_loss_scale, resmap_scale=config.distill_resmap_scale,
+                spatial_sigma=config.distill_spatial_sigma, loss_type=config.distill_anchor_loss_type,
+                use_proj=config.distill_anchor_proj, trajectory_anchors_file=config.plan_anchor_file)
+        else:
+            self.v7_distill = None
         if config.grad_balance_target:
             target = dict(config.grad_balance_target)
             unsupported = set(target) - {"plan", "det", "map", "distill"}
@@ -227,13 +243,56 @@ class ParaSSRLoss(torch.nn.Module):
             # per-command sums) as the v1-comparable planning error; it is not trained.
             if "sim_reward" not in targets:
                 raise KeyError("plan_anchor needs the sim_reward target: set plan_score_file")
-            al = anchor_plan_losses(predictions, targets["trajectory"], targets["sim_reward"],
-                                    targets["sim_reward_valid"])
+            # when the feasibility term owns the drivable-area head, the anchor label for that
+            # column must go: it describes the ANCHOR, the feasibility target the emitted trajectory
+            on = float(getattr(cfg, "feas_weight", 0.0)) > 0 and bool(getattr(cfg, "feas_to_score", False))
+            if str(getattr(cfg, "plan_head_mode", "wote")) == "corridor":
+                # heads are CORRIDOR_KEYS: the feasible head has no anchor label (feasibility.py
+                # owns it), the other three read WoTE's own columns for the same metric.
+                if not on:
+                    raise ValueError("plan_head_mode=corridor needs feas_weight>0 and feas_to_score:"
+                                     " nothing else supervises the feasible head")
+                skip = None
+                label_cols = [None] + [LABEL_COLS[k] for k in CORRIDOR_KEYS[1:]]
+            else:
+                # when the feasibility term owns the drivable-area head, the anchor label for that
+                # column must go: it describes the ANCHOR, the feasibility target the emitted one
+                skip = [i for i, use in ((DAC_INDEX, on),
+                                         (NC_INDEX, on and float(getattr(cfg, "feas_dyn_weight", 0.0)) > 0))
+                        if use] or None
+                label_cols = None
+            # the TTC column may be re-labelled on the emitted trajectory (feasibility.ttc_label)
+            from .feasibility import ep_label, ttc_label
+            sim_reward, ttc_logs = ttc_label(predictions, targets, cfg, targets["sim_reward"])
+            logs.update(ttc_logs)
+            # ... and the ego-progress column on the route centerline (feasibility.ep_label)
+            sim_reward, ep_logs = ep_label(predictions, targets, cfg, sim_reward)
+            logs.update(ep_logs)
+            hold_w = float(getattr(cfg, "plan_offset_hold_weight", 0.0))
+            al = anchor_plan_losses(predictions, targets["trajectory"], sim_reward,
+                                    targets["sim_reward_valid"], skip_sim_index=skip,
+                                    label_cols=label_cols,
+                                    offset_hold_radius=float(cfg.plan_offset_hold_radius) if hold_w > 0 else None)
             task_losses["plan"] = tw.get("plan", 1.0) * (
                 float(cfg.plan_offset_loss_weight) * al["traj_offset_loss"]
                 + float(cfg.plan_im_reward_weight) * al["im_reward_loss"]
-                + float(cfg.plan_sim_reward_weight) * al["sim_reward_loss"])
+                + float(cfg.plan_sim_reward_weight) * al["sim_reward_loss"]
+                + hold_w * al.get("offset_hold_loss", 0.0))
             logs.update({f"plan_v2/{k}": v.detach() for k, v in al.items()})
+            # listwise top-1 ranking inside the corridor (feasibility.admissible_rank_loss)
+            from .feasibility import admissible_rank_loss
+            rk_loss, rk_logs = admissible_rank_loss(predictions, targets, sim_reward, cfg)
+            if rk_loss is not None:
+                task_losses["plan"] = task_losses["plan"] + rk_loss
+                logs["loss_rank"] = rk_loss.detach()
+                logs.update(rk_logs)
+            # over-estimation on the would-be picks (feasibility.selection_curse_loss)
+            from .feasibility import selection_curse_loss
+            cu_loss, cu_logs = selection_curse_loss(predictions, targets, sim_reward, cfg)
+            if cu_loss is not None:
+                task_losses["plan"] = task_losses["plan"] + cu_loss
+                logs["loss_curse"] = cu_loss.detach()
+                logs.update(cu_logs)
         # Keep the historical raw metric, but expose the value that actually
         # enters total_loss so plan=2.0 is not hidden in dashboards.
         logs["loss_plan_reg_weighted"] = task_losses["plan"].detach()
@@ -282,6 +341,38 @@ class ParaSSRLoss(torch.nn.Module):
             map_losses = model.map_head.loss(predictions, map_pts, map_labels, map_valid)
             task_losses["map"] = sum(map_losses.values()) * tw.get("map", 1.0)
             logs.update({k: v.detach() for k, v in map_losses.items()})
+
+        # ---- drivable-area raster (bev_seg.py) --------------------------
+        # Folded into the "map" task so the existing GradBalancer keeps one valve for map
+        # supervision; it is map supervision, just in the representation DAC actually tests.
+        if "drivable_seg_logits" in predictions and "drivable_seg" in targets:
+            from .bev_seg import bev_seg_loss
+
+            seg_loss, seg_logs = bev_seg_loss(
+                predictions["drivable_seg_logits"], targets["drivable_seg"],
+                pos_weight=float(getattr(cfg, "bev_seg_pos_weight", 1.0)),
+            )
+            seg_loss = float(cfg.bev_seg_weight) * seg_loss * tw.get("map", 1.0)
+            task_losses["map"] = task_losses.get("map", seg_loss.new_zeros(())) + seg_loss
+            logs["loss_bev_seg"] = seg_loss.detach()
+            logs.update(seg_logs)
+
+        # ---- feasibility on the refined candidates (feasibility.py) -----
+        # Its own task so the GradBalancer can see it: the constraint is meant to steer planning,
+        # and folding it into "map" would hide that behind the map valve.
+        feas_loss, feas_logs = feasibility_losses(predictions, targets, cfg, self.iteration)
+        if feas_loss is not None:
+            task_losses["plan"] = task_losses.get("plan", feas_loss.new_zeros(())) + feas_loss
+            logs["loss_feas"] = feas_loss.detach()
+            logs.update(feas_logs)
+        # ---- driving force and its resistances on the refined set (feasibility.drive_terms) ----
+        if float(getattr(cfg, "feas_weight", 0.0)) > 0 and "trajectory_offset" in predictions:
+            from .feasibility import drive_terms
+            drive_loss, drive_logs = drive_terms(predictions, targets, features, cfg)
+            if drive_loss is not None:
+                task_losses["plan"] = task_losses.get("plan", drive_loss.new_zeros(())) + drive_loss
+                logs["loss_drive"] = drive_loss.detach()
+                logs.update(drive_logs)
 
         # ---- readout-space distillation (report/19) ---------------------
         if self.distiller is not None and "teacher_bev" in targets:
@@ -338,6 +429,44 @@ class ParaSSRLoss(torch.nn.Module):
                 }
                 for k, v in scales.items():
                     logs[k] = torch.tensor(v, device=bev_embed.device)
+
+        # ---- BEV selector v7 distillation (distill/anchor_distill.py) ----------
+        # Added after balancing, as in the teammate's run (GradBalancer off there): it reaches the
+        # shared BEV unscaled.  The teammate adds weight * EVERY returned term -- both bank losses and
+        # their mean loss_distill_tok, so the gradient is 1.5 x the bank sum; loss_attn_* are detached
+        # logs that only shift the value.  Kept exactly.  bev_pos = the planner's own encoding.
+        if self.v7_distill is not None and "v7_teacher_bevfusion" in targets:
+            sf = features["status_feature"]
+            bs = bev_embed.shape[0]
+            tok = lambda m: m.flatten(2).transpose(1, 2).to(bev_embed.dtype)          # noqa: E731
+            bev_pos = model.pts_bbox_head.positional_encoding(
+                bev_embed.new_zeros((bs, cfg.bev_h, cfg.bev_w))).to(bev_embed.dtype).flatten(2).transpose(1, 2)
+            v7_losses, v7_metrics = self.v7_distill(
+                bev_embed, (tok(targets["v7_teacher_bevfusion"]), tok(targets["v7_teacher_resmap"])),
+                predictions["trajectory_anchors"], gt_trajectory=targets["trajectory"],
+                command=sf[:, :cfg.num_navi_cmd], ego_status=sf[:, cfg.num_navi_cmd:], bev_pos=bev_pos,
+                sample_valid=targets.get("v7_teacher_valid"))
+            for name, value in v7_losses.items():
+                total_loss = total_loss + float(cfg.distill_v7_weight) * value
+                logs[f"v7/{name}"] = value.detach()
+            logs.update({f"v7/{k}": v for k, v in v7_metrics.items()})
+            if "v7_teacher_valid" in targets:
+                logs["v7/valid_frac"] = targets["v7_teacher_valid"].float().mean().detach()
+
+        # ---- stage 2: refine the pick (refine.py) ------------------------
+        # Added after balancing: it reaches neither the shared BEV nor stage 1 (its inputs are
+        # detached), so the balancer has nothing to measure and must not rescale it.
+        refiner = getattr(model, "refiner", None)
+        if refiner is not None and "plan_query" in predictions and "drivable_sdf_pred" in predictions:
+            from .refine import refine_losses, refine_select
+            status = features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4]
+            predictions.update(refine_select(refiner, predictions, predictions["plan_query"], status, cfg,
+                                             gt_trajectory=targets["trajectory"]))
+            ref_loss, ref_logs = refine_losses(predictions, targets, features, cfg)
+            if ref_loss is not None:
+                total_loss = total_loss + ref_loss
+                logs["loss_refine"] = ref_loss.detach()
+                logs.update(ref_logs)
 
         if model.training:
             self.iteration += 1

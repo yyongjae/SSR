@@ -114,7 +114,13 @@ class CKTrunk(RefinerNet):
         """refiner v4 parent pass: tau [T, K, 8, 3] (parent drafts) -> x [T*K, 49, d] (draft token + 48 station tokens
         after the 4 layers and norm_out), Hc [T*K, 128, 48, 17] (corridor conv features), ud, geom.  time_free zeroes
         the t_arr / v_arr geo channels (the station features then carry no schedule; candidates add their own).
-        Same modules as candidates() (no heads)."""
+        Same modules as candidates() (no heads).
+        Row independence (CKNet.score_set's parent dedupe relies on it): every op is per draft row -- geometry, the
+        per-token grid_sample, Conv / GroupNorm (per sample) / station Linear, self-attention within the row's 49
+        tokens, cross-attention per query to its TOKEN's 200 global tokens (the K rows' queries of a token are only
+        concatenated, softmax is over the keys), FFN / LayerNorm, dropout 0 -- so a row's output does not depend on
+        which other rows (or how many, K) are in the set.  Measured bit for bit on CPU fp32 (tests/test_v4_dedupe.py);
+        a GPU kernel choice may still depend on the batch size (rounding only)."""
         T, K = tau.shape[:2]
         B = T * K
         with torch.autocast(device_type=tau.device.type, enabled=False):
@@ -254,18 +260,67 @@ class CKNet(nn.Module):
         v0, a0, _, cmd = ego
         return self.pref_head(mem, v0, a0, cmd)
 
+    # refiner v4 parent dedupe (score_set): run trunk.stations once per unique parent of a token (plain attribute,
+    # not state; score_set(dedupe=...) overrides it per call, False = the repeated per-candidate parent pass)
+    dedupe_parents = True
+
+    @staticmethod
+    def unique_parents(par: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-token unique parent drafts by BITWISE equality of the float32 values (equal rows are equal inputs:
+        a NaN row matches its own bit pattern, -0.0 and +0.0 differ): par [T, K, 8, 3] ->
+        par_u [T, U, 8, 3] f32 (first-occurrence order, U = max_t U_t; slots u >= U_t repeat the token's first parent:
+        computed, never read), parent_index [T, K] int64 (par[t, k] == par_u[t, parent_index[t, k]] bit for bit),
+        n_unique [T] int64.  O(K^2) compares per token (K <= a few hundred here)."""
+        T, K = par.shape[:2]
+        p = par.float().contiguous()
+        key = p.view(torch.int32).reshape(T, K, -1)                                   # [T, K, 24] bit patterns
+        eq = torch.ones(T, K, K, dtype=torch.bool, device=p.device)
+        for c in range(key.shape[-1]):                                                # peak memory T K^2 (not x24)
+            eq &= key[:, :, None, c] == key[:, None, :, c]
+        ar = torch.arange(K, device=p.device)
+        first = torch.where(eq, ar, torch.full_like(ar, K)).amin(-1)                  # [T, K] first equal row (<= k)
+        is_u = first == ar
+        rank = torch.cumsum(is_u.long(), 1) - 1                                       # slot of each first occurrence
+        pidx = torch.gather(rank, 1, first)
+        n_u = is_u.sum(1)
+        U = int(n_u.max()) if T * K else 0
+        slot = torch.where(is_u, rank, torch.full_like(rank, U))                      # repeats -> dump column U
+        src = torch.zeros(T, U + 1, dtype=torch.long, device=p.device)
+        src = src.scatter(1, slot, ar.expand(T, K).contiguous())[:, :U]               # pad slots -> row 0 (unique)
+        par_u = torch.gather(p, 1, src[..., None, None].expand(T, U, *p.shape[2:]))
+        return par_u, pidx, n_u
+
     def score_set(self, feat: torch.Tensor, mem: torch.Tensor, ego, cand: torch.Tensor,
                   parents: Optional[torch.Tensor] = None, tfeat=None, pref: Optional[torch.Tensor] = None,
-                  return_ctx: bool = False) -> Dict:
+                  return_ctx: bool = False, parent_index: Optional[torch.Tensor] = None, pctx: Optional[Dict] = None,
+                  return_pctx: bool = False, dedupe: Optional[bool] = None) -> Dict:
         """Score one candidate set with the token's scene (feat, mem from trunk.scene):
         cand [T, K, 8, 3] -> score_logit [T, K, 5] f32, w_lat / z_lon [T, K, 6] f32, gate_logit [T, K], and for the v4
         parent-pass readouts 'haz' = {t_arr (bin-centre first arrival), t_in / t_out (entry / min(leave, horizon) of
         the station bins), d_lat, haz_mask [T, K, 48], is_self [T, K]; hazard: a_nc / a_ttc / a_dac
         [T, K, 48]; evidence: occ_logit [T, K, 48, 17, M], margin [T, K, 48, 17], pts [T, K, 48, 17, 2] (parent grid
         points, N frame), lp_nc / lp_ttc / lp_dac / min_margin [T, K]}.
-        readout 'mean': exactly trunk.candidates + score (the CK2 / v3 ops; parents ignored).
-        readout 'hazard': parents [T, K, 8, 3] = each candidate's parent draft (None: every candidate is its own
-        parent); the scene is read on the parent's corridor, the candidate reads it at its own schedule."""
+        readout 'mean': exactly trunk.candidates + score (the CK2 / v3 ops; parents and every v4 argument ignored).
+        readout 'hazard' / 'evidence': parents [T, K, 8, 3] = each candidate's parent draft (None: every candidate is
+        its own parent); the scene is read on the parent's corridor, the candidate reads it at its own schedule.
+        Parent dedupe (spec V4_3 M3): trunk.stations (the parent pass: corridor conv + 4 layers, ~0.64 GFLOP per row;
+        99 % of the repeated hazard score_set FLOPs, 91 % of evidence, whose O / D scene head still runs per candidate)
+        runs once per UNIQUE parent of each token and its x / Hc rows are gathered back to the candidates; the
+        candidates' own quantities (on_parent, corridor geometry of the parent rows, draft features, readout) stay per
+        candidate (96 pool, 16 parents: 5.7x fewer FLOPs).  Bit for bit the repeated pass (row independence, see
+        trunk.stations; max diff 0 on CPU fp32, tests/test_v4_dedupe.py); gradients equal up to summation order (the
+        K rows' gradients are summed before the parent pass instead of inside its weight GEMMs).
+          * parents [T, K, 8, 3]: unique rows found by bitwise equality (unique_parents); dedupe (None =
+            self.dedupe_parents, default True) False, or some token without a repeated parent (U = K, no saving) ->
+            the repeated per-candidate pass.
+          * parent_index [T, K] int64 + parents [T, U, 8, 3] (the unique parents): candidate k's parent is row
+            parent_index[t, k] (no search; the training sets know their parents' columns).
+          * pctx (+ parent_index; parents None or pctx['parents']): the per-parent context of an earlier
+            score_set(..., return_pctx=True) with the SAME feat / mem / ego -> no parent pass at all (the corrector's
+            edits re-scored on their sources' parents, correct_topk / corrector_logp).  Gradients flow into that
+            earlier graph (none if it ran under no_grad).
+        return_pctx -> + 'pctx' = {parents [T, U, 8, 3] f32, x [T*U, 49, d], Hc [T*U, 128, 48, 17], ud [T*U, 69],
+        geom (corridor_geometry of the T*U rows)} and 'parent_index' [T, K] (U = K, index = k without dedupe)."""
         T, K = cand.shape[:2]
         v0, a0, eds, cmd = ego
         if self.v4_readout is None:
@@ -278,32 +333,68 @@ class CKNet(nn.Module):
         from .v4.sibling import on_parent
         B = T * K
         cand = cand.float()
-        par = cand if parents is None else parents.float()
-        if tuple(par.shape) != tuple(cand.shape):
-            raise ValueError(f"score_set: parents {tuple(par.shape)} vs cand {tuple(cand.shape)}")
-        P = self.trunk.stations(feat, mem, par, v0, a0, eds, cmd, time_free=self.v4.time_free)
+        dev = cand.device
+        own = parents is None and parent_index is None                  # every candidate is its own parent
+        if pctx is not None and parent_index is None:
+            raise ValueError("score_set: pctx needs parent_index (each candidate's row of pctx['parents'])")
+        par_u = pidx = P = None
+        if parent_index is not None:                                    # explicit unique parents (+ reused context)
+            if pctx is not None:
+                par_u = pctx["parents"]
+                if parents is not None and not (tuple(parents.shape) == tuple(par_u.shape) and torch.equal(
+                        parents.float().contiguous().view(torch.int32), par_u.contiguous().view(torch.int32))):
+                    raise ValueError("score_set: parents differ from pctx['parents']")
+                P = pctx
+            elif parents is None:
+                raise ValueError("score_set: parent_index needs parents [T, U, 8, 3] (the unique parents) or pctx")
+            else:
+                par_u = parents.float()
+            pidx = parent_index.to(device=dev, dtype=torch.long)
+            U = par_u.shape[1]
+            if (par_u.dim() != 4 or par_u.shape[0] != T or tuple(pidx.shape) != (T, K)
+                    or bool(((pidx < 0) | (pidx >= U)).any())):
+                raise ValueError(f"score_set: parent_index {tuple(pidx.shape)} (range [0, {U})) / parents "
+                                 f"{tuple(par_u.shape)} vs cand {tuple(cand.shape)}")
+            par = torch.gather(par_u, 1, pidx[..., None, None].expand(T, K, *par_u.shape[2:]))
+        else:
+            par = cand if parents is None else parents.float()
+            if tuple(par.shape) != tuple(cand.shape):
+                raise ValueError(f"score_set: parents {tuple(par.shape)} vs cand {tuple(cand.shape)}")
+            if not own and (self.dedupe_parents if dedupe is None else dedupe) and K > 1 and T > 0:
+                par_u, pidx, _ = self.unique_parents(par)
+                if par_u.shape[1] == K:                                 # a token without repeats: no saving
+                    par_u = pidx = None
+        if pidx is None:                                                # the repeated per-candidate parent pass
+            P = self.trunk.stations(feat, mem, par, v0, a0, eds, cmd, time_free=self.v4.time_free)
+            x, Hc, pgeom = P["x"], P["Hc"], P["geom"]
+        else:                                                           # once per unique parent, gathered back
+            if P is None:
+                P = self.trunk.stations(feat, mem, par_u, v0, a0, eds, cmd, time_free=self.v4.time_free)
+            rows = (torch.arange(T, device=dev)[:, None] * par_u.shape[1] + pidx).reshape(B)
+            x, Hc = P["x"].index_select(0, rows), P["Hc"].index_select(0, rows)
+            with torch.autocast(device_type=dev.type, enabled=False):  # = the repeated pass's parent geometry
+                pgeom = corridor_geometry(par.reshape(B, N_POSE, 3), version=self.corridor_version)
         flat = cand.reshape(B, N_POSE, 3)
         rep = lambda x: x.reshape(T, *x.shape[1:]).repeat_interleave(K, 0)
         with torch.autocast(device_type=cand.device.type, enabled=False):
             is_self = (flat == par.reshape(B, N_POSE, 3)).flatten(1).all(1)
-            sib = on_parent(P["geom"], flat, is_self)
-            cgeom = P["geom"] if parents is None else corridor_geometry(flat, version=self.corridor_version)
-            ud = P["ud"] if parents is None else draft_features(flat, rep(v0.float()), rep(a0.float()),
-                                                               rep(eds.float()), rep(cmd), cgeom)
-        x = P["x"]
+            sib = on_parent(pgeom, flat, is_self)
+            cgeom = pgeom if own else corridor_geometry(flat, version=self.corridor_version)
+            ud = P["ud"] if own else draft_features(flat, rep(v0.float()), rep(a0.float()),
+                                                    rep(eds.float()), rep(cmd), cgeom)
         g = self.trunk.draft_mlp(ud.to(x.dtype))
         pr = None if pref is None else rep(pref.reshape(T, 1).float())[:, 0]
         sh = lambda a: a.reshape(T, K, *a.shape[1:])
         if self.v4.hazard:
             e = feasibility(cgeom.S, rep(v0.float().reshape(T, 1))[:, 0])
-            r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, sib["t_in"], sib["t_leave"], sib["v"], sib["d"],
+            r = self.v4_readout(x[:, 1:], x[:, 0], Hc, g, sib["t_in"], sib["t_leave"], sib["v"], sib["d"],
                                 cgeom.S[:, -1], e, pr)
             haz = {k: sh(r[k]) for k in ("a_nc", "a_ttc", "a_dac")}
         else:
-            r = self.v4_readout(x[:, 1:], x[:, 0], P["Hc"], g, P["geom"].s, sib["s_knots"], sib["d_knots"], sib["d"],
+            r = self.v4_readout(x[:, 1:], x[:, 0], Hc, g, pgeom.s, sib["s_knots"], sib["d_knots"], sib["d"],
                                 sib["t_in"], sib["t_leave"], cgeom.S[:, -1], pr)
             haz = {k: sh(r[k]) for k in ("occ_logit", "margin", "lp_nc", "lp_ttc", "lp_dac", "min_margin")}
-            haz["pts"] = sh(P["geom"].points.detach().float())
+            haz["pts"] = sh(pgeom.points.detach().float())
         haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), t_in=sh(sib["t_in"]), t_out=sh(r["t_out"]),
                    d_lat=sh(sib["d"]), is_self=sh(is_self))
         out = {"score_logit": sh(r["score_logit"]), "w_lat": sh(r["w_lat"]),
@@ -313,6 +404,13 @@ class CKNet(nn.Module):
             mf = r["mask"].to(x.dtype)[..., None]
             xs_mean = (x[:, 1:] * mf).sum(1) / mf.sum(1).clamp(min=1.0)
             out["ctx"] = sh(torch.cat([g, x[:, 0], xs_mean], -1).detach().float())
+        if return_pctx:         # per-parent context for re-use (pctx=): the parent pass's own rows
+            if pidx is None:
+                pidx = torch.arange(K, device=dev)[None].expand(T, K)
+                par_u = par
+            out["pctx"] = P if pctx is not None else {"parents": par_u, "x": P["x"], "Hc": P["Hc"], "ud": P["ud"],
+                                                      "geom": P["geom"]}
+            out["parent_index"] = pidx
         return out
 
     def correct_topk(self, feat: torch.Tensor, mem: torch.Tensor, ego, pool: torch.Tensor, parents: torch.Tensor,
@@ -322,8 +420,10 @@ class CKNet(nn.Module):
         """refiner v4 corrector A: shortlist the top-k of pool [T, N, 8, 3] by the critic selection score
         (corrector.critic_select_score of pool_out['score_logit'], invalid columns excluded), edit them (mu, or a
         sample when training), decode (mode B) and re-score the edits on their source's parent corridor.  pool_out
-        = score_set(..., return_ctx=True) of the pool.  -> src_idx [T, k], u / mu / log_sig [T, k, 12], logp [T, k],
-        edit_traj [T, k, 8, 3], edit_score_logit [T, k, 5], edit_w_lat [T, k, 6], edit_haz."""
+        = score_set(..., return_ctx=True) of the pool; with return_pctx=True as well, the edits re-use the pool's
+        parent pass (pool_out 'pctx' / 'parent_index', no second trunk.stations; bit for bit the re-run, see
+        score_set).  -> src_idx [T, k], u / mu / log_sig [T, k, 12], logp [T, k], edit_traj [T, k, 8, 3],
+        edit_score_logit [T, k, 5], edit_w_lat [T, k, 6], edit_haz."""
         from .v4.corrector import critic_select_score, decode_edits
         if self.corrector is None:
             raise ValueError("correct_topk: this CK net has no corrector (V4Cfg.corrector)")
@@ -340,17 +440,26 @@ class CKNet(nn.Module):
                          (ego[0].float() / 15.0).reshape(T, 1, 1).expand(T, idx.shape[1], 1)], -1)
         a = self.corrector.act(ctx, sample=sample, generator=generator)
         edits = decode_edits(src, a["u"], ego[0])
-        oe = self.score_set(feat, mem, ego, edits, src_par, pref=pref)
+        if pool_out.get("pctx") is not None:            # the pool's parent pass (src_par = its rows, bit for bit)
+            oe = self.score_set(feat, mem, ego, edits, pref=pref, parent_index=g4(pool_out["parent_index"]),
+                                pctx=pool_out["pctx"])
+        else:
+            oe = self.score_set(feat, mem, ego, edits, src_par, pref=pref)
         return {"src_idx": idx, "u": a["u"], "mu": a["mu"], "log_sig": a["log_sig"], "logp": a["logp"],
                 "edit_traj": edits, "edit_score_logit": oe["score_logit"], "edit_w_lat": oe["w_lat"],
                 "edit_haz": oe.get("haz"), "ctx": ctx}
 
-    def corrector_logp(self, feat: torch.Tensor, mem: torch.Tensor, ego, src: torch.Tensor, src_par: torch.Tensor,
-                       u: torch.Tensor, pref: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def corrector_logp(self, feat: torch.Tensor, mem: torch.Tensor, ego, src: torch.Tensor,
+                       src_par: Optional[torch.Tensor], u: torch.Tensor, pref: Optional[torch.Tensor] = None,
+                       parent_index: Optional[torch.Tensor] = None, pctx: Optional[Dict] = None) -> torch.Tensor:
         """log pi(u | ctx(src)) [T, k] under the CURRENT corrector for recorded sources src [T, k, 8, 3] (parents
-        src_par) and recorded controls u [T, k, 12] (AWR on official labels of earlier generations)."""
+        src_par) and recorded controls u [T, k, 12] (AWR on official labels of earlier generations).
+        parent_index [T, k] + pctx (score_set(..., return_pctx=True) of a set with these parents and the same scene):
+        re-use that parent pass (src_par then None or pctx['parents']); without them the parents are deduped as in
+        score_set."""
         with torch.no_grad():   # the critic only supplies the (detached) context
-            o = self.score_set(feat, mem, ego, src, src_par, pref=pref, return_ctx=True)
+            o = self.score_set(feat, mem, ego, src, src_par, pref=pref, return_ctx=True, parent_index=parent_index,
+                               pctx=pctx)
         T, k = src.shape[:2]
         ctx = torch.cat([o["ctx"], o["score_logit"].detach().float(),
                          (ego[0].float() / 15.0).reshape(T, 1, 1).expand(T, k, 1)], -1)

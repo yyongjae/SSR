@@ -118,3 +118,32 @@ Source: SSR/report/84_three_ideas_review.md (main), 80 (EP head), 82 (KD transfe
 * Also: empty-tube rate; scene bins (lead 10-25 m, near curb, lane-only); point vs box target; bin size 0.1/0.25/0.5 s;
   margin sensitivity; curvature speed-limit probe; selection-only oracle; EPDMS next to PDMS.
 * Both pass -> ask the user about teacher retraining; either fails -> report and drop idea 3.
+
+## Phase 0b — re-registration (written 2026-10-17 KST, BEFORE any held-out number; user: "b->c로 해봐")
+
+Phase 0 failed criterion 1 at the pre-registered setting (report 85).  The user chose (b) a new pre-registration
+of a corrected representation measured on held-out tokens, then (c) redefining idea 3 as SELECTION evidence.
+Everything below is fixed now; the held-out run must not change it.
+
+* **Data (held-out)**: the 12,179 navtrain_val tokens NOT in the F1 6,000 sample (token-disjoint; limitation: the
+  same 214 logs).  Candidates: v2 r34 top-16 + valid var80 (the 96).  Executed states: ck/v4/lqr.py float64
+  (parity 2.4e-5 m) from (status v0, a0).  Labels: the official labels (CK/labels/navtrain_val/cand, r34 variant
+  labels).  GT objects CK/v3/gt_objects/navtrain_val, SDF sdf/navtrain_val.  No tuning on these tokens.
+* **Representation R2 (learnable grid)**: as Phase 0 main (corridor v2 parent grid, 0.25 s x 20 bins, box target,
+  U/LON channel for TTC, DAC on D bilinear) with two changes fixed from the Phase 0 diagnosis:
+  (1) **stopped-aware B**: stopped / static objects block without the not-behind filter, moving objects with it
+  (exactly tools/ck/v4/oracle/oracle_common.stopped_aware_B01 / stopped_mask); (2) **any4 read** for B and U
+  (OR over the 2 x 2 cells around the read point).  Margins m_t 0.2 s, m_l 0.3 m.
+* **Criterion S (primary, selection; idea 3 as selection evidence)**: switch selection = the v2 top-1 if it is
+  inside the R2 GT tube, else filter the 96 to the inside rows and pick by the deployment blend (pool96_old_b1:
+  beta 1, ck2T10 critic probabilities, SEL_W); vs the deployment blend over the 96 without the tube:
+  mean dPDMS >= +1.0 with the paired log-bootstrap CI lower bound > 0, and break (NC/TTC/DAC pass -> fail over
+  tokens whose blend pick passes) <= 1.3 %.
+* **Criterion 1 (secondary, representation fidelity)**: per key NC / TTC / DAC and joint on all 96 executed rows,
+  fail recall >= 0.90 AND pass recall >= 0.90 (point estimates; CIs reported).
+* **Criterion 2 (informational)**: R2 computed edit on the v2 top-1 vs the DET lateral head, as Phase 0.
+* **Decision rule**: S passes -> (c): retrain the DET / MAP range teachers with R2 targets and measure how much of
+  the GT selection gain their learned fields recover (fixed-pool critic-only, val decides, navtest reported).
+  S fails -> stop idea 3 and report.  Criterion 1 is reported either way (if it fails, the learned tube is known
+  to be an approximate selection signal, not a faithful copy of the official rules).
+* EPDMS: not computed (no navtrain_val v2.2 metric cache; not approved).

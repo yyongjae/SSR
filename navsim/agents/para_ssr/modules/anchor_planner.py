@@ -174,8 +174,13 @@ def anchor_plan_losses(
     gt_trajectory: torch.Tensor,
     sim_reward: torch.Tensor,
     sim_valid: torch.Tensor,
+    ep_feasible_only: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    """WoTE's three planning terms.  gt_trajectory [B, T, 3]; sim_reward [B, 5, K]; sim_valid [B]."""
+    """WoTE's three planning terms.  gt_trajectory [B, T, 3]; sim_reward [B, 5, K]; sim_valid [B].
+    ep_feasible_only (km 10/15): the official EP label is raw progress * NC * DAC (normalised), i.e. 0 for every
+    infeasible anchor (64 % of the navtrain anchors), so the EP head learns feasibility again and cannot rank
+    progress among feasible candidates.  With the flag the EP channel is supervised only where the label's NC * DAC
+    > 0: the head predicts EP given feasibility; feasibility itself stays with the NC / DAC heads (and the corridor)."""
     anchors = predictions["trajectory_anchors"]
     offset = predictions["trajectory_offset"]
     bs, k = offset.shape[:2]
@@ -196,6 +201,12 @@ def anchor_plan_losses(
     target = sim_reward.to(sim.dtype)
     bce = -(target * (sim + eps).log() + (1 - target) * (1 - sim + eps).log())   # [B, 5, K]
     valid = sim_valid.to(sim.dtype).view(bs, 1, 1)
-    sim_reward_loss = (bce * valid).sum() / (valid.sum() * bce.shape[1] * bce.shape[2]).clamp(min=1.0) * 5
+    if ep_feasible_only:
+        w = torch.ones_like(bce)
+        w[:, 2] = (target[:, 0] * target[:, 1] > 0).to(bce.dtype)
+        valid = valid * w
+        sim_reward_loss = (bce * valid).sum() / (valid.sum()).clamp(min=1.0) * 5
+    else:
+        sim_reward_loss = (bce * valid).sum() / (valid.sum() * bce.shape[1] * bce.shape[2]).clamp(min=1.0) * 5
     return {"traj_offset_loss": traj_offset_loss, "im_reward_loss": im_reward_loss,
             "sim_reward_loss": sim_reward_loss}

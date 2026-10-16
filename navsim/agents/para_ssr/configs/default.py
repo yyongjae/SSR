@@ -315,6 +315,46 @@ class ParaSSRConfig:
     plan_map_extent: Tuple[float, float, float, float] = (-8.0, 72.0, -32.0, 32.0)
     plan_map_res: float = 0.25
     plan_map_clip: float = 10.0
+    # km 10/15: corridor head (modules/corridor_head.py) on bev_embed -> GT corridor of the metric cache
+    # (tools/corridor/build_corridor_dt01.py): static drivable SDF + agent occupancy swept over 0.5 s windows
+    # (8 planes, from the 0.1 s planes), 100 x 200 at 0.32 m.  Used at inference to evaluate every candidate.
+    corridor_weight: float = 0.0
+    corridor_dir: str = "/home/external-user/ssd/kyungmin_ck/corridor_dt01"
+    corridor_tokens_root: str = "/home/external-user/ssd/kyungmin_ck/km_runs/ck2e2e_bevkd/eval/root/packed"
+    corridor_occ_weight: float = 1.0
+    # km 10/15 (2): corridor CONSTRAINT on the plan.  Every candidate (anchor + offset, all K) is tracked by the
+    # differentiable port of the official LQR + bicycle simulation (modules/torch_tracker.py); its footprint is
+    # penalised (hinge, metres) where it leaves the GT drivable SDF (margin static_margin) or enters the GT agent
+    # occupancy at the same 0.1 s step (margin occ_margin, front half of the footprint).  0 = off.
+    corridor_plan_weight: float = 0.0
+    corridor_plan_static_margin: float = 0.1
+    corridor_plan_occ_margin: float = 0.3
+    corridor_plan_cap: float = 3.0
+    # km 10/15 (3): TTC term of the constraint (official _calculate_ttc on the GT agent field): at every 0.1 s step the
+    # front half of the footprint, shifted along the heading by speed * {0.3, 0.6, 0.9} s, vs the agents at t + dt
+    # (planes past 4.0 s = the 4.0 s plane), same margin / cap as the occupancy term.  Relative weight; 0 = off.
+    corridor_plan_ttc_weight: float = 0.0
+    # km 10/15 (4): supervise the EP head only on anchors whose label NC * DAC > 0 (EP given feasibility; see
+    # anchor_planner.anchor_plan_losses).  Normalisation = mean over the supervised entries.
+    plan_ep_feasible_only: bool = False
+    # km 10/15 (4): agent-occupancy planes of the corridor head: 8 = union over 0.5 s windows, 40 = every 0.1 s
+    # (the official NC / TTC time steps)
+    corridor_occ_planes: int = 8
+    # km 10/16: route progress / distance channels (the official EP path, metric_cache.centerline) predicted at the
+    # BEV resolution; GT: tools/corridor/build_route32.py (32 m) or build_corridor64.py (64 m).  0 = off.
+    corridor_route_weight: float = 0.0
+    corridor_route_dir: str = "/home/external-user/ssd/kyungmin_ck/route32"
+    # "dt01" = 32 m raster GT (corridor_dir = corridor_dt01) | "c64" = 64 m GT (corridor_dir = corridor64,
+    # tools/corridor/build_corridor64.py; needs pc_range forward 64 m, bev_h 100)
+    corridor_plan_prog_weight: float = 0.0     # km 10/16 v3.1: progress reward inside the GT-safe corridor
+    corridor_plan_prog_cap: float = 1.2        # reward saturates at cap x the GT trajectory's route progress
+    corridor_plan_comfort_weight: float = 0.0  # official comfort thresholds as a hinge on every tracked candidate
+    corridor_verdict_weight: float = 0.0       # km 10/16 v3.1: predicted-corridor verdicts vs GT verdicts
+    corridor_verdict_anchors: int = 64
+    corridor_agent_attn: bool = False      # km 10/16 v3.1: corridor pixels attend to det/motion agent tokens
+    corridor_agent_k: int = 32
+    corridor_agent_detach: bool = True     # the corridor loss does not update the det/motion head
+    corridor_format: str = "dt01"
     # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
     # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
     # always uses GT.

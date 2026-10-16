@@ -73,7 +73,7 @@ GEN2_FORMAT = "ck2_96"
 GEN2_ORDER = ("c = k*6 + v; k = v2 top-16 rank (plan_final_rewards desc); "
               "v = id, a-1.0, a-0.5, a+0.5, l-0.5, l+0.5")
 
-_CK = "/home/external-user/ssd/yongjae_refiner/ck"
+_CK = "/home/external-user/ssd/kyungmin_ck/ck"
 WARMUP_DEFAULT: Dict[str, Any] = {
     "packed": f"{_CK}/packed/navtrain_train",
     "raw_labels": f"{_CK}/labels/navtrain_train/raw256",

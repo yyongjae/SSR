@@ -89,7 +89,7 @@ PHASE2_CODE = {p: i for i, p in enumerate(PHASES2)}
 SUR_GROUP_MAX = {"near": 0, "near_mid": 1, "all": 2}
 SUR_GROUP_N = {"near": 8, "near_mid": 16, "all": 32}
 SCORE_PRIORS = ("ck2_warmup", "teacher", "none")
-_CK = "/home/external-user/ssd/yongjae_refiner/ck"
+_CK = "/home/external-user/ssd/kyungmin_ck/ck"
 
 
 # ----------------------------------------------------------------------------------------------- config
@@ -636,10 +636,12 @@ class TeacherPair2:
 
 # ----------------------------------------------------------------------------------------------- student forward
 def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status: torch.Tensor,
-                     extra: Optional[torch.Tensor] = None) -> Dict:
+                     extra: Optional[torch.Tensor] = None, return_h: bool = False) -> Dict:
     """One trunk.scene + ONE trunk.candidates over cat(cand, extra) (candidates are processed independently) ->
     score_logit [B,K,5] f32, extra_score_logit [B,K2,5] | None, w_lat [B,K,6], w_lat_extra [B,K2,6] | None,
-    score_all / w_lat_all (every candidate), ego.  No decode here (callers use lateral_decode, z_lon = 0)."""
+    score_all / w_lat_all (every candidate), ego.  No decode here (callers use lateral_decode, z_lon = 0).
+    return_h (km): also h_all [B, KA, 2d] (score-head input of every candidate) and the scene feat / mem, so a caller can
+    run trunk.candidates on more trajectories of the same scenes; every other output is unchanged."""
     from ..refiner.e2e import ego_inputs
 
     B, K = cand.shape[:2]
@@ -653,7 +655,7 @@ def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status
     w = o["w_lat"].float()
     return {"score_logit": sc[:, :K], "extra_score_logit": None if extra is None else sc[:, K:],
             "w_lat": w[:, :K], "w_lat_extra": None if extra is None else w[:, K:], "score_all": sc, "w_lat_all": w,
-            "ego": ego}
+            "ego": ego, **({"h_all": o["h"].reshape(B, KA, -1), "feat": feat, "mem": mem} if return_h else {})}
 
 
 # ----------------------------------------------------------------------------------------------- helpers
@@ -922,13 +924,22 @@ class CKE2E2:
         v0 = ego_inputs(status)[0]
         V = C2.online_variants(top["cand"], v0_from_status(status), self.cfg.variants)
         cand, fin = _sanitize_traj(V["traj96"], top["cand"][:, 0])
+        dump_h = os.environ.get("KM_DUMP_H", "") == "1"
         with torch.autocast(device_type=dev.type, enabled=False):
-            out = student_forward2(student, bev_sgrid(bev.float()), cand, status)
+            out = student_forward2(student, bev_sgrid(bev.float()), cand, status, return_h=dump_h)
         lat = lateral_decode(cand, out["w_lat"], v0, 0.0)
         res = {"ck2_cand_idx": top["idx"], "ck2_v2_final": top["final"], "ck2_v2_im": top["im"],
                "ck2_v2_sim": top["sim"], "ck2_cand96": V["traj96"], "ck2_valid96": V["valid96"] & fin,
                "ck2_score_logit": out["score_logit"].float(), "ck2_w_lat": out["w_lat"].float(),
                "ck2_e_lat": lat["e_lat"][..., 2:].float(), "ck2_lat_traj": lat["traj"].float()}
+        if dump_h:      # km: listwise reranker cache -- CK hidden of the pool and of the submitted (lateral) trajectories
+            ego = out["ego"]
+            lt, _ = _sanitize_traj(lat["traj"].float(), cand[:, 0])
+            with torch.autocast(device_type=dev.type, enabled=False):
+                ol = student.trunk.candidates(out["feat"], out["mem"], lt, *ego)
+            res["ck2_h"] = out["h_all"].float()
+            res["ck2_h_lat"] = ol["h"].reshape(lt.shape[0], lt.shape[1], -1).float()
+            res["ck2_score_logit_lat"] = student.score(ol, lt.shape[0], lt.shape[1]).float()
         sel = self.cfg.infer_select
         if sel is not None:
             from . import select2 as S2

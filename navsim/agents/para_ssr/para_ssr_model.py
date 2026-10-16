@@ -30,6 +30,7 @@ from .modules.det_motion_head import ParaDetMotionHead
 from .modules.lidar_encoder import build_lidar_encoder
 from .modules.map_head import ParaMapHead
 from .modules.planner_head import ParaSSRPlannerHead
+from .modules.corridor_head import CorridorHead
 
 
 
@@ -208,6 +209,14 @@ class ParaSSRModel(nn.Module):
             plan_rescore_refined=bool(getattr(cfg, "plan_rescore_refined", False)),
         )
         self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
+        # km 10/15: corridor head (GT corridor of the metric cache), see modules/corridor_head.py
+        self.corridor_head = (CorridorHead(cfg.embed_dims, cfg.bev_h, cfg.bev_w,
+                                           t=int(getattr(cfg, "corridor_occ_planes", 8)),
+                                           route=float(getattr(cfg, "corridor_route_weight", 0.0)) > 0,
+                                           agent_attn=bool(getattr(cfg, "corridor_agent_attn", False)),
+                                           agent_k=int(getattr(cfg, "corridor_agent_k", 32)),
+                                           agent_detach=bool(getattr(cfg, "corridor_agent_detach", True)))
+                              if float(getattr(cfg, "corridor_weight", 0.0)) > 0 else None)
 
         self.det_motion_head = (
             ParaDetMotionHead(
@@ -426,6 +435,8 @@ class ParaSSRModel(nn.Module):
             v0 = features["status_feature"][:, cfg.num_navi_cmd].to(predictions["trajectory"].dtype)
             ctrl = clamp_controls(poses_to_controls(predictions["trajectory"], v0, 0.5))
             predictions["trajectory"], _ = bicycle_rollout(ctrl, v0, 0.5)
+        if self.corridor_head is not None:
+            predictions.update(self.corridor_head(bev_embed, det_out))
         # Training always exposes predictions needed by every supervised loss,
         # even when a caller explicitly passes run_aux=False.
         if self.training or run_aux:

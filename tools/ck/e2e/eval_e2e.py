@@ -59,7 +59,7 @@ import numpy as np  # noqa: E402
 
 from tools.ck import ckutil as U  # noqa: E402
 
-PY = "/venv/ssr/bin/python"
+PY = "/home/external-user/miniconda3/envs/ssr/bin/python"   # km: this host
 CK_DATA = Path("/home/external-user/ssd/yongjae_refiner/ck")
 K = 16
 STUDENT_PREFIX = "agent.ck_student."

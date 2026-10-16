@@ -79,7 +79,7 @@ from tools.ck import ckutil as U  # noqa: E402
 from tools.ck.e2e import eval_e2e as E1  # noqa: E402   (Paths, resolve / pin ckpt, extract_ck, split_table, shards)
 from tools.ck.e2e2 import eval_ck2 as EV  # noqa: E402
 
-PY = "/venv/ssr/bin/python"
+PY = "/home/external-user/miniconda3/envs/ssr/bin/python"   # km: this host
 K16, G_K = 16, 96
 STAGES = ("extract", "dump", "label", "infer_check", "eval", "summary")
 N_CHECK_BEV = 8
@@ -100,6 +100,10 @@ PRED_TO_PACKED = {"ck2_cand96": "cand96", "ck2_valid96": "valid96", "ck2_cand_id
                   "ck2_v2_final": "v2_final", "ck2_v2_im": "v2_im", "ck2_v2_sim": "v2_sim"}
 PRED_TO_INFER = {"ck2_score_logit": "score_logit", "ck2_w_lat": "w_lat", "ck2_e_lat": "e_lat",
                  "ck2_lat_traj": "lat_traj"}
+if os.environ.get("KM_DUMP_H", "") == "1":     # km: CKE2E2.infer also returns the listwise reranker cache
+    INFER_SPECS.update(h=((G_K, 384), np.float16, np.nan), h_lat=((G_K, 384), np.float16, np.nan),
+                       score_logit_lat=((G_K, 5), np.float32, np.nan))
+    PRED_TO_INFER.update(ck2_h="h", ck2_h_lat="h_lat", ck2_score_logit_lat="score_logit_lat")
 
 
 def log(msg: str) -> None:
@@ -656,7 +660,7 @@ def get_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     ap.add_argument("--run-dir", required=True)
-    ap.add_argument("--split", required=True, choices=["navtrain_val", "navtest"])
+    ap.add_argument("--split", required=True, choices=["navtrain_train", "navtrain_val", "navtest"])   # km: + train
     ap.add_argument("--ckpt", default="", help="last (default) | epoch:<E> | <path>; pinned in <RUN>/eval/ckpt.json "
                     "(no --ckpt: the pin must be the current 'last', same file sha16)")
     ap.add_argument("--stage", default="all")

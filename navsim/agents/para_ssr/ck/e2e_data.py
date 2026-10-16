@@ -44,13 +44,13 @@ CK_IDX = list(CK_LABEL_IDX)
 BEV_SHAPE = (256, 50, 100)
 
 PHASE1_DEFAULT = {
-    "packed": "/home/external-user/ssd/yongjae_refiner/ck/packed/navtrain_train",
-    "labels_cand": "/home/external-user/ssd/yongjae_refiner/ck/labels/navtrain_train/cand",
-    "labels_kd_corr": "/home/external-user/ssd/yongjae_refiner/ck/labels/navtrain_train/kd_corr",
-    "kd_targets": "/home/external-user/ssd/yongjae_refiner/ck/kd_targets/phase1",
+    "packed": "/home/external-user/ssd/kyungmin_ck/ck/packed/navtrain_train",
+    "labels_cand": "/home/external-user/ssd/kyungmin_ck/ck/labels/navtrain_train/cand",
+    "labels_kd_corr": "/home/external-user/ssd/kyungmin_ck/ck/labels/navtrain_train/kd_corr",
+    "kd_targets": "/home/external-user/ssd/kyungmin_ck/ck/kd_targets/phase1",
 }
-TEACHER_DET_RUN = "/home/external-user/ssd/yongjae_refiner/ck/train/ckT_p1"
-TEACHER_MAP_RUN = "/home/external-user/ssd/yongjae_refiner/ck/train/ckM_p1"
+TEACHER_DET_RUN = "/home/external-user/ssd/kyungmin_ck/ck/train/ckT_p1"
+TEACHER_MAP_RUN = "/home/external-user/ssd/kyungmin_ck/ck/train/ckM_p1"
 REF_DATA_ROOT = "/home/external-user/ssd/yongjae_refiner"
 
 SRC_PHASE1, SRC_PREV, SRC_OLDER = 0, 1, 2      # G_src codes

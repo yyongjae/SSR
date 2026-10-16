@@ -54,6 +54,8 @@ from .readout.distill import KD_DISTANCES, KD_MODES
 from .readout.teacher_targets import ResMapTeacherTargetBuilder
 from .plan_map import DrivableAreaTargetBuilder
 from .plan_score_targets import AnchorScoreTargetBuilder
+from .modules.corridor_head import (CorridorPlanTargetBuilder, CorridorTargetBuilder, corridor_loss, corridor_plan_loss,
+                                    corridor_verdict_loss)
 
 
 class WarmupCosLR(_LRScheduler):
@@ -739,6 +741,13 @@ class ParaSSRAgent(AbstractAgent):
         # plan_score_file is training-only: evaluation leaves it null and gets no builder
         if getattr(cfg, "plan_anchor", False) and getattr(cfg, "plan_score_file", None):
             builders.append(AnchorScoreTargetBuilder(cfg))
+        if str(getattr(cfg, "corridor_format", "dt01")) == "c64" and float(getattr(cfg, "corridor_weight", 0.0)) > 0:
+            from .modules.corridor_head import Corridor64TargetBuilder
+            builders.append(Corridor64TargetBuilder(cfg, plan=float(getattr(cfg, "corridor_plan_weight", 0.0)) > 0))
+        elif float(getattr(cfg, "corridor_plan_weight", 0.0)) > 0:
+            builders.append(CorridorPlanTargetBuilder(cfg))
+        elif float(getattr(cfg, "corridor_weight", 0.0)) > 0:
+            builders.append(CorridorTargetBuilder(cfg))
         if self._ck_e2e is not None:
             from .ck.e2e_data import CKE2ETargetBuilder
 
@@ -785,6 +794,34 @@ class ParaSSRAgent(AbstractAgent):
         ``latest_logs`` and picked up by :class:`ParaSSRLoggingCallback`.
         """
         loss, logs = self._loss(self.para_ssr_model, features, targets, predictions)
+        if self.para_ssr_model.corridor_head is not None and "corridor_valid" in targets:
+            # km 10/15: corridor loss added AFTER the grad balancer (v2's plan/det/map shares unchanged)
+            c_loss, c_logs = corridor_loss(predictions, targets, float(self._config.corridor_occ_weight),
+                                           float(getattr(self._config, "corridor_route_weight", 0.0)))
+            logs["loss_v2"] = logs["loss"]
+            loss = loss + float(self._config.corridor_weight) * c_loss
+            logs.update(c_logs)
+            if float(self._config.corridor_plan_weight) > 0 and "corridor_occ_dist" in targets:
+                # km 10/15 (2): corridor constraint on every tracked candidate (GT corridor, training only)
+                cfg = self._config
+                p_loss, p_logs = corridor_plan_loss(
+                    predictions, targets, features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4],
+                    float(cfg.corridor_plan_static_margin), float(cfg.corridor_plan_occ_margin),
+                    float(cfg.corridor_plan_cap), float(getattr(cfg, "corridor_plan_ttc_weight", 0.0)),
+                    prog_weight=float(getattr(cfg, "corridor_plan_prog_weight", 0.0)),
+                    prog_cap=float(getattr(cfg, "corridor_plan_prog_cap", 1.2)),
+                    comfort_weight=float(getattr(cfg, "corridor_plan_comfort_weight", 0.0)))
+                loss = loss + float(cfg.corridor_plan_weight) * p_loss
+                logs.update(p_logs)
+                if float(getattr(cfg, "corridor_verdict_weight", 0.0)) > 0:
+                    # km 10/16 (v3.1): the predicted corridor's verdicts of model-free footprints vs the GT verdicts
+                    v_loss, v_logs = corridor_verdict_loss(
+                        predictions, targets, features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4],
+                        int(getattr(cfg, "corridor_verdict_anchors", 64)),
+                        ttc=float(getattr(cfg, "corridor_plan_ttc_weight", 0.0)) > 0)
+                    loss = loss + float(cfg.corridor_verdict_weight) * v_loss
+                    logs.update(v_logs)
+            logs["loss"] = loss.detach()
         if self._stage_e is not None and self.training:
             # Added AFTER the grad balancer: its plan/det/map shares are unchanged.
             ref_loss, ref_logs = self._stage_e.loss(

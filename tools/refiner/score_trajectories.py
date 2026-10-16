@@ -109,6 +109,7 @@ DATA = Path("/home/external-user/ssd/yongjae_refiner")
 SCORING_YAML = ROOT / "navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml"
 ARCHIVED_EVAL_CFG = ROOT / "work_dirs/eval/para_ssr_interaction_final/code/hydra/config.yaml"
 MC_ROOTS = (
+    Path("/home/external-user/ssd/kyungmin_ck/mc_navtrain_val/metric_cache"),   # km: navtrain_val cache sent by the teammate
     DATA / "metric_cache",
     ROOT / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache",
     ROOT / "data/exp/metric_cache",

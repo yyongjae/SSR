@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 REPO = str(Path(__file__).resolve().parents[3])   # repo root of this worktree
-PY = "/venv/ssr/bin/python"
+PY = "/home/external-user/miniconda3/envs/ssr/bin/python"   # km: this host
 HERE = Path(__file__).resolve().parent
 CK_YAML = HERE / "ck_e2e.yaml"
 E2E_ROOT = "/home/external-user/ssd/yongjae_refiner/ck/phase2/e2e"

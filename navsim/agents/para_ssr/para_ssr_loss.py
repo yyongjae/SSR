@@ -228,7 +228,8 @@ class ParaSSRLoss(torch.nn.Module):
             if "sim_reward" not in targets:
                 raise KeyError("plan_anchor needs the sim_reward target: set plan_score_file")
             al = anchor_plan_losses(predictions, targets["trajectory"], targets["sim_reward"],
-                                    targets["sim_reward_valid"])
+                                    targets["sim_reward_valid"],
+                                    ep_feasible_only=bool(getattr(cfg, "plan_ep_feasible_only", False)))
             task_losses["plan"] = tw.get("plan", 1.0) * (
                 float(cfg.plan_offset_loss_weight) * al["traj_offset_loss"]
                 + float(cfg.plan_im_reward_weight) * al["im_reward_loss"]

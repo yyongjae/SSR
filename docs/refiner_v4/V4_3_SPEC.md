@@ -171,3 +171,15 @@ S (+1.92) on these tokens, i.e. S does not discriminate the R2 changes; they imp
   v4T10_haz+v4M10_haz.
 * Decision: P1 passes -> ask the user about the v4_3 student run (about 52 h on 2 GPUs).  P1 fails -> report; the next
   candidates are past-frame inputs for forecasting or the student GT range aux (rg_gt_aux), decided with the user.
+
+### Phase 1c amendment (2026-10-17 KST, still BEFORE any R2 teacher exists; the waiter has not launched)
+A design check found that P1 as registered cannot be passed even by a perfect DET field: with the tube on NC / TTC only
+(no DAC flag on val), the SWITCH rule keeps the v2 top-1 whenever it is NC/TTC-inside and so lets its DAC failures
+through; the GT R2 tube on these keys gives switch - blend -2.16 [-2.74, -1.53] with break 3.75 % on the val held-out
+tokens (ratio criterion (c) then has a negative denominator).  P1 is therefore replaced, before any result:
+* **P1 (amended)**: FILTER rule with the learned DET tube (NC, TTC): drop the rows the tube flags as outside, pick by
+  the deployment blend (pool96_old_b1, ck2T10, pool-order ties) among the rest (none left -> the blend pick); vs the
+  blend over the 96.  Pass iff (a) mean dPDMS >= +0.30 with the paired log-bootstrap CI lower bound > 0, (b) break
+  <= 1.3 %, (c) >= 25 % of the GT R2 tube's filter-rule gain on the same keys and tokens (GT reference about +1.0 on
+  the val held-out tokens; must be positive with CI lower bound > 0, else P1 is void and reported as such).
+* Everything else in Phase 1c is unchanged.  The amendment is committed before the R2 teachers start.

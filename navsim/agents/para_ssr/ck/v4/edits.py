@@ -4,8 +4,23 @@ executed states (ck/v4/lqr.py), returned as EXTRA candidates (the corrector's K 
 changed, the edit only joins the set the critic picks from (96 + K).
 
 Frames / units: N frame (x forward, y left; m, s, m/s^2).  Fields of the source's PARENT (the score_set pool output,
-once per parent row): B / U = blk > 0 (logit 0, probability 0.5), D = margin; windows(B) per cell
+once per parent row): B / U (/ Bp) = blk > 0 (logit 0, probability 0.5), D = margin; windows(B) per cell
 (range_targets.windows: t_out_block = the end of the cell's last blocked bin, +inf if the last bin is blocked).
+The fields are read with the net's own rules (V4Cfg; range_readout.read_geometry / hard_evidence, the readout's
+thresholded twin): rg_stopped_aware -> a third group Bp (haz bp_logit_u): NC reads B (= the stopped-aware B), every TTC
+read that would read B (delta 0 and |v| delta < U_SWITCH_M = 2 m) reads Bp, U above the switch (read_geometry
+ttc_b_chan CH_BP); rg_read 'any4' -> the tube check and the critical reads OR the 2 x 2 cells around each read point
+(hard_evidence read='any4' = range_targets.executed_slack(read='any4')), and the longitudinal target of a critical read
+follows the any4 critical step of the Phase 0b oracle (tools/ck/v4/oracle/heldout_common.GridTubeR2.critical): the
+read's 4 cells (range_readout.any4_cells), t_out_block = the end of the last blocked bin of the OR of their profiles (of
+the read's channel group), and the critical arc length max(0, (jb - 0.5) ds) = where an any4 read first touches station
+jb (an any4 read at s reads stations floor(s / ds - 0.5) and + 1), jb = the lowest station of the 4 cells that holds a
+blocked bin (any4_targets).  Two differences to the oracle's critical step (Phase 0b criterion 2 only): it takes the
+lowest station of the 4 whether blocked or not (the same cut when the lower station of the read is blocked, one
+station (ds ~ 1 m) earlier -- a harsher brake -- when only the upper one is), and for a TTC critical read at delta 0
+it takes the window of the stopped-aware B, where these edits read Bp (= what the oracle's own check() reads TTC on
+there: the plain not-behind B, LON >= -1.3 m).
+With the defaults (nearest, no Bp) every call below is the R1 code path, bit for bit.
 
 Shortlist (spec M5 "the critic's top-edit_k PARENTS"): the sources are the pool columns that ARE their parent (score_set
 haz is_self, bitwise equal to the parent; one column per distinct parent, parent_columns), ranked by sel_score when
@@ -24,10 +39,11 @@ Per shortlisted source c:
     critical cell is >= t_out_block + edit_dt: NC = the first time the executed rear axle's station coordinate (Frenet
     on the parent frame) reaches the cell's bin start j ds; TTC = min over delta in (0, 0.3, 0.6, 0.9) s of (the first
     time the state projected |v| delta along its heading reaches j ds) + delta, against the window of the channel the
-    critical read used (B, or U where |v| delta >= 2 m).  Search: a coarse scan A_SCAN then N_BISECT bisection steps
-    in the first satisfying bracket (resolution 0.5 / 2^5 = 0.016 m/s^2; arrival is monotone in a: a lower speed profile
-    reaches every station later).  Up to MAX_ROUNDS rounds: if the edited trajectory still hits B / U somewhere (a
-    later critical cell), the search continues beyond the current a for the new cell;
+    critical read used (B, or U where |v| delta >= 2 m; Bp in place of B with rg_stopped_aware; with rg_read 'any4' the
+    window of the OR of the read's 4 cells and the cut (jb - 0.5) ds, header).  Search: a coarse scan A_SCAN then
+    N_BISECT bisection steps in the first satisfying bracket (resolution 0.5 / 2^5 = 0.016 m/s^2; arrival is monotone
+    in a: a lower speed profile reaches every station later).  Up to MAX_ROUNDS rounds: if the edited trajectory still
+    hits B / U (/ Bp) somewhere (a later critical cell), the search continues beyond the current a for the new cell;
   * DAC-limited (slack_dac < 0 on the profile after the longitudinal edit): lateral edit = the rule l+-0.5 shape
     (variants w_rule: decoder.smoothstep_lat with onset s_on = 0.2 S_8, flat end at S_8, projected on the lateral
     B-spline, lat_len = S_8) with the smallest |D| in (0, 2] m, on EITHER side, whose executed min corner margin
@@ -51,11 +67,13 @@ carries 'pctx': no second trunk.stations); the caller gives each edit its source
 blended selection over the pool + the edits and labels them with the pool (labeler2 96 + K).
 
 Approximations (the M5 rule is a target, the critic judges the result): the field's cell heading is the parent's;
-arrival is measured at one critical cell per round; the lateral search does not re-check NC / TTC (the critic scores the
-edit).  Measured behaviour worth knowing: braking can clear a DAC violation by itself (a shorter executed path, and the
-tracker follows a lateral offset more slowly at the lower speed), so the lateral need is re-read after the longitudinal
-edit; a box that is outside before the rule shape's onset (0.2 S_8) cannot be fixed by the lateral family (empty
-lateral tube, edit_need 2 without edit_kind 2).
+arrival is measured at one critical cell per round (any4: one critical read's 4 cells); the TTC arrival is the min over
+every delta even where only some deltas read the critical read's group (B / Bp below the 2 m switch, U above; the same
+rule in R1 and R2); the lateral search does not re-check NC / TTC (the critic scores the edit).  Measured behaviour
+worth knowing: braking can clear a DAC violation by itself (a shorter executed path, and the tracker follows a lateral
+offset more slowly at the lower speed), so the lateral need is re-read after the longitudinal edit; a box that is
+outside before the rule shape's onset (0.2 S_8) cannot be fixed by the lateral family (empty lateral tube, edit_need 2
+without edit_kind 2).
 Known fragility of the lon target (spec rule, kept; designer decision, review 2026-10-16 KST): t_out_block is the end
 of the cell's LAST blocked bin (+inf if the last bin is blocked), so on PREDICTED fields one spurious late blocked bin
 (a free gap after the real run, then noise at e.g. 4.5 s or in bin M - 1) moves the target to that bin's end or +inf and
@@ -79,7 +97,8 @@ from ..temporal.raster import frenet
 from ..variants import S_ON_FRAC
 from . import lqr as LQR
 from . import range_targets as RT
-from .range_readout import TTC_DELTAS, _ttc_points, grid_coords, hard_evidence, read_cells, read_geometry
+from .range_readout import (CH_B, CH_BP, CH_U, TTC_DELTAS, _ttc_points, any4_cells, grid_coords, hard_evidence,
+                            hard_slack, read_cells, read_geometry)
 
 Tensor = torch.Tensor
 KIND_NONE, KIND_LON, KIND_LAT, KIND_BOTH = 0, 1, 2, 3
@@ -91,6 +110,8 @@ D_SCAN = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
 N_BISECT = 5
 MAX_ROUNDS = 3
 I_NC, I_TTC, I_DAC = RT.I_NC, RT.I_TTC, RT.I_DAC
+FIELD_KEYS = ("occ_logit_u", "ovl_logit_u", "bp_logit_u")      # score_set haz groups B | U | Bp (CH_B, CH_U, CH_BP)
+A4_KEYS = ("a4_cut_nc", "a4_tout_nc", "a4_station_nc", "a4_cut_ttc", "a4_tout_ttc", "a4_station_ttc")
 
 
 # ----------------------------------------------------------------------------------------------- decode
@@ -258,18 +279,63 @@ def parent_columns(pool: Tensor, is_self: Tensor) -> Tensor:
     return s & ~earlier
 
 
+@torch.no_grad()
+def any4_targets(blk_b: Tensor, rows: Tensor, geo: Dict[str, Tensor], M: int, tbin: float,
+                 ds: Tensor) -> Dict[str, Tensor]:
+    """Longitudinal targets of the NC and the TTC critical read under rg_read 'any4' (module header; the Phase 0b
+    oracle's GridTubeR2.critical step on the thresholded predicted fields): blk_b [R, 48, 17, G M] bool (B | U [| Bp]),
+    rows [n], geo = read_geometry(...) of the n rows, ds [n] (m, the rows' station spacing) -> per key k in (nc, ttc):
+    a4_station_k [n] long (the nearest station of the critical read = hard_evidence crit_station), a4_cut_k [n] f32
+    (m, max(0, (jb - 0.5) ds), jb = the lowest station among the read's 2 x 2 cells with a blocked bin in the read's
+    channel group, the lowest of the 4 if none), a4_tout_k [n] float64 (s, range_targets.windows t_out_block of the OR
+    of the 4 cells' profiles in that group: 0 if none blocked, +inf if the last bin is).  The critical read = the
+    arg-min point of the same range_readout.hard_slack call as hard_evidence(read='any4') (first minimum); rows without
+    a hit of that key get unused values."""
+    n = rows.shape[0]
+    dev = rows.device
+    bidx = torch.arange(n, device=dev)
+    mi = torch.arange(int(M), device=dev)
+    out: Dict[str, Tensor] = {}
+    for key, chan in (("nc", 0), ("ttc", geo["chan"])):
+        g = geo[key]
+        sl, j, _ = hard_slack(blk_b, rows, g, geo[f"t_{key}"], chan, geo[f"use_{key}"], M, tbin, read="any4")
+        q = sl.min(-1).indices                                                        # hard_evidence's critical point
+        jn, in_, _ = any4_cells(g)                                                    # [n, P, 4]
+        jq, iq = jn[bidx, q], in_[bidx, q]                                            # [n, 4]
+        grp = (torch.zeros(n, dtype=torch.long, device=dev) if not torch.is_tensor(chan)
+               else chan.long()[bidx, q])
+        prof = blk_b[rows.reshape(n, 1).expand(n, 4), jq, iq]                         # [n, 4, G M]
+        sel = (grp[:, None] * int(M) + mi[None])[:, None, :].expand(n, 4, int(M))
+        prof4 = torch.gather(prof, 2, sel)                                            # [n, 4, M] the read's group
+        out[f"a4_tout_{key}"] = RT.windows(prof4.any(1)[:, None, None, :], tbin)["t_out_block"][:, 0, 0]
+        blk4 = prof4.any(-1)                                                          # [n, 4] cells with a blocked bin
+        jb = torch.where(blk4, jq, torch.full_like(jq, 1 << 20)).min(-1).values
+        jb = torch.where(blk4.any(-1), jb, jq.min(-1).values)
+        out[f"a4_cut_{key}"] = ((jb.float() - 0.5) * ds.float()).clamp(min=0.0)
+        out[f"a4_station_{key}"] = j[bidx, q]
+    return out
+
+
 # ----------------------------------------------------------------------------------------------- main
 @torch.no_grad()
-def _gather_sources(pool_out: Dict, idx: Tensor, parents: Tensor, corridor_version: int, M: int):
-    """per source (n = T k rows): fields blk [n, 48, 17, 2M] (logits), D [n, 48, 17] of its parent, the parent's station
-    frame (pool_out 'pctx' rg_frame rows, else corridor_geometry of the gathered parents)."""
+def _gather_sources(pool_out: Dict, idx: Tensor, parents: Tensor, corridor_version: int, M: int, groups: int = 2):
+    """per source (n = T k rows): fields blk [n, 48, 17, groups M] (logits B | U (| Bp with groups 3, the net's
+    rg_stopped_aware)), D [n, 48, 17] of its parent, the parent's station frame (pool_out 'pctx' rg_frame rows, else
+    corridor_geometry of the gathered parents)."""
     h = pool_out["haz"]
     T, k = idx.shape
+    if int(groups) not in (2, 3):
+        raise ValueError(f"computed_edits: {groups} field groups (B | U, or B | U | Bp)")
+    keys = FIELD_KEYS[:int(groups)]
+    miss = [kk for kk in keys if kk not in h]
+    if miss or (int(groups) == 2 and FIELD_KEYS[2] in h):
+        raise ValueError(f"computed_edits: pool_out haz has {sorted(kk for kk in FIELD_KEYS if kk in h)}, the net's "
+                         f"rg_stopped_aware needs {list(keys)}")
     pi = torch.gather(h["parent_index"], 1, idx)                                    # [T, k] parent row of each source
     U = h["occ_logit_u"].shape[1]
     rows = (torch.arange(T, device=idx.device)[:, None] * U + pi).reshape(-1)
     per = lambda a: a.reshape(T * U, *a.shape[2:]).index_select(0, rows).detach().float()
-    blk = torch.cat([per(h["occ_logit_u"]), per(h["ovl_logit_u"])], -1).contiguous()      # [n, 48, 17, 2M]
+    blk = torch.cat([per(h[kk]) for kk in keys], -1).contiguous()                  # [n, 48, 17, groups M]
     D = per(h["margin_u"]).contiguous()
     pc = pool_out.get("pctx")
     if pc is not None and "rg_frame" in pc:
@@ -308,6 +374,9 @@ def computed_edits(net, feat: Tensor, mem: Tensor, ego, pool: Tensor, parents: T
     dev = pool.device
     M = int(cfg.ev_tbins)
     tbin = float(cfg.ev_tbin_s)
+    sa = bool(cfg.rg_stopped_aware)                 # R2 (1): + the Bp group, TTC's B read (module header)
+    read = str(cfg.rg_read)                         # R2 (2): 'nearest' | 'any4'
+    ttc_b = CH_BP if sa else CH_B
     sc = (critic_select_score(pool_out["score_logit"].detach()) if sel_score is None else sel_score.detach().float())
     vmask = torch.ones(T, N, dtype=torch.bool, device=dev) if valid is None else valid.bool().to(dev)
     vmask = vmask & torch.isfinite(pool.float()).flatten(2).all(-1)
@@ -326,17 +395,22 @@ def computed_edits(net, feat: Tensor, mem: Tensor, ego, pool: Tensor, parents: T
     lqr_ego = torch.stack([torch.nan_to_num(vx, nan=0.0), torch.nan_to_num(ax, nan=0.0)], -1)
     tq = torch.arange(LQR.NT, dtype=torch.float64, device=dev) * LQR.DT
     with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=False):
-        blk, D, fr, _ = _gather_sources(pool_out, idx, parents, net.corridor_version, M)
+        blk, D, fr, _ = _gather_sources(pool_out, idx, parents, net.corridor_version, M, 3 if sa else 2)
         blk_b = blk > 0
-        win_b, win_u = RT.windows(blk_b[..., :M], tbin), RT.windows(blk_b[..., M:], tbin)
+        if read == "nearest":                       # per-cell windows (any4: of the critical read's 4 cells, below)
+            win_b, win_u = RT.windows(blk_b[..., :M], tbin), RT.windows(blk_b[..., M:2 * M], tbin)
+            win_p = RT.windows(blk_b[..., 2 * M:], tbin) if sa else None
         rows_all = torch.arange(n, device=dev)
         sim = lambda tr, r: LQR.simulate(tr, lqr_ego[r], dtype=torch.float32)
 
-        def evidence(states: Tensor, r: Tensor) -> Dict:
-            geo = read_geometry(RT.gather_frame(fr, r), states, tq, M, tbin)
-            return hard_evidence(blk_b, D, r, geo, M, tbin)
+        def evidence(states: Tensor, r: Tensor, crit: bool = False) -> Dict:
+            geo = read_geometry(RT.gather_frame(fr, r), states, tq, M, tbin, ttc_b_chan=ttc_b)
+            e = hard_evidence(blk_b, D, r, geo, M, tbin, read=read)
+            if crit and read == "any4":             # the any4 targets of the critical reads (A4_KEYS)
+                e.update(any4_targets(blk_b, r, geo, M, tbin, fr["ds"][r]))
+            return e
 
-        ev = evidence(sim(flat_s, rows_all), rows_all)
+        ev = evidence(sim(flat_s, rows_all), rows_all, crit=True)
         S8 = DraftPath(flat_s.double()).knots()[:, -1].float()
         elig = (v0n >= V0_MIN) & (S8 >= S8_MIN) & torch.gather(vmask, 1, idx).reshape(n) & fin
         a_lon = torch.zeros(n, dtype=torch.float32, device=dev)
@@ -349,17 +423,23 @@ def computed_edits(net, feat: Tensor, mem: Tensor, ego, pool: Tensor, parents: T
             r = torch.nonzero(need, as_tuple=True)[0]
             if r.numel() == 0:
                 break
-            cs, ci = ev_cur["crit_station"][r], ev_cur["crit_lat"][r]
             use_nc = ev_cur["slack_nc"][r] < 0
             use_tt = ev_cur["slack_ttc"][r] < 0
-            ds = fr["ds"][r]
-            cut_nc = cs[:, I_NC].clamp(min=0).float() * ds
-            cut_tt = cs[:, I_TTC].clamp(min=0).float() * ds
-            jn, in_ = cs[:, I_NC].clamp(min=0), ci[:, I_NC].clamp(min=0)
-            jt, it = cs[:, I_TTC].clamp(min=0), ci[:, I_TTC].clamp(min=0)
-            tout_nc = win_b["t_out_block"][r, jn, in_]                                 # [m] float64, +inf possible
-            wtt = torch.where(ev_cur["crit_chan"][r].bool(), win_u["t_out_block"][r, jt, it],
-                              win_b["t_out_block"][r, jt, it])
+            if read == "any4":                      # the read's 4 cells: OR window, cut (jb - 0.5) ds (any4_targets)
+                cut_nc, cut_tt = ev_cur["a4_cut_nc"][r], ev_cur["a4_cut_ttc"][r]
+                tout_nc, wtt = ev_cur["a4_tout_nc"][r], ev_cur["a4_tout_ttc"][r]
+            else:
+                cs, ci = ev_cur["crit_station"][r], ev_cur["crit_lat"][r]
+                ds = fr["ds"][r]
+                cut_nc = cs[:, I_NC].clamp(min=0).float() * ds
+                cut_tt = cs[:, I_TTC].clamp(min=0).float() * ds
+                jn, in_ = cs[:, I_NC].clamp(min=0), ci[:, I_NC].clamp(min=0)
+                jt, it = cs[:, I_TTC].clamp(min=0), ci[:, I_TTC].clamp(min=0)
+                tout_nc = win_b["t_out_block"][r, jn, in_]                             # [m] float64, +inf possible
+                ch = ev_cur["crit_chan"][r]                 # TTC window of the group its critical read used
+                wtt = torch.where(ch == CH_U, win_u["t_out_block"][r, jt, it], win_b["t_out_block"][r, jt, it])
+                if sa:
+                    wtt = torch.where(ch == CH_BP, win_p["t_out_block"][r, jt, it], wtt)
             pos = torch.full((n,), -1, dtype=torch.long, device=dev)
             pos[r] = torch.arange(r.numel(), device=dev)
 
@@ -385,11 +465,13 @@ def computed_edits(net, feat: Tensor, mem: Tensor, ego, pool: Tensor, parents: T
             rf = r[found]
             if rf.numel() == 0:
                 break
-            e1 = evidence(sim(decode_rule(flat_s[rf], a_lon[rf], torch.zeros_like(a_lon[rf]), v0n[rf]), rf), rf)
+            e1 = evidence(sim(decode_rule(flat_s[rf], a_lon[rf], torch.zeros_like(a_lon[rf]), v0n[rf]), rf), rf,
+                          crit=True)
             still = (e1["slack_nc"] < 0) | (e1["slack_ttc"] < 0)
-            # rows that still hit B / U at another (later) critical cell continue beyond their a in the next round
+            # rows that still hit B / U (/ Bp) at another (later) critical cell continue beyond their a next round
             ev_cur = {kk_: v.clone() for kk_, v in ev_cur.items()}
-            for kk_ in ("slack_nc", "slack_ttc", "crit_station", "crit_lat", "crit_chan"):
+            for kk_ in ("slack_nc", "slack_ttc", "crit_station", "crit_lat", "crit_chan") + (
+                    A4_KEYS if read == "any4" else ()):
                 ev_cur[kk_][rf] = e1[kk_]
             need[rf] = still & (a_lon[rf] > A_MIN + 1e-6)
         # ---------------------------------------------------------------- lateral (DAC) on the edited profile

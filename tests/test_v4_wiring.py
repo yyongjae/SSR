@@ -76,7 +76,9 @@ def teachers(tmp_path_factory):
     if not TL.have_inputs():
         pytest.skip("CK2 smoke teachers absent")
     root = tmp_path_factory.mktemp("range_teachers")
+    r2 = V4Cfg.range_arm(rg_read="any4", rg_stopped_aware=True)          # the Phase 0b R2 teachers (v4_3 arm)
     return {"T": _range_run(root, "T"), "M": _range_run(root, "M"), "T_cv1": _range_run(root, "T", cv=1),
+            "T_r2": _range_run(root, "T", v4=r2, name="rngT_r2"), "M_r2": _range_run(root, "M", v4=r2, name="rngM_r2"),
             "root": root}
 
 
@@ -677,10 +679,12 @@ def test_v4_3_arm_overrides_and_refusals(teachers, tmp_path):
         O._d_v4().keys()                                                     # older arms: no optional key declared
     with pytest.raises(L2.LaunchError, match="PLACEHOLDER"):
         L2.build_overrides2(str(tmp_path / "ck2e2e_v43"), ["0", "1"], ck_sets=sets, wandb="disable")
-    own = L2.LU.read_lines(str(_set_file(tmp_path / "t.set", teachers)))
+    r2t = dict(teachers, T=teachers["T_r2"], M=teachers["M_r2"])            # the arm is R2: R2 teachers
+    own = L2.LU.read_lines(str(_set_file(tmp_path / "t.set", r2t)))
     ov, ck, tj = L2.build_overrides2(str(tmp_path / "ck2e2e_v43"), ["0", "1"], ck_sets=sets + own, wandb="disable")
     c = O.CKE2E2Config.from_any(ck)
-    assert c.v4_net() == V4Cfg.range_arm(edits="computed") and c.kd_score_keys == ["nc", "dac"]
+    assert c.v4_net() == V4Cfg.range_arm(edits="computed", rg_read="any4", rg_stopped_aware=True)
+    assert c.kd_score_keys == ["nc", "dac"] and c.kd_constraint["occ_channels"] == "B"
     assert c.v4["kd_parent_only"] and not c.v4["corrector"] and c.bev_kd["enabled"] and c.kd_score_scope == "all"
     assert tj["kd_constraint"]["det"]["readout"] == "range" and tj["kd_constraint"]["student_grid"]["ev_tbins"] == 20
     parsed = OverridesParser.create().parse_overrides([o for o in ov if o.startswith("++agent.config.ck_e2e2.")])
@@ -694,14 +698,14 @@ def test_v4_3_arm_overrides_and_refusals(teachers, tmp_path):
     assert O.CKE2E2Config.from_any(d).to_dict() == c.to_dict()
     # constraint KD refuses mean teachers and a teacher on another grid
     for det in (TL.SMOKE_T, teachers["T_cv1"]):
-        bad = L2.LU.read_lines(str(_set_file(tmp_path / "b.set", dict(teachers, T=det))))
+        bad = L2.LU.read_lines(str(_set_file(tmp_path / "b.set", dict(r2t, T=det))))
         with pytest.raises(L2.LaunchError, match="range teachers|grid"):
             L2.build_overrides2(str(tmp_path / "ck2e2e_v43b"), ["0", "1"], ck_sets=sets + bad, wandb="disable")
 
 
 @have
 def test_train_e2e2_dry_run_arm_v4_3(teachers, tmp_path):
-    sf = _set_file(tmp_path / "t.set", teachers)
+    sf = _set_file(tmp_path / "t.set", dict(teachers, T=teachers["T_r2"], M=teachers["M_r2"]))   # R2 arm + teachers
     env = dict(os.environ, E2E_ROOT=str(tmp_path / "root"), E2E_DRY_RUN="1", CK2_E2E_APPROVED="1", ARM="v4_3",
                RUN="dry_v43", PYTHONPATH=str(REPO))
     sh = lambda e: subprocess.run(["bash", str(REPO / "tools/ck/e2e2/train_e2e2.sh"), "start", "--gpus", "0,1"],

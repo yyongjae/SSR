@@ -298,10 +298,8 @@ def test_config_r2_keys():
                 V4Cfg(readout=ro, **kw).validate()
     with pytest.raises(ValueError, match="rg_read"):
         V4Cfg.range_arm(rg_read="bilinear")
-    with pytest.raises(ValueError, match="not wired"):
-        V4Cfg.range_arm(rg_read="any4", edits="computed")
-    with pytest.raises(ValueError, match="not wired"):                      # edits.py reads the B | U groups only
-        V4Cfg.range_arm(rg_stopped_aware=True, edits="computed")
+    assert V4Cfg.range_arm(rg_read="any4", edits="computed").computed_edits        # edits.py reads the R2 fields
+    assert V4Cfg.range_arm(rg_stopped_aware=True, edits="computed").computed_edits  # (tests/test_v4_student_r2.py)
     v42 = {k: v for k, v in V4Cfg(readout="hazard").to_dict().items() if k not in C.V43_KEYS}
     with pytest.raises(ValueError, match="v4_2"):
         V4Cfg.from_dict(dict(v42, version="v4_2", rg_read="nearest"))

@@ -175,7 +175,7 @@ S (+1.92) on these tokens, i.e. S does not discriminate the R2 changes; they imp
 ### Phase 1c amendment (2026-10-17 KST, still BEFORE any R2 teacher exists; the waiter has not launched)
 A design check found that P1 as registered cannot be passed even by a perfect DET field: with the tube on NC / TTC only
 (no DAC flag on val), the SWITCH rule keeps the v2 top-1 whenever it is NC/TTC-inside and so lets its DAC failures
-through; the GT R2 tube on these keys gives switch - blend -2.16 [-2.74, -1.53] with break 3.75 % on the val held-out
+through; the GT R2 tube on these keys gives switch - blend -2.15 [-2.74, -1.53] with break 3.75 % on the val held-out
 tokens (ratio criterion (c) then has a negative denominator).  P1 is therefore replaced, before any result:
 * **P1 (amended)**: FILTER rule with the learned DET tube (NC, TTC): drop the rows the tube flags as outside, pick by
   the deployment blend (pool96_old_b1, ck2T10, pool-order ties) among the rest (none left -> the blend pick); vs the

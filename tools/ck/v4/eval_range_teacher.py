@@ -24,8 +24,11 @@ Stages (--stage comma list; resumable per row through done.npy)
           score_set of the 16 (own parents) and of the 80 (their parents = the 16), P_ref query, fp16 autocast on CUDA)
           -> <root>/<teacher>/: score_logit16 / 80 [N, K, 5], slack16 / 80 [N, K, 3] (the readout's thresholded-field
           slacks nc [s], ttc [s], dac [m], range_readout.hard_evidence with the teacher's own rg_read), lp16 / 80
-          [N, K, 3] (log P_pass of the soft evidence), done / bev_ok [N], infer_meta.json.  The LEARNED tube flag of a
-          key = slack < 0 (outside), NC / TTC from the DET teacher, DAC from the MAP teacher.
+          [N, K, 3] (log P_pass of the soft evidence), done / bev_ok [N], infer_meta.json (written before the first row
+          and at the end).  Resume only into outputs of the same teacher / checkpoint: an existing infer_meta.json that
+          differs on INFER_ID_KEYS (ckpt_sha16, which, arm, rg_read, ...), or done rows without one, are refused
+          (infer_resume_check).  The LEARNED tube flag of a key = slack < 0 (outside), NC / TTC from the DET teacher,
+          DAC from the MAP teacher.
   gttube  (CPU, --workers <= 28) the Phase 0b R2 GT tube on the same pool: GT fields on the 16 parents' grids
           (corridor version 2, heading 'parent', range_targets.blocked_field_np at 0.1 s with the STOPPED-AWARE B
           (stopped_mask_np) + lon_max, pooled to 0.25 s: OR for B, max for LON; D = the official SDF at the grid points,
@@ -47,7 +50,26 @@ Stages (--stage comma list; resumable per row through done.npy)
                (over the keys present), fail recall = P(outside | official fail), pass recall = P(inside | pass) on
                every valid row of the 96, log-clustered bootstrap CIs (ratio estimator, 2,000, seed 0); the GT R2 tube
                on the same rows, and the learned / GT agreement;
-          (ii) criterion S with the LEARNED tube: switch = the v2 top-1 if it is inside the tube, else the best
+          (ii) DECISION (V4_3_SPEC.md 'Phase 1c amendment', DECISION_RULE): P1 = the FILTER rule with the learned DET
+               tube on NC / TTC (drop the rows it flags outside, the deployment blend among the rest, pool-order ties,
+               none left -> the blend pick) vs the blend over the 96; PASS iff (a) mean dPDMS >= +0.30 with CI lower
+               bound > 0, (b) break <= 1.3 %, (c) >= 25 % of the GT R2 tube's filter gain on the same keys / tokens
+               (point estimate); VOID if that GT reference is not positive with CI lower bound > 0 (p1_decide).  It
+               decides only in the ck2T10-blend block of a run that passes p1_gate: --split navtrain_val --subset
+               heldout without --limit, AND the evaluated tokens = the registered 12,179 (HO/prep/ho_rows.npy; a row
+               removed by missing teacher outputs / BEV / baselines / GT tube / labels / blend critic makes the run
+               'report only', with the per-input counts; so does a missing GT tube; on that split both exit non-zero
+               after the outputs are written), AND the DET outputs are the registered teacher's (P1_TEACHER: v4T10_rng2, arm T, --which
+               last, rg_read any4, rg_stopped_aware; infer_meta.json ckpt_sha16 = the checkpoint's current sha16).
+               Every other block (navtest: the deployed pair and the ck2T10 convention; a --limit smoke; another
+               teacher) prints it as 'report only' with the reason.  The md header prints each teacher's --which,
+               rg_read and ckpt_sha16.  Descriptive: the filter rows of each tube on NC only / TTC only
+               (<tube>_nc_only / _ttc_only) and their share of P1's GT gain (blk['filter']['key_share']).
+               With a MAP teacher (navtest) the P1 rows use the DET keys only (learned_nc_ttc / gt_r2_nc_ttc /
+               gt_rule_nc_ttc); the filter rows of the full learned tube are descriptive.  -> res['P1'] (the deciding
+               block's p1_decide, None elsewhere), res['decision'], per block blk['filter'] / blk['P1'].
+               Descriptive (the old Phase 1c P1 / Phase 0b criterion S, replaced by the amendment):
+               the SWITCH rule with the LEARNED tube: switch = the v2 top-1 if it is inside the tube, else the best
                deployment-blend candidate inside the tube (none inside -> the blend pick); blend = select2 pool96_old_b1
                (beta 1, SEL_W, v2 im inherited by the variants) on the --blend-critic probabilities (default: navtrain_val
                ck2T10 = the Phase 0b rule; navtest the deployed pair ck2T10,ck2M10 (critic_prob: each key from its own
@@ -58,18 +80,20 @@ Stages (--stage comma list; resumable per row through done.npy)
                tube, and the fraction of the GT-tube gain the learned tube recovers = sum(dPDMS learned) / sum(dPDMS GT)
                (bootstrap of the ratio over the same log resamples), also against the readout-rule ceiling.  On the
                Phase 0b token set (navtrain_val heldout, no --limit) the ck2T10 GT-tube row on all keys must reproduce
-               HO/results.json criterion S (mean dPDMS, break count): checked, printed, a mismatch exits non-zero
-               after the outputs are written;
+               HO/results.json criterion S (mean dPDMS, break count) and its filter row HO/results.json
+               selection.picks['R2 tube filter + blend']: checked, printed, a mismatch exits non-zero after the
+               outputs are written;
           (iii) fixed-pool critic-only selection of the teacher pair (each key from its own teacher: DET nc / ttc /
                comfort, MAP dac, EP mean; DET only: dac neutral = 1, EP the DET's; MAP only: nc / ttc / comfort
                neutral) vs each baseline pair (--baselines, the same key rule), all modes of
                eval_teacher_navtest_r34.select_modes (pool96_ck_noim = the critic-only headline), PDMS b - a paired
                log bootstrap.
-          -> <root>/eval_<tag>.json / .md (+ eval_<tag>_picks.npz).  PDMS only (no EPDMS: not approved for val).
-          The md states that no (c) decision rule is registered in V4_3_SPEC.md 'Phase 0b' (DECISION_RULE None): the
-          numbers are descriptive until the user fixes the rule (before the val infer).
-  gtcheck (CPU, no teacher) the GT-only rows of (i) / (ii) (R2 tube and readout-rule tube, all keys, each blend critic)
-          and the Phase 0b reproduction check -> <root>/gtcheck.json / .md: run it after gttube, before training.
+          -> <root>/eval_<teachers>[_<--tag>].json / .md (+ _picks.npz).  PDMS only (no EPDMS: not approved for val).
+  gtcheck (CPU, no teacher) the GT-only rows of (i) / (ii) (R2 tube and readout-rule tube, each blend critic): the
+          old switch rows on all keys and on NC / TTC, the FILTER rows on NC / TTC and all keys, and P1's GT reference
+          (blk['P1_reference']: gt_r2_nc_ttc mean / CI / break, valid = positive with CI lower bound > 0, + all keys;
+          'deciding' = the registered split and token set, p1_gate without a teacher; + the NC only / TTC only rows),
+          and the Phase 0b reproduction checks -> <root>/gtcheck[_<--tag>].json / .md: run it after gttube.
 
   cd /workspace/yongjae/SSR-v4 && CUDA_VISIBLE_DEVICES=2 PYTHONPATH=$PWD OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 nice -n 10 \
       /venv/ssr/bin/python tools/ck/v4/eval_range_teacher.py --split navtest --det v4T10_rng2 --map v4M10_rng2 \
@@ -124,10 +148,25 @@ PHASE0B_BLEND = "ck2T10"          # Phase 0b's deployment-blend critic (criterio
 REP_ID = "R2"                     # gt tube meta.json representation_id
 GT_TUBE_FORMAT = 2                # 2: + rule16 / rule80 (the readout-rule perfect-field tube)
 GPU_MEM_MAX = 1024                # [MiB] stage infer refuses a GPU using this much or more (as run_teachers.sh)
-# (c) decision rule of Phase 0b ('measure how much of the GT selection gain the learned fields recover, val decides'):
-# NOT registered in docs/refiner_v4/V4_3_SPEC.md -- the user fixes it before the val infer; until then None and the
-# eval md says the numbers are descriptive.
-DECISION_RULE: Optional[str] = None
+# (c) decision rule: docs/refiner_v4/V4_3_SPEC.md 'Phase 1c' primary P1 as replaced by the 'Phase 1c amendment'
+# (registered 2026-10-17 KST before any R2 teacher existed).  The old switch-rule rows stay in the outputs, descriptive.
+P1_KEYS = ("nc", "ttc")           # the keys the DET teacher owns (val has no DAC flag)
+P1_D_MIN = 0.30                   # (a) mean dPDMS (x 100) of filter - blend, and its CI lower bound > 0
+P1_BREAK_MAX = BREAK_MAX          # (b) break <= 1.3 %
+P1_FRAC_MIN = 0.25                # (c) >= 25 % of the GT R2 tube's filter gain (point estimate; report 67 precedent)
+P1_SPLIT, P1_SUBSET, P1_BLEND = "navtrain_val", "heldout", PHASE0B_BLEND   # the deciding token set and blend critic
+# the registered teacher (Phase 1c: v4T10_rng2 = run_teachers.sh READOUT=range R2=1, evaluated at --which last): the
+# infer_meta.json of its outputs must say so, and its checkpoint must still have the sha16 the outputs were written with
+P1_TEACHER = dict(name="v4T10_rng2", arm="T", which="last", rg_read="any4", rg_stopped_aware=True)
+INFER_ID_KEYS = ("teacher", "role", "arm", "which", "ckpt_sha16", "rg_read", "rg_stopped_aware", "corridor_version",
+                 "split")         # stage infer resumes into a dir only when its infer_meta.json agrees on these
+DECISION_RULE: Optional[str] = (
+    "V4_3_SPEC.md Phase 1c P1 (amended 2026-10-17 KST): FILTER rule with the learned DET tube on NC / TTC -- drop the "
+    "rows the tube flags as outside, pick by the deployment blend (pool96_old_b1, ck2T10, pool-order ties) among the "
+    "rest (none left -> the blend pick) -- vs the blend over the 96, on the navtrain_val held-out tokens (navtest: "
+    "report only). PASS iff (a) mean dPDMS >= +0.30 with the paired log-bootstrap CI lower bound > 0, (b) break <= "
+    "1.3 %, (c) >= 25 % of the GT R2 tube's filter-rule gain on the same keys and tokens (point estimate); VOID if that "
+    "GT reference is not positive with CI lower bound > 0.")
 SPLITS = {
     "navtest": dict(variants=NAVTEST_ROOT / "r34_variants", base_root=NAVTEST_ROOT, arms=("T", "M"),
                     baselines=("ck2T10,ck2M10", "v4T10_haz,v4M10_haz"), subset="all", blend="ck2T10,ck2M10",
@@ -252,6 +291,25 @@ def cuda_guard(a) -> None:
     log(f"[infer] GPU {g}: {used:.0f} MiB used (< {GPU_MEM_MAX}), approved")
 
 
+def infer_resume_check(td: Path, meta: Dict) -> Dict:
+    """stage infer resumes into td only when the outputs there were written by the same teacher / checkpoint: the old
+    infer_meta.json must agree on INFER_ID_KEYS (ckpt_sha16, which, arm, rg_read, ...) once any row is done; done
+    rows without an infer_meta.json are refused too -> the old meta ({} for a fresh dir)."""
+    old = U.read_json(td / "infer_meta.json", None)
+    dp = td / "done.npy"
+    has_done = bool(dp.is_file() and np.load(dp, mmap_mode="r").any())
+    if old is None:
+        if has_done:
+            raise SystemExit(f"{td}: done rows but no infer_meta.json (cannot tell which checkpoint wrote them): resume "
+                             f"refused; remove the dir or use another --out-root")
+        return {}
+    diff = [f"{k} {old.get(k)!r} -> {meta.get(k)!r}" for k in INFER_ID_KEYS if old.get(k) != meta.get(k)]
+    if diff and has_done:
+        raise SystemExit(f"{td}: resume refused -- the existing outputs were written by another teacher / checkpoint "
+                         f"({'; '.join(diff)}); remove the dir or use another --out-root")
+    return old if not diff else {}
+
+
 def stage_infer(a, role: str, name: str) -> Dict:
     import torch
     from torch.utils.data import DataLoader
@@ -282,20 +340,24 @@ def stage_infer(a, role: str, name: str) -> Dict:
     vd = SPLITS[a.split]["variants"]
     var_all = np.load(vd / "traj80.npy", mmap_mode="r")
     td = split_root(a) / tname(name)
+    ck_file = run / f"ckpt_{a.which}.pt"
+    meta = dict(role=role, teacher=tname(name), run=str(run), which=a.which, arm=cfg["arm"],
+                ckpt=str(ck_file.absolute()), ckpt_sha16=U.sha256_file(ck_file) if ck_file.is_file() else None,
+                v4=net.v4.to_dict(),
+                rg_read=net.v4.rg_read, rg_stopped_aware=bool(net.v4.rg_stopped_aware),
+                corridor_version=int(net.corridor_version), split=a.split, subset=a.subset, n=N, limit=a.limit,
+                device=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), batch=a.batch,
+                amp="fp16 autocast on CUDA (as eval_teacher_navtest_r34)", variants=str(vd / "traj80.npy"),
+                started=kst(t0))
+    old = infer_resume_check(td, meta)
     specs = {"done": ((N,), np.bool_, False), "bev_ok": ((N,), np.bool_, False),
              "score_logit16": ((N, K16, 5), np.float32, np.nan), "score_logit80": ((N, K80, 5), np.float32, np.nan),
              "slack16": ((N, K16, 3), np.float32, np.nan), "slack80": ((N, K80, 3), np.float32, np.nan),
              "lp16": ((N, K16, 3), np.float32, np.nan), "lp80": ((N, K80, 3), np.float32, np.nan)}
     A = {k: U.open_memmap(td / f"{k}.npy", s, d, fill=f) for k, (s, d, f) in specs.items()}
     rr = rows[~np.asarray(A["done"][rows], bool)]
-    ck_file = run / f"ckpt_{a.which}.pt"
-    meta = dict(role=role, teacher=tname(name), run=str(run), which=a.which, arm=cfg["arm"], ckpt=str(ck_file),
-                ckpt_sha16=U.sha256_file(ck_file) if ck_file.is_file() else None, v4=net.v4.to_dict(),
-                rg_read=net.v4.rg_read, rg_stopped_aware=bool(net.v4.rg_stopped_aware),
-                corridor_version=int(net.corridor_version), split=a.split, subset=a.subset, n=N, limit=a.limit,
-                device=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), batch=a.batch,
-                amp="fp16 autocast on CUDA (as eval_teacher_navtest_r34)", variants=str(vd / "traj80.npy"),
-                started=kst(t0))
+    # written before any row, so that outputs of an interrupted call still say which checkpoint wrote them
+    U.write_json(td / "infer_meta.json", dict(meta, status="running", sessions=old.get("sessions") or []))
     log(f"[infer] {role} {tname(name)} ({ck_file.name}, rg_read {net.v4.rg_read}) -> {td}: todo {len(rr)} of "
         f"{len(rows)}")
     n = n_bad = 0
@@ -327,10 +389,10 @@ def stage_infer(a, role: str, name: str) -> Dict:
                     log(f"[infer] {n}/{len(rr)} {el:.0f}s {n / max(el, 1e-6):.1f} tok/s")
         for m in A.values():
             m.flush()
-    old = U.read_json(td / "infer_meta.json", {}) or {}
     meta.update(n_rows=int(len(rows)), n_done=int(np.asarray(A["done"][rows]).sum()), n_bev_bad_this_call=n_bad,
-                sec=round(time.time() - t0, 1), finished=kst(),
-                sessions=(old.get("sessions") or []) + [dict(started=meta["started"], finished=kst(), n=n)])
+                sec=round(time.time() - t0, 1), finished=kst(), status="finished",
+                sessions=(old.get("sessions") or []) + [dict(started=meta["started"], finished=kst(), n=n,
+                                                             ckpt_sha16=meta["ckpt_sha16"])])
     U.write_json(td / "infer_meta.json", meta)
     log(f"[infer] done {n} rows ({n_bad} without BEV) in {meta['sec']} s")
     return meta
@@ -625,26 +687,106 @@ def fails3(lab: np.ndarray) -> np.ndarray:
     return (lab[..., LBL["nc"]] < 1) | (lab[..., LBL["ttc"]] < 1) | (lab[..., LBL["dac"]] < 1)
 
 
-def criterion_s(lab96: np.ndarray, score: np.ndarray, allowed: np.ndarray, inside: np.ndarray, logs: np.ndarray
-                ) -> Tuple[Dict, np.ndarray, Dict[str, np.ndarray]]:
-    """-> (row dict, per-token dPDMS x 100 of switch - blend [n], picks)."""
+def _vs_blend(lab96: np.ndarray, pick: np.ndarray, blend: np.ndarray, logs: np.ndarray) -> Dict:
+    """a pick [n] vs the blend pick [n] on labels [n, 96, 9]: per-token dPDMS x 100 (d), the picked / blend labels, the
+    paired log bootstrap of mean(d), break = P(pick fails NC / TTC / DAC | the blend pick passes all three)."""
     from navsim.agents.para_ssr.ck.constants import LBL
     from tools.ck.eval_ck import log_bootstrap
-    pk = tube_switch(score, allowed, inside)
     ar = np.arange(len(lab96))
-    Lb, Ls = lab96[ar, pk["blend"]], lab96[ar, pk["switch"]]
-    pdm = lambda L: 100.0 * L[:, LBL["pdms"]]
-    d = pdm(Ls) - pdm(Lb)
+    Lb, Lp = lab96[ar, blend], lab96[ar, pick]
+    d = 100.0 * Lp[:, LBL["pdms"]] - 100.0 * Lb[:, LBL["pdms"]]
     ok_b = ~fails3(Lb)
-    n_brk, den = int(fails3(Ls)[ok_b].sum()), int(ok_b.sum())
-    brk = n_brk / den if den else float("nan")
-    boot = log_bootstrap(d, logs, N_BOOT)
+    n_brk, den = int(fails3(Lp)[ok_b].sum()), int(ok_b.sum())
+    return dict(d=d, Lb=Lb, Lp=Lp, boot=log_bootstrap(d, logs, N_BOOT), n_brk=n_brk, den=den,
+                brk=n_brk / den if den else float("nan"))
+
+
+def criterion_s(lab96: np.ndarray, score: np.ndarray, allowed: np.ndarray, inside: np.ndarray, logs: np.ndarray
+                ) -> Tuple[Dict, np.ndarray, Dict[str, np.ndarray]]:
+    """Phase 0b criterion S (SWITCH rule; in Phase 1c descriptive only, replaced by the amendment's filter rule)
+    -> (row dict, per-token dPDMS x 100 of switch - blend [n], picks)."""
+    from navsim.agents.para_ssr.ck.constants import LBL
+    pk = tube_switch(score, allowed, inside)
+    v = _vs_blend(lab96, pk["switch"], pk["blend"], logs)
+    Lb, Ls, boot, brk = v["Lb"], v["Lp"], v["boot"], v["brk"]
+    pdm = lambda L: 100.0 * L[:, LBL["pdms"]]
     row = dict(pdms_switch=float(pdm(Ls).mean()), pdms_blend=float(pdm(Lb).mean()), d_vs_blend=boot, break_=brk,
-               break_n=n_brk, break_den=den, top1_outside=float((~inside[:, 0]).mean()),
+               break_n=v["n_brk"], break_den=v["den"], top1_outside=float((~inside[:, 0]).mean()),
                changed_vs_top1=float((pk["switch"] != 0).mean()),
                no_inside=float((~(inside & allowed).any(1)).mean()), fail3_switch=float(fails3(Ls).mean()),
                bars_pass=bool(boot["mean"] >= S_MIN and boot["lo"] > 0 and brk <= BREAK_MAX))
-    return row, d, pk
+    return row, v["d"], pk
+
+
+def criterion_filter(lab96: np.ndarray, score: np.ndarray, allowed: np.ndarray, inside: np.ndarray, logs: np.ndarray
+                     ) -> Tuple[Dict, np.ndarray, Dict[str, np.ndarray]]:
+    """Phase 1c amendment P1's FILTER rule: drop the columns the tube flags as outside (inside [n, 96] False), pick by
+    the deployment blend score [n, 96] among the rest of the allowed [n, 96] columns (pool-order ties, argmax_pool),
+    none left -> the blend pick; vs the blend over the 96 -> (row dict, per-token dPDMS x 100 of filter - blend [n],
+    picks of tube_switch).  The row's bars are P1's (a) / (b); (c) needs the GT reference (p1_decide)."""
+    from navsim.agents.para_ssr.ck.constants import LBL
+    pk = tube_switch(score, allowed, inside)
+    v = _vs_blend(lab96, pk["filter"], pk["blend"], logs)
+    Lb, Lf, boot, brk = v["Lb"], v["Lp"], v["boot"], v["brk"]
+    pdm = lambda L: 100.0 * L[:, LBL["pdms"]]
+    n_allowed = int(allowed.sum())
+    row = dict(rule="filter", pdms_filter=float(pdm(Lf).mean()), pdms_blend=float(pdm(Lb).mean()), d_vs_blend=boot,
+               break_=brk, break_n=v["n_brk"], break_den=v["den"],
+               dropped_rows=float((allowed & ~inside).sum() / n_allowed) if n_allowed else float("nan"),
+               blend_pick_dropped=float((~inside[np.arange(len(inside)), pk["blend"]]).mean()),
+               changed_vs_blend=float((pk["filter"] != pk["blend"]).mean()),
+               changed_vs_top1=float((pk["filter"] != 0).mean()), no_inside=float((~(inside & allowed).any(1)).mean()),
+               fail3_filter=float(fails3(Lf).mean()), fail3_blend=float(fails3(Lb).mean()),
+               bars_ab_pass=bool(boot["mean"] >= P1_D_MIN and boot["lo"] > 0 and np.isfinite(brk)
+                                 and brk <= P1_BREAK_MAX))
+    return row, v["d"], pk
+
+
+def _finite_pos(b: Dict) -> bool:
+    return bool(np.isfinite(b["mean"]) and np.isfinite(b["lo"]) and b["mean"] > 0 and b["lo"] > 0)
+
+
+def p1_reference(gt: Dict) -> Dict:
+    """the GT R2 reference of P1 (c) from its filter row: mean / CI / break and whether it is valid (positive with the
+    CI lower bound > 0; else P1 is VOID)."""
+    return {"d_vs_blend": gt["d_vs_blend"], "break_": gt["break_"], "break_n": gt["break_n"],
+            "break_den": gt["break_den"], "valid": _finite_pos(gt["d_vs_blend"])}
+
+
+def p1_decide(learned: Dict, d_learned: np.ndarray, gt: Optional[Dict], d_gt: Optional[np.ndarray],
+              lb: Optional[LogBoot] = None, rule: Optional[Dict] = None, d_rule: Optional[np.ndarray] = None) -> Dict:
+    """Phase 1c amended P1 from the FILTER rows (criterion_filter) of the learned DET tube (learned, d_learned [n]) and
+    the GT R2 tube on the same keys and tokens (gt, d_gt [n]); rule / d_rule = the readout-rule tube (descriptive
+    ceiling).  verdict: 'VOID' when the GT reference is not positive with CI lower bound > 0; else 'PASS' iff
+    (a) mean >= P1_D_MIN and CI lower bound > 0, (b) break <= P1_BREAK_MAX, (c) sum(d_learned) / sum(d_gt) >=
+    P1_FRAC_MIN (point estimate); else 'FAIL'.  No GT tube -> verdict None (not evaluable)."""
+    dl, brk = learned["d_vs_blend"], learned["break_"]
+    out: Dict = {"rule": "filter", "keys": list(P1_KEYS), "d_learned": dl, "break_": brk,
+                 "break_n": learned["break_n"], "break_den": learned["break_den"],
+                 "bars": {"d_min": P1_D_MIN, "break_max": P1_BREAK_MAX, "frac_min": P1_FRAC_MIN}}
+    pa = bool(np.isfinite(dl["mean"]) and dl["mean"] >= P1_D_MIN and np.isfinite(dl["lo"]) and dl["lo"] > 0)
+    pb = bool(np.isfinite(brk) and brk <= P1_BREAK_MAX)
+    if gt is None or d_gt is None:
+        out.update(verdict=None, parts={"a_mean_and_ci": pa, "b_break": pb, "c_gain_fraction": None,
+                                        "gt_reference_valid": None},
+                   reason="no GT R2 tube: the reference of (c) is missing (run --stage gttube)")
+        return out
+    d_learned, d_gt = np.asarray(d_learned, np.float64), np.asarray(d_gt, np.float64)
+    if d_learned.shape != d_gt.shape:
+        raise ValueError(f"p1_decide: learned / GT rows on different tokens ({d_learned.shape} vs {d_gt.shape})")
+    ref = p1_reference(gt)
+    sl, sg = float(d_learned.sum()), float(d_gt.sum())
+    frac = sl / sg if sg > 0 else float("nan")
+    pc = bool(ref["valid"] and np.isfinite(frac) and frac >= P1_FRAC_MIN)
+    out.update(gt_reference=ref, gain_fraction=frac, gain_fraction_ci=lb.ratio(d_learned, d_gt) if lb is not None else
+               None, parts={"a_mean_and_ci": pa, "b_break": pb, "c_gain_fraction": pc,
+                            "gt_reference_valid": ref["valid"]},
+               verdict="VOID" if not ref["valid"] else ("PASS" if pa and pb and pc else "FAIL"))
+    if rule is not None and d_rule is not None:
+        sr = float(np.asarray(d_rule, np.float64).sum())
+        out["ceiling"] = {"d_vs_blend": rule["d_vs_blend"], "break_": rule["break_"],
+                          "gain_fraction_vs_ceiling": sl / sr if sr > 0 else float("nan")}
+    return out
 
 
 def critic_prob(pd_: Optional[np.ndarray], pm: Optional[np.ndarray]) -> np.ndarray:
@@ -747,11 +889,24 @@ def load_gt_tube(a, N: int) -> Optional[Dict[str, np.ndarray]]:
     return out
 
 
-def s_block(LP: np.ndarray, score: np.ndarray, allowed: np.ndarray, logs: np.ndarray, lb: LogBoot,
-            tubes: Dict[str, np.ndarray]) -> Tuple[Dict, Dict[str, np.ndarray]]:
-    """criterion S rows of every tube (inside [n, 96]) with one blend score, + the gain fractions of the learned tube
-    (vs gt_r2_same_keys = 'gain_fraction', vs gt_rule_same_keys = 'gain_fraction_vs_rule') -> (block, picks)."""
+def _gain_fractions(blk: Dict, d: Dict[str, np.ndarray], lb: LogBoot, logs: np.ndarray) -> None:
     from tools.ck.eval_ck import log_bootstrap
+    for tag, ref in (("gain_fraction", "gt_r2_same_keys"), ("gain_fraction_vs_rule", "gt_rule_same_keys")):
+        if "learned" in d and ref in d:
+            den = float(d[ref].sum())
+            blk[tag] = {"vs": ref, "estimate": float(d["learned"].sum() / den) if den != 0 else float("nan"),
+                        "ci": lb.ratio(d["learned"], d[ref]),
+                        "d_learned_minus_ref": log_bootstrap(d["learned"] - d[ref], logs, N_BOOT)}
+
+
+def s_block(LP: np.ndarray, score: np.ndarray, allowed: np.ndarray, logs: np.ndarray, lb: LogBoot,
+            tubes: Dict[str, np.ndarray], filter_tubes: Optional[Dict[str, np.ndarray]] = None,
+            p1_names: Optional[Dict[str, Optional[str]]] = None) -> Tuple[Dict, Dict[str, np.ndarray]]:
+    """criterion S rows (old SWITCH rule, descriptive) of every tube (inside [n, 96]) with one blend score, + the gain
+    fractions of the learned tube (vs gt_r2_same_keys = 'gain_fraction', vs gt_rule_same_keys =
+    'gain_fraction_vs_rule'); with filter_tubes: blk['filter'] = the FILTER-rule rows of those tubes (+ the same gain
+    fractions); with p1_names {learned, gt, rule} (names in filter_tubes; gt / rule None when absent): blk['P1'] =
+    p1_decide on them, or with only {gt} (no teacher, stage gtcheck): blk['P1_reference'] -> (block, picks)."""
     blk: Dict = {}
     d: Dict[str, np.ndarray] = {}
     picks: Dict[str, np.ndarray] = {}
@@ -759,19 +914,73 @@ def s_block(LP: np.ndarray, score: np.ndarray, allowed: np.ndarray, logs: np.nda
         row, dd, pk = criterion_s(LP, score, allowed, inside & allowed, logs)
         blk[nm], d[nm] = row, dd
         picks.update({f"S_{nm}_{k}": v for k, v in pk.items()})
-    for tag, ref in (("gain_fraction", "gt_r2_same_keys"), ("gain_fraction_vs_rule", "gt_rule_same_keys")):
-        if "learned" in d and ref in d:
-            den = float(d[ref].sum())
-            blk[tag] = {"vs": ref, "estimate": float(d["learned"].sum() / den) if den != 0 else float("nan"),
-                        "ci": lb.ratio(d["learned"], d[ref]),
-                        "d_learned_minus_ref": log_bootstrap(d["learned"] - d[ref], logs, N_BOOT)}
+    _gain_fractions(blk, d, lb, logs)
+    if filter_tubes:
+        fb: Dict = {}
+        fd: Dict[str, np.ndarray] = {}
+        for nm, inside in filter_tubes.items():
+            row, dd, pk = criterion_filter(LP, score, allowed, inside & allowed, logs)
+            fb[nm], fd[nm] = row, dd
+            picks.setdefault(f"S_{nm}_filter", pk["filter"])
+            picks.setdefault(f"S_{nm}_blend", pk["blend"])
+        _gain_fractions(fb, fd, lb, logs)
+        gref = (p1_names or {}).get("gt")
+        if gref in fd and any(nm.endswith("_only") for nm in fd):        # descriptive: per-key share of P1's GT gain
+            den = float(fd[gref].sum())
+            fb["key_share"] = {"vs": gref, "shares": {nm: (float(fd[nm].sum()) / den if den > 0 else float("nan"))
+                                                      for nm in fd if nm.endswith("_only")}}
+        blk["filter"] = fb
+        if p1_names:
+            ln, gn, rn = p1_names.get("learned"), p1_names.get("gt"), p1_names.get("rule")
+            an = p1_names.get("gt_all")
+            if ln is not None:
+                blk["P1"] = p1_decide(fb[ln], fd[ln], fb.get(gn) if gn else None, fd.get(gn) if gn else None, lb,
+                                      fb.get(rn) if rn else None, fd.get(rn) if rn else None)
+                blk["P1"].update(learned_tube=ln, gt_tube=gn, ceiling_tube=rn)
+                tgt = blk["P1"]
+            elif gn is not None:
+                blk["P1_reference"] = tgt = dict(p1_reference(fb[gn]), tube=gn, keys=list(P1_KEYS))
+            else:
+                tgt = None
+            if tgt is not None and an and an in fb:                         # descriptive: the GT tube on all keys
+                tgt["gt_reference_all_keys"] = dict(p1_reference(fb[an]), tube=an)
     return blk, picks
 
 
-def phase0b_check(a, r: np.ndarray, row: Optional[Dict]) -> Dict:
+PHASE0B_FILTER_PICK = "R2 tube filter + blend"    # HO/results.json selection.picks row of the filter rule
+
+
+def phase0b_check(a, r: np.ndarray, row: Optional[Dict], filter_row: Optional[Dict] = None) -> Dict:
     """The tool's criterion S of the R2 GT tube on all keys with the Phase 0b blend (ck2T10) vs the pre-registered
     held-out run (HO/results.json selection.criterion_S): comparable only on its token set (navtrain_val heldout, no
-    --limit, the same packed rows) -> {comparable, match, ours, phase0b, reason}."""
+    --limit, the same packed rows) -> {comparable, match, ours, phase0b, reason}; with filter_row (the same tube's
+    FILTER row) also out['filter'] vs HO/results.json selection.picks['R2 tube filter + blend'] (its d_vs_blend /
+    break_vs_blend; comparable when that row is stored) -> {comparable, match, ours, phase0b}."""
+    out = _phase0b_switch(a, r, row)
+    if filter_row is not None:
+        f: Dict = {"comparable": False, "match": None}
+        if out.get("comparable"):
+            R = json.loads((HO_DIR / "results.json").read_text())
+            pk = ((R.get("selection") or {}).get("picks") or {}).get(PHASE0B_FILTER_PICK)
+            if pk is None:
+                f["reason"] = f"HO/results.json has no selection.picks[{PHASE0B_FILTER_PICK!r}]"
+            else:
+                ours = {"mean": filter_row["d_vs_blend"]["mean"], "lo": filter_row["d_vs_blend"]["lo"],
+                        "hi": filter_row["d_vs_blend"]["hi"], "break_n": filter_row["break_n"],
+                        "break_den": filter_row["break_den"]}
+                theirs = {"mean": pk["d_vs_blend"]["mean"], "lo": pk["d_vs_blend"]["lo"], "hi": pk["d_vs_blend"]["hi"],
+                          "break_n": pk["break_vs_blend"]["n"], "break_den": pk["break_vs_blend"]["den"]}
+                f.update(comparable=True, ours=ours, phase0b=theirs,
+                         match=bool(abs(ours["mean"] - theirs["mean"]) <= 1e-9 and ours["break_n"] == theirs["break_n"]
+                                    and ours["break_den"] == theirs["break_den"]),
+                         ci_abs_diff=max(abs(ours["lo"] - theirs["lo"]), abs(ours["hi"] - theirs["hi"])))
+        else:
+            f["reason"] = out.get("reason", "switch check not comparable")
+        out["filter"] = f
+    return out
+
+
+def _phase0b_switch(a, r: np.ndarray, row: Optional[Dict]) -> Dict:
     out: Dict = {"comparable": False, "match": None, "results": str(HO_DIR / "results.json")}
     if a.split != "navtrain_val" or a.subset != "heldout" or a.limit:
         out["reason"] = "not the Phase 0b token set (needs --split navtrain_val --subset heldout, no --limit)"
@@ -823,18 +1032,23 @@ def _common(a, need_teachers: bool) -> Dict:
     names = [primary] + ([PHASE0B_BLEND] if primary != PHASE0B_BLEND else [])
     blends = [blend_critic(sp, nm) for nm in names]
     gt = load_gt_tube(a, N)
-    keep = np.zeros(N, bool)
-    keep[rows] = True
-    keep &= okc.all(1) & (okv | ~valid80).all(1)
+    # the token set = the AND of these [N] masks (named, so that p1_token_gate can say which input removed a row)
+    inrows = np.zeros(N, bool)
+    inrows[rows] = True
+    filters: Dict[str, np.ndarray] = {"rows (packed ok, variants built, subset, --limit)": inrows,
+                                      "labels": okc.all(1) & (okv | ~valid80).all(1)}
     for b in blends:
-        keep &= b["done"]
-    for t in tch.values():
+        filters[f"blend {b['name']}"] = np.asarray(b["done"], bool)
+    for role, t in tch.items():
         if t is not None:
-            keep &= np.asarray(t["done"], bool) & np.asarray(t["bev_ok"], bool)
+            # (a row without BEV is never done: stage infer leaves both False, as for a row not yet inferred)
+            filters[f"teacher {role} outputs (done & BEV)"] = np.asarray(t["done"], bool) & np.asarray(t["bev_ok"], bool)
     if gt is not None:
-        keep &= np.asarray(gt["done"], bool) & np.asarray(gt["ok"], bool)
+        filters["GT tube"] = np.asarray(gt["done"], bool) & np.asarray(gt["ok"], bool)
+    keep = np.logical_and.reduce(list(filters.values()))
     return dict(sp=sp, pdir=pdir, tdf=tdf, N=N, rows=rows, labc=labc, labv=labv, valid80=valid80, tch=tch,
-                blends=blends, gt=gt, keep=keep, LBL=LBL, allowed_mask=allowed_mask)
+                blends=blends, gt=gt, keep=keep, filters=filters, LBL=LBL, allowed_mask=allowed_mask, split=a.split,
+                subset=a.subset, limit=a.limit)
 
 
 def _gt_flags(gt: Dict, r: np.ndarray) -> Dict[str, np.ndarray]:
@@ -844,9 +1058,135 @@ def _gt_flags(gt: Dict, r: np.ndarray) -> Dict[str, np.ndarray]:
     return out
 
 
-def _s_all(C: Dict, r: np.ndarray, LP, allowed, logs, lb, tube_sets: Dict[str, np.ndarray]) -> Tuple[Dict, Dict]:
+def p1_deciding_set(a) -> bool:
+    """the amended P1 decides only on its registered token set: navtrain_val held-out, every token (no --limit).  The
+    run's arguments only: the tokens actually evaluated are checked against the registered rows by p1_token_gate."""
+    return a.split == P1_SPLIT and a.subset == P1_SUBSET and not a.limit
+
+
+def p1_registered_rows() -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """the registered P1 token set = the Phase 0b held-out rows (HO/prep/ho_rows.npy, 12,179 packed navtrain_val rows;
+    when HO/results.json is present it must have used all of them) -> (sorted rows, None) | (None, reason)."""
+    hp, rp = HO_DIR / "prep" / "ho_rows.npy", HO_DIR / "results.json"
+    if not hp.is_file():
+        return None, f"registered token set unavailable ({hp} missing)"
+    ho = np.unique(np.load(hp).astype(np.int64))
+    if rp.is_file():
+        nu = json.loads(rp.read_text()).get("n_tokens_used")
+        if nu is not None and int(nu) != len(ho):
+            return None, f"registered token set unclear (Phase 0b used {nu} of its {len(ho)} rows)"
+    return ho, None
+
+
+def p1_token_gate(r: np.ndarray, reg: np.ndarray, filters: Dict[str, np.ndarray]) -> Dict:
+    """the evaluated rows r vs the registered rows reg: complete iff the same set; missing_by_input = per input filter
+    ([N] bool masks of _common / stage_eval) the number of registered rows it removes (overlapping counts)."""
+    r, reg = np.unique(np.asarray(r, np.int64)), np.unique(np.asarray(reg, np.int64))
+    miss, extra = np.setdiff1d(reg, r), np.setdiff1d(r, reg)
+    by = {k: int((~np.asarray(m, bool)[reg]).sum()) for k, m in filters.items()}
+    return dict(n=int(len(r)), n_registered=int(len(reg)), n_missing=int(len(miss)), n_extra=int(len(extra)),
+                complete=bool(len(miss) == 0 and len(extra) == 0), missing_by_input={k: v for k, v in by.items() if v},
+                missing_example=[int(x) for x in miss[:5]])
+
+
+def _token_reason(ts: Dict) -> str:
+    by = ", ".join(f"{k} {v}" for k, v in ts["missing_by_input"].items()) or "none"
+    return (f"token set {ts['n']} of {ts['n_registered']} registered rows ({ts['n_missing']} missing, {ts['n_extra']} "
+            f"extra; registered rows removed by input -- teacher outputs / BEV / baselines / GT tube / labels / blend: "
+            f"{by})")
+
+
+def teacher_identity(name: Optional[str], meta: Optional[Dict]) -> Optional[Dict]:
+    """what the infer outputs of a teacher are about (from its infer_meta.json) + whether its checkpoint still has the
+    sha16 they were written with (ckpt_current; None when it cannot be checked)."""
+    if not name:
+        return None
+    m = meta or {}
+    p, sha = m.get("ckpt"), m.get("ckpt_sha16")
+    now = U.sha256_file(p) if p and Path(p).is_file() else None
+    return dict(name=tname(name), arm=m.get("arm"), which=m.get("which"), rg_read=m.get("rg_read"),
+                rg_stopped_aware=m.get("rg_stopped_aware"), ckpt=p, ckpt_sha16=sha, ckpt_sha16_now=now,
+                ckpt_current=(None if not sha or now is None else bool(now == sha)), n_done=m.get("n_done"),
+                n_rows=m.get("n_rows"), status=m.get("status"), has_meta=meta is not None and bool(meta))
+
+
+def p1_teacher_problems(ti: Optional[Dict]) -> List[str]:
+    """why the DET teacher's outputs are not the registered P1 teacher's (P1_TEACHER) at its current checkpoint."""
+    if ti is None:
+        return ["no DET teacher"]
+    if not ti["has_meta"]:
+        return [f"{ti['name']}: no infer_meta.json (cannot tell which teacher / checkpoint wrote the outputs)"]
+    bad = []
+    for k, want in P1_TEACHER.items():
+        got = ti[k]
+        if (got is not want) if isinstance(want, bool) else (got != want):
+            bad.append(f"{k} {got!r} (registered {want!r})")
+    if not ti["ckpt_sha16"]:
+        bad.append("infer_meta.json has no ckpt_sha16")
+    elif ti["ckpt_sha16_now"] is None:
+        bad.append(f"checkpoint {ti['ckpt']} missing (cannot check the outputs against it)")
+    elif not ti["ckpt_current"]:
+        bad.append(f"checkpoint {ti['ckpt']} changed since infer (sha16 {ti['ckpt_sha16_now']} != {ti['ckpt_sha16']})")
+    return bad
+
+
+def p1_gate(a, r: np.ndarray, filters: Dict[str, np.ndarray], teacher: Optional[Dict] = None,
+            need_teacher: bool = True, have_gt: bool = True) -> Dict:
+    """whether P1 decides on this run: the registered split (p1_deciding_set) AND the evaluated rows r = the registered
+    rows (p1_registered_rows; nothing removed by a missing teacher output, BEV, baseline, GT tube, label or blend input)
+    AND the GT R2 tube is there (have_gt: the reference of (c))
+    AND (need_teacher) the DET outputs are the registered teacher's at its current checkpoint (p1_teacher_problems) ->
+    {deciding, registered_split, incomplete (registered split but the token set unavailable / not complete), token_set,
+    teacher, teacher_problems, reasons, reason}."""
+    g: Dict = {"registered_split": p1_deciding_set(a), "token_set": None, "teacher": teacher,
+               "teacher_problems": p1_teacher_problems(teacher) if need_teacher else [], "reasons": [],
+               "incomplete": False}
+    if not g["registered_split"]:
+        g["reasons"].append(f"not the registered split ({a.split} {a.subset}{', --limit' if a.limit else ''}; P1 "
+                            f"decides on {P1_SPLIT} {P1_SUBSET}, every token, no --limit)")
+    else:
+        reg, why = p1_registered_rows()
+        if reg is None:
+            g["reasons"].append(why)
+            g["incomplete"] = True
+        else:
+            ts = g["token_set"] = p1_token_gate(r, reg, filters)
+            if not ts["complete"]:
+                g["reasons"].append(_token_reason(ts))
+                g["incomplete"] = True
+        if not have_gt:
+            g["reasons"].append("no GT R2 tube (the reference of (c); run --stage gttube or pass --gt-tube)")
+            g["incomplete"] = True
+        if g["teacher_problems"]:
+            g["reasons"].append("not the registered teacher's outputs (" + "; ".join(g["teacher_problems"]) + ")")
+    g["deciding"] = not g["reasons"]
+    g["reason"] = "; ".join(g["reasons"]) or None
+    return g
+
+
+def _token_note(gate: Dict) -> str:
+    ts = gate.get("token_set")
+    return f", tokens {ts['n']} / {ts['n_registered']} registered" if ts else ""
+
+
+def _per_key_tubes(G: Dict[str, np.ndarray], learned: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+    """descriptive FILTER-rule tubes on NC only / TTC only (which P1 key carries the gain): <tube>_nc_only /
+    <tube>_ttc_only for the GT tubes G and the learned DET tube (flags [n, 96, 3])."""
+    src = dict(G)
+    if learned is not None:
+        src = {"learned": learned, **src}
+    return {f"{nm}_{k}_only": ~h[..., KI[k]] for nm, h in src.items() for k in P1_KEYS}
+
+
+def _s_all(C: Dict, r: np.ndarray, LP, allowed, logs, lb, tube_sets: Dict[str, np.ndarray],
+           filter_sets: Optional[Dict[str, np.ndarray]] = None, p1_names: Optional[Dict] = None,
+           deciding_set: bool = False, gate_reason: Optional[str] = None, token_note: str = ""
+           ) -> Tuple[Dict, Dict]:
     """criterion S blocks for every blend critic: res['criterion_S'] = the primary's, 'criterion_S_phase0b_convention'
-    = ck2T10 alone when the primary is another critic (navtest)."""
+    = ck2T10 alone when the primary is another critic (navtest); with filter_sets / p1_names the FILTER rows and P1 of
+    each block (s_block); P1 'deciding' = deciding_set (stage eval: the registered split AND tokens AND teacher,
+    p1_gate) and the block's blend critic is P1_BLEND (ck2T10), else 'report only' (+ ': gate_reason' when the gate
+    failed); token_note is appended to the deciding context (e.g. ', tokens 12179 / 12179 registered')."""
     from navsim.agents.para_ssr.ck.select2 import pool_scores
     v2f = np.asarray(np.load(C["pdir"] / "v2_final.npy", mmap_mode="r")[r], np.float64)
     v2i = np.asarray(np.load(C["pdir"] / "v2_im.npy", mmap_mode="r")[r], np.float64)
@@ -854,13 +1194,29 @@ def _s_all(C: Dict, r: np.ndarray, LP, allowed, logs, lb, tube_sets: Dict[str, n
     for q, b in enumerate(C["blends"]):
         p16, p80 = b["prob"](r)
         score = pool_scores(v2f, v2i, to_pool(p16, p80), beta=1.0)
-        blk, pk = s_block(LP, score, allowed, logs, lb, tube_sets)
+        blk, pk = s_block(LP, score, allowed, logs, lb, tube_sets, filter_sets, p1_names)
         blk["blend_critic"] = b["name"]
         key = "criterion_S" if q == 0 else "criterion_S_phase0b_convention"
         blk["label"] = ("primary" if q == 0 else "Phase 0b convention (ck2T10 alone as the deployment blend)")
+        for k in ("P1", "P1_reference"):
+            if k in blk:
+                dec = bool(deciding_set and b["name"] == P1_BLEND)
+                why = f": {gate_reason}" if gate_reason and not deciding_set else ""
+                blk[k].update(deciding=dec, context=(
+                    f"decision ({P1_SPLIT} {P1_SUBSET}, blend {P1_BLEND}{token_note})" if dec else
+                    f"report only ({C['split']} {C['subset']}{', limit' if C['limit'] else ''}, blend {b['name']})"
+                    f"{why}"))
         out[key] = blk
         picks.update({(f"{k}" if q == 0 else f"conv_{k}"): v for k, v in pk.items()})
     return out, picks
+
+
+def p1_summary(S: Dict) -> Optional[Dict]:
+    """the deciding P1 of the criterion S blocks (the one with deciding True), else None."""
+    for blk in S.values():
+        if isinstance(blk, dict) and (blk.get("P1") or {}).get("deciding"):
+            return dict(blk["P1"], blend_critic=blk["blend_critic"])
+    return None
 
 
 def stage_gtcheck(a) -> Dict:
@@ -881,24 +1237,38 @@ def stage_gtcheck(a) -> Dict:
     fail = np.stack([LP[..., LBL[k]] < 1 for k in KEYS], -1)
     G = _gt_flags(C["gt"], r)
     res: Dict = {"stage": "gtcheck", "split": a.split, "subset": a.subset, "limit": a.limit, "n_tokens": int(len(r)),
-                 "n_logs": int(lb.L), "gt_tube": C["gt"]["dir"], "fidelity": {}, "caveats": []}
+                 "n_logs": int(lb.L), "gt_tube": C["gt"]["dir"], "fidelity": {}, "caveats": [],
+                 "decision_rule": DECISION_RULE}
     for nm, h in G.items():
         res["fidelity"][f"{nm}_all_keys"] = fidelity(h, fail, allowed, KEYS, lb)
     if "gt_rule" in G:
         res["fidelity"]["agreement_rule_vs_r2"] = {
             **{k: float((G["gt_rule"][..., KI[k]] == G["gt_r2"][..., KI[k]])[allowed].mean()) for k in KEYS},
             "joint": float((G["gt_rule"].any(-1) == G["gt_r2"].any(-1))[allowed].mean())}
+    pi = [KI[k] for k in P1_KEYS]
+    # old switch rule (descriptive): all keys as before + the P1 keys (the amendment's design check)
     tubes = {f"{nm}_all_keys": ~h.any(-1) for nm, h in G.items()}
-    S, _ = _s_all(C, r, LP, allowed, logs, lb, tubes)
+    tubes.update({f"{nm}_nc_ttc": ~h[..., pi].any(-1) for nm, h in G.items()})
+    # P1's filter rule: the GT reference of (c) = gt_r2 on NC / TTC; all keys / the readout-rule tube descriptive
+    ftubes = {f"{nm}_{sfx}": ~(h[..., pi] if sfx == "nc_ttc" else h).any(-1) for nm, h in G.items()
+              for sfx in ("nc_ttc", "all_keys")}
+    ftubes.update(_per_key_tubes(G))                                    # descriptive: NC only / TTC only
+    gate = p1_gate(a, r, C["filters"], need_teacher=False)
+    res["p1_gate"] = gate
+    S, _ = _s_all(C, r, LP, allowed, logs, lb, tubes, ftubes, {"gt": "gt_r2_nc_ttc", "gt_all": "gt_r2_all_keys"},
+                  deciding_set=gate["deciding"], gate_reason=gate["reason"] if gate["registered_split"] else None,
+                  token_note=_token_note(gate))
     res.update(S)
     conv = res.get("criterion_S_phase0b_convention", res["criterion_S"])
-    res["phase0b_check"] = phase0b_check(a, r, conv.get("gt_r2_all_keys"))
+    res["phase0b_check"] = phase0b_check(a, r, conv.get("gt_r2_all_keys"),
+                                         (conv.get("filter") or {}).get("gt_r2_all_keys"))
     res["sec"], res["finished"] = round(time.time() - t0, 1), kst()
     root = split_root(a)
     root.mkdir(parents=True, exist_ok=True)
-    (root / "gtcheck.json").write_text(json.dumps(res, indent=1, default=float))
+    stem = f"gtcheck_{a.tag}" if a.tag else "gtcheck"
+    (root / f"{stem}.json").write_text(json.dumps(res, indent=1, default=float))
     md = report_md(res)
-    (root / "gtcheck.md").write_text(md)
+    (root / f"{stem}.md").write_text(md)
     print(md, flush=True)
     _raise_on_mismatch(res)
     return res
@@ -908,6 +1278,10 @@ def _raise_on_mismatch(res: Dict) -> None:
     c = res.get("phase0b_check") or {}
     if c.get("comparable") and not c.get("match"):
         raise SystemExit(f"Phase 0b reproduction FAILED (outputs written): ours {c['ours']} vs Phase 0b {c['phase0b']}")
+    f = c.get("filter") or {}
+    if f.get("comparable") and not f.get("match"):
+        raise SystemExit(f"Phase 0b reproduction FAILED for the filter rule (outputs written): ours {f['ours']} vs "
+                         f"Phase 0b {f['phase0b']}")
 
 
 def stage_eval(a) -> Dict:
@@ -931,14 +1305,19 @@ def stage_eval(a) -> Dict:
         bases[b] = P
     # token set (the same for (i) - (iii))
     keep = C["keep"].copy()
-    for P in bases.values():
-        for v in P.values():
+    filters = dict(C["filters"])
+    for b, P in bases.items():
+        for role, v in P.items():
             if v is not None:
-                keep &= np.asarray(v["done"], bool)
+                filters[f"baseline {b} {role}"] = np.asarray(v["done"], bool)
+                keep &= filters[f"baseline {b} {role}"]
     r = np.flatnonzero(keep)
     n = len(r)
     if n == 0:
         raise SystemExit("[eval] no token has every input (labels, teacher outputs, baselines, blend critic, GT tube)")
+    # what the teacher outputs are about, and whether P1 decides here (registered split, tokens and teacher)
+    tid = {role: teacher_identity(getattr(a, role), v["meta"] if v is not None else None) for role, v in tch.items()}
+    gate = p1_gate(a, r, filters, tid["det"], have_gt=gt is not None) if tch["det"] is not None else None
     logs = C["tdf"].log.astype(str).to_numpy()[r]
     lb = LogBoot(logs)
     LP = to_pool(labc[r], labv[r])                                                   # [n, 96, 9]
@@ -954,6 +1333,7 @@ def stage_eval(a) -> Dict:
     res: Dict = {"stage": "eval", "split": a.split, "subset": a.subset, "limit": a.limit, "n_tokens": int(n),
                  "n_rows_candidate": int(len(rows)), "n_logs": int(lb.L), "keys": list(keys), "det": tname(a.det),
                  "map": tname(a.map), "teacher_meta": {k: (v["meta"] if v is not None else None) for k, v in tch.items()},
+                 "teacher_identity": tid, "p1_gate": gate,
                  "blend_critic": C["blends"][0]["name"], "gt_tube": gt["dir"] if gt is not None else None,
                  "baselines": list(bases), "caveats": [], "decision_rule": DECISION_RULE}
     if a.split == "navtrain_val":
@@ -972,18 +1352,54 @@ def stage_eval(a) -> Dict:
         res["fidelity"][f"agreement_learned_{nm}"] = {
             **{k: float((learned[..., KI[k]] == h[..., KI[k]])[allowed].mean()) for k in keys},
             "joint": float((learned[..., ki].any(-1) == h[..., ki].any(-1))[allowed].mean())}
-    # (ii) criterion S with the learned / GT / readout-rule tubes, for each blend critic
+    # (ii) criterion S with the learned / GT / readout-rule tubes, for each blend critic: the old SWITCH rule rows
+    # (descriptive) and the FILTER rule rows + the amended P1 (learned DET tube on NC / TTC vs the GT R2 tube on the
+    # same keys and tokens)
     tubes = {"learned": ~learned[..., ki].any(-1)}
     for nm, h in G.items():
         tubes[f"{nm}_same_keys"] = ~h[..., ki].any(-1)
         tubes[f"{nm}_all_keys"] = ~h.any(-1)
-    S, picks_out = _s_all(C, r, LP, allowed, logs, lb, tubes)
+    ftubes = dict(tubes)
+    p1n: Optional[Dict] = None
+    if tch["det"] is not None:
+        ftubes.update(_per_key_tubes(G, learned))                       # descriptive: NC only / TTC only
+        if tuple(keys) == P1_KEYS:
+            p1n = {"learned": "learned", "gt": "gt_r2_same_keys" if "gt_r2" in G else None,
+                   "rule": "gt_rule_same_keys" if "gt_rule" in G else None}
+        else:                                                               # DET + MAP: P1 on the DET keys only
+            pi = [KI[k] for k in P1_KEYS]
+            ftubes["learned_nc_ttc"] = ~learned[..., pi].any(-1)
+            for nm, h in G.items():
+                ftubes[f"{nm}_nc_ttc"] = ~h[..., pi].any(-1)
+            p1n = {"learned": "learned_nc_ttc", "gt": "gt_r2_nc_ttc" if "gt_r2" in G else None,
+                   "rule": "gt_rule_nc_ttc" if "gt_rule" in G else None}
+        p1n["gt_all"] = "gt_r2_all_keys" if "gt_r2" in G else None
+    else:
+        res["caveats"].append("no DET teacher: P1 (learned DET tube on NC / TTC) not evaluable")
+    dec_ok = bool(gate is not None and gate["deciding"])
+    S, picks_out = _s_all(C, r, LP, allowed, logs, lb, tubes, ftubes, p1n, deciding_set=dec_ok,
+                          gate_reason=gate["reason"] if gate is not None and gate["registered_split"] else None,
+                          token_note=_token_note(gate) if gate is not None else "")
     for blk in S.values():
         blk["keys"] = list(keys)
     res.update(S)
+    res["P1"] = p1_summary(S)
+    if res["P1"] is not None:
+        res["decision"] = {"verdict": res["P1"]["verdict"], "deciding": True, "blend_critic": res["P1"]["blend_critic"],
+                           "token_set": gate["token_set"], "teacher": tid["det"]}
+    elif p1n is None:
+        res["decision"] = {"verdict": None, "deciding": False, "reason": "no DET teacher"}
+    else:
+        why = (f"report only: P1 decides on {P1_SPLIT} {P1_SUBSET} (every registered token, no --limit) with the "
+               f"{P1_BLEND} blend and the registered teacher {P1_TEACHER['name']} (--which {P1_TEACHER['which']})")
+        if gate["registered_split"]:
+            why += f" -- here: {gate['reason']}"
+        res["decision"] = {"verdict": None, "deciding": False, "reason": why, "token_set": gate["token_set"],
+                           "teacher_problems": gate["teacher_problems"], "incomplete": gate["incomplete"]}
     picks_out["rows"] = r
     conv = res.get("criterion_S_phase0b_convention", res["criterion_S"])
-    res["phase0b_check"] = phase0b_check(a, r, conv.get("gt_r2_all_keys"))
+    res["phase0b_check"] = phase0b_check(a, r, conv.get("gt_r2_all_keys"),
+                                         (conv.get("filter") or {}).get("gt_r2_all_keys"))
     # (iii) fixed-pool critic-only selection: the range pair vs each baseline pair
     v2f = np.asarray(np.load(C["pdir"] / "v2_final.npy", mmap_mode="r")[r], np.float64)
     v2i = np.asarray(np.load(C["pdir"] / "v2_im.npy", mmap_mode="r")[r], np.float64)
@@ -1026,7 +1442,7 @@ def stage_eval(a) -> Dict:
     res["selection"] = sel
     res["sec"] = round(time.time() - t0, 1)
     res["finished"] = kst()
-    tag = "+".join(x for x in (tname(a.det), tname(a.map)) if x)
+    tag = "+".join(x for x in (tname(a.det), tname(a.map)) if x) + (f"_{a.tag}" if a.tag else "")
     root = split_root(a)
     root.mkdir(parents=True, exist_ok=True)
     (root / f"eval_{tag}.json").write_text(json.dumps(res, indent=1, default=float))
@@ -1035,6 +1451,9 @@ def stage_eval(a) -> Dict:
     (root / f"eval_{tag}.md").write_text(md)
     print(md, flush=True)
     _raise_on_mismatch(res)
+    if gate is not None and gate["incomplete"]:
+        raise SystemExit(f"P1: the deciding split is incomplete -- {gate['reason']} -- so P1 is reported only (outputs "
+                         f"written to {root / f'eval_{tag}'}.*); complete the inputs (e.g. resume stage infer) and rerun")
     return res
 
 
@@ -1054,22 +1473,106 @@ def _rc(x) -> str:
     return s + f" (fail {x['n_fail']})"
 
 
-def _s_md(S: Dict) -> List[str]:
-    L = [f"Blend critic: {S['blend_critic']} ({S['label']}).", "",
-         "| tube | PDMS switch | PDMS blend | switch - blend | break % (n / den) | top-1 outside % | no inside % | bars |",
-         "|---|---|---|---|---|---|---|---|"]
-    for nm, x in S.items():
-        if not isinstance(x, dict) or "pdms_switch" not in x:
-            continue
-        L.append(f"| {nm} | {x['pdms_switch']:.2f} | {x['pdms_blend']:.2f} | {_ci(x['d_vs_blend'])} | "
-                 f"{100 * x['break_']:.2f} ({x['break_n']} / {x['break_den']}) | {100 * x['top1_outside']:.1f} | "
-                 f"{100 * x['no_inside']:.2f} | {'pass' if x['bars_pass'] else 'fail'} |")
+def _pct(x: float) -> str:
+    return "n/a" if not np.isfinite(x) else f"{100 * x:.2f}"
+
+
+def _gain_md(S: Dict) -> List[str]:
+    L = []
     for tag in ("gain_fraction", "gain_fraction_vs_rule"):
         if tag in S:
             g = S[tag]
             L += ["", f"Fraction of the {g['vs']} gain (same keys, same tokens) recovered by the learned tube: "
                       f"{g['estimate']:.3f} [{g['ci'][0]:.3f}, {g['ci'][1]:.3f}]; learned - ref "
                       f"{_ci(g['d_learned_minus_ref'])}."]
+    return L
+
+
+def _ok(b: Optional[bool]) -> str:
+    return "n/a" if b is None else ("ok" if b else "NOT met")
+
+
+def _p1_md(P: Dict) -> List[str]:
+    """the amended P1 lines of one block (p1_decide output)."""
+    v = P.get("verdict")
+    head = f"**P1 (amended, filter rule) -- {v if v is not None else 'not evaluable'}** ({P.get('context', '')})"
+    pa = P["parts"]
+    L = [head, "",
+         f"- (a) learned tube {P['learned_tube']}: filter - blend {_ci(P['d_learned'])} (bar >= +{P1_D_MIN:.2f} and CI "
+         f"lower bound > 0: {_ok(pa['a_mean_and_ci'])})",
+         f"- (b) break {_pct(P['break_'])} % ({P['break_n']} / {P['break_den']}) (bar <= {100 * P1_BREAK_MAX:.1f} %: "
+         f"{_ok(pa['b_break'])})"]
+    if P.get("gt_reference") is not None:
+        g, ci = P["gt_reference"], P.get("gain_fraction_ci") or [float("nan")] * 2
+        L += [f"- (c) fraction of the GT R2 filter gain ({P['gt_tube']}, same keys and tokens): "
+              f"{P['gain_fraction']:.3f} (bootstrap [{ci[0]:.3f}, {ci[1]:.3f}]) (bar >= {P1_FRAC_MIN:.2f}: "
+              f"{_ok(pa['c_gain_fraction'])})",
+              f"- GT reference {P['gt_tube']}: filter - blend {_ci(g['d_vs_blend'])}, break {_pct(g['break_'])} % "
+              f"({g['break_n']} / {g['break_den']}) (positive with CI lower bound > 0: {_ok(g['valid'])}"
+              f"{'' if g['valid'] else ' -> P1 VOID'})"]
+    else:
+        L.append(f"- (c) not evaluable: {P.get('reason', 'no GT reference')}")
+    if "ceiling" in P:
+        c = P["ceiling"]
+        L.append(f"- descriptive: readout-rule ceiling {P['ceiling_tube']} filter - blend {_ci(c['d_vs_blend'])}, "
+                 f"learned / ceiling gain {c['gain_fraction_vs_ceiling']:.3f}")
+    if "gt_reference_all_keys" in P:
+        g = P["gt_reference_all_keys"]
+        L.append(f"- descriptive: GT R2 tube on all keys ({g['tube']}) filter - blend {_ci(g['d_vs_blend'])}, break "
+                 f"{_pct(g['break_'])} % ({g['break_n']} / {g['break_den']})")
+    return L
+
+
+def _ref_md(R: Dict) -> List[str]:
+    """gtcheck: the GT reference of P1 (c) (no teacher)."""
+    ok = ("valid (positive, CI lower bound > 0): P1 is not void on this token set" if R["valid"] else
+          "NOT valid: P1 would be VOID")
+    L = [f"**P1 GT reference** ({R.get('context', '')}): {R['tube']} (keys {', '.join(R['keys'])}) filter - blend "
+         f"{_ci(R['d_vs_blend'])}, break {_pct(R['break_'])} % ({R['break_n']} / {R['break_den']}) -- {ok}."]
+    if "gt_reference_all_keys" in R:
+        g = R["gt_reference_all_keys"]
+        L.append(f"All keys ({g['tube']}, descriptive): filter - blend {_ci(g['d_vs_blend'])}, break "
+                 f"{_pct(g['break_'])} % ({g['break_n']} / {g['break_den']}).")
+    return L
+
+
+def _s_md(S: Dict) -> List[str]:
+    L = [f"Blend critic: {S['blend_critic']} ({S['label']}).", ""]
+    if "filter" in S:
+        F = S["filter"]
+        L += ["FILTER rule (Phase 1c amendment P1): drop the tube-outside rows, blend among the rest (none left -> the "
+              "blend pick).", "",
+              "| tube | PDMS filter | PDMS blend | filter - blend | break % (n / den) | rows dropped % | blend pick dropped "
+              "% | changed vs blend % | no inside % | (a)+(b) |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+        for nm, x in F.items():
+            if not isinstance(x, dict) or "pdms_filter" not in x:
+                continue
+            L.append(f"| {nm} | {x['pdms_filter']:.2f} | {x['pdms_blend']:.2f} | {_ci(x['d_vs_blend'])} | "
+                     f"{_pct(x['break_'])} ({x['break_n']} / {x['break_den']}) | {_pct(x['dropped_rows'])} | "
+                     f"{_pct(x['blend_pick_dropped'])} | {_pct(x['changed_vs_blend'])} | {_pct(x['no_inside'])} | "
+                     f"{'pass' if x['bars_ab_pass'] else 'fail'} |")
+        L += _gain_md(F) + [""]
+        if "key_share" in F:
+            ks = F["key_share"]
+            L += [f"Per-key share of the {ks['vs']} filter gain (descriptive; *_nc_only / *_ttc_only = the tube on "
+                  f"one key, sum dPDMS / sum dPDMS of {ks['vs']}): "
+                  + ", ".join(f"{nm} {v:.3f}" if np.isfinite(v) else f"{nm} n/a" for nm, v in ks["shares"].items()), ""]
+        if "P1" in S:
+            L += _p1_md(S["P1"]) + [""]
+        if "P1_reference" in S:
+            L += _ref_md(S["P1_reference"]) + [""]
+    L += ["Old SWITCH rule (Phase 0b criterion S; descriptive, replaced for P1 by the amendment): top-1 if inside, else "
+          "the filter pick. bars = Phase 0b's (>= +1.0, CI lower bound > 0, break <= 1.3 %).", "",
+          "| tube | PDMS switch | PDMS blend | switch - blend | break % (n / den) | top-1 outside % | no inside % | bars |",
+          "|---|---|---|---|---|---|---|---|"]
+    for nm, x in S.items():
+        if not isinstance(x, dict) or "pdms_switch" not in x:
+            continue
+        L.append(f"| {nm} | {x['pdms_switch']:.2f} | {x['pdms_blend']:.2f} | {_ci(x['d_vs_blend'])} | "
+                 f"{100 * x['break_']:.2f} ({x['break_n']} / {x['break_den']}) | {100 * x['top1_outside']:.1f} | "
+                 f"{100 * x['no_inside']:.2f} | {'pass' if x['bars_pass'] else 'fail'} |")
+    L += _gain_md(S)
     return L
 
 
@@ -1082,14 +1585,30 @@ def report_md(res: Dict) -> str:
         L.append(f"Generated {res['finished']}. Tokens {res['n_tokens']} ({res['n_logs']} logs); GT tube "
                  f"{res['gt_tube']}. PDMS x 100, official labels of the fixed r34 96 pool. CIs: log-clustered bootstrap "
                  "(2,000).")
+        if res.get("decision_rule"):
+            L += ["", f"(c) decision rule (registered; here only its GT reference, no teacher): {res['decision_rule']}"]
     else:
         L.append(f"Generated {res['finished']}. Teachers: DET {res['det']}, MAP {res['map']}; keys {', '.join(keys)}; "
                  f"tokens {res['n_tokens']} ({res['n_logs']} logs); blend critic {res['blend_critic']}; GT tube "
                  f"{res['gt_tube']}. PDMS x 100, official labels of the fixed r34 96 pool ('_a' picks). CIs: "
                  "log-clustered bootstrap (2,000).")
-        L += ["", ("**(c) decision rule: not registered** in docs/refiner_v4/V4_3_SPEC.md 'Phase 0b' -- the numbers below "
-                   "are descriptive until the user fixes the rule (before the val infer)." if not res.get("decision_rule")
-                   else f"(c) decision rule (registered): {res['decision_rule']}")]
+        for role, ti in (res.get("teacher_identity") or {}).items():
+            if ti is not None:
+                cur = {True: "unchanged", False: "CHANGED since infer", None: "not checkable"}[ti["ckpt_current"]]
+                L += ["", f"Teacher {role} {ti['name']}: --which {ti['which']}, arm {ti['arm']}, rg_read "
+                          f"{ti['rg_read']}, rg_stopped_aware {ti['rg_stopped_aware']}, ckpt_sha16 {ti['ckpt_sha16']} "
+                          f"(checkpoint {cur}), infer done {ti['n_done']} / {ti['n_rows']} rows."]
+        L += ["", ("**(c) decision rule: not registered** -- the numbers below are descriptive."
+                   if not res.get("decision_rule") else f"(c) decision rule (registered): {res['decision_rule']}")]
+        dec = res.get("decision") or {}
+        if dec.get("deciding"):
+            ts, ti = dec.get("token_set") or {}, dec.get("teacher") or {}
+            L += ["", f"**DECISION (P1, amended): {dec['verdict'] if dec['verdict'] is not None else 'not evaluable'}** "
+                      f"({P1_SPLIT} {P1_SUBSET}, blend {dec['blend_critic']}, tokens {ts.get('n')} / "
+                      f"{ts.get('n_registered')} registered; teacher {ti.get('name')} --which {ti.get('which')}, "
+                      f"ckpt_sha16 {ti.get('ckpt_sha16')}; details in (ii))."]
+        elif dec:
+            L += ["", f"**P1 not deciding here** -- {dec.get('reason', '')}; the P1 lines in (ii) are reported only."]
     L.append("")
     for c in res["caveats"]:
         L.append(f"- caveat: {c}")
@@ -1100,6 +1619,16 @@ def report_md(res: Dict) -> str:
                  f"{'MATCH' if c['match'] else 'MISMATCH'} -- here {o['mean']:+.4f} [{o['lo']:+.2f}, {o['hi']:+.2f}], "
                  f"break {o['break_n']} / {o['break_den']}; Phase 0b {t['mean']:+.4f} [{t['lo']:+.2f}, {t['hi']:+.2f}], "
                  f"break {t['break_n']} / {t['break_den']} (CI bound diff {c['ci_abs_diff']:.2e}).")
+        f = c.get("filter") or {}
+        if f.get("comparable"):
+            o, t = f["ours"], f["phase0b"]
+            L.append(f"- Phase 0b reproduction of the filter rule (R2 GT tube, all keys, ck2T10 blend vs HO/results.json "
+                     f"picks['{PHASE0B_FILTER_PICK}']): {'MATCH' if f['match'] else 'MISMATCH'} -- here "
+                     f"{o['mean']:+.4f} [{o['lo']:+.2f}, {o['hi']:+.2f}], break {o['break_n']} / {o['break_den']}; "
+                     f"Phase 0b {t['mean']:+.4f} [{t['lo']:+.2f}, {t['hi']:+.2f}], break {t['break_n']} / "
+                     f"{t['break_den']} (CI bound diff {f['ci_abs_diff']:.2e}).")
+        elif f:
+            L.append(f"- Phase 0b reproduction of the filter rule: not comparable ({f.get('reason', 'n/a')}).")
     else:
         L.append(f"- Phase 0b reproduction: not comparable ({c.get('reason', 'n/a')}).")
     L += ["", "## (i) tube fidelity vs official labels (fail recall / pass recall)", "",
@@ -1116,7 +1645,8 @@ def report_md(res: Dict) -> str:
     L += ["", "gt_r2 = the Phase 0b R2 GT tube; gt_rule = the readout-rule perfect-field tube (the R2 teacher's own rule "
               "on the GT fields: the ceiling of the learned tube; differs from gt_r2 by the 2 m TTC switch and "
               "float32)."]
-    L += ["", "## (ii) criterion S: switch selection with the tube vs the deployment blend over the 96", ""]
+    L += ["", "## (ii) selection with the tube vs the deployment blend over the 96: FILTER rule (P1, amended) and the "
+              "old SWITCH rule (descriptive)", ""]
     for key in ("criterion_S", "criterion_S_phase0b_convention"):
         if key in res:
             L += _s_md(res[key]) + [""]
@@ -1161,6 +1691,8 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--workers-io", type=int, default=4, help="DataLoader workers (stage infer)")
     ap.add_argument("--workers", type=int, default=24, help=f"CPU workers (stage gttube, <= {MAX_WORKERS})")
+    ap.add_argument("--tag", default="", help="report file suffix of stages gtcheck / eval: gtcheck_<tag>.json / .md, "
+                                              "eval_<teachers>_<tag>.* (default none: gtcheck.json, eval_<teachers>.*)")
     return ap
 
 
@@ -1176,6 +1708,8 @@ def main(argv=None):
         raise SystemExit("navtrain_val has no ReSMap cache: DET only (--map refused)")
     if a.workers > MAX_WORKERS:
         raise SystemExit(f"--workers <= {MAX_WORKERS}")
+    if a.tag and not all(ch.isalnum() or ch in "-_." for ch in a.tag):
+        raise SystemExit(f"--tag {a.tag!r}: letters, digits, '-', '_', '.' only")
     out = {}
     if "infer" in stages:
         for role in ("det", "map"):

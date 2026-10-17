@@ -71,10 +71,10 @@ names one declares it (launch_util2.apply_sets2).  With the v4_3 arm (tools/ck/e
 |---|---|---|
 | Official LQR tracker port (M1), GT range fields + reductions (M2), parent dedupe (M3) | `ck/v4/lqr.py`, `ck/v4/range_targets.py`, `CKNet.score_set` | always available / dedupe on by default (exact) |
 | Range readout (M4): B / U blocked-field logits + margin D per unique parent, read at the executed states | `ck/v4/range_readout.py` | `v4.readout=range` (+ `v4.exec_model=lqr`, `v4.ev_tbins=20`, `v4.ev_tbin_s=0.25`, `v4.ep_evidence=true`) |
-| Computed edits (M5): rule edits of the critic's top-8 parents on the predicted fields, EXTRA candidates only | `ck/v4/edits.py`, `CKNet.computed_edits`; recorded by `online2.CKE2E2.computed_edits_rec` | `v4.edits=computed` (`edit_k` 8 = the recorded edit block) |
+| Computed edits (M5): rule edits of the critic's top-8 parents on the predicted fields, EXTRA candidates only; the fields are read with the net's rg_read / rg_stopped_aware (R2 student, below) | `ck/v4/edits.py`, `CKNet.computed_edits`; recorded by `online2.CKE2E2.computed_edits_rec` | `v4.edits=computed` (`edit_k` 8 = the recorded edit block) |
 | Score KD routing (M6): nc <- DET, dac <- MAP only | `online2` loss | `kd_score_keys=[nc,dac]` |
 | Score KD scope (M6): NC KD where the nearest lead's ttc0 < 4 s, DAC KD where the parent's min executed corner SDF < 1 m (ref_* GT, train only; missing ref_* keys = ValueError). Each key's KL is the mean over its own mask: its total weight stays that of scope `all`, so a near candidate weighs ~1 / near-fraction more | `online2.lead_ttc0`, `parent_min_corner_sdf`, `score_kd_near` | `v4.kd_score_scope=near` (default `all`) |
-| Constraint KD (M6): DET teacher sigmoid(B) -> student BCE, MAP teacher D -> student Huber (s <= 32 m), on the student's unique parents of the KD set, masked by teacher ok | `online2.constraint_kd`, `TeacherPair2(fields=True)` | `v4.kd_constraint.enabled=true` (`lambda_occ` 0.5, `lambda_margin` 0.5, `map_range_m` 32, `occ_channels` B = spec; `BU` also distils the TTC channel U, an option the user has not confirmed) |
+| Constraint KD (M6): DET teacher sigmoid(B) -> student BCE, MAP teacher D -> student Huber (s <= 32 m), on the student's unique parents of the KD set, masked by teacher ok; teachers must share the student's grid and rg_stopped_aware (runtime and launch, one rule; rg_read may differ, recorded) | `online2.constraint_kd`, `TeacherPair2(fields=True)`, `check_constraint_teachers`, `launch_util2.kd_constraint_check` | `v4.kd_constraint.enabled=true` (`lambda_occ` 0.5, `lambda_margin` 0.5, `map_range_m` 32, `occ_channels` B = spec; `BU` + the TTC channel U, `BBp` + the Bp group (R2 only), `all` B, U, Bp -- options the user has not confirmed) |
 | Range teachers: GT field aux online from ref_* (DET: blocked field B + the TTC channel U, BCE on known bins; MAP: SDF margin Huber), specialist key masking as v4_2 | `tools/ck/train_ck2.py range_gt_aux` | `--v4-readout range` (+ `--v4-exec-model`, `--v4-ev-tbin-s`, `--v4-ep-evidence`, `--v4-vmax`, `--rg-max-parents` 8, weight `--lambda-ev`) |
 | 96 + K headline: selection over the 96 + K edits, beta / variant set chosen on navtrain_val and frozen for navtest; 96-only rows on the same tokens | `tools/ck/e2e2/eval_ck2.py` ('Edits'), `eval_e2e2.py` | automatic when a dump holds edits |
 
@@ -103,11 +103,11 @@ Teachers (range; do not launch without approval):
     V4_USER_APPROVED=1 V4_GPUS=2,3 READOUT=range bash tools/ck/v4/run_teachers.sh both   # -> CK/v4/train/v4T10_rng, v4M10_rng
     V4_DRY_RUN=1 READOUT=range bash tools/ck/v4/run_teachers.sh both                     # print the arguments only
 
-Student (after the teachers and their KD calibration on nc / dac exist; the arm file's teacher / calibration paths are
-placeholders that launch_util2 refuses):
+Student (after the teachers and their KD calibration on nc / dac exist).  The arm file is R2 (rg_read any4 +
+rg_stopped_aware, below) and names the R2 teachers CK/v4/train/v4T10_rng2 / v4M10_rng2 (refused until they have
+finished); its KD calibration paths are placeholders that launch_util2 refuses:
 
-    printf '%s\n' teacher_det_run=<v4T10_rng run> teacher_map_run=<v4M10_rng run> \
-      kd_calib.det=<DET calib json> kd_calib.map=<MAP calib json> > /tmp/v4_3_teachers.set
+    printf '%s\n' kd_calib.det=<DET calib json> kd_calib.map=<MAP calib json> > /tmp/v4_3_teachers.set
     RUN=<run> CK2_E2E_APPROVED=1 ARM=v4_3 E2E_CK_SET=/tmp/v4_3_teachers.set bash tools/ck/e2e2/train_e2e2.sh start --gpus 0,1
 
 Evaluation: `tools/ck/e2e2/eval_e2e2.py --stage all` on navtrain_val, then navtest (`--fix-from` default = the val
@@ -125,12 +125,12 @@ gradients, checked against the pre-change files).
 | Piece | Where | Switch |
 |---|---|---|
 | Stopped-aware B (R2 (1)): stopped / static objects (not an agent, or first-appearance speed <= 0.05 m/s) block without the not-behind filter, moving ones with it; = oracle_common.stopped_aware_B01 bitwise (numpy twin, torch, and the training ref_* path on real navtrain_val tokens) | `range_targets.blocked_field[_np](stopped_aware=, stopped=)`, `stopped_mask_np`, `stopped_from_ref` | `V4Cfg.rg_stopped_aware` (target side; provenance) |
-| any4 read (R2 (2)): B / U read as the OR of the 2 x 2 cells around each executed point -- hard slacks / critical points = `range_targets.executed_slack(read='any4')`, the soft evidence a soft OR (the distinct cells join the soft max over the states; the prior subtracts tau ln 4Q) | `range_readout.any4_cells / soft_read / hard_slack(read=)` | `V4Cfg.rg_read='any4'` (not combined with `edits=computed` yet: edits.py reads the nearest cell; refused) |
-| Bp group (review of cprep): R2 makes only NC stopped-aware (the official TTC rule has no stopped-track exception; Phase 0b's tube reads TTC on LON >= -1.3 - \|v\| delta). With `rg_stopped_aware` the readout has a third field group Bp = the plain not-behind B (target LON >= -1.3 m of the same GT call); every TTC read of B (delta 0 and \|v\| delta < 2 m) reads Bp, NC reads the stopped-aware B, U unchanged. blk_head 2M -> 3M outputs (+1,100 parameters, inside the CK2 budget); constraint KD still distils B (\| U) | `range_readout` (CH_BP, `read_geometry(ttc_b_chan=)`, `field_hits`), `gt_field_aux` (bp_logit_u target), `CKNet.score_set` haz `bp_logit_u` | `V4Cfg.rg_stopped_aware` (now also a network change; not combined with `edits=computed`: edits.py reads B \| U only; refused) |
+| any4 read (R2 (2)): B / U read as the OR of the 2 x 2 cells around each executed point -- hard slacks / critical points = `range_targets.executed_slack(read='any4')`, the soft evidence a soft OR (the distinct cells join the soft max over the states; the prior subtracts tau ln 4Q) | `range_readout.any4_cells / soft_read / hard_slack(read=)` | `V4Cfg.rg_read='any4'` (with `edits=computed` the edits read any4 too, below) |
+| Bp group (review of cprep): R2 makes only NC stopped-aware (the official TTC rule has no stopped-track exception; Phase 0b's tube reads TTC on LON >= -1.3 - \|v\| delta). With `rg_stopped_aware` the readout has a third field group Bp = the plain not-behind B (target LON >= -1.3 m of the same GT call); every TTC read of B (delta 0 and \|v\| delta < 2 m) reads Bp, NC reads the stopped-aware B, U unchanged. blk_head 2M -> 3M outputs (+1,100 parameters, inside the CK2 budget); constraint KD distils B by default (`occ_channels` BBp / all add Bp) | `range_readout` (CH_BP, `read_geometry(ttc_b_chan=)`, `field_hits`), `gt_field_aux` (bp_logit_u target), `CKNet.score_set` haz `bp_logit_u` | `V4Cfg.rg_stopped_aware` (now also a network change; with `edits=computed` the edits read the three groups, below) |
 | GT field aux shared by teachers and student (GT = training TARGET only, never an input) | `range_targets.gt_field_aux` (train_ck2.range_gt_aux calls it) | -- |
 | Teachers with R2 | `train_ck2 --v4-rg-read any4 --v4-rg-stopped-aware 1` (range only; stored in config.json v4, part of the --resume check) | `run_teachers.sh READOUT=range R2=1` -> `v4T10_rng2` / `v4M10_rng2` |
 | WAIT launcher: polls the GPUs every minute, launches only after they were continuously idle (< 1 GB and 0 % util, failed query = busy) for N minutes; still needs approval, GPUs 0,1 / 2,3 only, a launch refused by the memory check keeps waiting, gives up after 72 h; one waiter per tag (the foreground waiter writes its pid too); neither WAIT nor a normal launch starts while a chain of the tag is alive (exit 6) | `run_teachers.sh` | `V4_WAIT_IDLE_MIN=N` (log `teachers_rng2.wait.log`, stop `kill -TERM -- -$(cat <out>/teachers_rng2.wait.pgid)`) |
-| Student's own GT range aux: its B / U (BCE, R2 target rule = its rg_stopped_aware) and D (Huber) on its first 8 unique own-parent rows of the KD set, GT from the batch ref_obj_* / ref_sdf, tokens without GT masked, independent of kd_constraint | `online2._rg_gt_aux` | `ck_e2e2.v4.rg_gt_aux {enabled, lambda 0.5, max_parents 8}` (+ `v4.rg_read`, `v4.rg_stopped_aware`); constraint KD refuses a DET teacher whose B rule differs |
+| Student's own GT range aux: its B / U (BCE, R2 target rule = its rg_stopped_aware) and D (Huber) on its first 8 unique own-parent rows of the KD set, GT from the batch ref_obj_* / ref_sdf, tokens without GT masked, independent of kd_constraint | `online2._rg_gt_aux` | `ck_e2e2.v4.rg_gt_aux {enabled, lambda 0.5, max_parents 8}` (+ `v4.rg_read`, `v4.rg_stopped_aware`); constraint KD refuses teachers whose rg_stopped_aware differs (rg_read may differ) |
 | Selection-evidence evaluation: (i) learned-tube fidelity vs official labels, (ii) criterion S with the LEARNED tube (switch rule, ties in the Phase 0b pool order; deployment blend pool96_old_b1 on ck2T10 for val = Phase 0b, on the ck2T10 + ck2M10 pair for navtest + the ck2T10-only 'Phase 0b convention' rows) + the fraction of the R2 GT-tube gain and of the readout-rule ceiling (the R2 teacher's own rule on the GT fields: rule16 / rule80 of gttube), (iii) fixed-pool critic-only selection vs ck2T10/ck2M10 and v4T10_haz/v4M10_haz; gtcheck = the GT rows without a teacher + the Phase 0b reproduction check (on the held-out set the R2-tube criterion S must equal HO/results.json: a mismatch exits non-zero) | `tools/ck/v4/eval_range_teacher.py` (stages infer / gttube / gtcheck / eval) | -- |
 
 Launch (needs the user's approval; GPUs 0-3):
@@ -140,8 +140,11 @@ Launch (needs the user's approval; GPUs 0-3):
     V4_DRY_RUN=1 READOUT=range R2=1 bash tools/ck/v4/run_teachers.sh both                             # arguments only
 
 Evaluation after the teachers (val decides: DET only, held-out tokens = outside the F1 6,000; navtest reported).
-**No (c) decision rule is registered yet** (V4_3_SPEC.md 'Phase 0b' says only "val decides"): the user fixes it before
-the val infer; until then the eval md marks its numbers descriptive.  Stage infer on CUDA refuses without approval
+**(c) decision rule = the amended P1** (V4_3_SPEC.md 'Phase 1c amendment'): FILTER rule with the learned DET tube
+(NC, TTC) vs the deployment blend (ck2T10) on the registered 12,179 navtrain_val held-out rows; deciding only for the
+registered teacher v4T10_rng2 at --which last with an unchanged checkpoint (else 'report only'; an incomplete deciding
+split exits non-zero after writing its outputs); navtest is report only.  gtcheck prints the GT references (FILTER /
+P1_reference rows, NC-only / TTC-only rows).  Stage infer on CUDA refuses without approval
 (V4_USER_APPROVED=1 or --approved) and on a GPU using >= 1024 MiB (nvidia-smi of CUDA_VISIBLE_DEVICES, one of 0-3):
 
     CUDA_VISIBLE_DEVICES= PYTHONPATH=$PWD OMP_NUM_THREADS=1 nice -n 10 /venv/ssr/bin/python \
@@ -166,6 +169,30 @@ on 24 CPU workers): R2-tube criterion S = Phase 0b exactly (+1.9088 [+1.42, +2.4
 bounds; criterion-1 recalls as HO/summary.md); the readout-rule ceiling +1.91 [+1.43, +2.42], break 34 / 11594, flag
 agreement with the R2 tube TTC 0.9949, joint 0.9961.
 
+### v4_3 student with R2 (tools/ck/e2e2/v4_3_arm.set; prepared, nothing launched)
+
+The student arm is R2 (`v4.rg_read=any4`, `v4.rg_stopped_aware=true`) to match the R2 teachers v4T10_rng2 / v4M10_rng2;
+`occ_channels` stays `B` (spec M6 / user decision; for this pair B is the stopped-aware B on both sides), `BBp` (+ the Bp
+group the student's TTC reads) is the named option.  The teacher training path (range_readout / range_targets / lqr /
+model / train_ck2 / run_teachers.sh) is unchanged.
+
+| Piece | Where | Switch |
+|---|---|---|
+| Computed edits read the fields like the readout: NC on B (the stopped-aware B with R2), TTC on Bp below the 2 m switch and U above (read_geometry ttc_b_chan, the critical read's group picks the window); any4: the tube check / critical reads OR the 2 x 2 cells (hard_evidence read='any4'), the lon target of a critical read = the OR window of its 4 cells and the cut max(0, (jb - 0.5) ds), jb = the lowest of the 4 stations holding a blocked bin. Two differences to the Phase 0b GridTubeR2 critical step (criterion 2 only, informational): it uses the lowest station whether blocked or not (one station, ~1 m, earlier when only the upper one is blocked), and for a TTC delta-0 critical read it takes the window of the stopped-aware B where the edits read Bp (the oracle's own check() reads TTC on the plain not-behind B there, as the edits do). Logged: `v4/edit_clear_frac` = the made edits that read inside the predicted tube | `edits.any4_targets`, `_gather_sources(groups=3)` | `V4Cfg.rg_read` / `rg_stopped_aware` with `edits=computed` (V4Cfg no longer refuses; validate only, same network) |
+| Teacher field groups: `teacher_forward(return_fields=)` / `TeacherPair2.run(fields=)` take True (B \| U, the old dict) or the groups of an occ_channels name; constraint_kd distils group by group (B / BU with the B \| U dict: the old ops bit for bit) | `online2.field_groups`, `kd_constraint_request`, `constraint_kd` | `v4.kd_constraint.occ_channels` B (default) \| BU \| BBp \| all (BBp / all: rg_stopped_aware students only, validate) |
+| One compatibility rule at runtime and launch, same message: both teachers' grid and rg_stopped_aware = the student's, occ_channels' groups on the student and the DET teacher (an R1 student with R2 teachers, the R2 arm with R1 teachers, a mixed R2 DET + R1 MAP pair: refused). rg_read is NOT required to match (the recorded decision of tests/test_v4_r2.py: a read is how a field is consumed, the cells are distilled as cells); requiring it is a user decision not taken (an any4 teacher's B is also shaped by its label BCE through the 2 x 2 OR) | `online2.constraint_teacher_problems` / `CONSTRAINT_REFUSAL`, `check_constraint_teachers`, `launch_util2.kd_constraint_check` (records `student_r2`, each teacher's rg_* and `rg_read_differs`) | `v4.kd_constraint.enabled` |
+
+Verified (CPU, 2026-10-17 KST): with R1 settings (nearest, no Bp) the computed edits are bit-identical to the code
+before the change on 15 scenarios (lon / lat both sides / both, random fields with U != B, the T = 16 x 96 worst case);
+constraint KD B / BU with the B | U teacher dict: values, stats and gradients bit-identical to the code before the
+change (16 random cases).
+tests/test_v4_student_r2.py: synthetic fields where any4 vs nearest and B vs Bp change the edit (any4 target checked
+against executed_slack(read='any4') + range_targets._cells, minimal up to the bisection step), R2 with Bp = B = R1
+bitwise, any4_targets vs hard_evidence on random fields; the R2 student with R2 teachers passes the runtime and launch
+checks and runs a warm-up and an on-policy CPU loss step (constraint KD on, edits of the moving token recorded,
+v4/edit_clear_frac logged); R1 student + R2 teachers refused at launch and at runtime with the same text; a student
+whose rg_read differs from the R2 teachers' (same rg_stopped_aware) accepted at both, rg_read_differs recorded.
+
 ## Not yet done
 
 * Evidence-level KD (DET -> occupancy, MAP -> margin) needs v4 teachers with the evidence readout; KD is still on the
@@ -175,14 +202,13 @@ agreement with the R2 tube TTC 0.9949, joint 0.9961.
   tests/test_v4_model.py).
 * Navtest time-index sidecars (train / val are built: CK/v4/time_idx, 0 consistency violations).
 * v4_3: the range student's own GT field aux is opt-in (`v4.rg_gt_aux`, off in tools/ck/e2e2/v4_3_arm.set: its fields
-  learn from the constraint KD and the label BCE unless it is enabled); `rg_read=any4` and `rg_stopped_aware` are not wired
-  into the computed edits (ck/v4/edits.py reads the nearest cell of the B | U groups; V4Cfg refuses both combinations); launch_util2.kd_constraint_check does not
-  compare the teachers' rg_stopped_aware (the runtime online2.check_constraint_teachers does);
+  learn from the constraint KD and the label BCE unless it is enabled); the computed-edit TTC target is the min arrival
+  over every delta even where only some deltas read the critical group (R1 and R2 alike, edits.py 'Approximations');
   the computed-edit shortlist is critic-only in training and at the dump (the val beta is not known then);
   ck_e2e2.infer_select.edits true selects over 96 + K, but a standard NAVSIM submission still submits
   predictions['trajectory'] (v2's, eval_e2e2 docstring); tools/ck/v4/eval_edits.py does not read edit_valid and
   would treat filler / no-edit slots as candidates (eval_ck2's 96 + K rows are the reference); the constraint KD
-  distils B only (spec M6; `occ_channels=BU` also distils U -- not confirmed by the user).
+  distils B only by default (spec M6; `occ_channels` BU / BBp / all also distil U / Bp -- not confirmed by the user).
 * Review SSR/report 79 (verified 2026-10-16): fixed in v4_2 -- near-stop candidates read station 0 with their dwell
   + feasibility features (F1), `stage_infer_check` / r34 sanity check pass the parents (F2), exact leave-one-out credit
   (F3), evidence bins to 5.0 s (F6), AWR re-score in fp32 after an amp forward (F8), station / evidence aux terms
@@ -197,4 +223,4 @@ agreement with the R2 tube TTC 0.9949, joint 0.9961.
       tests/test_v4_time_idx.py tests/test_v4_eval_edits.py tests/test_v4_corrector_plumbing.py
     # v4_3 (M1-M6): + tests/test_v4_lqr.py tests/test_v4_range_targets.py tests/test_v4_dedupe.py \
     #   tests/test_v4_range_readout.py tests/test_v4_edits.py tests/test_v4_gt_splits.py tests/test_v4_wiring.py
-    # Phase 0b R2 / (c): + tests/test_v4_r2.py tests/test_v4_eval_range_teacher.py
+    # Phase 0b R2 / (c): + tests/test_v4_r2.py tests/test_v4_eval_range_teacher.py tests/test_v4_student_r2.py

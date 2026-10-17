@@ -43,8 +43,12 @@ teachers.json det.temporal + kd_objects recorded and ck2/kd_obj_ok_frac logged w
 refiner v4_3 (tools/ck/e2e2/v4_3_arm.set, ARM=v4_3; arm_of 'v4_3' for a range readout): apply_sets2 declares the
 optional v4 keys a set line names (absent from ck_e2e2.yaml: older arms unchanged); placeholder_check refuses any
 ck_e2e2 value still holding the arm file's /PLACEHOLDER/ (teacher runs / KD calibration files of the range teachers,
-set by the user's E2E_CK_SET file); kd_constraint_check (v4.kd_constraint.enabled) refuses non-range teachers or teachers on
-another grid (corridor version, time bins) than the student and records them as teachers.json 'kd_constraint'.
+set by the user's E2E_CK_SET file); kd_constraint_check (v4.kd_constraint.enabled) refuses non-range teachers, teachers on
+another grid (corridor version, time bins) than the student, teachers whose rg_stopped_aware differs from the student's
+(Phase 0b R2 B semantics: an R2 student needs R2 teachers and vice versa) and an occ_channels group missing on the
+student or the DET teacher -- the runtime rule and message (online2.constraint_teacher_problems / CONSTRAINT_REFUSAL) on
+the runs' config.json -- and records them as teachers.json 'kd_constraint' (rg_read of both sides recorded; it may
+differ, rg_read_differs names the teachers whose read is not the student's).
 """
 from __future__ import annotations
 
@@ -404,8 +408,9 @@ def apply_sets2(ck: Dict[str, Any], sets: Sequence[str]) -> Dict[str, Any]:
 
 
 def placeholder_check(ck: Dict[str, Any]) -> None:
-    """Refuse an effective ck_e2e2 dict that still holds an arm file's PLACEHOLDER value (v4_3_arm.set: the range
-    teacher runs and their KD calibration files are set by the user's E2E_CK_SET file once those teachers exist)."""
+    """Refuse an effective ck_e2e2 dict that still holds an arm file's PLACEHOLDER value (v4_3_arm.set: the KD
+    calibration files of its R2 teachers v4T10_rng2 / v4M10_rng2 are set by the user's E2E_CK_SET file once those
+    teachers exist; the teacher runs themselves are named and refused by teacher_check until they have finished)."""
     kc_on = str((ck.get("kd_calib") or {}).get("enabled", True)).lower() in ("true", "1")
     bad = [k for k, v in LU.flatten(ck) if isinstance(v, str) and PLACEHOLDER in v
            and (kc_on or not k.startswith("kd_calib."))]               # unused calibration paths when it is off
@@ -417,15 +422,23 @@ def placeholder_check(ck: Dict[str, Any]) -> None:
 
 def kd_constraint_check(c) -> Dict[str, Any]:
     """refiner v4_3 constraint KD (ck_e2e2.v4.kd_constraint.enabled; {} when off): both teacher runs must have the 'range'
-    readout (config.json v4) on the student's grid -- corridor_version, ev_tbins and ev_tbin_s equal (the fields are
-    distilled cell by cell) -- else LaunchError.  -> record (teachers.json 'kd_constraint')."""
+    readout (config.json v4), and the runtime rule online2.constraint_teacher_problems must hold on their config.json:
+    the student's grid (corridor_version, ev_tbins, ev_tbin_s: the fields are distilled cell by cell), the student's
+    B semantics (rg_stopped_aware) on both teachers, occ_channels' groups on the student and the DET teacher -- else
+    LaunchError with the runtime message (online2.CONSTRAINT_REFUSAL + the mismatches, the text
+    online2.check_constraint_teachers raises when the teachers are loaded).  rg_read is not part of the rule (the
+    recorded v4_3 decision, constraint_teacher_problems): recorded per side, rg_read_differs = the teachers whose read
+    is not the student's.  -> record (teachers.json 'kd_constraint')."""
     if not c.kd_constraint["enabled"]:
         return {}
+    from navsim.agents.para_ssr.ck.online2 import CONSTRAINT_REFUSAL, constraint_teacher_problems
     from navsim.agents.para_ssr.ck.v4.config import V4Cfg
     sn = c.v4_net()
     want = {"corridor_version": int(c.v4["corridor_version"]), "ev_tbins": int(sn.ev_tbins),
             "ev_tbin_s": float(sn.ev_tbin_s)}
-    rec: Dict[str, Any] = {"cfg": dict(c.kd_constraint), "student_grid": want}
+    rec: Dict[str, Any] = {"cfg": dict(c.kd_constraint), "student_grid": want,
+                           "student_r2": {"rg_read": str(sn.rg_read), "rg_stopped_aware": bool(sn.rg_stopped_aware)}}
+    tlist = []
     for name, run in (("det", c.teacher_det_run), ("map", c.teacher_map_run)):
         cfg = json.loads((Path(run) / "config.json").read_text())
         try:
@@ -437,10 +450,13 @@ def kd_constraint_check(c) -> Dict[str, Any]:
         if not v4.range:
             raise LaunchError(f"teacher {name} {run}: v4.readout {v4.readout!r}; ck_e2e2.v4.kd_constraint needs range "
                               f"teachers (train_ck2.py --v4-readout range, tools/ck/v4/run_teachers.sh READOUT=range)")
-        if got != want:
-            raise LaunchError(f"teacher {name} {run}: grid {got} != the student's {want} (constraint KD distils the "
-                              f"fields cell by cell)")
-        rec[name] = dict(got, readout=v4.readout, exec_model=v4.exec_model)
+        tlist.append((name, run, v4, got["corridor_version"]))
+        rec[name] = dict(got, readout=v4.readout, exec_model=v4.exec_model, rg_read=str(v4.rg_read),
+                         rg_stopped_aware=bool(v4.rg_stopped_aware))
+    bad = constraint_teacher_problems(sn, want["corridor_version"], str(c.kd_constraint["occ_channels"]), tlist)
+    if bad:
+        raise LaunchError(CONSTRAINT_REFUSAL + "; ".join(bad))
+    rec["rg_read_differs"] = [n for n, _, v4, _ in tlist if str(v4.rg_read) != str(sn.rg_read)]
     return rec
 
 

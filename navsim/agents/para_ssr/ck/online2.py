@@ -70,7 +70,8 @@ refiner v4_3 (docs/refiner_v4/V4_3_SPEC.md M5 / M6; every option OFF by default 
     gate; ck2_edit_valid False for filler slots and, without the corrector, for no-edit slots: kind 0 = the source
     column bitwise); on-policy steps record the edits of the KD set (computed_edits_rec, same validity rule) in the rec2
     edit block, labeler2 labels them with the 96, and LabelStore2(with_edits) puts them in the next epochs' BCE label
-    set (as the corrector's edits; the AWR term only with v4.corrector);
+    set (as the corrector's edits; the AWR term only with v4.corrector); logs v4/edit_rec_{valid,lon,lat,both}_frac and
+    v4/edit_clear_frac (the made edits that read inside the predicted tube);
   infer_select.edits (optional; required when the student emits edits): true = ck2_traj / ck2_sel_idx over the 96 + K
     (select96_edits = eval_ck2's 96 + K rule; an edit pick is the edit itself, no lateral head), false = the 96 only;
   v4.kd_score_scope 'near': NC score KD only on tokens whose nearest lead (lead_ttc0) has ttc0 < NEAR_TTC_S, DAC score KD
@@ -78,13 +79,16 @@ refiner v4_3 (docs/refiner_v4/V4_3_SPEC.md M5 / M6; every option OFF by default 
     (tokens without GT excluded; a batch without the ref_* keys is a ValueError); other KD keys unrestricted
     (score_kd_near: each key's KL is the mean over its own mask, so the per-candidate NC / DAC weight is ~1 / (near
     fraction) times the 'all' weight while each key's total weight stays lambda_kd_score / n_keys);
-  v4.kd_constraint: + r * (lambda_occ * BCE(student B, sigmoid(DET teacher B)) (occ_channels 'BU': + the U channel) +
-    lambda_margin * Huber(student D, MAP teacher D) on s <= map_range_m) on the student's unique parents of the KD set
-    (constraint_kd), teacher fields
-    from TeacherPair2.run(fields=True) (range teachers on the student's grid only, check_constraint_teachers);
+  v4.kd_constraint: + r * (lambda_occ * BCE(student B, sigmoid(DET teacher B)) (occ_channels 'BU': + the U channel,
+    'BBp': + the Bp channel (R2 only), 'all': B, U, Bp) + lambda_margin * Huber(student D, MAP teacher D) on
+    s <= map_range_m) on the student's unique parents of the KD set (constraint_kd), teacher fields from
+    TeacherPair2.run(fields=kd_constraint_request(occ_channels)) (the requested groups; range teachers on the student's
+    grid with the student's rg_stopped_aware only -- rg_read may differ, recorded at launch: check_constraint_teachers
+    at runtime, the same rule and message at launch, launch_util2.kd_constraint_check);
   v4.rg_read / v4.rg_stopped_aware (Phase 0b R2): V4Cfg keys of the student's range readout (any4 read; the B target
-    rule of its GT field aux + the Bp group that its TTC reads (V4Cfg docstring), also checked against the DET
-    teacher's for the constraint KD, which distils the B (| U) groups);
+    rule of its GT field aux + the Bp group that its TTC reads (V4Cfg docstring); the computed edits read the same way,
+    ck/v4/edits.py); rg_stopped_aware is also required of both teachers for the constraint KD (an R2 student with R2
+    teachers distils the stopped-aware B as B), rg_read is not (how a field is read, not what a cell holds);
   v4.rg_gt_aux {enabled, lambda, max_parents}: + lambda * (BCE(student B / U (/ Bp), GT) + Huber(student D, GT SDF)) on the
     student's first max_parents unique own-parent rows of the KD set (range_targets.gt_field_aux, the range teachers'
     aux), GT computed online from the batch's ref_obj_* / ref_sdf: a training TARGET only (never an input), tokens
@@ -204,12 +208,15 @@ V4_NET_OPT_KEYS = ("exec_model", "ev_tbins", "ev_tbin_s", "ep_evidence", "vmax",
 
 def _d_kd_constraint() -> Dict[str, Any]:
     # refiner v4_3 M6 constraint KD (docs/refiner_v4/V4_3_SPEC.md; constraint_kd), ck_e2e2.v4.kd_constraint: the DET
-    # teacher's blocked field (sigmoid of its range logits; occ_channels 'B' = the not-behind channel only = spec M6
-    # "DET B BCE", the default; 'BU' = + the TTC overlap channel U, an unconfirmed option: with 'B' the student's U,
-    # read by its TTC key and by the edits' TTC windows, learns from the TTC label BCE only) -> the student's logits,
-    # BCE (lambda_occ), and the MAP teacher's margin D -> the student's D, Huber (lambda_margin) on the stations
-    # s <= map_range_m (the ReSMap BEV's front reach), both on the student's unique parents of the KD set and masked by
-    # the teacher's per-token ok.  enabled false = no term (old KD exactly).
+    # teacher's blocked field groups (sigmoid of its range logits; occ_channels = CN_GROUPS: 'B' = the B channel only =
+    # spec M6 "DET B BCE", the default (the stopped-aware B for an R2 student / teacher pair, the plain not-behind B
+    # otherwise); 'BU' = + the TTC overlap channel U; 'BBp' = + the plain not-behind Bp that an R2 readout's TTC reads
+    # below the 2 m switch (rg_stopped_aware students only); 'all' = B, U, Bp (R2 only).  Options beyond 'B' are not
+    # confirmed by the user: with 'B' the student's U (/ Bp), read by its TTC key and by the edits' TTC windows, learns
+    # from the TTC label BCE (and rg_gt_aux) only) -> the student's logits, BCE (lambda_occ), and the MAP teacher's
+    # margin D -> the student's D, Huber (lambda_margin) on the stations s <= map_range_m (the ReSMap BEV's front
+    # reach), both on the student's unique parents of the KD set and masked by the teacher's per-token ok.  enabled
+    # false = no term (old KD exactly).
     return {"enabled": False, "lambda_occ": 0.5, "lambda_margin": 0.5, "map_range_m": 32.0, "occ_channels": "B"}
 
 
@@ -224,7 +231,12 @@ def _d_rg_gt_aux() -> Dict[str, Any]:
 
 
 KD_SCORE_SCOPES = ("all", "near")
-OCC_CHANNELS = ("B", "BU")
+# constraint KD field groups (kd_constraint.occ_channels -> the distilled groups, in this order); a range net's groups:
+# B (occ_logit_u; the stopped-aware B with rg_stopped_aware), U (ovl_logit_u), Bp (bp_logit_u, rg_stopped_aware only)
+CN_GROUPS = {"B": ("B",), "BU": ("B", "U"), "BBp": ("B", "Bp"), "all": ("B", "U", "Bp")}
+OCC_CHANNELS = tuple(CN_GROUPS)
+FIELD_GROUP_KEY = {"B": "occ_logit_u", "U": "ovl_logit_u", "Bp": "bp_logit_u"}    # score_set haz key of each group
+FIELDS_TRUE = ("B", "U")           # teacher_forward(return_fields=True) / run(fields=True): the original B | U dict
 NEAR_TTC_S = 4.0                   # [s] kd_score_scope 'near': NC KD where the nearest lead's ttc0 < this
 NEAR_SDF_M = 1.0                   # [m] kd_score_scope 'near': DAC KD where the parent's min executed corner SDF < this
 # the targets kd_score_scope 'near' reads (lead_ttc0 + parent_min_corner_sdf); absent -> ValueError (_near_scope)
@@ -608,6 +620,9 @@ class CKE2E2Config:
             if kq["occ_channels"] not in OCC_CHANNELS:
                 raise ValueError(f"ck_e2e2.v4.kd_constraint.occ_channels must be one of {OCC_CHANNELS}, got "
                                  f"{kq['occ_channels']!r}")
+            if "Bp" in CN_GROUPS[kq["occ_channels"]] and not _b(self.v4_opt("rg_stopped_aware")):
+                raise ValueError(f"ck_e2e2.v4.kd_constraint.occ_channels {kq['occ_channels']!r} distils the Bp group: "
+                                 f"R2 only (needs v4.rg_stopped_aware true; 'B' / 'BU' otherwise)")
         gq = self.rg_gt_aux
         if gq["enabled"]:
             if q["readout"] != "range":
@@ -840,17 +855,42 @@ def is_range_net(net) -> bool:
     return getattr(net, "v4_readout", None) is not None and v4 is not None and bool(getattr(v4, "range", False))
 
 
+def net_field_groups(v4) -> Tuple[str, ...]:
+    """the blocked-field groups a range readout of V4Cfg v4 outputs: B, U (+ Bp with rg_stopped_aware)."""
+    return ("B", "U", "Bp") if bool(getattr(v4, "rg_stopped_aware", False)) else ("B", "U")
+
+
+def field_groups(spec) -> Tuple[str, ...]:
+    """A teacher field request (teacher_forward return_fields / TeacherPair2.run fields) -> the group names in order:
+    True = FIELDS_TRUE ('B', 'U': the original dict), an occ_channels name (CN_GROUPS: 'B' / 'BU' / 'BBp' / 'all') or
+    a sequence of distinct 'B' / 'U' / 'Bp' (ValueError otherwise)."""
+    if spec is True:
+        return FIELDS_TRUE
+    if isinstance(spec, str):
+        if spec not in CN_GROUPS:
+            raise ValueError(f"field groups {spec!r} not in {OCC_CHANNELS}")
+        return CN_GROUPS[spec]
+    g = tuple(str(x) for x in spec)
+    if not g or len(set(g)) != len(g) or any(x not in FIELD_GROUP_KEY for x in g):
+        raise ValueError(f"field groups {spec!r}: distinct names of {tuple(FIELD_GROUP_KEY)}")
+    return g
+
+
 def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optional[Dict[str, torch.Tensor]] = None,
-                    parents: Optional[torch.Tensor] = None, return_fields: bool = False):
+                    parents: Optional[torch.Tensor] = None, return_fields=False):
     """The KD teacher ops under the caller's autocast / no_grad: trunk.scene once, trunk.candidates on `cand`, score
     -> (score logits [B,K,5] f32, w_lat [B,K,6]).  A temporal teacher (net.temporal, refiner-v3) additionally runs
     TemporalBranch.scene(objs) once and binds its hook to this candidate set -- the order and ops of
     CKNet.forward(bev, cand, status, decode=False, objs=objs) (train_ck2.forward / infer_val_v3).  objs must be given
     iff the teacher has a temporal branch (ValueError otherwise: a silently dropped branch / stray input).
-    return_fields (refiner v4_3 constraint KD; range teachers only, ValueError otherwise) -> (score, w_lat, fields):
-    fields = {blk_u [B, U, 48, 17, 2M] f32 (B | U logits of the teacher's unique parents of `cand`), margin_u
-    [B, U, 48, 17] (m), parent_index [B, K] (candidate -> row), s_u [B, U, 48] (station arc lengths, m)} of the same
-    score_set (scores unchanged by the extra outputs)."""
+    return_fields (refiner v4_3 constraint KD; range teachers only, ValueError otherwise): True (the B | U groups, the
+    original dict), an occ_channels name ('B' / 'BU' / 'BBp' / 'all') or a sequence of group names (field_groups;
+    'Bp' only from an rg_stopped_aware teacher, ValueError otherwise) -> (score, w_lat, fields): fields = {blk_u
+    [B, U, 48, 17, G M] f32 (the requested groups' logits of the teacher's unique parents of `cand`, concatenated in
+    the request's order: B = occ_logit_u (the teacher's own B: the stopped-aware one with rg_stopped_aware), U =
+    ovl_logit_u, Bp = bp_logit_u), groups (the G names, that order), margin_u [B, U, 48, 17] (m), parent_index [B, K]
+    (candidate -> row), s_u [B, U, 48] (station arc lengths, m)} of the same score_set (scores unchanged by the extra
+    outputs)."""
     B, K = cand.shape[:2]
     temporal = getattr(net, "temporal", None)
     if temporal is None and objs is not None:
@@ -861,6 +901,12 @@ def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optio
         raise ValueError("teacher_forward: range fields requested from a teacher without the v4_3 'range' readout "
                          f"(v4.readout {getattr(getattr(net, 'v4', None), 'readout', 'mean')!r}): constraint KD "
                          "needs range teachers")
+    groups = field_groups(return_fields) if return_fields else None
+    if groups is not None:
+        miss = [g for g in groups if g not in net_field_groups(net.v4)]
+        if miss:
+            raise ValueError(f"teacher_forward: field group(s) {miss} requested from a teacher with the groups "
+                             f"{net_field_groups(net.v4)} (Bp: rg_stopped_aware teachers only)")
     feat, mem = net.trunk.scene(bev, B)
     if getattr(net, "v4_readout", None) is not None:    # refiner v4 teacher: hazard readout on the parents' corridors
         kw = {"return_pctx": True} if return_fields else {}
@@ -869,7 +915,7 @@ def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optio
             return o["score_logit"], o["w_lat"]
         h = o["haz"]
         U = h["occ_logit_u"].shape[1]
-        fields = {"blk_u": torch.cat([h["occ_logit_u"], h["ovl_logit_u"]], -1).float(),
+        fields = {"blk_u": torch.cat([h[FIELD_GROUP_KEY[g]] for g in groups], -1).float(), "groups": groups,
                   "margin_u": h["margin_u"].float(), "parent_index": o["parent_index"].long(),
                   "s_u": o["pctx"]["rg_frame"]["s"].float().reshape(B, U, -1)}
         return o["score_logit"], o["w_lat"], fields
@@ -946,7 +992,8 @@ class TeacherPair2:
     obj_ok_det=) is then required (teacher_forward; kd_obj_ok False -> ok False for the token); self.temporal_info
     records the cfg and the forecaster / branch state sha16 (None for a CK2 teacher).
     fields (refiner v4_3 constraint KD; default False = the old object): both teachers must have the 'range' readout
-    (ValueError otherwise) and run(..., fields=True) also returns their B / U / D fields (teacher_forward)."""
+    (ValueError otherwise) and run(..., fields=True | groups) also returns their blocked-field groups (True: B | U, or
+    the requested ones) and D fields (teacher_forward return_fields)."""
 
     def __init__(self, det_run: str, map_run: str, which: str = "last", device="cpu", amp: bool = True,
                  require_done: bool = True, ep_target: Optional[str] = None,
@@ -1048,7 +1095,7 @@ class TeacherPair2:
     @torch.no_grad()
     def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None, objs_det=None,
             obj_ok_det=None, parents: Optional[torch.Tensor] = None,
-            family: Optional[torch.Tensor] = None, fields: bool = False) -> Dict[str, torch.Tensor]:
+            family: Optional[torch.Tensor] = None, fields=False) -> Dict[str, torch.Tensor]:
         """bev_* [B, 256, 50, 100] (f16 cache), ok_* [B], cand [B, K, 8, 3] (finite), status [B, 8], cand_ok [B, K]
         -> kd_score_prob f32 [B,K,5] (combine_teacher: nc/ttc DET, dac MAP, ep/comfort mean), kd_e_lat f32 [B,K,6]
         = 0.5 (e_DET + e_MAP) (decode z_lon = 0, slope 0), kd_ok bool [B,K] = DET ok & MAP ok (per token) & finite
@@ -1058,10 +1105,12 @@ class TeacherPair2:
         Temporal DET teacher only (self.det_temporal): objs_det = {obj_in [B,3,96,17], obj_mask [B,3,96], frame_valid
         [B,3]} (kd_objs_of: exactly OBJ_INPUT_KEYS) and obj_ok_det [B] are required; DET ok = ok_det & obj_ok_det.
         A CK2 DET teacher: both must be None (the old path, bit for bit).
-        fields (refiner v4_3 constraint KD; the pair must be built with fields=True): + fields_det / fields_map
-        (teacher_forward fields of the parents of `cand`; from the same forward, the scores are unchanged) and the
-        per-token teacher ok ok_det_tok / ok_map_tok [B] (ok_det / ok_map as passed & finite fields; the temporal
-        object-row ok never applies: range teachers have no temporal branch, is_range_net)."""
+        fields (refiner v4_3 constraint KD; the pair must be built with fields=True): True (the B | U groups) or the
+        requested groups (an occ_channels name / group names, field_groups; the same request to both teachers) ->
+        + fields_det / fields_map (teacher_forward fields of the parents of `cand`, with their 'groups'; from the same
+        forward, the scores are unchanged) and the per-token teacher ok ok_det_tok / ok_map_tok [B] (ok_det / ok_map
+        as passed & finite returned fields; the temporal object-row ok never applies: range teachers have no temporal
+        branch, is_range_net)."""
         from ..refiner.e2e import ego_inputs
         from .kd import combine_teacher
 
@@ -1087,7 +1136,7 @@ class TeacherPair2:
             with ac:
                 r = teacher_forward(net, bev.to(dev).float(), cand, ego, objs,
                                     None if parents is None else parents.detach().float().to(dev),
-                                    **({"return_fields": True} if fields else {}))
+                                    **({"return_fields": fields} if fields else {}))
             logits.append(r[0].float())
             ws.append(r[1].float())
             if fields:
@@ -1196,24 +1245,64 @@ def _dist_mean_many(xs: Sequence[float], device) -> List[float]:
 
 
 # ----------------------------------------------------------------------------------------------- refiner v4_3 M6
-def check_constraint_teachers(tp: "TeacherPair2", cfg: CKE2E2Config) -> None:
-    """Constraint KD reads the teachers' fields cell by cell on the student's parent grid: both teachers must use the
-    student's corridor version (the grid geometry) and its time bins (ev_tbins x ev_tbin_s), and the DET teacher's B
-    must mean what the student's own B means (V4Cfg.rg_stopped_aware: the stopped-aware B of Phase 0b R2 or the plain
-    not-behind B; the student's rg_gt_aux trains B with the same rule) -> ValueError otherwise.  rg_read (how a net
-    reads its fields) is not a field property and may differ."""
-    sn = cfg.v4_net()
-    want = (int(cfg.v4["corridor_version"]), int(sn.ev_tbins), float(sn.ev_tbin_s))
-    bad = []
-    for name, net in (("det", tp.det), ("map", tp.map)):
-        got = (int(net.corridor_version), int(net.v4.ev_tbins), float(net.v4.ev_tbin_s))
+def kd_constraint_request(occ_channels: str):
+    """TeacherPair2.run's fields request for occ_channels: True (the original B | U dict; constraint_kd then runs the
+    original ops bit for bit) for 'B' / 'BU', else the occ_channels name (its groups, field_groups)."""
+    return True if CN_GROUPS[str(occ_channels)] in (("B",), FIELDS_TRUE) else str(occ_channels)
+
+
+CONSTRAINT_REFUSAL = ("constraint KD refused (the teachers' fields are distilled cell by cell: their geometry, time "
+                      "bins and B semantics must be the student's): ")
+
+
+def constraint_teacher_problems(sn, student_cv: int, occ_channels: str,
+                                teachers: Sequence[Tuple[str, str, Any, int]]) -> List[str]:
+    """The constraint-KD compatibility rule, shared by the runtime check (check_constraint_teachers, the loaded nets) and
+    the launch check (tools/ck/e2e2/launch_util2.kd_constraint_check, the runs' config.json): sn = the student's V4Cfg,
+    student_cv its corridor version, occ_channels the distilled groups (CN_GROUPS), teachers = [(name 'det' | 'map',
+    run, V4Cfg, corridor_version)] -> the mismatches ([] = compatible), each naming the teacher:
+      * grid: corridor version (the grid geometry) and time bins (ev_tbins x ev_tbin_s) of every teacher = the
+        student's;
+      * B semantics: rg_stopped_aware of every teacher = the student's (B = the stopped-aware B of Phase 0b R2 on both
+        sides, or the plain not-behind B on both; the student's rg_gt_aux trains B with its own rule);
+      * NOT rg_read (the recorded v4_3 decision, tests/test_v4_r2.py::test_constraint_teachers_b_semantics_check: the
+        read is how the net consumes a field, not what a cell holds; the cells are distilled as cells, so a teacher's
+        read may differ from the student's -- launch_util2.kd_constraint_check records both sides' rg_read.  Caveat:
+        a teacher's B is also shaped by its label / station BCE through its own read (any4: the 2 x 2 OR), so its
+        cells are not only its GT field target; requiring the same read is a user decision, not taken);
+      * groups: occ_channels' groups exist on the student and on the DET teacher (Bp: rg_stopped_aware only)."""
+    want = (int(student_cv), int(sn.ev_tbins), float(sn.ev_tbin_s))
+    bad: List[str] = []
+    groups = CN_GROUPS.get(str(occ_channels))
+    if groups is None:
+        bad.append(f"occ_channels {occ_channels!r} not in {OCC_CHANNELS}")
+    elif any(g not in net_field_groups(sn) for g in groups):
+        bad.append(f"student: occ_channels {occ_channels!r} distils {list(groups)}, the student's fields are "
+                   f"{list(net_field_groups(sn))} (Bp: rg_stopped_aware only)")
+    for name, run, tv, tcv in teachers:
+        got = (int(tcv), int(tv.ev_tbins), float(tv.ev_tbin_s))
         if got != want:
-            bad.append(f"{name} {tp.runs[name]}: corridor_version / ev_tbins / ev_tbin_s {got} != the student's {want}")
-    if bool(tp.det.v4.rg_stopped_aware) != bool(sn.rg_stopped_aware):
-        bad.append(f"det {tp.runs['det']}: rg_stopped_aware {bool(tp.det.v4.rg_stopped_aware)} != the student's "
-                   f"{bool(sn.rg_stopped_aware)} (B semantics)")
+            bad.append(f"{name} {run}: grid (corridor_version, ev_tbins, ev_tbin_s) {got} != the student's {want}")
+        if bool(tv.rg_stopped_aware) != bool(sn.rg_stopped_aware):
+            bad.append(f"{name} {run}: rg_stopped_aware {bool(tv.rg_stopped_aware)} != the student's "
+                       f"{bool(sn.rg_stopped_aware)} (B semantics: the R2 stopped-aware B vs the plain not-behind B)")
+        if name == "det" and groups is not None and any(g not in net_field_groups(tv) for g in groups):
+            bad.append(f"{name} {run}: occ_channels {occ_channels!r} distils {list(groups)}, the teacher's fields are "
+                       f"{list(net_field_groups(tv))} (Bp: rg_stopped_aware only)")
+    return bad
+
+
+def check_constraint_teachers(tp: "TeacherPair2", cfg: CKE2E2Config) -> None:
+    """Constraint KD reads the teachers' fields cell by cell on the student's parent grid: constraint_teacher_problems
+    on the loaded nets (grid and rg_stopped_aware of both teachers = the student's, occ_channels' groups on the student
+    and the DET teacher; rg_read may differ) -> ValueError (CONSTRAINT_REFUSAL + the mismatches) otherwise.  For an R2
+    student with R2 teachers the distilled B is the stopped-aware B on both sides."""
+    bad = constraint_teacher_problems(cfg.v4_net(), int(cfg.v4["corridor_version"]),
+                                      str(cfg.kd_constraint["occ_channels"]),
+                                      [(name, tp.runs[name], net.v4, int(net.corridor_version))
+                                       for name, net in (("det", tp.det), ("map", tp.map))])
     if bad:
-        raise ValueError("constraint KD: teacher fields on another grid than the student's: " + "; ".join(bad))
+        raise ValueError(CONSTRAINT_REFUSAL + "; ".join(bad))
 
 
 def parent_rows(pidx_s: torch.Tensor, m: torch.Tensor, U: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1230,14 +1319,17 @@ def parent_rows(pidx_s: torch.Tensor, m: torch.Tensor, U: int) -> Tuple[torch.Te
 def constraint_kd(haz: Dict[str, torch.Tensor], T: Dict[str, torch.Tensor], cand_ok: torch.Tensor,
                   kc: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """refiner v4_3 M6 constraint KD (spec V4_3 M6; ck_e2e2.kd_constraint) on the student's unique parents of the KD set.
-    haz = the student's split_haz of the KD set (range readout: occ_logit_u / ovl_logit_u [B, U, 48, 17, M], margin_u
-    [B, U, 48, 17] (m) per parent row, parent_index [B, K]); T = TeacherPair2.run(..., fields=True) on the same KD
-    candidates and parents (fields_det / fields_map with their own parent_index, ok_det_tok / ok_map_tok [B]); cand_ok
-    [B, K] the counted KD candidates.  Row pairing: student row u <- its first counted candidate k <- the teacher's row
-    parent_index_t[k] (the same parent draft, bitwise; each teacher deduplicated it on its own).
+    haz = the student's split_haz of the KD set (range readout: occ_logit_u / ovl_logit_u (/ bp_logit_u with
+    rg_stopped_aware) [B, U, 48, 17, M], margin_u [B, U, 48, 17] (m) per parent row, parent_index [B, K]); T =
+    TeacherPair2.run(..., fields=<occ_channels> | True) on the same KD candidates and parents (fields_det / fields_map
+    with their own parent_index and 'groups' (absent = ('B', 'U'), the fields=True dict), ok_det_tok / ok_map_tok
+    [B]); cand_ok [B, K] the counted KD candidates.  Row pairing: student row u <- its first counted candidate k <- the
+    teacher's row parent_index_t[k] (the same parent draft, bitwise; each teacher deduplicated it on its own).
       occ:    BCE(student logits, sigmoid(DET teacher logits)) - H(target) (= the Bernoulli KL, gradient of the BCE) over
-              every cell and bin of channels occ_channels ('B' the not-behind channel, 'BU' + the TTC overlap channel),
-              mean over the rows of DET-ok tokens;
+              every cell and bin of the groups CN_GROUPS[occ_channels] ('B' the B channel -- the stopped-aware B of an
+              R2 pair --, 'BU' + the TTC overlap channel U, 'BBp' + the plain not-behind Bp, 'all' B, U, Bp; each group
+              student <- the same group of the teacher), mean over the rows of DET-ok tokens (ValueError if a group is
+              missing on either side);
       margin: Huber(student D, MAP teacher D clipped +-CK_MARGIN_CLIP m, delta 1 m) over the cells of stations
               s_j <= map_range_m (the teacher row's arc lengths), MAP-ok tokens.
     -> (l_occ, l_margin, stats); zeros (graph-connected) when nothing is selected.  BCE / Huber only (no ranking or
@@ -1263,10 +1355,23 @@ def constraint_kd(haz: Dict[str, torch.Tensor], T: Dict[str, torch.Tensor], cand
             continue
         ut = f["parent_index"].long().to(dev)[b, rep[b, u]]                       # the teacher's row of the same parent
         if name == "det":
-            s_log = torch.cat([Bo[b, u], Bu[b, u]], -1).float()                    # [P, 48, 17, 2M]
-            t_log = f["blk_u"].to(dev)[b, ut].float()
-            if kc["occ_channels"] == "B":
-                s_log, t_log = s_log[..., :M], t_log[..., :M]
+            want = CN_GROUPS[str(kc["occ_channels"])]
+            tg = tuple(f.get("groups", FIELDS_TRUE))                              # the teacher's returned groups
+            miss = ([f"student {g}" for g in want if FIELD_GROUP_KEY[g] not in haz]
+                    + [f"teacher {g}" for g in want if g not in tg])
+            if miss:
+                raise ValueError(f"constraint_kd: occ_channels {kc['occ_channels']!r} needs the groups {list(want)}; "
+                                 f"missing {miss} (teacher fields {list(tg)})")
+            if tg == FIELDS_TRUE and want in (("B",), FIELDS_TRUE):   # B | U teacher dict: the original ops, bitwise
+                s_log = torch.cat([Bo[b, u], Bu[b, u]], -1).float()                # [P, 48, 17, 2M]
+                t_log = f["blk_u"].to(dev)[b, ut].float()
+                if want == ("B",):
+                    s_log, t_log = s_log[..., :M], t_log[..., :M]
+            else:                                                       # any other request: group by group
+                s_log = torch.cat([haz[FIELD_GROUP_KEY[g]][b, u] for g in want], -1).float()   # [P, 48, 17, G M]
+                t_all = f["blk_u"].to(dev)[b, ut].float()
+                t_log = t_all if tg == want else torch.cat([t_all[..., tg.index(g) * M:(tg.index(g) + 1) * M]
+                                                            for g in want], -1)
             p = torch.sigmoid(t_log).detach()
             per = F.binary_cross_entropy_with_logits(s_log, p, reduction="none") - bernoulli_entropy(p)
             out.append(per.mean())
@@ -1736,7 +1841,7 @@ class CKE2E2:
         if getattr(student, "corrector", None) is None:
             valid = valid & (ce["edit_kind"] > 0)
         return {"traj": traj.detach(), "src": torch.gather(S["kd_col96"], 1, ce["src_idx"]), "u": ce["u"].detach(),
-                "valid": valid, "kind": ce["edit_kind"]}
+                "valid": valid, "kind": ce["edit_kind"], "clear": ce["edit_clear"]}
 
     # -------------------------------------------------------------------------------------- refiner v4_3 KD scope
     @staticmethod
@@ -2002,7 +2107,7 @@ class CKE2E2:
             objs_det, obj_ok_det = kd_objs_of(targets, dev)
             tkw = {"objs_det": objs_det, "obj_ok_det": obj_ok_det}
         if c.kd_constraint["enabled"]:                  # refiner v4_3 constraint KD: the teachers' range fields
-            tkw["fields"] = True
+            tkw["fields"] = kd_constraint_request(c.kd_constraint["occ_channels"])
         T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
                    cand_ok=S["cand_ok"], parents=S.get("cand_parent"), family=S.get("vtype_kd"), **tkw)
         t_teacher = time.time() - tt
@@ -2021,10 +2126,14 @@ class CKE2E2:
             ed = (self.computed_edits_rec(student, out, S, s_kd) if computed
                   else self.corrector_edits(student, out, S, s_kd))
             if ed is not None and "kind" in ed:
-                kd_ = ed.pop("kind")
+                kd_, cl_ = ed.pop("kind"), ed.pop("clear")
                 logs["v4/edit_rec_valid_frac"] = float(ed["valid"].float().mean())
                 for code, nm in ((1, "lon"), (2, "lat"), (3, "both")):
                     logs[f"v4/edit_rec_{nm}_frac"] = float((kd_ == code).float().mean())
+                # the computed edits (kind > 0) whose edit reads inside the predicted tube (NC, TTC, DAC; edits.py
+                # edit_clear) -- noisy predicted fields can leave many outside (0 when no edit was made)
+                ek = kd_ > 0
+                logs["v4/edit_clear_frac"] = float(cl_[ek].float().mean()) if bool(ek.any()) else 0.0
             n_rec = self.recorder.add(rows, V["traj96"], V["valid96"], top["idx"], top["final"], v0v, self.gstep,
                                       edits=ed)
             self.cum["rec_tokens"] += n_rec

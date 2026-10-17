@@ -1,11 +1,17 @@
-"""tools/ck/v4/eval_range_teacher.py (refiner v4_3 (c): range teachers as selection evidence): the criterion S switch
-rule (pool-order ties = Phase 0b) and its numbers, the fidelity / bootstrap helpers, the pair key rule, the blend
-critics, the Phase 0b R2 GT tube (bitwise equal to tools/ck/v4/oracle/oracle_common.grid_eval 'grid stopped-aware NC +
-read any4' on the same states; the LQR states from the packed status vs the official F1 states) and the readout-rule
-tube, the --gt-tube rules (gttube refuses it; eval reads it read-only after the meta / shape checks), the Phase 0b
-reproduction check logic, the CUDA guard of stage infer (approval, busy GPU; no GPU is touched), and a CPU smoke of
-every stage on a few real navtest / navtrain_val tokens with randomly initialised R2 range teachers saved to a scratch
-dir (MAP refused on val, non-range teachers refused).
+"""tools/ck/v4/eval_range_teacher.py (refiner v4_3 (c): range teachers as selection evidence): the amended Phase 1c P1
+decision (FILTER rule rows; p1_decide PASS / FAIL by (a), (b), (c) / VOID on synthetic arrays, the inclusive bars, the
+deciding block = val held-out + ck2T10 only, the md decision lines; the P1 gate: the registered token set
+(HO/prep/ho_rows.npy, per-input counts of removed rows), the registered teacher / unchanged checkpoint, the GT tube, and
+stage eval on the deciding split with fake v4T10_rng2 outputs: half done -> report only + non-zero exit), the resume
+refusal of stage infer (another checkpoint / which, done rows without infer_meta.json), the descriptive NC only / TTC
+only filter rows, the old criterion S switch rule (pool-order ties = Phase 0b) and its numbers, the fidelity / bootstrap
+helpers, the pair key rule, the blend critics, the Phase 0b R2 GT tube (bitwise equal to
+tools/ck/v4/oracle/oracle_common.grid_eval 'grid stopped-aware NC + read any4' on the same states; the LQR states from
+the packed status vs the official F1 states) and the readout-rule tube, the --gt-tube rules (gttube refuses it; eval
+reads it read-only after the meta / shape checks), the Phase 0b reproduction check logic (switch and filter rows), --tag
+report names, the CUDA guard of stage infer (approval, busy GPU; no GPU is touched), and a CPU smoke of every stage on a
+few real navtest / navtrain_val tokens with randomly initialised R2 range teachers saved to a scratch dir (MAP refused
+on val, non-range teachers refused).
 CPU only:
 
   cd /workspace/yongjae/SSR-v4 && nice -n 10 env PYTHONPATH=$PWD OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
@@ -116,6 +122,313 @@ def test_criterion_s_numbers_and_break():
     assert row["break_"] == pytest.approx(0.5)                               # tokens 1, 2 pass the blend; 2 breaks
     assert (row["break_n"], row["break_den"]) == (1, 2)
     assert not row["bars_pass"] and row["top1_outside"] == 0.0 and row["changed_vs_top1"] == 0.0
+
+
+def test_criterion_filter_numbers():
+    """the FILTER rule row: filter - blend, break, rows dropped, blend pick dropped, changed vs blend, none left -> the
+    blend pick; the picks are tube_switch's filter picks."""
+    n = 4
+    pd_ = np.ones((n, 96))
+    fail = np.zeros((n, 96), bool)
+    pd_[:, 7], fail[:, 7] = 0.0, True                                       # the blend's pick fails NC everywhere
+    pd_[3, 7], fail[3, 7] = 1.0, False                                      # ... except on token 3
+    pd_[2, 12], fail[2, 12] = 0.4, True                                     # token 2: the next best fails too
+    lab = _lab(pd_, fail)
+    score = np.zeros((n, 96))
+    score[:, 7], score[:, 12] = 3.0, 2.0
+    allowed = np.ones((n, 96), bool)
+    inside = np.ones((n, 96), bool)
+    inside[[0, 2, 3], 7] = False                                            # token 1: the tube keeps the failing pick
+    inside[3, :] = False                                                    # token 3: nothing left -> the blend pick
+    row, d, pk = E.criterion_filter(lab, score, allowed, inside, np.array(["a", "a", "b", "b"]))
+    assert pk["filter"].tolist() == [12, 7, 12, 7] and pk["blend"].tolist() == [7, 7, 7, 7]
+    assert np.allclose(d, [100.0, 0.0, 40.0, 0.0])
+    assert row["d_vs_blend"]["mean"] == pytest.approx(35.0)
+    assert (row["break_n"], row["break_den"]) == (0, 1)                     # only token 3's blend pick passes
+    assert row["dropped_rows"] == pytest.approx((3 + 95) / (4 * 96))
+    assert row["blend_pick_dropped"] == pytest.approx(0.75) and row["changed_vs_blend"] == pytest.approx(0.5)
+    assert row["no_inside"] == pytest.approx(0.25) and row["rule"] == "filter"
+    assert row["fail3_blend"] == pytest.approx(0.75) and row["fail3_filter"] == pytest.approx(0.5)
+
+
+def _p1_case(learned_fix_every: int = 1, false_drop_tokens: int = 0, gt: str = "fix"):
+    """synthetic P1 arrays: 400 tokens in 40 logs (10 consecutive tokens each); the blend picks column 7, which fails
+    NC (PDMS 0) on the even tokens; column 12 (next best) passes there but fails on the odd tokens.
+    GT tube: 'fix' drops column 7 on every even token (+100 there); 'none' drops nothing (gain 0); 'harm' drops it on
+    the odd tokens only (-100 there).  Learned tube: drops column 7 on the even tokens i with i % (2 *
+    learned_fix_every) == 0, and on the first false_drop_tokens odd tokens (-> column 12, a break)."""
+    n = 400
+    logs = np.array([f"log{i // 10}" for i in range(n)])
+    i = np.arange(n)
+    even = i % 2 == 0
+    pd_ = np.ones((n, 96))
+    fail = np.zeros((n, 96), bool)
+    pd_[even, 7], fail[even, 7] = 0.0, True
+    pd_[~even, 12], fail[~even, 12] = 0.0, True
+    lab = _lab(pd_, fail)
+    score = np.zeros((n, 96))
+    score[:, 7], score[:, 12] = 3.0, 2.0
+    allowed = np.ones((n, 96), bool)
+    ins_gt = np.ones((n, 96), bool)
+    if gt == "fix":
+        ins_gt[even, 7] = False
+    elif gt == "harm":
+        ins_gt[~even, 7] = False
+    ins_l = np.ones((n, 96), bool)
+    ins_l[even & (i % (2 * learned_fix_every) == 0), 7] = False
+    ins_l[np.flatnonzero(~even)[:false_drop_tokens], 7] = False
+    return lab, score, allowed, ins_l, ins_gt, logs
+
+
+def _p1(lab, score, allowed, ins_l, ins_gt, logs):
+    lb = E.LogBoot(logs)
+    blk, _ = E.s_block(lab, score, allowed, logs, lb, {}, {"learned": ins_l, "gt_r2_same_keys": ins_gt},
+                       {"learned": "learned", "gt": "gt_r2_same_keys"})
+    return blk["P1"], blk
+
+
+def test_p1_decision_pass_fail_void_synthetic():
+    """the amended P1 decision on synthetic arrays (through s_block's filter rows): PASS; FAIL by (a), by (b) only, by
+    (c) only; VOID when the GT reference is zero or negative (whatever the learned tube does)."""
+    # PASS: the learned tube = the GT tube
+    P, blk = _p1(*_p1_case(1))
+    assert P["verdict"] == "PASS" and all(P["parts"].values())
+    assert P["d_learned"]["mean"] == pytest.approx(50.0) and P["gain_fraction"] == pytest.approx(1.0)
+    assert P["break_n"] == 0 and P["gt_reference"]["valid"] and blk["filter"]["gain_fraction"]["estimate"] == 1.0
+    assert P["learned_tube"] == "learned" and P["gt_tube"] == "gt_r2_same_keys" and P["keys"] == ["nc", "ttc"]
+    # FAIL (a): the learned tube drops nothing -> 0 gain (and 0 % of the GT gain)
+    lab, score, allowed, _, ins_gt, logs = _p1_case(1)
+    P, _ = _p1(lab, score, allowed, np.ones((400, 96), bool), ins_gt, logs)
+    assert P["verdict"] == "FAIL" and not P["parts"]["a_mean_and_ci"] and not P["parts"]["c_gain_fraction"]
+    assert P["d_learned"]["mean"] == 0.0 and P["gain_fraction"] == 0.0 and P["parts"]["b_break"]
+    # FAIL (a): one fix (token 0) in 400 tokens: mean +0.25 < +0.30
+    P, _ = _p1(*_p1_case(learned_fix_every=10 ** 6))
+    assert P["verdict"] == "FAIL" and P["d_learned"]["mean"] == pytest.approx(0.25)
+    assert not P["parts"]["a_mean_and_ci"] and not P["parts"]["c_gain_fraction"]
+    # FAIL (b) only: GT fixes + 6 false drops of a passing blend pick (break 6 / 200 = 3 %)
+    P, _ = _p1(*_p1_case(1, false_drop_tokens=6))
+    assert P["verdict"] == "FAIL" and P["parts"]["a_mean_and_ci"] and P["parts"]["c_gain_fraction"]
+    assert not P["parts"]["b_break"] and (P["break_n"], P["break_den"]) == (6, 200)
+    assert P["d_learned"]["mean"] == pytest.approx(50.0 - 600 / 400) and P["gain_fraction"] == pytest.approx(0.97)
+    # FAIL (c) only: the learned tube fixes 1 of the 5 bad tokens of every log: +10 everywhere (CI > 0), 20 % < 25 %
+    P, _ = _p1(*_p1_case(learned_fix_every=5))
+    assert P["verdict"] == "FAIL" and P["parts"]["a_mean_and_ci"] and P["parts"]["b_break"]
+    assert not P["parts"]["c_gain_fraction"] and P["gain_fraction"] == pytest.approx(0.2)
+    assert P["d_learned"]["lo"] > 0 and P["gain_fraction_ci"] == pytest.approx([0.2, 0.2])
+    # 2 of 5 (40 %) passes (c)
+    lab, score, allowed, ins_l, ins_gt, logs = _p1_case(1)
+    i = np.arange(400)
+    ins_l = np.ones((400, 96), bool)
+    ins_l[(i % 10 == 0) | (i % 10 == 2), 7] = False
+    P, _ = _p1(lab, score, allowed, ins_l, ins_gt, logs)
+    assert P["verdict"] == "PASS" and P["gain_fraction"] == pytest.approx(0.4)
+    # VOID: the GT reference has no gain (CI lower bound 0, not > 0) or loses; the learned tube is irrelevant
+    for gt in ("none", "harm"):
+        P, _ = _p1(*_p1_case(1, gt=gt))
+        assert P["verdict"] == "VOID" and not P["gt_reference"]["valid"] and not P["parts"]["gt_reference_valid"]
+        assert P["parts"]["a_mean_and_ci"] and not P["parts"]["c_gain_fraction"]
+        assert P["gt_reference"]["d_vs_blend"]["mean"] == (0.0 if gt == "none" else pytest.approx(-50.0))
+
+
+def test_p1_decide_bars_and_edges():
+    """p1_decide on hand-made rows: the bars are inclusive (mean 0.30, break 1.3 %, fraction 0.25 pass), the CI lower
+    bound must be > 0 (0 fails), NaN never passes, no GT tube -> verdict None, token mismatch -> ValueError; the
+    readout-rule ceiling and the all-key reference are descriptive."""
+    def row(mean, lo, brk=0.0, n_brk=0, den=100):
+        return {"d_vs_blend": {"mean": mean, "lo": lo, "hi": mean + 1}, "break_": brk, "break_n": n_brk,
+                "break_den": den}
+    d_l = np.full(8, 0.5)                                                   # sums 4 / 16: exactly 25 %
+    d_g = np.full(8, 2.0)
+    P = E.p1_decide(row(0.30, 0.01, 0.013, 13, 1000), d_l, row(2.0, 0.5), d_g)
+    assert P["verdict"] == "PASS" and P["gain_fraction"] == 0.25 and P["gain_fraction_ci"] is None
+    assert E.p1_decide(row(0.30, 0.0), d_l, row(2.0, 0.5), d_g)["verdict"] == "FAIL"           # CI lower bound 0
+    assert E.p1_decide(row(0.2999, 0.1), d_l, row(2.0, 0.5), d_g)["verdict"] == "FAIL"
+    assert E.p1_decide(row(0.5, 0.1, 0.0131), d_l, row(2.0, 0.5), d_g)["verdict"] == "FAIL"
+    assert E.p1_decide(row(0.5, 0.1, float("nan")), d_l, row(2.0, 0.5), d_g)["verdict"] == "FAIL"  # no break den
+    assert E.p1_decide(row(0.5, 0.1), np.full(8, 0.4999), row(2.0, 0.5), d_g)["verdict"] == "FAIL"  # 24.995 %
+    assert E.p1_decide(row(0.5, 0.1), d_l, row(2.0, 0.0), d_g)["verdict"] == "VOID"            # GT CI touches 0
+    assert E.p1_decide(row(0.5, 0.1), d_l, row(float("nan"), float("nan")), d_g)["verdict"] == "VOID"
+    P = E.p1_decide(row(0.5, 0.1), d_l, None, None)
+    assert P["verdict"] is None and "gttube" in P["reason"] and P["parts"]["a_mean_and_ci"]
+    with pytest.raises(ValueError, match="different tokens"):
+        E.p1_decide(row(0.5, 0.1), d_l, row(2.0, 0.5), d_g[:5])
+    P = E.p1_decide(row(0.5, 0.1), d_l, row(2.0, 0.5), d_g, rule=row(2.5, 0.6), d_rule=np.full(8, 2.5))
+    assert P["ceiling"]["gain_fraction_vs_ceiling"] == pytest.approx(0.2) and P["verdict"] == "PASS"
+    # the deciding token set and the summary
+    from types import SimpleNamespace as NS
+    assert E.p1_deciding_set(NS(split="navtrain_val", subset="heldout", limit=0))
+    for a in (NS(split="navtrain_val", subset="heldout", limit=2), NS(split="navtrain_val", subset="all", limit=0),
+              NS(split="navtest", subset="all", limit=0)):
+        assert not E.p1_deciding_set(a)
+    S = {"criterion_S": {"blend_critic": "ck2T10,ck2M10", "P1": {"verdict": "PASS", "deciding": False}},
+         "criterion_S_phase0b_convention": {"blend_critic": "ck2T10", "P1": {"verdict": "FAIL", "deciding": True}}}
+    assert E.p1_summary(S) == {"verdict": "FAIL", "deciding": True, "blend_critic": "ck2T10"}
+    S["criterion_S_phase0b_convention"]["P1"]["deciding"] = False
+    assert E.p1_summary(S) is None
+    assert E.DECISION_RULE and "FILTER" in E.DECISION_RULE and "VOID" in E.DECISION_RULE
+    assert (E.P1_D_MIN, E.P1_BREAK_MAX, E.P1_FRAC_MIN, E.P1_KEYS, E.P1_BLEND) == (0.30, 0.013, 0.25, ("nc", "ttc"),
+                                                                                   "ck2T10")
+
+
+def test_p1_deciding_block_and_md(tmp_path, monkeypatch):
+    """_s_all marks P1 deciding only on the val held-out set (no --limit) in the ck2T10 block; navtest blocks (pair
+    and ck2T10 convention) and a --limit run are report only; the md prints the decision header and the P1 lines."""
+    from types import SimpleNamespace as NS
+    from navsim.agents.para_ssr.ck import select2
+    lab, score, allowed, ins_l, ins_gt, logs = _p1_case(1)
+    n = len(lab)
+    np.save(tmp_path / "v2_final.npy", np.zeros((n, 16)))
+    np.save(tmp_path / "v2_im.npy", np.zeros((n, 16)))
+    monkeypatch.setattr(select2, "pool_scores", lambda v2f, v2i, p, beta: score)
+    prob = lambda r: (np.zeros((len(r), 16, 5)), np.zeros((len(r), 80, 5)))
+    tubes = {"learned": ins_l, "gt_r2_same_keys": ins_gt}
+    names = {"learned": "learned", "gt": "gt_r2_same_keys"}
+    r, lb = np.arange(n), E.LogBoot(logs)
+
+    def run(split, subset, limit, blends):
+        a = NS(split=split, subset=subset, limit=limit)
+        C = {"pdir": tmp_path, "blends": [{"name": b, "prob": prob} for b in blends], "split": split,
+             "subset": subset, "limit": limit}
+        return E._s_all(C, r, lab, allowed, logs, lb, tubes, tubes, names, deciding_set=E.p1_deciding_set(a))[0]
+
+    S = run("navtrain_val", "heldout", 0, ["ck2T10"])
+    P = S["criterion_S"]["P1"]
+    assert P["deciding"] and P["verdict"] == "PASS" and P["context"] == "decision (navtrain_val heldout, blend ck2T10)"
+    assert E.p1_summary(S)["verdict"] == "PASS"
+    S2 = run("navtest", "all", 0, ["ck2T10,ck2M10", "ck2T10"])
+    assert not S2["criterion_S"]["P1"]["deciding"] and not S2["criterion_S_phase0b_convention"]["P1"]["deciding"]
+    assert S2["criterion_S_phase0b_convention"]["P1"]["context"] == "report only (navtest all, blend ck2T10)"
+    assert E.p1_summary(S2) is None
+    S3 = run("navtrain_val", "heldout", 5, ["ck2T10"])
+    assert not S3["criterion_S"]["P1"]["deciding"] and E.p1_summary(S3) is None
+    S4 = run("navtrain_val", "heldout", 0, ["v4T10_haz", "ck2T10"])                # --blend-critic other: ck2T10 decides
+    assert not S4["criterion_S"]["P1"]["deciding"] and S4["criterion_S_phase0b_convention"]["P1"]["deciding"]
+    # the gate (stage eval: registered tokens / teacher) failed: report only with its reason; passed: the token note
+    C = {"pdir": tmp_path, "blends": [{"name": "ck2T10", "prob": prob}], "split": "navtrain_val", "subset": "heldout",
+         "limit": 0}
+    S5 = E._s_all(C, r, lab, allowed, logs, lb, tubes, tubes, names, deciding_set=False,
+                  gate_reason="token set 4 of 8 registered rows")[0]
+    assert not S5["criterion_S"]["P1"]["deciding"] and E.p1_summary(S5) is None
+    assert S5["criterion_S"]["P1"]["context"] == "report only (navtrain_val heldout, blend ck2T10): token set 4 of 8 " \
+                                                 "registered rows"
+    S6 = E._s_all(C, r, lab, allowed, logs, lb, tubes, tubes, names, deciding_set=True,
+                  token_note=", tokens 400 / 400 registered")[0]
+    assert S6["criterion_S"]["P1"]["context"] == "decision (navtrain_val heldout, blend ck2T10, tokens 400 / 400 " \
+                                                 "registered)"
+    # md: decision header + the P1 lines of the block
+    res = {"stage": "eval", "split": "navtrain_val", "subset": "heldout", "finished": "t", "det": "x", "map": None,
+           "keys": ["nc", "ttc"], "n_tokens": n, "n_logs": lb.L, "blend_critic": "ck2T10", "gt_tube": "g",
+           "decision_rule": E.DECISION_RULE, "caveats": [], "phase0b_check": {}, "fidelity": {}, **S,
+           "decision": {"verdict": "PASS", "deciding": True, "blend_critic": "ck2T10"},
+           "selection": {"rule": "DET only", "v2_top1_pdms": 0.0, "range": {}, "vs": {}}}
+    md = E.report_md(res)
+    assert "**DECISION (P1, amended): PASS** (navtrain_val heldout, blend ck2T10" in md
+    assert "**P1 (amended, filter rule) -- PASS** (decision (navtrain_val heldout, blend ck2T10))" in md
+    assert "(c) fraction of the GT R2 filter gain (gt_r2_same_keys, same keys and tokens): 1.000" in md
+
+
+def _ns(split="navtrain_val", subset="heldout", limit=0):
+    from types import SimpleNamespace as NS
+    return NS(split=split, subset=subset, limit=limit)
+
+
+def _good_teacher(tmp_path, name=None, **over):
+    """teacher_identity of infer_meta of the registered teacher (fake checkpoint file); over: fields to change
+    (... = drop the field)."""
+    ck = tmp_path / "ckpt_last.pt"
+    if not ck.is_file():
+        ck.write_bytes(b"fake checkpoint")
+    meta = {k: v for k, v in E.P1_TEACHER.items() if k != "name"}
+    meta.update(ckpt=str(ck), ckpt_sha16=E.U.sha256_file(ck), n_done=8, n_rows=8, status="finished")
+    meta.update(over)
+    return E.teacher_identity(name or E.P1_TEACHER["name"], {k: v for k, v in meta.items() if v is not Ellipsis})
+
+
+def test_p1_gate_tokens_and_teacher(tmp_path, monkeypatch):
+    """P1 decides only when the evaluated rows are the registered rows (HO/prep/ho_rows.npy: a row removed by a missing
+    teacher output / baseline / GT tube is counted per input) AND the DET outputs are the registered teacher's
+    (v4T10_rng2, arm T, --which last, rg_read any4, rg_stopped_aware True) at an unchanged checkpoint."""
+    ho = tmp_path / "HO"
+    monkeypatch.setattr(E, "HO_DIR", ho)
+    reg, why = E.p1_registered_rows()
+    assert reg is None and "unavailable" in why
+    (ho / "prep").mkdir(parents=True)
+    np.save(ho / "prep" / "ho_rows.npy", np.array([9, 3, 5, 7, 11, 13, 15, 17]))
+    reg, why = E.p1_registered_rows()
+    assert why is None and reg.tolist() == [3, 5, 7, 9, 11, 13, 15, 17]
+    (ho / "results.json").write_text(json.dumps({"n_tokens_used": 7}))
+    assert "used 7 of its 8" in E.p1_registered_rows()[1]
+    (ho / "results.json").write_text(json.dumps({"n_tokens_used": 8}))
+    assert E.p1_registered_rows()[1] is None
+    # token gate: half the teacher outputs missing; a baseline missing one more row
+    N = 20
+    tdone = np.zeros(N, bool)
+    tdone[[3, 5, 7, 9]] = True
+    base = np.ones(N, bool)
+    base[3] = False
+    filters = {"labels": np.ones(N, bool), "teacher det outputs (done & BEV)": tdone, "baseline b det": base}
+    r = np.flatnonzero(tdone & base)
+    ts = E.p1_token_gate(r, reg, filters)
+    assert (ts["n"], ts["n_registered"], ts["n_missing"], ts["n_extra"], ts["complete"]) == (3, 8, 5, 0, False)
+    assert ts["missing_by_input"] == {"teacher det outputs (done & BEV)": 4, "baseline b det": 1}
+    assert "3 of 8 registered" in E._token_reason(ts) and "baseline b det 1" in E._token_reason(ts)
+    ts = E.p1_token_gate(np.r_[reg, 19], reg, {})
+    assert not ts["complete"] and ts["n_extra"] == 1                       # an extra row is not the registered set
+    assert E.p1_token_gate(reg[::-1], reg, {})["complete"]
+    # teacher identity
+    good = _good_teacher(tmp_path)
+    assert good["ckpt_current"] is True and E.p1_teacher_problems(good) == []
+    for over, msg in (({"rg_read": "center"}, "rg_read 'center'"), ({"rg_read": ...}, "rg_read None"),
+                      ({"which": "best"}, "which 'best'"), ({"rg_stopped_aware": False}, "rg_stopped_aware False"),
+                      ({"rg_stopped_aware": 1}, "rg_stopped_aware 1"), ({"arm": "M"}, "arm 'M'"),
+                      ({"name": "v4T10_rng"}, "name 'v4T10_rng'"), ({"ckpt_sha16": "0" * 16}, "changed since infer"),
+                      ({"ckpt_sha16": ...}, "no ckpt_sha16"), ({"ckpt": str(tmp_path / "gone.pt")}, "missing")):
+        bad = E.p1_teacher_problems(_good_teacher(tmp_path, **over))
+        assert len(bad) == 1 and msg in bad[0], (over, bad)
+    assert "no infer_meta.json" in E.p1_teacher_problems(E.teacher_identity("v4T10_rng2", {}))[0]
+    assert E.p1_teacher_problems(None) == ["no DET teacher"]
+    # the gate
+    full = np.ones(N, bool)
+    g = E.p1_gate(_ns(), reg, {"labels": full}, good)
+    assert g["deciding"] and g["reason"] is None and g["token_set"]["complete"] and not g["incomplete"]
+    assert E._token_note(g) == ", tokens 8 / 8 registered"
+    g = E.p1_gate(_ns(), r, filters, good)
+    assert not g["deciding"] and g["incomplete"] and "3 of 8" in g["reason"]
+    g = E.p1_gate(_ns(), reg, {"labels": full}, _good_teacher(tmp_path, which="best"))
+    assert not g["deciding"] and not g["incomplete"] and "registered teacher" in g["reason"]
+    for a in (_ns(limit=4), _ns(split="navtest", subset="all")):
+        g = E.p1_gate(a, reg, {"labels": full}, good)
+        assert not g["deciding"] and not g["registered_split"] and not g["incomplete"] and g["token_set"] is None
+    g = E.p1_gate(_ns(), reg, {"labels": full}, good, have_gt=False)       # no GT reference: incomplete
+    assert not g["deciding"] and g["incomplete"] and "no GT R2 tube" in g["reason"]
+    g = E.p1_gate(_ns(), reg, {"labels": full}, need_teacher=False)       # gtcheck: no teacher
+    assert g["deciding"] and g["teacher_problems"] == []
+    (ho / "prep" / "ho_rows.npy").unlink()
+    g = E.p1_gate(_ns(), reg, {"labels": full}, good)
+    assert not g["deciding"] and g["incomplete"] and "unavailable" in g["reason"]
+
+
+def test_infer_resume_check(tmp_path):
+    """stage infer resumes only into outputs of the same teacher / checkpoint."""
+    td = tmp_path / "t"
+    td.mkdir()
+    meta = {"teacher": "t", "role": "det", "arm": "T", "which": "last", "ckpt_sha16": "a" * 16, "rg_read": "any4",
+            "rg_stopped_aware": True, "corridor_version": 2, "split": "navtest", "sessions": [{"n": 3}]}
+    assert E.infer_resume_check(td, meta) == {}                            # fresh dir
+    done = np.zeros(10, bool)
+    np.save(td / "done.npy", done)
+    assert E.infer_resume_check(td, meta) == {}                            # no row done yet, no meta
+    done[2] = True
+    np.save(td / "done.npy", done)
+    with pytest.raises(SystemExit, match="no infer_meta.json"):
+        E.infer_resume_check(td, meta)
+    (td / "infer_meta.json").write_text(json.dumps(meta))
+    assert E.infer_resume_check(td, dict(meta, sessions=None, batch=4))["sessions"] == [{"n": 3}]   # same ckpt: resume
+    for k, v in (("ckpt_sha16", "b" * 16), ("which", "best"), ("rg_read", "center"), ("rg_stopped_aware", False)):
+        with pytest.raises(SystemExit, match=f"resume refused.*{k}"):
+            E.infer_resume_check(td, dict(meta, **{k: v}))
+    np.save(td / "done.npy", np.zeros(10, bool))                            # nothing done: a new teacher may start
+    assert E.infer_resume_check(td, dict(meta, ckpt_sha16="b" * 16)) == {}
 
 
 def test_recall_fidelity_and_logboot():
@@ -265,6 +578,23 @@ def test_phase0b_check_logic(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="Phase 0b reproduction FAILED"):
         E._raise_on_mismatch({"phase0b_check": E.phase0b_check(a, rows, dict(row, break_n=3))})
     E._raise_on_mismatch({"phase0b_check": c})
+    # the filter row vs HO/results.json selection.picks['R2 tube filter + blend'] (absent -> not comparable)
+    frow = {"d_vs_blend": {"mean": 2.75, "lo": 2.3, "hi": 3.2}, "break_n": 7, "break_den": 40}
+    c = E.phase0b_check(a, rows, row, frow)
+    assert c["match"] and not c["filter"]["comparable"] and "picks" in c["filter"]["reason"]
+    pk = {"d_vs_blend": {"mean": 2.75, "lo": 2.3, "hi": 3.2}, "break_vs_blend": {"n": 7, "den": 40}}
+    (ho / "results.json").write_text(json.dumps({"n_tokens_used": 3, "selection": {
+        "criterion_S": cs, "picks": {E.PHASE0B_FILTER_PICK: pk}}}))
+    c = E.phase0b_check(a, rows, row, frow)
+    assert c["match"] and c["filter"]["comparable"] and c["filter"]["match"]
+    E._raise_on_mismatch({"phase0b_check": c})
+    bad = E.phase0b_check(a, rows, row, dict(frow, break_n=8))
+    assert bad["match"] and bad["filter"]["comparable"] and not bad["filter"]["match"]
+    with pytest.raises(SystemExit, match="FAILED for the filter rule"):
+        E._raise_on_mismatch({"phase0b_check": bad})
+    nc = E.phase0b_check(SimpleNamespace(split="navtest", subset="all", limit=0), rows, row, frow)
+    assert not nc["comparable"] and not nc["filter"]["comparable"]
+    assert "filter" not in E.phase0b_check(a, rows, row)                    # no filter row: the old dict
 
 
 # ----------------------------------------------------------------------------------------------- CPU smoke
@@ -329,20 +659,56 @@ def test_cpu_smoke_navtest_all_stages(tmp_path):
     assert S["blend_critic"] == "ck2T10,ck2M10"                              # navtest: the deployed pair
     conv = ev["criterion_S_phase0b_convention"]
     assert conv["blend_critic"] == "ck2T10" and "Phase 0b convention" in conv["label"]
-    assert ev["phase0b_check"]["comparable"] is False and ev["decision_rule"] is None
+    assert ev["phase0b_check"]["comparable"] is False and ev["decision_rule"] == E.DECISION_RULE
+    # the amended P1 (filter rule, DET keys only next to a MAP): report only on navtest, for both blend critics
+    assert set(S["filter"]) >= {"learned", "learned_nc_ttc", "gt_r2_nc_ttc", "gt_rule_nc_ttc", "gt_r2_same_keys",
+                                "gt_r2_all_keys", "gain_fraction", "gain_fraction_vs_rule"}
+    for blk in (S, conv):
+        P = blk["P1"]
+        assert (P["learned_tube"], P["gt_tube"], P["ceiling_tube"]) == ("learned_nc_ttc", "gt_r2_nc_ttc",
+                                                                        "gt_rule_nc_ttc")
+        assert P["deciding"] is False and P["context"].startswith("report only") and P["verdict"] in (
+            "PASS", "FAIL", "VOID")
+        assert P["d_learned"] == blk["filter"]["learned_nc_ttc"]["d_vs_blend"]
+        assert P["gt_reference"]["d_vs_blend"] == blk["filter"]["gt_r2_nc_ttc"]["d_vs_blend"]
+    assert ev["P1"] is None and ev["decision"]["deciding"] is False and ev["decision"]["verdict"] is None
     assert set(ev["selection"]["vs"]) == {"ck2T10,ck2M10", "v4T10_haz,v4M10_haz"}
     assert "pool96_ck_noim" in ev["selection"]["range"]
     tag = "rng2T+rng2M"
     assert (root / f"eval_{tag}.md").is_file() and (root / f"eval_{tag}_picks.npz").is_file()
     md = (root / f"eval_{tag}.md").read_text()
-    assert "decision rule: not registered" in md and "Phase 0b convention" in md and "gt_rule_same_keys" in md
+    assert "decision rule (registered)" in md and "Phase 0b convention" in md and "gt_rule_same_keys" in md
+    assert "P1 not deciding here" in md and "FILTER rule" in md and "Old SWITCH rule" in md
+    # the md header says what the outputs are about; the identity is checked against the checkpoint
+    ti = ev["teacher_identity"]["det"]
+    assert (ti["which"], ti["rg_read"], ti["rg_stopped_aware"], ti["ckpt_current"]) == ("last", "any4", True, True)
+    assert f"Teacher det rng2T: --which last, arm T, rg_read any4, rg_stopped_aware True, ckpt_sha16 " \
+           f"{ti['ckpt_sha16']} (checkpoint unchanged)" in md and "Teacher map rng2M" in md
+    assert ev["p1_gate"]["registered_split"] is False and any("name 'rng2T'" in x for x in
+                                                              ev["p1_gate"]["teacher_problems"])
+    # descriptive per-key filter rows and their share of P1's GT gain
+    assert {"learned_nc_only", "learned_ttc_only", "gt_r2_nc_only", "gt_r2_ttc_only"} <= set(S["filter"])
+    assert S["filter"]["key_share"]["vs"] == "gt_r2_nc_ttc" and "Per-key share" in md
     j = json.loads((root / f"eval_{tag}.json").read_text())
     assert j["n_tokens"] == 3
-    # gtcheck: GT rows only, no teacher
-    g = E.main(base + ["--stage", "gtcheck"])["gtcheck"]
-    assert g["n_tokens"] == 3 and set(g["criterion_S"]) >= {"gt_r2_all_keys", "gt_rule_all_keys"}
+    # gtcheck: GT rows only, no teacher; --tag names new report files
+    g = E.main(base + ["--stage", "gtcheck", "--tag", "t1"])["gtcheck"]
+    assert g["n_tokens"] == 3 and set(g["criterion_S"]) >= {"gt_r2_all_keys", "gt_rule_all_keys", "gt_r2_nc_ttc"}
     assert g["criterion_S"]["gt_r2_all_keys"] == S["gt_r2_all_keys"]         # the same row as in eval
+    assert g["criterion_S"]["filter"]["gt_r2_nc_ttc"] == S["filter"]["gt_r2_nc_ttc"]
+    assert g["criterion_S"]["filter"]["gt_r2_all_keys"] == S["filter"]["gt_r2_all_keys"]
+    R = g["criterion_S"]["P1_reference"]
+    assert R["tube"] == "gt_r2_nc_ttc" and R["deciding"] is False and R["gt_reference_all_keys"]["tube"] == \
+        "gt_r2_all_keys"
+    assert R["d_vs_blend"] == S["P1"]["gt_reference"]["d_vs_blend"]
+    assert {"gt_r2_nc_only", "gt_r2_ttc_only"} <= set(g["criterion_S"]["filter"]) and not g["p1_gate"]["deciding"]
+    assert g["criterion_S"]["filter"]["gt_r2_nc_only"] == S["filter"]["gt_r2_nc_only"]
+    assert (root / "gtcheck_t1.md").is_file() and (root / "gtcheck_t1.json").is_file()
+    assert not (root / "gtcheck.json").exists()
+    E.main(base + ["--stage", "gtcheck"])
     assert (root / "gtcheck.md").is_file()
+    with pytest.raises(SystemExit, match="--tag"):
+        E.main(base + ["--stage", "gtcheck", "--tag", "../x"])
     # gttube writes only its own dir; eval reads another dir read-only after the meta / shape checks
     with pytest.raises(SystemExit, match="writes only its own"):
         E.main(base + ["--stage", "gttube", "--gt-tube", str(root / "gt_tube_r2")])
@@ -363,10 +729,27 @@ def test_cpu_smoke_navtest_all_stages(tmp_path):
         E.main(base + ["--det", str(det), "--stage", "eval", "--gt-tube", str(ext)])
     # resumable: a second infer call has nothing to do
     m2 = E.main(base + ["--det", str(det), "--stage", "infer"])["infer_det"]
-    assert m2["sessions"][-1]["n"] == 0
+    assert m2["sessions"][-1]["n"] == 0 and len(m2["sessions"]) == 2 and m2["status"] == "finished"
+    # ... but only into outputs of the same checkpoint (infer_meta.json ckpt_sha16 / which ...)
+    mp_ = root / "rng2T" / "infer_meta.json"
+    good = mp_.read_text()
+    mp_.write_text(json.dumps(dict(json.loads(good), ckpt_sha16="0" * 16)))
+    with pytest.raises(SystemExit, match="resume refused.*ckpt_sha16"):
+        E.main(base + ["--det", str(det), "--stage", "infer"])
+    mp_.unlink()
+    with pytest.raises(SystemExit, match="no infer_meta.json"):
+        E.main(base + ["--det", str(det), "--stage", "infer"])
+    mp_.write_text(good)
     # DET only: keys nc / ttc, the DET-only rule, baselines reduced to their DET member
     e1 = E.main(base + ["--det", str(det), "--stage", "eval"])["eval"]
     assert e1["keys"] == ["nc", "ttc"] and e1["selection"]["rule"].startswith("DET only")
+    P = e1["criterion_S"]["P1"]
+    assert (P["learned_tube"], P["gt_tube"]) == ("learned", "gt_r2_same_keys") and "learned_nc_ttc" not in \
+        e1["criterion_S"]["filter"]
+    # MAP only: no DET tube, P1 not evaluable
+    e2 = E.main(base + ["--map", str(mp), "--stage", "eval"])["eval"]
+    assert "P1" not in e2["criterion_S"] and e2["decision"]["reason"] == "no DET teacher"
+    assert any("P1" in c for c in e2["caveats"])
 
 
 @pytest.mark.skipif(not _val_inputs(), reason="navtrain_val eval inputs / smoke teachers absent")
@@ -386,3 +769,93 @@ def test_cpu_smoke_val_det_only_and_refusals(tmp_path):
     picks = np.load(out / "smoke2" / "navtrain_val" / "eval_rng2T_picks.npz")
     assert not (set(picks["rows"].tolist()) & f1)                          # held-out tokens only
     assert any("in-sample" in c for c in ev["caveats"]) and list(ev["selection"]["vs"]) == ["ck2T10"]
+    # the P1 block on val (ck2T10 blend, DET keys): a --limit smoke is not the deciding token set -> report only
+    P = ev["criterion_S"]["P1"]
+    assert ev["criterion_S"]["blend_critic"] == "ck2T10" and (P["learned_tube"], P["gt_tube"]) == (
+        "learned", "gt_r2_same_keys")
+    assert P["deciding"] is False and "limit" in P["context"] and ev["P1"] is None
+    assert "criterion_S_phase0b_convention" not in ev
+
+
+GT_VAL = E.OUT_ROOT / "navtrain_val" / "gt_tube_r2"
+
+
+def _fake_det_outputs(root: Path, name: str, rows: np.ndarray, N: int, meta: dict) -> Path:
+    """stage infer outputs of a fake DET range teacher on the given packed rows: slacks = the GT R2 tube's flags
+    (learned tube = the GT tube), score logits 0."""
+    td = root / "navtrain_val" / name
+    td.mkdir(parents=True, exist_ok=True)
+    done = np.zeros(N, bool)
+    done[rows] = True
+    np.save(td / "done.npy", done)
+    np.save(td / "bev_ok.npy", done)
+    for k, K in (("16", 16), ("80", 80)):
+        hit = np.asarray(np.load(GT_VAL / f"hit{k}.npy", mmap_mode="r"))
+        np.save(td / f"slack{k}.npy", np.where(hit, -1.0, 1.0).astype(np.float32))
+        np.save(td / f"score_logit{k}.npy", np.zeros((N, K, 5), np.float32))
+    (td / "infer_meta.json").write_text(json.dumps(meta))
+    return td
+
+
+@pytest.mark.skipif(not (_val_inputs() and (GT_VAL / "rule16.npy").is_file()),
+                    reason="navtrain_val eval inputs / the val GT tube absent")
+def test_p1_gate_stage_eval_registered_split(tmp_path, monkeypatch):
+    """stage eval on --split navtrain_val --subset heldout without --limit (the deciding split), with the registered
+    token set monkeypatched to 8 real held-out rows (HO/prep/ho_rows.npy) and a fake v4T10_rng2 DET output dir (learned
+    tube = the GT tube, the real val GT tube read-only via --gt-tube): a half-done teacher -> report only + per-input
+    counts, non-zero exit after the outputs are written; complete + registered teacher -> DECISION (tokens 8 / 8);
+    no GT tube -> non-zero exit; infer_meta without rg_read, or a changed checkpoint -> report only (exit 0)."""
+    out = tmp_path / "out"
+    base = ["--split", "navtrain_val", "--out-root", str(out), "--gt-tube", str(GT_VAL), "--stage", "eval"]
+    a = E.get_parser().parse_args(base)
+    a.subset = "heldout"
+    C = E._common(a, need_teachers=False)
+    rows = np.flatnonzero(C["keep"])[:8]
+    N = int(C["N"])
+    assert len(rows) == 8
+    ho = tmp_path / "HO"
+    (ho / "prep").mkdir(parents=True)
+    np.save(ho / "prep" / "ho_rows.npy", rows)
+    monkeypatch.setattr(E, "HO_DIR", ho)
+    ck = tmp_path / "ckpt_last.pt"
+    ck.write_bytes(b"fake v4T10_rng2 checkpoint")
+    meta = {"role": "det", "teacher": "v4T10_rng2", "arm": "T", "which": "last", "rg_read": "any4",
+            "rg_stopped_aware": True, "corridor_version": 2, "split": "navtrain_val", "ckpt": str(ck),
+            "ckpt_sha16": E.U.sha256_file(ck), "n_done": 8, "n_rows": 12179, "status": "finished"}
+    root = out / "navtrain_val"
+    ev = lambda tag: json.loads((root / f"eval_v4T10_rng2_{tag}.json").read_text())
+    md = lambda tag: (root / f"eval_v4T10_rng2_{tag}.md").read_text()
+    # half done: report only, non-zero exit, the outputs written
+    _fake_det_outputs(out, "v4T10_rng2", rows[:4], N, meta)
+    with pytest.raises(SystemExit, match="deciding split is incomplete.*4 of 8"):
+        E.main(base + ["--det", "v4T10_rng2", "--tag", "half"])
+    j = ev("half")
+    assert j["n_tokens"] == 4 and j["P1"] is None and j["decision"]["deciding"] is False and j["decision"]["incomplete"]
+    assert j["decision"]["token_set"]["missing_by_input"] == {"teacher det outputs (done & BEV)": 4}
+    P = j["criterion_S"]["P1"]
+    assert P["deciding"] is False and "report only" in P["context"] and "token set 4 of 8" in P["context"]
+    assert "**P1 not deciding here**" in md("half") and "**DECISION" not in md("half")
+    # complete, the registered teacher: deciding
+    _fake_det_outputs(out, "v4T10_rng2", rows, N, meta)
+    j = E.main(base + ["--det", "v4T10_rng2", "--tag", "full"])["eval"]
+    assert j["n_tokens"] == 8 and j["decision"]["deciding"] is True and j["P1"]["deciding"]
+    assert j["decision"]["verdict"] in ("PASS", "FAIL", "VOID") and j["decision"]["token_set"]["complete"]
+    assert j["P1"]["d_learned"] == j["P1"]["gt_reference"]["d_vs_blend"]           # learned tube = the GT tube
+    assert j["criterion_S"]["P1"]["context"] == "decision (navtrain_val heldout, blend ck2T10, tokens 8 / 8 registered)"
+    assert f"**DECISION (P1, amended): {j['decision']['verdict']}** (navtrain_val heldout, blend ck2T10, tokens 8 / 8 " \
+           f"registered; teacher v4T10_rng2 --which last, ckpt_sha16 {meta['ckpt_sha16']}" in md("full")
+    # no GT tube (the reference of (c)): incomplete, non-zero exit
+    with pytest.raises(SystemExit, match="deciding split is incomplete.*no GT R2 tube"):
+        E.main([x for x in base if x not in ("--gt-tube", str(GT_VAL))] + ["--det", "v4T10_rng2", "--tag", "nogt"])
+    assert ev("nogt")["decision"]["deciding"] is False and ev("nogt")["gt_tube"] is None
+    # infer_meta without rg_read: report only (complete token set: exit 0)
+    _fake_det_outputs(out, "v4T10_rng2", rows, N, {k: v for k, v in meta.items() if k != "rg_read"})
+    j = E.main(base + ["--det", "v4T10_rng2", "--tag", "noread"])["eval"]
+    assert j["decision"]["deciding"] is False and not j["decision"]["incomplete"] and "rg_read None" in \
+        j["decision"]["reason"]
+    # the checkpoint changed after infer: report only
+    _fake_det_outputs(out, "v4T10_rng2", rows, N, meta)
+    ck.write_bytes(b"retrained")
+    j = E.main(base + ["--det", "v4T10_rng2", "--tag", "newck"])["eval"]
+    assert j["decision"]["deciding"] is False and "changed since infer" in j["decision"]["reason"]
+    assert "checkpoint CHANGED since infer" in md("newck")

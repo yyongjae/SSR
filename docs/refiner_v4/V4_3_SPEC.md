@@ -99,9 +99,9 @@ Source: SSR/report/84_three_ideas_review.md (main), 80 (EP head), 82 (KD transfe
   DAC KD only on parents with min corner SDF < 1 m; both from ref_* GT, train-time only).
 * `kd_constraint` block: enabled, lambda_occ (DET B BCE to the teacher's sigmoid(B) on the unique parents),
   lambda_margin (MAP D Huber where s <= map_range_m = 32 m), both masked by teacher ok.
-* Teachers (`train_ck2 --v4-readout range`): DET gets the box-level B GT aux (+ station BCE on its own keys); MAP the
-  SDF D aux; specialist key masking as v4_2.  teacher_forward / TeacherPair2.run return the range fields of the
-  unique parents for constraint KD.
+* Teachers (`train_ck2 --v4-readout range`): DET gets the box-level B GT aux (no station BCE: it reads the hazard
+  readout's a_* only, which the range readout does not have); MAP the SDF D aux; specialist key masking as
+  v4_2.  teacher_forward / TeacherPair2.run return the range fields of the unique parents for constraint KD.
 * GT data: GTLoader reads ref_obj_* from CK/v3/gt_objects/<split> and ref_sdf from sdf/<split> for val / navtest
   (builders: tools/ck/v4/build_sdf_split.py).
 

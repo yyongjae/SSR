@@ -667,10 +667,11 @@ class ParaSSRAgent(AbstractAgent):
         """
         if not any(bool(getattr(config, k, False))
                    for k in ("distill_selector_v6", "distill_selector_v7", "distill_selector_v8",
-                             "distill_selector_v9", "distill_selector_v10", "distill_selector_v11")):
+                             "distill_selector_v9", "distill_selector_v10", "distill_selector_v11",
+                             "distill_selector_v12")):
             raise NotImplementedError(
                 "use_distill on this core supports only the trajectory-anchor path "
-                "(distill_selector_v6/v7/v8/v9/v10/v11); the stage-1 adapter / corridor / "
+                "(distill_selector_v6/v7/v8/v9/v10/v11/v12); the stage-1 adapter / corridor / "
                 "register-selector paths need aux_distill's own v2 port")
         anchor_file = getattr(config, "plan_anchor_file", None)
         if not getattr(config, "plan_anchor", False) or not anchor_file or not os.path.isfile(str(anchor_file)):
@@ -687,6 +688,7 @@ class ParaSSRAgent(AbstractAgent):
             getattr(config, "distill_selector_v9", False)
             or getattr(config, "distill_selector_v10", False)
             or getattr(config, "distill_selector_v11", False)
+            or getattr(config, "distill_selector_v12", False)
         )
         trainable_prefix = "anchor_distill." if is_pgp else "anchor_distill.student_proj."
         for name, param in module.named_parameters():
@@ -1112,7 +1114,7 @@ class ParaSSRAgent(AbstractAgent):
                 if p.requires_grad and not n.startswith("anchor_distill.student_proj.")
             ]
             if proj_params:
-                if bool(getattr(cfg, "distill_selector_v11", False)):
+                if bool(getattr(cfg, "distill_selector_v11", False) or getattr(cfg, "distill_selector_v12", False)):
                     proj_mult = float(getattr(cfg, "distill_proj_lr_mult", 2.0))
                     groups.append({
                         "params": proj_params,

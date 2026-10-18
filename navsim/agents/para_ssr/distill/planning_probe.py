@@ -267,6 +267,7 @@ class PlanningGroundedProbe(nn.Module):
         gt_trajectory: Optional[torch.Tensor] = None,
         sim_reward: Optional[torch.Tensor] = None,
         sim_reward_valid: Optional[torch.Tensor] = None,
+        sibling_pairs: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute domain-specific planning loss L_probe,b on Teacher BEV predictions."""
         sim_logits = preds["sim_logits"]  # [B, 5, K]
@@ -279,8 +280,10 @@ class PlanningGroundedProbe(nn.Module):
         # Touch all output heads with 0.0 so plain DDP never sees an unused parameter
         zero_touch = 0.0 * (sim_logits.sum() + im_logits.sum() + offset.sum())
         metrics: Dict[str, torch.Tensor] = {}
+        tag = "det" if self.domain == "bevfusion" else "map"
 
-        # 1. Domain-masked PDM simulation reward BCE loss
+        # 1. Domain-masked PDM simulation reward BCE loss (+ v12 Velocity-Sibling Cliff Ranking Loss)
+        cliff_loss = zero_touch
         if sim_reward is not None and sim_reward.numel() > 0:
             target = sim_reward.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
             bce = F.binary_cross_entropy_with_logits(sim_logits.float(), target, reduction="none")  # [B, 5, K]
@@ -291,6 +294,22 @@ class PlanningGroundedProbe(nn.Module):
                 valid = torch.ones((bs, 1, 1), device=device, dtype=torch.float32)
             denom = (valid.sum() * mask.sum() * k).clamp_min(1.0)
             sim_loss = ((bce * mask * valid).sum() / denom).to(dtype=dtype) * 5.0
+
+            if self.version == "v12" and sibling_pairs is not None and sibling_pairs.numel() > 0:
+                sib = sibling_pairs.to(device=device, dtype=torch.long)
+                i_slow, j_fast = sib[:, 0], sib[:, 1]
+                if self.domain == "bevfusion":
+                    safe_t = (target[:, 0] * target[:, 3]).clamp(0.0, 1.0)
+                    safe_z = 0.5 * (sim_logits[:, 0].float() + sim_logits[:, 3].float())
+                else:
+                    safe_t = target[:, 1].clamp(0.0, 1.0)
+                    safe_z = sim_logits[:, 1].float()
+                cliff = (safe_t[:, i_slow] - safe_t[:, j_fast]).clamp(0.0, 1.0)
+                active = (cliff > 0.25).float() * valid.view(bs, 1)
+                c_w = active * cliff
+                d_z = safe_z[:, i_slow] - safe_z[:, j_fast]
+                cliff_loss = ((c_w * F.softplus(1.0 - d_z)).sum() / c_w.sum().clamp_min(1.0)).to(dtype=dtype)
+                metrics[f"probe/{tag}/cliff_loss"] = cliff_loss.detach()
 
             with torch.no_grad():
                 probs = sim_logits.detach().float().sigmoid()
@@ -319,8 +338,13 @@ class PlanningGroundedProbe(nn.Module):
             offset_loss = zero_touch
             im_loss = zero_touch
 
-        total_probe_loss = sim_loss + self.im_weight * im_loss + self.offset_weight * offset_loss + zero_touch
-        tag = "det" if self.domain == "bevfusion" else "map"
+        total_probe_loss = (
+            sim_loss
+            + 0.5 * cliff_loss
+            + self.im_weight * im_loss
+            + self.offset_weight * offset_loss
+            + zero_touch
+        )
         metrics[f"probe/{tag}/loss"] = total_probe_loss.detach()
         metrics[f"probe/{tag}/gamma_mean"] = preds["gamma"].mean().detach()
         return total_probe_loss, metrics

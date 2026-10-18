@@ -324,6 +324,70 @@ def stopped_from_ref(ref: Dict[str, Tensor], tok: Tensor, device=None) -> Tensor
     return valid & ((meta[..., GF.MT_AGENT] <= 0) | (vfirst <= STOP_TRACK))
 
 
+# ----------------------------------------------------------------------------------------------- privileged input
+PRIV_WIN = (0.0, 32.0, -32.0, 32.0)   # [m] DET BEV window in N (BEVFusion point_cloud_range x [0, 32], y [-32, 32])
+PRIV_FAR_X = 64.0                     # [m] 'far' band: t0 centre x in (32, 64], |y| <= 32
+
+
+def priv_region(x0: Tensor, y0: Tensor, region: str) -> Tensor:
+    """[..] bool: t0 centres (x0, y0) in the V4Cfg.rg_priv region ('far' | 'out' | 'all'; config docstring)."""
+    inwin = (x0 >= PRIV_WIN[0]) & (x0 <= PRIV_WIN[1]) & (y0 >= PRIV_WIN[2]) & (y0 <= PRIV_WIN[3])
+    if region == "all":
+        return torch.ones_like(inwin)
+    if region == "out":
+        return ~inwin
+    if region == "far":
+        return (x0 > PRIV_WIN[1]) & (x0 <= PRIV_FAR_X) & (y0 >= PRIV_WIN[2]) & (y0 <= PRIV_WIN[3])
+    raise ValueError(f"rg_priv region {region!r} not in ('far', 'out', 'all')")
+
+
+@torch.no_grad()
+def priv_channels(ref: Dict[str, Tensor], tok: Tensor, fr: Dict[str, Tensor], n_bins: int, tbin_s: float,
+                  region: str, device=None) -> Tensor:
+    """PRIVILEGED teacher input of V4Cfg.rg_priv (config docstring; training-time teachers only): [P, 48, 17, M]
+    float32 any-overlap occupancy (blocked_field, behind_m None, no stopped rule) on the P parent grids `fr`
+    (parent_frame of the rows) of the batch's GT objects (ref_obj_*, losses.EV_REF_KEYS: the tensors the GT field aux
+    uses as TARGET) that are PRESENT at t0, whose t0 centre lies in `region` (priv_region), moved at their annotated
+    t0 velocity (constant velocity; heading and size fixed) at the 0.1 s samples 0 .. 4.9 s, max-pooled into the M
+    bins of tbin_s.  tok [P]: batch token (ref row) of each parent row.  Tokens without GT objects (ref_obj_n 0, or the
+    loader's ref_obj_ok False) and padding objects give zeros.  No gradient, float64 geometry as the GT field."""
+    from ...refiner import gt_future as GF
+    dev = device if device is not None else fr["p"].device
+    P = int(fr["p"].shape[0])
+    M = int(n_bins)
+    out = torch.zeros(P, N_ST, N_LAT, M, dtype=torch.float32, device=dev)
+    tok = torch.as_tensor(tok, device=ref["ref_obj_kf"].device).long().reshape(-1)
+    if tok.numel() != P:
+        raise ValueError(f"priv_channels: tok {tuple(tok.shape)} vs {P} parent rows")
+    ut, inv = torch.unique(tok, return_inverse=True)
+    n = ref["ref_obj_n"][ut].long()
+    a = int(max(int(n.max()) if n.numel() else 0, 1))
+    kf = ref["ref_obj_kf"][ut][:, :a].to(dev).double()                         # [S, A, 11, 6]
+    first = ref["ref_obj_first"][ut][:, :a].to(dev).double()                   # [S, A, 6]
+    S = kf.shape[0]
+    valid = torch.arange(a, device=dev)[None] < n.to(dev)[:, None]
+    # objects loaded?  GTLoader's per-part flag when it returns one (held-out splits: ref_gt_ok there also needs the
+    # SDF / side parts, which this input does not); a token without a file has ref_obj_n 0 (no selection) anyway
+    ok = (ref["ref_obj_ok"][ut].reshape(-1).bool().to(dev) if "ref_obj_ok" in ref
+          else torch.ones(S, dtype=torch.bool, device=dev))
+    k0 = kf[:, :, 0]
+    x0, y0, h0 = k0[..., GF.KF_X], k0[..., GF.KF_Y], k0[..., GF.KF_H]
+    sel = valid & ok[:, None] & (k0[..., GF.KF_PRESENT] > 0) & priv_region(x0, y0, region)
+    if not bool(sel.any()):
+        return out
+    t = torch.as_tensor(fine_times(), dtype=torch.float64, device=dev)       # [T] 0 .. 4.9 s
+    T = t.shape[0]
+    bx = torch.zeros(S, a, T, 5, dtype=torch.float64, device=dev)
+    bx[..., 0] = x0[..., None] + k0[..., GF.KF_VX][..., None] * t
+    bx[..., 1] = y0[..., None] + k0[..., GF.KF_VY][..., None] * t
+    bx[..., 2] = h0[..., None]
+    bx[..., 3] = first[..., GF.FI_L][..., None]
+    bx[..., 4] = first[..., GF.FI_W][..., None]
+    obs = sel[..., None].expand(S, a, T)
+    B = blocked_field(fr, bx, obs, index=inv.to(dev), tbin_s=float(tbin_s), n_bins=M, behind_m=None)
+    return B.to(torch.float32)
+
+
 # ----------------------------------------------------------------------------------------------- blocked field
 def _cull_bbox(c0: Tensor, n: Tensor) -> Tuple[Tensor, Tensor]:
     """bounding box [P, 2] lo / hi of the ego box centres of all cells (segment end points c0 +- 4.8 n)."""

@@ -364,9 +364,9 @@ class CK2Dataset(torch.utils.data.Dataset):
             it["bev"], it["bev_ok"] = self.load_bev(it["token"])
         if self.gt:
             if self._gtl is None or self._pid != os.getpid():
-                from navsim.agents.para_ssr.refiner.e2e import GTLoader
+                from navsim.agents.para_ssr.refiner.e2e import GT_SOURCES, GTLoader
                 self._arr("status")
-                self._gtl = GTLoader(CM.DATA_ROOT)
+                self._gtl = GTLoader(CM.DATA_ROOT, split=self.split) if self.split in GT_SOURCES else GTLoader(CM.DATA_ROOT)   # held-out splits: their own GT stores (gt_ok was always False there before 2026-10-19)
             it.update(self._gtl.load(it["token"]))
         if self.objects is not None:
             it.update(self.objects.item(it["row"], it["token"], self.epoch, self.seed))

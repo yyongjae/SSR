@@ -296,8 +296,11 @@ class CKNet(nn.Module):
     def score_set(self, feat: torch.Tensor, mem: torch.Tensor, ego, cand: torch.Tensor,
                   parents: Optional[torch.Tensor] = None, tfeat=None, pref: Optional[torch.Tensor] = None,
                   return_ctx: bool = False, parent_index: Optional[torch.Tensor] = None, pctx: Optional[Dict] = None,
-                  return_pctx: bool = False, dedupe: Optional[bool] = None) -> Dict:
-        """Score one candidate set with the token's scene (feat, mem from trunk.scene):
+                  return_pctx: bool = False, dedupe: Optional[bool] = None,
+                  priv: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
+        """Score one candidate set with the token's scene (feat, mem from trunk.scene).  priv: the batch's ref_obj_*
+        dict (losses.EV_REF_KEYS) of a PRIVILEGED range teacher (V4Cfg.rg_priv != 'off'; required then, refused
+        otherwise; range_targets.priv_channels on the parent rows, reused from a range pctx):
         cand [T, K, 8, 3] -> score_logit [T, K, 5] f32, w_lat / z_lon [T, K, 6] f32, gate_logit [T, K], and for the v4
         parent-pass readouts 'haz' = {t_arr (bin-centre first arrival), t_in / t_out (entry / min(leave, horizon) of
         the station bins), d_lat, haz_mask [T, K, 48], is_self [T, K]; hazard: a_nc / a_ttc / a_dac
@@ -412,7 +415,7 @@ class CKNet(nn.Module):
             haz = {k: sh(r[k]) for k in ("occ_logit", "margin", "lp_nc", "lp_ttc", "lp_dac", "min_margin")}
             haz["pts"] = sh(pgeom.points.detach().float())
         else:                                                           # range (V4_3 M4): fields once per parent row
-            r, haz, rg = self._range_read(P, rows, pidx, T, K, flat, ego, x, g, cgeom, sib, pr)
+            r, haz, rg = self._range_read(P, rows, pidx, T, K, flat, ego, x, g, cgeom, sib, pr, priv)
             haz["pts"] = sh(pgeom.points.detach().float())
         haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), t_in=sh(sib["t_in"]), t_out=sh(r["t_out"]),
                    d_lat=sh(sib["d"]), is_self=sh(is_self))
@@ -435,7 +438,8 @@ class CKNet(nn.Module):
         return out
 
     def _range_read(self, P: Dict, rows: Optional[torch.Tensor], pidx: Optional[torch.Tensor], T: int, K: int,
-                    flat: torch.Tensor, ego, x: torch.Tensor, g: torch.Tensor, cgeom, sib: Dict, pr):
+                    flat: torch.Tensor, ego, x: torch.Tensor, g: torch.Tensor, cgeom, sib: Dict, pr,
+                    priv: Optional[Dict[str, torch.Tensor]] = None):
         """score_set's readout 'range' (spec V4_3 M4; ck/v4/range_readout.py): scene fields on the R rows of the parent
         pass P (R = T * U unique parents, or T * K without dedupe; reused from P['rg_fields'] / P['rg_frame'] when P is
         a range pctx), the candidates' states (exec_model; ego (vx, ax) = eds[:, 0], eds[:, 2], i.e. status[..., 4] /
@@ -449,8 +453,21 @@ class CKNet(nn.Module):
         if "rg_fields" in P:
             Fs, fr_u = P["rg_fields"], P["rg_frame"]
         else:
-            Fs = self.v4_readout.scene(P["x"][:, 1:], P["Hc"])
             fr_u = RT.parent_frame(P["geom"])
+            pv = None
+            if self.v4.rg_priv != "off":                     # PRIVILEGED input (V4Cfg.rg_priv, config docstring)
+                if priv is None:
+                    raise ValueError(f"CKNet.score_set: this range teacher is PRIVILEGED (v4.rg_priv "
+                                     f"{self.v4.rg_priv!r}): priv= (the batch's ref_obj_* dict, losses.EV_REF_KEYS) "
+                                     f"is required")
+                R = int(P["Hc"].shape[0])
+                tok_rows = torch.arange(R, device=dev) // max(R // T, 1)      # row r -> token (R = T * U rows)
+                pv = RT.priv_channels(priv, tok_rows, fr_u, self.v4_readout.M, self.v4_readout.tbin,
+                                      self.v4.rg_priv, device=dev)
+            elif priv is not None:
+                raise ValueError("CKNet.score_set: priv given to a range teacher without v4.rg_priv")
+            Fs = (self.v4_readout.scene(P["x"][:, 1:], P["Hc"]) if pv is None       # off: the unchanged call
+                  else self.v4_readout.scene(P["x"][:, 1:], P["Hc"], priv=pv))
         eds = ego[2].float()
         rep = lambda a: a.reshape(T, 1).repeat_interleave(K, 0)[:, 0]
         with torch.autocast(device_type=dev.type, enabled=False):
@@ -554,12 +571,16 @@ class CKNet(nn.Module):
     def forward(self, bev: Optional[torch.Tensor], cand: torch.Tensor, status: torch.Tensor,
                 extra: Optional[torch.Tensor] = None, decode: bool = True, slope: float = 0.0,
                 rescore_corr: bool = False, objs: Optional[Dict[str, torch.Tensor]] = None,
-                cand_parent: Optional[torch.Tensor] = None, extra_parent: Optional[torch.Tensor] = None) -> Dict:
+                cand_parent: Optional[torch.Tensor] = None, extra_parent: Optional[torch.Tensor] = None,
+                priv: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
         """cand_parent / extra_parent [T, K(2), 8, 3]: refiner v4 hazard readout only (each candidate's parent draft;
-        None = itself); ignored by the mean readout."""
+        None = itself); ignored by the mean readout.  priv: the ref_obj_* dict of a PRIVILEGED range teacher
+        (score_set)."""
         if self.v4_readout is not None:
             return self._forward_v4(bev, cand, status, extra, decode, slope, rescore_corr, objs, cand_parent,
-                                    extra_parent)
+                                    extra_parent, priv)
+        if priv is not None:
+            raise ValueError("priv given to a CK net without a range readout")
         T, K = cand.shape[:2]
         if status.shape[0] != T:
             raise ValueError(f"status {tuple(status.shape)} vs cand {tuple(cand.shape)}")
@@ -599,7 +620,7 @@ class CKNet(nn.Module):
         return out
 
     def _forward_v4(self, bev, cand, status, extra, decode, slope, rescore_corr, objs, cand_parent,
-                    extra_parent) -> Dict:
+                    extra_parent, priv=None) -> Dict:
         """forward() with the v4 hazard readout (same output keys; + 'haz' (per set: a_nc / a_ttc / a_dac / haz_mask /
         t_arr / d_lat) and 'pref_logp' [T] when the P_ref head is on)."""
         T, K = cand.shape[:2]
@@ -612,7 +633,7 @@ class CKNet(nn.Module):
         cand = cand.float()
         feat, mem = self.trunk.scene(bev, T)
         pref = self.scene_pref(mem, ego)
-        o = self.score_set(feat, mem, ego, cand, cand_parent, pref=pref)
+        o = self.score_set(feat, mem, ego, cand, cand_parent, pref=pref, priv=priv)
         out = {"score_logit": o["score_logit"], "z_lon": o["z_lon"], "w_lat": o["w_lat"],
                "gate_logit": o["gate_logit"], "ego": ego, "haz": o["haz"]}
         if pref is not None:
@@ -621,11 +642,11 @@ class CKNet(nn.Module):
             out["corr"] = correct(cand, out["z_lon"], out["w_lat"], v0, slope)
         if rescore_corr:
             ct = out["corr"]["traj"].detach()
-            out["corr_score_logit"] = self.score_set(feat, mem, ego, ct, cand, pref=pref)["score_logit"]
+            out["corr_score_logit"] = self.score_set(feat, mem, ego, ct, cand, pref=pref, priv=priv)["score_logit"]
         if extra is not None:
             if extra.shape[0] != T:
                 raise ValueError(f"extra {tuple(extra.shape)} vs cand {tuple(cand.shape)}")
-            oe = self.score_set(feat, mem, ego, extra.float(), extra_parent, pref=pref)
+            oe = self.score_set(feat, mem, ego, extra.float(), extra_parent, pref=pref, priv=priv)
             out["extra_score_logit"] = oe["score_logit"]
             out["extra_haz"] = oe["haz"]
         return out
@@ -747,6 +768,10 @@ def load_ck(run_dir: Union[str, Path], which: str = "last", device="cpu",
     if tcfg.privileged and not allow_privileged:
         raise PermissionError(f"CK run {run_dir} is PRIVILEGED (temporal forecaster {tcfg.forecaster!r}, source "
                               f"{tcfg.source!r}): analysis only, pass allow_privileged=True")
+    rg_priv = str((cfg.get("v4") or {}).get("rg_priv", "off"))
+    if rg_priv != "off" and not allow_privileged:
+        raise PermissionError(f"CK run {run_dir} is PRIVILEGED (v4.rg_priv {rg_priv!r}: GT t0 objects as input): "
+                              f"analysis only, pass allow_privileged=True")
     # the checkpoint carries the adapter's z-score buffers, so a missing norm file is not fatal
     norm = load_arm_norm(run_dir, arm) if arm in NORM_FILE and (run_dir / NORM_FILE[arm]).is_file() else None
     net = CKNet(arm, int(cfg.get("seed", 0)), norm,

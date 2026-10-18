@@ -241,6 +241,10 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--v4-rg-read", choices=("nearest", "any4"), default=None,
                     help="range: B / U read at the executed points (default nearest; any4 = OR over the 2 x 2 cells, "
                          "Phase 0b R2)")
+    ap.add_argument("--v4-rg-priv", choices=("off", "far", "out", "all"), default=None,
+                    help="range: PRIVILEGED GT t0-object input channels (V4Cfg.rg_priv: far = front band 32-64 m, "
+                         "out = outside the DET BEV window, all); the run is privileged (name must end with _PRIV, "
+                         "load_ck refuses it as a KD teacher)")
     ap.add_argument("--v4-rg-stopped-aware", type=int, choices=(0, 1), default=None,
                     help="range: 1 = the GT field aux trains B on the stopped-aware blocked field (stopped / static "
                          "objects without the not-behind filter, Phase 0b R2) and adds the Bp group (plain not-behind "
@@ -352,11 +356,14 @@ def resolve_args(a):
     parse_best(a.best_metric)
     a.temporal_cfg = resolve_temporal(a)
     a.v4_cfg = resolve_v4(a)
+    if a.v4_cfg.rg_priv != "off" and not str(a.run).endswith("_PRIV"):
+        raise SystemExit(f"PRIVILEGED range run (--v4-rg-priv {a.v4_cfg.rg_priv}): the run name must end with _PRIV "
+                         f"(got {a.run!r})")
     return a
 
 
 V4_3_FLAGS = ("v4_exec_model", "v4_ev_tbin_s", "v4_ep_evidence", "v4_vmax", "v4_rg_read",
-              "v4_rg_stopped_aware")                                            # range readout only (None = default)
+              "v4_rg_stopped_aware", "v4_rg_priv")                                            # range readout only (None = default)
 
 
 def resolve_v4(a):
@@ -381,7 +388,8 @@ def resolve_v4(a):
             kw = dict(exec_model=getattr(a, "v4_exec_model", None) or "lqr", ev_tbins=nb, ev_tbin_s=tb,
                       ep_evidence=True if epe is None else bool(int(epe)), vmax=getattr(a, "v4_vmax", None) or "off",
                       rg_read=getattr(a, "v4_rg_read", None) or "nearest",
-                      rg_stopped_aware=False if sa is None else bool(int(sa)))
+                      rg_stopped_aware=False if sa is None else bool(int(sa)),
+                      rg_priv=getattr(a, "v4_rg_priv", None) or "off")
             return V4Cfg(readout=ro, pref_head=ph, time_free=bool(int(getattr(a, "v4_time_free", 1))),
                          lat_haz=bool(int(getattr(a, "v4_lat_haz", 1))), horizon=float(getattr(a, "v4_horizon", 4.0)),
                          **kw).validate(temporal_cfg_of(a).on)
@@ -557,13 +565,14 @@ def build_datasets(a) -> Dict:
         v4kw["with_pref"] = True
     train = CK2Dataset(a.split, bev=a.arm, n_var=a.n_var, gt=True, limit=a.limit_tokens or 0, **ck2,
                        **ob(a.split, True), **v4kw)
+    egt = v4_cfg_of(a).rg_priv != "off"           # PRIVILEGED teacher: the evals need the GT objects as input too
     evals = []
     if a.val_split and a.val_split != "none":
-        evals.append((a.val_split, "r34", CKDataset(a.val_split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
+        evals.append((a.val_split, "r34", CKDataset(a.val_split, bev=a.arm, k=C().K_CAND, labels="cand", gt=egt,
                                                     limit=a.val_limit or 0, ep_target=ep, **ob(a.val_split))))
         if a.val_raw:
             evals.append((a.val_split + RAW_SUFFIX, "raw",
-                          CK2Dataset(a.val_split, bev=a.arm, n_var=a.eval_n_var, gt=False, epoch=0,
+                          CK2Dataset(a.val_split, bev=a.arm, n_var=a.eval_n_var, gt=egt, epoch=0,
                                      limit=a.val_limit or 0, **ck2, **ob(a.val_split))))
     if a.train_eval_rows:
         tdf = TC.packed_tokens(a.split)
@@ -572,9 +581,9 @@ def build_datasets(a) -> Dict:
             n_eval = a.train_eval_rows if not a.val_limit else min(a.train_eval_rows, a.val_limit)
             rows = pool[U.log_stratified_rows(tdf["log"].values[pool], n_eval, seed=0)]
             name = TRAIN_EVAL_NAME.format(a.split)
-            evals.append((name, "r34", CKDataset(a.split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
+            evals.append((name, "r34", CKDataset(a.split, bev=a.arm, k=C().K_CAND, labels="cand", gt=egt,
                                                  rows=rows, ep_target=ep, **ob(a.split))))
-            evals.append((name + RAW_SUFFIX, "raw", CK2Dataset(a.split, bev=a.arm, n_var=a.eval_n_var, gt=False,
+            evals.append((name + RAW_SUFFIX, "raw", CK2Dataset(a.split, bev=a.arm, n_var=a.eval_n_var, gt=egt,
                                                                epoch=0, rows=rows, **ck2, **ob(a.split))))
     if on:
         check_obj_bad(a.split, train)
@@ -736,6 +745,10 @@ def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool, tcfg=None) -> 
     if tcfg is not None and tcfg.on:
         from navsim.agents.para_ssr.ck.temporal.branch import objs_from_batch
         kw["objs"] = objs_from_batch(batch, tcfg, dev)
+    v4 = getattr(core, "v4", None)
+    if v4 is not None and v4.range and v4.rg_priv != "off":      # PRIVILEGED teacher: the batch's GT objects as input
+        from navsim.agents.para_ssr.ck.v4.losses import EV_REF_KEYS
+        kw["priv"] = {k: batch[k].to(dev) for k in EV_REF_KEYS if k in batch}
     with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_amp):
         return net(batch.get("bev"), batch["cand"].float(), batch["status"].float(), extra=extra, decode=False,
                    **kw)
@@ -1220,7 +1233,7 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                ep_target_rule=(EP_RULE if a.ep_target == "decoupled" else "official EP label column"),
                score_hidden=256, lead_aux=0, param_count=int(sum(p.numel() for p in net.parameters())),
                param_count_trainable=int(sum(p.numel() for p in params)),
-               temporal=tcfg.to_dict(), privileged=int(tcfg.privileged),
+               temporal=tcfg.to_dict(), privileged=int(tcfg.privileged or v4_cfg_of(a).rg_priv != "off"),
                **({"v4": v4_cfg_of(a).to_dict(), "lambda_pref": float(a.lambda_pref),
                    "lambda_station": float(a.lambda_station), "lambda_ev": float(a.lambda_ev),
                    "time_idx_root": str(a.time_idx_root or "")}
@@ -1326,7 +1339,7 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                 if D.is0 and "logit" in R:          # temporal r34 evals: logits of this eval (infer check, D6)
                     save_eval_logits(run / f"eval_r34_{name}_last.npz", R, pend)
                 TC.check_bev_bad(int(m.get("n_bev_bad", 0)), int(m.get("n_tokens", 0)), f"eval {name}", force=True)
-                if tcfg.privileged:
+                if tcfg.privileged or v4_cfg_of(a).rg_priv != "off":
                     m["privileged"] = 1
                 if D.is0:
                     U.log_jsonl(valp, dict(epoch=pend["epoch"], step=pend["step"], split=name, kind=kind,

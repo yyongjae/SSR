@@ -39,13 +39,21 @@ WHICH=${1:-both}
 case "$WHICH" in both|det|map) ;; *) echo "usage: run_teachers.sh [both|det|map]"; exit 2 ;; esac
 READOUT=${READOUT:-hazard}
 R2=${R2:-0}
+PRIV=${PRIV:-off}     # far | out | all: PRIVILEGED GT t0-object input (V4Cfg.rg_priv; READOUT=range R2=1, det only)
+VER=${VER:-10}        # run-name version: v4T<VER>_<suffix> (11 for the rg_priv runs)
 RNG_ARGS="--v4-readout range --v4-exec-model lqr --v4-ev-tbin-s 0.25 --v4-ep-evidence 1"
 case "$READOUT" in
   hazard) SUF=haz; TAG=teachers; RO_ARGS="--v4-readout hazard"
           [ "$R2" = 0 ] || { echo "refusing: R2=$R2 needs READOUT=range"; exit 2; } ;;
   range) case "$R2" in
            0) SUF=rng; TAG=teachers_rng; RO_ARGS="$RNG_ARGS" ;;
-           1) SUF=rng2; TAG=teachers_rng2; RO_ARGS="$RNG_ARGS --v4-rg-read any4 --v4-rg-stopped-aware 1" ;;
+           1) SUF=rng2; TAG=teachers_rng2; RO_ARGS="$RNG_ARGS --v4-rg-read any4 --v4-rg-stopped-aware 1"
+              if [ "$PRIV" != off ]; then
+                case "$PRIV" in far|out|all) ;; *) echo "refusing: PRIV='$PRIV' (off, far, out or all)"; exit 2 ;; esac
+                [ "$WHICH" = det ] || { echo "refusing: PRIV=$PRIV is a DET-only (arm T) run: run_teachers.sh det"; exit 2; }
+                VER=${VER_PRIV:-11}; SUF=rngP${PRIV}_PRIV; TAG=teachers_rngP_$PRIV
+                RO_ARGS="$RO_ARGS --v4-rg-priv $PRIV"
+              fi ;;
            *) echo "refusing: R2='$R2' (0 or 1)"; exit 2 ;;
          esac ;;
   *) echo "refusing: READOUT='$READOUT' (hazard or range)"; exit 2 ;;
@@ -84,8 +92,8 @@ done
 cd "$V4"
 COMMON="--epochs 10 --tokens-per-batch 16 --lr 6e-4 --sur-groups near_mid --eval-every 2 --best-metric none \
 $RO_ARGS --v4-pref-head 1 --corridor-version 2 --time-idx-root $TI --out-root $OUT --resume"
-RUN_T=v4T10_$SUF
-RUN_M=v4M10_$SUF
+RUN_T=v4T${VER}_$SUF
+RUN_M=v4M${VER}_$SUF
 DET="--arm T --run-name $RUN_T --score-keys nc,ttc,ep,comfort $COMMON"
 MAP="--arm M --run-name $RUN_M --score-keys dac,ep $COMMON"
 if [ -n "$WAIT" ]; then
@@ -101,7 +109,7 @@ if [ -n "$WAIT" ]; then
     GIT_STATE="head $(git rev-parse HEAD 2>/dev/null || echo n/a), dirty diff sha256 $( (git diff HEAD 2>/dev/null || true) | sha256sum | cut -c1-16)"
   fi
   {
-    echo "[$(TZ=Asia/Seoul date '+%F %T KST')] WAIT request: $WHICH ($READOUT, R2=$R2) on GPUs $CVD, idle >= $WAIT min"
+    echo "[$(TZ=Asia/Seoul date '+%F %T KST')] WAIT request: $WHICH ($READOUT, R2=$R2, PRIV=$PRIV) on GPUs $CVD, idle >= $WAIT min"
     echo "  git at the wait start: $GIT_STATE"
     echo "  DET $DET"
     echo "  MAP $MAP"

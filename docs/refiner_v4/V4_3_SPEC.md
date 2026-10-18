@@ -183,3 +183,37 @@ tokens (ratio criterion (c) then has a negative denominator).  P1 is therefore r
   <= 1.3 %, (c) >= 25 % of the GT R2 tube's filter-rule gain on the same keys and tokens (GT reference about +1.0 on
   the val held-out tokens; must be positive with CI lower bound > 0, else P1 is void and reported as such).
 * Everything else in Phase 1c is unchanged.  The amendment is committed before the R2 teachers start.
+
+## Phase 1e — P2: privileged out-of-window input (registered 2026-10-19 02:45 KST, BEFORE the runs start)
+P1 FAILED (report 90, 2026-10-18 22:30 KST): the learned DET tube gives filter - blend -0.12 [-0.24, -0.01] vs the GT
+tube +1.01.  No bug.  The misses are moving objects at t >= 2 s, and more than half of the missed failures are caused by
+objects OUTSIDE the teacher's BEV window at t0 (x 0-32 m, |y| <= 32 m): behind, beyond 32 m ahead, or not yet present.
+Ceilings on the same filter rule, val 12,179 tokens (CK/v4/analysis/p1diag/candidate_level/window_ceiling{,2}.json,
+2026-10-19 02:05 KST): in-window objects + perfect future +0.27 [+0.11, +0.44]; in-window + CV -0.13; all objects + CV
+-0.19; in-window perfect + out-of-window CV +0.41 [+0.19, +0.62]; in-window CV + out-of-window perfect +0.63
+[+0.44, +0.84]; all objects + constant acceleration (GT 0.5 s speed change, stop-clamped) +0.29 [+0.14, +0.47]; all
+objects perfect to 2 s then CV +0.49 [+0.31, +0.68]; in-window perfect to 2 s then CV +0.12 [-0.00, +0.24].
+Question: given the out-of-window t0 state (as an input the teacher can learn to extrapolate), does a learned range
+teacher recover a useful share of the GT gain?  This is a TRAINING-TIME teacher question (privileged input; never a KD
+teacher as is, model.load_ck refuses it without allow_privileged).
+* **Design** (`V4Cfg.rg_priv`, ck/v4/config.py docstring; `--v4-rg-priv`): the batch's GT objects present at t0
+  whose t0 centre lies in the region are moved at their annotated t0 velocity (constant velocity) and rasterised as an
+  any-overlap occupancy [48, 17, 20 bins] on each parent grid (range_targets.priv_channels, the GT field's own
+  blocked_field, behind_m None); the readout's per-cell MLPs get it as a zero-initialised 1x1-conv term.  Everything
+  else = v4T10_rng2 (R2, any4, stopped-aware, same recipe, 10 epochs, seed 0).  Two arms, in parallel:
+  - `v4T11_rngPout_PRIV` (region 'out': every t0 object outside the BEV window — behind, beyond 32 m, sides);
+  - `v4T11_rngPfar_PRIV` (region 'far': the front band x in (32, 64] m, |y| <= 32 only — the part a front camera
+    student could in principle see).
+* **P2 decision rule** (each arm separately; the P1 (amended) FILTER rule, keys NC / TTC, the registered val held-out
+  12,179 tokens, blend ck2T10 pool96_old_b1, `tools/ck/v4/eval_range_teacher.py --stage infer` then `--stage eval`):
+  PASS iff (a) filter - blend >= +0.30 with the paired log-bootstrap CI lower bound > 0, (b) break <= 1.3 %,
+  (c) >= 25 % of the GT R2 tube's filter-rule gain on the same keys and tokens.  Reported beside the rule: the arm vs
+  the matching ceiling (out: all objects + CA +0.29 / perfect 2 s +0.49; far: no exact ceiling, the out-of-window
+  perfect +0.63 is an upper bound), and the plain R2 teacher's -0.12.
+* **Reading**: 'out' PASS -> the forecasting-from-t0-state lever is real once the coverage limit is removed; the next
+  question (with the user) is how the student gets it (GT-direct range aux = control arm B, a KD prior, or a wider
+  student input).  'far' PASS -> the front band alone is worth it and a 0-64 m student BEV is the natural follow-up.
+  Both FAIL -> a CV-level input is not enough even all-around; the remaining lever is forecasting beyond CV from
+  history (the v3 result says that is small) or the corrector line; report either way.
+* The runs are launched by the user's standing approval of 2026-10-19 ("teacher 학습 알아서 해놔"); GPUs 0,1 (out)
+  and 2,3 (far); eval chain on completion.

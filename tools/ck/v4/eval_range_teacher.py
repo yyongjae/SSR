@@ -249,22 +249,54 @@ def load_labels(split: str, vd: Path, n: int):
 
 
 # ----------------------------------------------------------------------------------------------- stage infer
-def range_forward(net, bev, cand, status, var):
+def range_forward(net, bev, cand, status, var, priv=None):
     """eval_teacher_navtest_r34.teacher_forward for a range teacher + its haz slacks / log P_pass:
-    -> s16 [T, 16, 5], s80 [T, 80, 5], slack16 / slack80 [T, K, 3] (nc s, ttc s, dac m), lp16 / lp80 [T, K, 3]."""
+    -> s16 [T, 16, 5], s80 [T, 80, 5], slack16 / slack80 [T, K, 3] (nc s, ttc s, dac m), lp16 / lp80 [T, K, 3].
+    priv: the batch's ref_obj_* dict for a PRIVILEGED teacher (V4Cfg.rg_priv; None otherwise)."""
     from navsim.agents.para_ssr.refiner.e2e import ego_inputs
     T = cand.shape[0]
     ego = ego_inputs(status)
     feat, mem = net.trunk.scene(bev, T)
     pref = net.scene_pref(mem, ego)
-    o16 = net.score_set(feat, mem, ego, cand.float(), pref=pref)
-    o80 = net.score_set(feat, mem, ego, var.float(), cand.float().repeat_interleave(NVAR, 1), pref=pref)
+    o16 = net.score_set(feat, mem, ego, cand.float(), pref=pref, priv=priv)
+    o80 = net.score_set(feat, mem, ego, var.float(), cand.float().repeat_interleave(NVAR, 1), pref=pref, priv=priv)
     import torch
     st = lambda o, ks: torch.stack([o["haz"][k].float() for k in ks], -1)
     return {"s16": o16["score_logit"], "s80": o80["score_logit"],
             "slack16": st(o16, ("slack_nc", "slack_ttc", "slack_dac")),
             "slack80": st(o80, ("slack_nc", "slack_ttc", "slack_dac")),
             "lp16": st(o16, ("lp_nc", "lp_ttc", "lp_dac")), "lp80": st(o80, ("lp_nc", "lp_ttc", "lp_dac"))}
+
+
+def priv_ref(gt_dir: Path, tokens, device) -> Dict:
+    """ref_obj_* dict (losses.EV_REF_KEYS minus ref_sdf) of a batch of tokens from the split's GT object store
+    (SPLITS[..]['gt_obj'], gt_future.save_objects files; the store the GT tube is built from) for a PRIVILEGED range
+    teacher (V4Cfg.rg_priv): kf [T, A, 11, 6], first [T, A, 6], meta [T, A, 5], n [T], n_kf [T], gt_ok [T] (False and
+    empty rows for a token without a file).  Built here, not by CKDataset(gt=True): its GTLoader reads the
+    navtrain_train stores only (gt_ok False on every held-out token)."""
+    import torch
+    from navsim.agents.para_ssr.refiner import gt_future as GF
+    objs = []
+    for t in tokens:
+        p = gt_dir / f"{t}.npz"
+        objs.append(GF.load_objects(p) if p.is_file() else None)
+    A = max([int(o["kf"].shape[0]) for o in objs if o is not None] + [1])
+    T = len(tokens)
+    kf = np.zeros((T, A, GF.N_KF, 6), np.float32)
+    first = np.zeros((T, A, 6), np.float32)
+    meta = np.zeros((T, A, 5), np.int16)
+    n = np.zeros(T, np.int32)
+    n_kf = np.full(T, GF.N_KF, np.int16)
+    ok = np.zeros(T, bool)
+    for i, o in enumerate(objs):
+        if o is None:
+            continue
+        a = int(o["kf"].shape[0])
+        kf[i, :a], first[i, :a], meta[i, :a] = o["kf"], o["first"], o["meta"]
+        n[i], n_kf[i], ok[i] = a, int(o.get("n_kf", GF.N_KF)), True
+    f = lambda x: torch.from_numpy(x).to(device)
+    return {"ref_obj_kf": f(kf), "ref_obj_first": f(first), "ref_obj_meta": f(meta), "ref_obj_n": f(n),
+            "ref_obj_n_kf": f(n_kf), "ref_gt_ok": f(ok)}
 
 
 def cuda_guard(a) -> None:
@@ -328,8 +360,9 @@ def stage_infer(a, role: str, name: str) -> Dict:
     else:
         dev = torch.device("cpu")
     torch.set_num_threads(max(1, int(os.environ.get("OMP_NUM_THREADS", "1"))))
-    net, cfg = load_ck(run, which=a.which, device=str(dev))
-    net.eval()
+    net, cfg = load_ck(run, which=a.which, device=str(dev), allow_privileged=True)   # analysis tool: a PRIVILEGED
+    net.eval()                                                                       # (rg_priv) teacher is evaluated
+    privd = str(getattr(net.v4, "rg_priv", "off")) != "off"                          # with the GT objects as input
     if cfg["arm"] != want:
         raise SystemExit(f"--{role} {run}: arm {cfg['arm']!r}, expected {want!r}")
     if not is_range_net(net):
@@ -345,6 +378,7 @@ def stage_infer(a, role: str, name: str) -> Dict:
                 ckpt=str(ck_file.absolute()), ckpt_sha16=U.sha256_file(ck_file) if ck_file.is_file() else None,
                 v4=net.v4.to_dict(),
                 rg_read=net.v4.rg_read, rg_stopped_aware=bool(net.v4.rg_stopped_aware),
+                rg_priv=str(getattr(net.v4, "rg_priv", "off")), privileged=bool(privd),
                 corridor_version=int(net.corridor_version), split=a.split, subset=a.subset, n=N, limit=a.limit,
                 device=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), batch=a.batch,
                 amp="fp16 autocast on CUDA (as eval_teacher_navtest_r34)", variants=str(vd / "traj80.npy"),
@@ -360,9 +394,9 @@ def stage_infer(a, role: str, name: str) -> Dict:
     U.write_json(td / "infer_meta.json", dict(meta, status="running", sessions=old.get("sessions") or []))
     log(f"[infer] {role} {tname(name)} ({ck_file.name}, rg_read {net.v4.rg_read}) -> {td}: todo {len(rr)} of "
         f"{len(rows)}")
-    n = n_bad = 0
+    n = n_bad = n_priv_missing = 0
     if len(rr):
-        ds = CKDataset(a.split, bev=want, k=K16, labels=None, gt=False, rows=rr)
+        ds = CKDataset(a.split, bev=want, k=K16, labels=None, gt=False, rows=rr)   # priv: priv_ref (own GT store)
         dl = DataLoader(ds, batch_size=a.batch, shuffle=False, collate_fn=collate_ck, num_workers=a.workers_io,
                         pin_memory=dev.type == "cuda", prefetch_factor=4 if a.workers_io > 0 else None)
         use_amp = dev.type == "cuda"
@@ -374,8 +408,13 @@ def stage_infer(a, role: str, name: str) -> Dict:
                 n_bad += int((~bok).sum())
                 cand = b["cand"].to(dev).float()
                 var = torch.from_numpy(np.asarray(var_all[prow], np.float32)).to(dev)
+                priv = None
+                if privd:
+                    priv = priv_ref(SPLITS[a.split]["gt_obj"], [str(x) for x in tdf.token.to_numpy()[prow]], dev)
+                    n_priv_missing += int((~priv["ref_gt_ok"].cpu().numpy()).sum())
                 with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_amp):
-                    o = range_forward(net, b["bev"].to(dev, non_blocking=True), cand, b["status"].to(dev).float(), var)
+                    o = range_forward(net, b["bev"].to(dev, non_blocking=True), cand, b["status"].to(dev).float(), var,
+                                      priv=priv)
                 q = prow[bok]
                 g = lambda t: t.float().cpu().numpy()[bok]
                 A["score_logit16"][q], A["score_logit80"][q] = g(o["s16"]), g(o["s80"])
@@ -389,6 +428,9 @@ def stage_infer(a, role: str, name: str) -> Dict:
                     log(f"[infer] {n}/{len(rr)} {el:.0f}s {n / max(el, 1e-6):.1f} tok/s")
         for m in A.values():
             m.flush()
+    if privd:
+        log(f"[infer] privileged input: {n_priv_missing} of {n} rows without a GT object file")
+        meta["n_priv_missing"] = int(n_priv_missing)
     meta.update(n_rows=int(len(rows)), n_done=int(np.asarray(A["done"][rows]).sum()), n_bev_bad_this_call=n_bad,
                 sec=round(time.time() - t0, 1), finished=kst(), status="finished",
                 sessions=(old.get("sessions") or []) + [dict(started=meta["started"], finished=kst(), n=n,

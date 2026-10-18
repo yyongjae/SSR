@@ -81,6 +81,18 @@ range critic should use:
                               then outputs 3 x ev_tbins (+ rg_hidden * ev_tbins + ev_tbins parameters, 1,100 at the
                               spec sizes; inside the CK2 budget).  edits 'computed' reads the three groups with the
                               same channel rule (ck/v4/edits.py: NC windows on B, TTC on Bp / U).
+rg_priv 'off' | 'far' | 'out' | 'all'  PRIVILEGED teacher input (2026-10-19, after P1 FAIL: report 90 found the misses to be
+                              objects outside the DET BEV window at t0 and their future).  The GT objects of the batch
+                              (ref_obj_*, the same tensors the GT field aux uses as TARGET) present at t0 in the region
+                              are moved at their annotated t0 velocity (constant velocity, heading and size fixed) and
+                              rasterised as an any-overlap occupancy [R, 48, 17, M] on each parent grid
+                              (range_targets.priv_channels, blocked_field behind_m None); the readout's per-cell MLPs
+                              get it as an extra zero-initialised 1x1-conv term (range_readout.RangeReadout.scene).
+                              'far': t0 centre x in (32, 64] m, |y| <= 32 (the front band beyond the BEV); 'out': any
+                              t0 centre outside x in [0, 32], |y| <= 32 (behind, beyond, sides); 'all': every t0 object.
+                              A run with rg_priv != off is PRIVILEGED: model.load_ck refuses it without
+                              allow_privileged (as the temporal oracle), CKNet.score_set needs priv= (the ref_obj_*
+                              dict) and raises without it; never a KD teacher as is.  Default off = unchanged.
 Head sizes (haz_hidden, ep_hidden, comfort_hidden, lat_hidden, pref_kdim, pref_hidden, ev_hidden, rg_hidden,
 ep_ev_hidden): the defaults give the hazard + P_ref (the evidence + P_ref, the range + P_ref with or without
 ep_evidence) critic the trainable parameter count of the CK2 critic it replaces (CK2 as trained: 3,391,755 = the
@@ -106,6 +118,7 @@ EXEC_MODELS = ("plan", "lqr")
 VMAX_MODES = ("off", "feature")
 EDIT_MODES = ("off", "computed")
 RG_READS = ("nearest", "any4")
+RG_PRIVS = ("off", "far", "out", "all")   # rg_priv: privileged GT-object input region (range_targets.priv_channels)
 RANGE_T_END = 5.0                # [s] range time bins cover [0, 5.0 s) (= range_targets.T_END, the GT field's horizon)
 MAX_TBINS = 20
 
@@ -146,6 +159,9 @@ class V4Cfg:
     ep_ev_hidden: int = 61             # range: EP head width when ep_evidence (budget-matched, docstring)
     rg_read: str = "nearest"           # range: B / U read at the executed points ('nearest' | 'any4', Phase 0b R2)
     rg_stopped_aware: bool = False     # range: B target = the stopped-aware B (R2) + a Bp group for TTC (docstring)
+    rg_priv: str = "off"               # range: PRIVILEGED GT t0-object input channels (training-time teacher only; "far"
+                                       # = t0 centres x in (32, 64] m, |y| <= 32; "out" = outside the DET BEV window;
+                                       # "all" = every t0 object), constant-velocity occupancy per bin (docstring)
     version: str = CONFIG_VERSION
 
     @property
@@ -206,7 +222,8 @@ class V4Cfg:
         if not (0.5 <= float(self.horizon) <= 8.0):
             raise ValueError(f"v4.horizon {self.horizon} outside [0.5, 8] s")
         for name, val, allowed in (("exec_model", self.exec_model, EXEC_MODELS), ("vmax", self.vmax, VMAX_MODES),
-                                   ("edits", self.edits, EDIT_MODES), ("rg_read", self.rg_read, RG_READS)):
+                                   ("edits", self.edits, EDIT_MODES), ("rg_read", self.rg_read, RG_READS),
+                                   ("rg_priv", self.rg_priv, RG_PRIVS)):
             if val not in allowed:
                 raise ValueError(f"v4.{name} {val!r} not in {allowed}")
         # edits 'computed' reads the fields with rg_read / rg_stopped_aware as the readout does (ck/v4/edits.py header)
@@ -274,4 +291,4 @@ class V4Cfg:
 
 # keys a 'v4_2' config.json never carries (from_dict); the size fields are listed too (v4_2 had no range heads)
 V43_KEYS = ("exec_model", "ev_tbin_s", "ep_evidence", "vmax", "edits", "edit_k", "edit_dt", "edit_dlat", "rg_hidden",
-            "ep_ev_hidden", "rg_read", "rg_stopped_aware")
+            "ep_ev_hidden", "rg_read", "rg_stopped_aware", "rg_priv")

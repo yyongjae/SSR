@@ -469,6 +469,13 @@ class RangeReadout(nn.Module):
         self.ttc_b_chan = CH_BP if cfg.rg_stopped_aware else CH_B
         self.blk_head = _mlp(HC_CH + d, h, self.n_groups * M)   # [B bins | U bins (| Bp bins)] logits per cell
         self.marg_head = _mlp(HC_CH + d, h, 1)                  # D [m]
+        # PRIVILEGED GT-object input (V4Cfg.rg_priv, config docstring): [R, 48, 17, M] constant-velocity occupancy as a
+        # zero-initialised 1x1-conv term of both per-cell MLPs (off: no module, the heads are bitwise unchanged)
+        # (plain zero parameters, no RNG draw: the seeded modules after them are bitwise those of the plain net)
+        self.priv_blk_w = self.priv_marg_w = None
+        if cfg.rg_priv != "off":
+            self.priv_blk_w = nn.Parameter(torch.zeros(h, M, 1, 1))
+            self.priv_marg_w = nn.Parameter(torch.zeros(h, M, 1, 1))
         self.log_eps = nn.Parameter(torch.tensor(math.log(float(cfg.ev_eps))))
         self.resid = _mlp(N_RES + d, h, 3, zero_last=True) if cfg.ev_resid else None
         ep_in = 3 * d + 3 + ((N_EP_EV + d + HC_CH) if cfg.ep_evidence else 0)
@@ -491,19 +498,35 @@ class RangeReadout(nn.Module):
             head[-1].bias.fill_(math.log(p[i] / (1 - p[i])))
 
     @staticmethod
-    def _cell_mlp(mlp: nn.Sequential, xs: Tensor, Hc: Tensor) -> Tensor:
+    def _cell_mlp(mlp: nn.Sequential, xs: Tensor, Hc: Tensor, hp: Optional[Tensor] = None) -> Tensor:
         """mlp (Linear(128 + d, h), GELU, Linear(h, o)) on [Hc(j, i) || x'_j] of every cell, as 1x1 convolutions ->
-        [R, 48, 17, o] (f32)."""
+        [R, 48, 17, o] (f32).  hp [R, h, 48, 17]: an extra pre-activation term (the privileged input's 1x1 conv)."""
         W1, b1, W2, b2 = mlp[0].weight, mlp[0].bias, mlp[2].weight, mlp[2].bias
         hc = F.conv2d(Hc, W1[:, :HC_CH, None, None])                                  # [R, h, 48, 17]
         hx = F.linear(xs, W1[:, HC_CH:], b1)                                          # [R, 48, h]
-        z = F.gelu(hc + hx.transpose(1, 2)[..., None].to(hc.dtype))
+        pre = hc + hx.transpose(1, 2)[..., None].to(hc.dtype)
+        if hp is not None:
+            pre = pre + hp.to(hc.dtype)
+        z = F.gelu(pre)
         return F.conv2d(z, W2[:, :, None, None], b2).permute(0, 2, 3, 1).float().contiguous()
 
-    def scene(self, xs: Tensor, Hc: Tensor) -> Dict[str, Tensor]:
+    def scene(self, xs: Tensor, Hc: Tensor, priv: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """xs [R, 48, d], Hc [R, 128, 48, 17] (parent rows) -> blk [R, 48, 17, 2M] logits (B | U; [R, 48, 17, 3M]
-        B | U | Bp with rg_stopped_aware), margin [R, 48, 17] (m), both f32 contiguous."""
-        return {"blk": self._cell_mlp(self.blk_head, xs, Hc), "margin": self._cell_mlp(self.marg_head, xs, Hc)[..., 0]}
+        B | U | Bp with rg_stopped_aware), margin [R, 48, 17] (m), both f32 contiguous.  priv [R, 48, 17, M]
+        (range_targets.priv_channels): required iff V4Cfg.rg_priv != 'off'."""
+        hb = hm = None
+        if self.priv_blk_w is not None:
+            if priv is None:
+                raise ValueError(f"range readout with rg_priv {self.cfg.rg_priv!r}: scene() needs priv [R, 48, 17, M] "
+                                 f"(range_targets.priv_channels of the batch's ref_obj_*)")
+            if tuple(priv.shape) != (Hc.shape[0], N_ST, N_LAT, self.M):
+                raise ValueError(f"range readout: priv {tuple(priv.shape)} vs [{Hc.shape[0]}, {N_ST}, {N_LAT}, {self.M}]")
+            pv = priv.permute(0, 3, 1, 2).to(Hc.dtype).contiguous()                   # [R, M, 48, 17]
+            hb, hm = F.conv2d(pv, self.priv_blk_w.to(pv.dtype)), F.conv2d(pv, self.priv_marg_w.to(pv.dtype))
+        elif priv is not None:
+            raise ValueError("priv given to a range readout without rg_priv")
+        return {"blk": self._cell_mlp(self.blk_head, xs, Hc, hb),
+                "margin": self._cell_mlp(self.marg_head, xs, Hc, hm)[..., 0]}
 
     def forward(self, fields: Dict[str, Tensor], rows: Tensor, fr: Dict[str, Tensor], states: Tensor, t: Tensor,
                 xs: Tensor, xd: Tensor, Hc: Tensor, g: Tensor, S8: Tensor, d_st: Tensor, t_in: Tensor,

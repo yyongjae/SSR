@@ -512,11 +512,12 @@ class ParaSSRConfig:
     distill_lambda_risk: float = 0.2
     distill_tau_gt: float = 5.0
     distill_tau_risk: float = 8.0
-    # v9/v10/v11/v12: Domain-Specific Planning-Grounded Probe (PGP) + structural fixes
+    # v9/v10/v11/v12/v13: Domain-Specific Planning-Grounded Probe (PGP) + structural fixes
     distill_selector_v9: bool = False
     distill_selector_v10: bool = False
     distill_selector_v11: bool = False
     distill_selector_v12: bool = False
+    distill_selector_v13: bool = False
     distill_proj_lr_mult: float = 2.0
     distill_probe_warmup_steps: int = 1000
     distill_probe_ramp_steps: int = 2000

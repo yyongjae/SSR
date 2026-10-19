@@ -98,7 +98,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         # Bank 1: Road Boundary / Map interaction (ReSMap)
         self.probes: Optional[nn.ModuleList] = None
         if self.mode == "cross_attn":
-            if self.version in ("v9", "v10", "v11", "v12"):
+            if self.version in ("v9", "v10", "v11", "v12", "v13"):
                 from .planning_probe import PlanningGroundedProbe
 
                 self.probes = nn.ModuleList([
@@ -153,9 +153,14 @@ class TrajectoryAnchorDistillation(nn.Module):
                     nn.init.eye_(proj.weight)
                     proj.weight.data.mul_(0.1)
                     nn.init.zeros_(proj.bias)
+                elif self.version == "v13":
+                    # v13 Fix: Near-zero orthogonal init (gain=0.02, energy=0.0004) avoids v12's arbitrary identity
+                    # channel prior while keeping full-rank spatial variation at step 0 so LayerNorm/cosine_similarity
+                    # in feat_loss and diff_loss never divide by eps on step 0.
+                    nn.init.orthogonal_(proj.weight, gain=0.02)
+                    nn.init.zeros_(proj.bias)
                 elif self.version == "v11":
-                    # v11 Fix 2: Zero-initialize 1x1 projection adapter (matching ck/bev_kd.py init="zero")
-                    # so step-0 gradient into BEV is identically zero and no arbitrary identity channel mapping is forced.
+                    # v11 Fix: Zero-initialize 1x1 projection adapter (matching ck/bev_kd.py init="zero")
                     nn.init.zeros_(proj.weight)
                     nn.init.zeros_(proj.bias)
                 else:
@@ -164,10 +169,10 @@ class TrajectoryAnchorDistillation(nn.Module):
         else:
             self.student_proj = None
 
-        # v10/v11/v12 Fix 5: Per-channel frozen Teacher Z-Score statistics (norm.npz for BEVFusion, norm_map.npz for ReSMap),
+        # v10/v11/v12/v13 Fix 5: Per-channel frozen Teacher Z-Score statistics (norm.npz for BEVFusion, norm_map.npz for ReSMap),
         # matching ck/bev_kd.py TeacherZ so heavy-tailed post-ReLU BEVFusion channels are standardized per channel.
         self.ratio_ctrl = None
-        if self.version in ("v10", "v11", "v12"):
+        if self.version in ("v10", "v11", "v12", "v13"):
             import numpy as np
             from ..ck.bev_kd_arm import TeacherRatioControllers
             default_norms = (
@@ -194,7 +199,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         self.last_unit_inputs: Dict[str, torch.Tensor] = {}
         self.last_unit_losses: Dict[str, torch.Tensor] = {}
 
-        # Precompute spatial distance bias (and v12 sibling pairs + horizon row gain) for 256 anchors
+        # Precompute spatial distance bias (and v12/v13 sibling pairs + horizon row gain) for 256 anchors
         if trajectory_anchors_file is not None and os.path.exists(trajectory_anchors_file):
             import numpy as np
             anchors_np = np.load(trajectory_anchors_file)
@@ -204,10 +209,10 @@ class TrajectoryAnchorDistillation(nn.Module):
             # bias_anchors records which anchors built it (sync_spatial_bias)
             self.register_buffer("spatial_bias", bias, persistent=False)
             self.register_buffer("bias_anchors", anchors_t.clone(), persistent=False)
-            if self.version == "v12":
+            if self.version in ("v12", "v13"):
                 self.register_buffer("sibling_pairs", self._build_sibling_pairs(anchors_t), persistent=False)
                 self.register_buffer("row_gain", self._build_row_gain(anchors_t.device), persistent=False)
-        elif trajectory_anchors_file is not None and str(version).lower() in ("v7", "v8", "v9", "v10", "v11", "v12"):
+        elif trajectory_anchors_file is not None and str(version).lower() in ("v7", "v8", "v9", "v10", "v11", "v12", "v13"):
             # fusion_v1: a missing file used to leave a plain attribute and fail at the
             # first forward (register_buffer KeyError); fail at construction instead.
             raise FileNotFoundError(f"trajectory anchors file not found: {trajectory_anchors_file}")
@@ -233,7 +238,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         if torch.equal(a, self.bias_anchors):
             return False
         self.spatial_bias.copy_(self._build_spatial_bias(a).to(self.spatial_bias))
-        if self.version == "v12":
+        if self.version in ("v12", "v13"):
             new_pairs = self._build_sibling_pairs(a).to(device=self.bias_anchors.device)
             if self.sibling_pairs is not None and self.sibling_pairs.shape == new_pairs.shape:
                 self.sibling_pairs.copy_(new_pairs)
@@ -243,15 +248,22 @@ class TrajectoryAnchorDistillation(nn.Module):
         return True
 
     def _build_row_gain(self, device: torch.device) -> torch.Tensor:
-        """v12 Fix 1: Horizon density compensation gain g(y) = 0.65 + 0.90 * (y / 32.0) in [1, HW]."""
+        """Horizon density compensation gain in [1, HW].
+        - v12: 0.65 + 0.90 * (y / 32.0)
+        - v13: Non-penalizing far-field boost 1.0 + 0.50 * clamp((y - 10.0) / 22.0, 0.0, 1.0) in [1.0, 1.5]
+               so near-field (0..10m) is never penalized below 1.0 while mid/far-field gets up to 1.5x boost.
+        """
         r = torch.arange(self.bev_h, dtype=torch.float32, device=device)
         y_min, y_max = self.pc_range[1], self.pc_range[4]
         grid_y = y_min + (r + 0.5) * ((y_max - y_min) / self.bev_h)
-        gain_r = 0.65 + 0.90 * (grid_y / max(y_max, 1e-4)).clamp(0.0, 1.0)
+        if self.version == "v13":
+            gain_r = 1.0 + 0.50 * ((grid_y - 10.0) / max(y_max - 10.0, 1e-4)).clamp(0.0, 1.0)
+        else:
+            gain_r = 0.65 + 0.90 * (grid_y / max(y_max, 1e-4)).clamp(0.0, 1.0)
         return gain_r.unsqueeze(1).expand(self.bev_h, self.bev_w).reshape(1, -1)
 
     def _build_sibling_pairs(self, anchors: torch.Tensor) -> torch.Tensor:
-        """v12 Fix 2: Build velocity-sibling pairs (i_slow, j_fast) along the same geometric path.
+        """v12/v13 Fix 2: Build velocity-sibling pairs (i_slow, j_fast) along the same geometric path.
         For each anchor i with terminal progress S_8 >= 1.0m, pairs it with the closest cross-track
         faster sibling j in [2.0m, 6.0m] (+0.5~1.0 m/s^2) and [5.0m, 12.0m] (+1.0~2.0 m/s^2).
         """
@@ -291,7 +303,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         return torch.tensor(pairs, dtype=torch.long, device=anchors.device)
 
     def _build_spatial_bias(self, anchors: torch.Tensor) -> torch.Tensor:
-        """Compute Gaussian spatial distance bias [K, HW] (v7) or [H, K, HW] (v8/v9/v10/v11/v12) for 256 anchors."""
+        """Compute Gaussian spatial distance bias [K, HW] (v7) or [H, K, HW] (v8/v9/v10/v11/v12/v13) for 256 anchors."""
         device = anchors.device
         r = torch.arange(self.bev_h, dtype=torch.float32, device=device)
         c = torch.arange(self.bev_w, dtype=torch.float32, device=device)
@@ -307,8 +319,8 @@ class TrajectoryAnchorDistillation(nn.Module):
         y_ssr = anchors[..., 0]
         wp_pts = torch.stack([x_ssr, y_ssr], dim=-1)  # [K, T, 2]
 
-        if self.version == "v12" and wp_pts.size(1) >= 2:
-            # v12 Fix 1: 1.0s TTC braking look-ahead extension (T=8 -> 10 points)
+        if self.version in ("v12", "v13") and wp_pts.size(1) >= 2:
+            # v12/v13 Fix 1: 1.0s TTC braking look-ahead extension (T=8 -> 10 points)
             delta_end = wp_pts[:, -1, :] - wp_pts[:, -2, :]  # [K, 2]
             step_norm = torch.norm(delta_end, dim=-1, keepdim=True)  # [K, 1]
             v_end = step_norm / 0.5  # [K, 1]
@@ -322,7 +334,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         dists = torch.norm(wp_pts.unsqueeze(2) - grid_pts.unsqueeze(0).unsqueeze(0), dim=-1)  # [K, T, HW]
         min_dist = dists.min(dim=1).values  # [K, HW]
 
-        if self.version in ("v8", "v9", "v10", "v11", "v12"):
+        if self.version in ("v8", "v9", "v10", "v11", "v12", "v13"):
             sigmas = list(self.spatial_sigmas)
             if len(sigmas) != self.num_heads:
                 sigmas = [sigmas[i % len(sigmas)] for i in range(self.num_heads)]
@@ -355,13 +367,13 @@ class TrajectoryAnchorDistillation(nn.Module):
             else:
                 cmd = cmd.to(dtype=dtype)
             q = q + self.cmd_mlp(cmd).unsqueeze(1)
-        elif self.version in ("v9", "v10", "v11", "v12"):
+        elif self.version in ("v9", "v10", "v11", "v12", "v13"):
             q = q + 0.0 * (self.cmd_mlp.weight.sum() + self.cmd_mlp.bias.sum())
 
         if ego_status is not None:
             stat = ego_status[..., :4].to(device=device, dtype=dtype)
             q = q + self.status_mlp(stat).unsqueeze(1)
-        elif self.version in ("v9", "v10", "v11", "v12"):
+        elif self.version in ("v9", "v10", "v11", "v12", "v13"):
             q = q + 0.0 * (self.status_mlp.weight.sum() + self.status_mlp.bias.sum())
 
         return self.query_norm(q)
@@ -383,8 +395,17 @@ class TrajectoryAnchorDistillation(nn.Module):
         dist = torch.norm(flat_anchors - flat_gt, dim=-1)  # [B, K]
         winner = dist.argmin(dim=-1)  # [B]
 
-        if self.version in ("v8", "v9", "v10", "v11", "v12"):
-            if self.version == "v12" and domain in ("bevfusion", "resmap"):
+        if self.version in ("v8", "v9", "v10", "v11", "v12", "v13"):
+            if self.version == "v13" and domain in ("bevfusion", "resmap"):
+                if domain == "bevfusion":
+                    # v13 Fix 1 (DET): Wide ±4.8m corridor & adjacent-lane exploration (N_eff ~ 125)
+                    lam_gt, lam_cov, lam_risk = 0.45, 0.20, 0.35
+                    t_gt, t_risk = 4.5, 8.0
+                else:
+                    # v13 Fix 1 (MAP): Wide road-boundary exploration (N_eff ~ 130)
+                    lam_gt, lam_cov, lam_risk = 0.35, 0.20, 0.45
+                    t_gt, t_risk = 4.5, 8.0
+            elif self.version == "v12" and domain in ("bevfusion", "resmap"):
                 if domain == "bevfusion":
                     # v12 Fix 3 (DET): Tight ego-corridor focus (N_eff ~ 54) for obstacle & TTC precision
                     lam_gt, lam_cov, lam_risk = 0.58, 0.15, 0.27
@@ -409,14 +430,14 @@ class TrajectoryAnchorDistillation(nn.Module):
                 # sim_reward: [B, 5, K], 0=NC, 1=DAC, 2=EP, 3=TTC, 4=Comfort
                 nc = sim_reward[:, 0, :].to(device=dist.device, dtype=dist.dtype).clamp(0.0, 1.0)
                 dac = sim_reward[:, 1, :].to(device=dist.device, dtype=dist.dtype).clamp(0.0, 1.0)
-                if self.version in ("v11", "v12") and domain in ("bevfusion", "resmap"):
+                if self.version in ("v11", "v12", "v13") and domain in ("bevfusion", "resmap"):
                     ttc = sim_reward[:, 3, :].to(device=dist.device, dtype=dist.dtype).clamp(0.0, 1.0)
                     if domain == "bevfusion":
-                        # v11/v12 Fix 3 (DET): Explore anchors that collide or have TTC hazard with obstacles,
+                        # v11/v12/v13 Fix 3 (DET): Explore anchors that collide or have TTC hazard with obstacles,
                         # prioritizing obstacles inside the drivable road (0.5 + 0.5 * DAC).
                         s_det = (nc * ttc).clamp(0.0, 1.0)
                         risk_factor = (1.0 - s_det) * (0.5 + 0.5 * dac)
-                        if self.version == "v12" and self.sibling_pairs is not None and self.sibling_pairs.numel() > 0:
+                        if self.version in ("v12", "v13") and self.sibling_pairs is not None and self.sibling_pairs.numel() > 0:
                             pairs = self.sibling_pairs.to(device=dist.device)
                             i_slow, j_fast = pairs[:, 0], pairs[:, 1]
                             cliff = (s_det[:, i_slow] - s_det[:, j_fast]).relu() * dac[:, j_fast]
@@ -427,10 +448,10 @@ class TrajectoryAnchorDistillation(nn.Module):
                             cliff_boost.scatter_reduce_(1, idx_fast, cliff, reduce="amax", include_self=True)
                             risk_factor = risk_factor + 0.5 * cliff_boost
                     else:
-                        # v11/v12 Fix 3 (MAP): Explore anchors that cross road/lane drivable area boundaries (1 - DAC).
+                        # v11/v12/v13 Fix 3 (MAP): Explore anchors that cross road/lane drivable area boundaries (1 - DAC).
                         s_map = dac
                         risk_factor = 1.0 - s_map
-                        if self.version == "v12" and self.sibling_pairs is not None and self.sibling_pairs.numel() > 0:
+                        if self.version in ("v12", "v13") and self.sibling_pairs is not None and self.sibling_pairs.numel() > 0:
                             pairs = self.sibling_pairs.to(device=dist.device)
                             i_slow, j_fast = pairs[:, 0], pairs[:, 1]
                             cliff = (s_map[:, i_slow] - s_map[:, j_fast]).relu()
@@ -550,6 +571,50 @@ class TrajectoryAnchorDistillation(nn.Module):
         weighted_cos = (w_pair * cos_sim).sum(dim=-1).mean()
         return loss, weighted_cos
 
+    def _multiscale_ck2_grid_loss(
+        self,
+        s_bev: torch.Tensor,
+        t_bev: torch.Tensor,
+        w_pgp: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute CK2-matched multi-scale grid KD (M3b 5x5 global context pool + M3a local spatial edge).
+
+        Args:
+            s_bev: [B, HW, C] projected student BEV tokens
+            t_bev: [B, HW, C] z-normalized teacher BEV tokens
+            w_pgp: [B, HW] soft-capped wide corridor spatial weights (mean == 1.0)
+
+        Returns:
+            (global_5x5_loss, edge_3x3_loss, cos_5x5)
+        """
+        bs = s_bev.size(0)
+        # 1. M3b 5x5 Global Context Pool KD ([B, C, 50, 100] -> [B, 200, C], matching corridor.py:global_tokens)
+        s_map = s_bev.transpose(1, 2).reshape(bs, self.channels, self.bev_h, self.bev_w)
+        t_map = t_bev.transpose(1, 2).reshape(bs, self.channels, self.bev_h, self.bev_w)
+        s_5x5 = F.avg_pool2d(s_map, kernel_size=5, stride=5).flatten(2).transpose(1, 2)
+        t_5x5 = F.avg_pool2d(t_map, kernel_size=5, stride=5).flatten(2).transpose(1, 2)
+        global_5x5_loss = (s_5x5 - t_5x5).pow(2).mean()
+        with torch.no_grad():
+            cos_5x5 = F.cosine_similarity(s_5x5, t_5x5, dim=-1, eps=1e-6).mean()
+
+        # 2. M3a Corridor Spatial-Derivative (3x3 Edge) KD along forward rows and lateral columns
+        s_grid = s_bev.view(bs, self.bev_h, self.bev_w, self.channels)
+        t_grid = t_bev.view(bs, self.bev_h, self.bev_w, self.channels)
+        w_grid = w_pgp.view(bs, self.bev_h, self.bev_w)
+
+        ds_r = s_grid[:, 1:, :, :] - s_grid[:, :-1, :, :]
+        dt_r = t_grid[:, 1:, :, :] - t_grid[:, :-1, :, :]
+        w_r = 0.5 * (w_grid[:, 1:, :] + w_grid[:, :-1, :])
+        loss_edge_r = (w_r * (ds_r - dt_r).pow(2).mean(dim=-1)).mean()
+
+        ds_c = s_grid[:, :, 1:, :] - s_grid[:, :, :-1, :]
+        dt_c = t_grid[:, :, 1:, :] - t_grid[:, :, :-1, :]
+        w_c = 0.5 * (w_grid[:, :, 1:] + w_grid[:, :, :-1])
+        loss_edge_c = (w_c * (ds_c - dt_c).pow(2).mean(dim=-1)).mean()
+
+        edge_3x3_loss = 0.5 * (loss_edge_r + loss_edge_c)
+        return global_5x5_loss, edge_3x3_loss, cos_5x5
+
     def _navsim_to_bev_grid(
         self,
         anchors: torch.Tensor,
@@ -632,17 +697,17 @@ class TrajectoryAnchorDistillation(nn.Module):
             if bev_pos is None:
                 raise ValueError("bev_pos must be provided by planner_head for TrajectoryAnchorDistillation")
 
-            if self.version in ("v9", "v10", "v11", "v12"):
+            if self.version in ("v9", "v10", "v11", "v12", "v13"):
                 # -------------------------------------------------------------
-                # v9/v10/v11/v12: Domain-Specific Planning-Grounded Probe (PGP) +
-                #                 PGP-Weighted Dense 1x1 Cell KD (v10/v11/v12)
+                # v9/v10/v11/v12/v13: Domain-Specific Planning-Grounded Probe (PGP) +
+                #                     Multi-Scale / PGP-Weighted Cell KD
                 # -------------------------------------------------------------
                 if not hasattr(self, "spatial_bias") or self.spatial_bias is None:
                     spatial_bias = self._build_spatial_bias(trajectory_anchors)
                     self.register_buffer("spatial_bias", spatial_bias, persistent=False)
-                if self.version == "v12" and (not hasattr(self, "sibling_pairs") or self.sibling_pairs is None):
+                if self.version in ("v12", "v13") and (not hasattr(self, "sibling_pairs") or self.sibling_pairs is None):
                     self.register_buffer("sibling_pairs", self._build_sibling_pairs(trajectory_anchors), persistent=False)
-                if self.version == "v12" and (not hasattr(self, "row_gain") or self.row_gain is None):
+                if self.version in ("v12", "v13") and (not hasattr(self, "row_gain") or self.row_gain is None):
                     self.register_buffer("row_gain", self._build_row_gain(device), persistent=False)
 
                 if self.spatial_bias.dim() == 2:
@@ -670,13 +735,13 @@ class TrajectoryAnchorDistillation(nn.Module):
                 for bank, name in enumerate(names):
                     probe = self.probes[bank]
                     t_bev = teacher_by_bank[bank].detach()
-                    if self.version in ("v10", "v11", "v12"):
+                    if self.version in ("v10", "v11", "v12", "v13"):
                         zm = getattr(self, f"z_mean_{bank}", None)
                         zs = getattr(self, f"z_std_{bank}", None)
                         if zm is not None and zs is not None:
                             t_bev = ((t_bev.float() - zm.to(device=device)) / zs.to(device=device)).to(dtype=dtype)
                     proj = self.student_proj[bank] if self.use_proj else None
-                    if self.version in ("v10", "v11", "v12"):
+                    if self.version in ("v10", "v11", "v12", "v13"):
                         # Scale-pinned per-cell LayerNorm (no affine) before 1x1 student_proj (matching ck/bev_kd.py)
                         # Put GradScale before student_proj so student_proj always gets 100% unscaled gradients
                         # while bev_embed gradient is gated by ramp * RatioController weight!
@@ -706,13 +771,85 @@ class TrajectoryAnchorDistillation(nn.Module):
                         gt_trajectory=gt_trajectory,
                         sim_reward=sim_reward,
                         sim_reward_valid=sim_reward_valid,
-                        sibling_pairs=self.sibling_pairs if self.version == "v12" else None,
+                        sibling_pairs=self.sibling_pairs if self.version in ("v12", "v13") else None,
                     )
                     losses[f"loss_probe_{name}"] = self.probe_loss_weight * probe_loss
                     metrics.update(probe_metrics)
 
                     domain_scale = self.resmap_scale if name == "resmap" else 1.0
-                    if self.version == "v12":
+                    if self.version == "v13":
+                        # v13 Fix 1 + Fix 2 + Fix 3 + Fix 4:
+                        # - Fix 1: Wide Corridor Coverage (tau_gt=4.5, tau_risk=8.0, N_eff~125-130) + Soft-Capped Ribbon w_pgp (0.75 + 0.25*m_cap_norm)
+                        # - Fix 2: Non-Penalizing Far-Field Boost (row_gain in [1.0, 1.5]) + 10-pt Look-Ahead Spatial Bias
+                        # - Fix 3: CK2-Matched Multi-Scale Grid KD (M3b 5x5 Global Pool + M3a 3x3 Spatial-Derivative Edge KD)
+                        # - Fix 4: Balanced Dual-Consumer Allocation (55% 1x1 Cell + 15% 5x5 Pool + 10% 3x3 Edge + 10% Feat + 10% Diff + 0.20x Attn KL)
+                        with torch.no_grad():
+                            if gt_trajectory is not None and gt_trajectory.numel() > 0:
+                                weights_b, _, n_eff_b = self._compute_anchor_weights(
+                                    trajectory_anchors, gt_trajectory, sim_reward=sim_reward, domain=name,
+                                )
+                            else:
+                                weights_b = weights
+                                n_eff_b = n_eff
+                            metrics[f"distill/effective_anchors_{name}"] = n_eff_b.detach()
+                            if name == "bevfusion":
+                                metrics["distill/effective_anchors"] = n_eff_b.detach()
+
+                            ent_t = -(attn_t.detach() * attn_t.detach().clamp_min(1e-12).log()).sum(dim=-1)
+                            metrics[f"probe/head_entropy/{name}"] = ent_t.mean().detach()
+                            head_conf = (1.0 - ent_t / max_ent).clamp(0.1, 1.0)
+                            head_w = head_conf / head_conf.mean(dim=1, keepdim=True).clamp_min(1e-6)
+                            attn_hw = (head_w.unsqueeze(-1) * attn_t.detach()).mean(dim=1)  # [B, K, HW]
+                            m_spatial = torch.bmm(weights_b.unsqueeze(1), attn_hw).squeeze(1)  # [B, HW]
+                            if self.row_gain is not None and self.row_gain.numel() == hw:
+                                m_spatial = m_spatial * self.row_gain.to(device=device, dtype=m_spatial.dtype)
+                            m_norm = m_spatial * (float(hw) / m_spatial.sum(dim=-1, keepdim=True).clamp_min(1e-12))
+                            m_cap = 4.0 * torch.tanh(m_norm / 4.0)
+                            m_cap_norm = m_cap * (float(hw) / m_cap.sum(dim=-1, keepdim=True).clamp_min(1e-12))
+                            w_pgp = 0.75 + 0.25 * m_cap_norm
+                            metrics[f"distill/w_pgp_max/{name}"] = w_pgp.max(dim=-1).values.mean().detach()
+                            metrics[f"distill/w_pgp_std/{name}"] = w_pgp.std(dim=-1).mean().detach()
+                            metrics[f"distill/w_pgp_far/{name}"] = w_pgp[:, hw // 2:].mean().detach()
+
+                        # Student Stop-Grad Probe Pass (gradients flow through s_bev into student_proj and x_unit)
+                        attn_s, feat_s, preds_s = probe.forward_student(q.detach(), s_bev, s_pos, bias)
+                        feat_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t.detach(), weights_b)
+                        diff_loss, diff_cos = self._sibling_diff_loss(
+                            feat_s, feat_t.detach(), weights_b, sim_reward=sim_reward, domain=name
+                        )
+                        kl_per_head = F.kl_div(
+                            attn_s.clamp_min(1e-8).log(), attn_t.detach(), reduction="none"
+                        ).sum(dim=-1)
+                        kl = (head_w * kl_per_head).mean(dim=1)
+                        attn_loss = (weights_b * kl).sum(dim=-1).mean()
+
+                        cell_mse = (s_bev - t_bev).pow(2).mean(dim=-1)
+                        cell_loss = (w_pgp * cell_mse).mean()
+                        global_5x5_loss, edge_3x3_loss, cos_5x5 = self._multiscale_ck2_grid_loss(
+                            s_bev, t_bev, w_pgp
+                        )
+                        metrics[f"distill_cell_mse/{name}"] = cell_loss.detach()
+                        metrics[f"distill_uniform_mse/{name}"] = cell_mse.mean().detach()
+                        metrics[f"distill_global_5x5/{name}"] = global_5x5_loss.detach()
+                        metrics[f"distill_global_5x5_cos/{name}"] = cos_5x5.detach()
+                        metrics[f"distill_edge_3x3/{name}"] = edge_3x3_loss.detach()
+                        metrics[f"distill_sibling_diff/{name}"] = diff_loss.detach()
+                        metrics[f"distill_sibling_cos/{name}"] = diff_cos.detach()
+
+                        raw_bank_loss = (
+                            self.loss_scale * (
+                                0.55 * cell_loss
+                                + 0.15 * global_5x5_loss
+                                + 0.10 * edge_3x3_loss
+                                + 0.10 * feat_loss
+                                + 0.10 * diff_loss
+                            )
+                            + 0.20 * self.attn_loss_scale * attn_loss
+                        )
+                        bank_loss = raw_bank_loss
+                        self.last_unit_inputs[tkey[name]] = x_unit
+                        self.last_unit_losses[tkey[name]] = 0.5 * raw_bank_loss
+                    elif self.version == "v12":
                         # v12 Fix 1 + Fix 2 + Fix 3 + Fix 4:
                         # - Fix 1: Look-ahead spatial bias (10 pts) + Horizon density gain g(y) on w_pgp
                         # - Fix 2: Velocity-Sibling Differential Feature KD (10% of loss_scale)

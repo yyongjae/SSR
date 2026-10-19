@@ -295,7 +295,7 @@ class PlanningGroundedProbe(nn.Module):
             denom = (valid.sum() * mask.sum() * k).clamp_min(1.0)
             sim_loss = ((bce * mask * valid).sum() / denom).to(dtype=dtype) * 5.0
 
-            if self.version == "v12" and sibling_pairs is not None and sibling_pairs.numel() > 0:
+            if self.version in ("v12", "v13") and sibling_pairs is not None and sibling_pairs.numel() > 0:
                 sib = sibling_pairs.to(device=device, dtype=torch.long)
                 i_slow, j_fast = sib[:, 0], sib[:, 1]
                 if self.domain == "bevfusion":

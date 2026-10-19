@@ -227,6 +227,16 @@ teacher as is, model.load_ck refuses it without allow_privileged).
   ck2T10, the corrector-A / Platt lines of report 91).  Chain note: the navtest infer stage exited 1 after the DET rows
   were complete (the GPU guard re-ran for the MAP teacher inside the same process and saw its own memory); outputs
   valid; guard made once-per-process.
+* **Descriptive addendum (2026-10-19 13:00 KST, report 93; NOT a registered rule)**: score-stack test of the P2 out
+  teacher's outputs -- per key nc/ttc a logistic fit of [logit p_ck2T10, lp, slack, 1[slack<0], score-head logit] on the
+  official candidate labels, 5-fold GroupKFold by log on the val held-out tokens, p_pass replacing ck2T10's nc/ttc in the
+  deployment blend (pool96_old_b1): +0.31 [+0.17, +0.46] vs blend (break 0.44 %), filter rule +0.16; Platt on ck2T10 alone
+  -0.03; P1 teacher -0.00; knock-out +0.03; GT flag +1.17 (score-path ceiling, filter-rule GT +1.01); GBM = logistic
+  within 0.03.  Fit on all val, applied to navtest (report only): +0.43 [+0.23, +0.62] on the ck2T10,ck2M10 pair blend
+  (filter rule +0.00), +0.33 on the DET-only blend.  Two independent implementations agree bit for bit; 5 adversarial
+  verifiers CONFIRMED (CK/v4/analysis/p2diag/stack/{impl_A,impl_B,navtest}).  Reading: the privileged out-of-window
+  information is worth ~+0.3-0.4 PDMS through a score path and transfers across splits, but it is privileged (not a
+  deployable selector); the same net without the input (knock-out) carries none of it.
 
 * The runs are launched by the user's standing approval of 2026-10-19 ("teacher 학습 알아서 해놔"); GPUs 0,1 (out)
   and 2,3 (far); eval chain on completion.

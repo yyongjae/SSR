@@ -545,6 +545,8 @@ class CKNet(nn.Module):
                            rel_objs_tok=rel["objs_tok"])
                 if "top_idx" in rel:                     # V5Cfg.top_feats 'v2': object slot of each top entry (-1 none)
                     haz["rel_top_idx"] = sh(rel["top_idx"])
+                if "lr_nc" in rel:                       # relation 'student': log r for the relation BCE (report 102 N1)
+                    haz.update(rel_lr_nc=sh(rel["lr_nc"]), rel_lr_ttc=sh(rel["lr_ttc"]))
         return r, haz, (Fs, fr_u)
 
     def correct_topk(self, feat: torch.Tensor, mem: torch.Tensor, ego, pool: torch.Tensor, parents: torch.Tensor,
@@ -828,8 +830,11 @@ class CKNet(nn.Module):
             tok = torch.arange(T, device=dev).repeat_interleave(per)
             rel = self.relation.read(O, states[:, ::zs], tq[::zs], tok)
         sh = lambda a: a.reshape(*lead, *a.shape[1:])                                           # noqa: E731
-        return {"r_nc": sh(rel["r_nc"]), "r_ttc": sh(rel["r_ttc"]), "H": sh(rel["H"]), "a_tok": rel["a_tok"],
-                "states": states[:, ::zs], "tq": tq[::zs]}
+        out = {"r_nc": sh(rel["r_nc"]), "r_ttc": sh(rel["r_ttc"]), "H": sh(rel["H"]), "a_tok": rel["a_tok"],
+               "states": states[:, ::zs], "tq": tq[::zs]}
+        if "lr_nc" in rel:                               # relation 'student': log r (report 102 N1)
+            out["lr_nc"], out["lr_ttc"] = sh(rel["lr_nc"]), sh(rel["lr_ttc"])
+        return out
 
     def v5_logp(self, feat: torch.Tensor, mem: torch.Tensor, ego, src: torch.Tensor, src_par: Optional[torch.Tensor],
                 u: torch.Tensor, pref: Optional[torch.Tensor] = None,

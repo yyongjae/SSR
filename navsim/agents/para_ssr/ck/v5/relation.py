@@ -55,11 +55,14 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as TF
 
 from ..temporal.config import COL, EGO_L, EGO_OFF, EGO_W, GROUP_OF_CLASS, N_CLS
 from ..temporal.forecast import ca_history, effective_mask
 from ..temporal.raster import sat_sep
 from .config import N_TOP, N_TOP_FEAT, V5Cfg
+
+LOG_FLOOR = math.log(1e-30)          # log r of a state the ego does not move at / a zero weight (student log r)
 
 Tensor = torch.Tensor
 DELTAS = (0.0, 0.3, 0.6, 0.9)          # official TTC future_time_idcs x 0.1 s (delta 0 = the NC read)
@@ -244,13 +247,30 @@ class RelationReader(nn.Module):
             if self.use_ca:
                 p = p + ww(w_ca) * torch.sigmoid(-s_ca / eps)
             p = p * gate                                                                 # [B, Q, D, N]
+            # the student's per-object log r (report 102 N1): the same mixture in log space (logsigmoid tails, log of
+            # the weights / gates floored at LOG_FLOOR), so the relation BCE's positive term -log r keeps a gradient of
+            # ~1 / eps per metre on a deeply missed overlap (the probability clamp at 1e-4 zeroed it)
+            want_log = self.source == "student"
+            if want_log:
+                lw = lambda w: torch.log(w.clamp(min=1e-30))                             # noqa: E731
+                terms = [lw(ww(w_hold)) + TF.logsigmoid(-s_hold / eps), lw(ww(w_cv)) + TF.logsigmoid(-s_cv / eps)]
+                if self.use_ca:
+                    terms.append(lw(ww(w_ca)) + TF.logsigmoid(-s_ca / eps))
+                lpm = torch.logsumexp(torch.stack(terms), 0) + lw(gate)                  # [B, Q, D, N]
             if self.use_fut:
-                p = p + self._fut_term(O, g, ce_x, he_x, ce_now, eh_now, ho, Lo, Wo, c0, pi_s, fwd, valid, tt,
-                                       w_fut_tot, eps)
+                ft = self._fut_term(O, g, ce_x, he_x, ce_now, eh_now, ho, Lo, Wo, c0, pi_s, fwd, valid, tt,
+                                    w_fut_tot, eps, want_log=want_log)
+                if want_log:
+                    ft, lft = ft
+                    lpm = torch.logaddexp(lpm, lft)
+                p = p + ft
             p_nc = p[:, :, 0] * mv_nc                                                    # [B, Q, N]
             p_tt = p.amax(2) * mv_tt
             a = g(a_tok)                                                                 # [B, N]
             r_nc, r_tt = p_nc.amax(1), p_tt.amax(1)                                      # [B, N]
+            if want_log:
+                lr_nc = torch.where(mv_nc > 0, lpm[:, :, 0], torch.full_like(lpm[:, :, 0], LOG_FLOOR)).amax(1)
+                lr_tt = torch.where(mv_tt > 0, lpm.amax(2), torch.full_like(lpm[:, :, 0], LOG_FLOOR)).amax(1)
             ar_nc, ar_tt = (a * r_nc).clamp(max=P_MAX), (a * r_tt).clamp(max=P_MAX)
             lp = torch.stack([torch.log1p(-ar_nc).sum(-1), torch.log1p(-ar_tt).sum(-1)], -1)   # [B, 2]
             H = torch.stack([1 - torch.exp(torch.log1p(-(a[:, None] * p_nc).clamp(max=P_MAX)).sum(-1)),
@@ -296,11 +316,15 @@ class RelationReader(nn.Module):
                "valid_tok": O["valid"], "objs_tok": O, "r_nc": r_nc, "r_ttc": r_tt}
         if top_idx is not None:
             out["top_idx"] = top_idx
+        if want_log:
+            out["lr_nc"], out["lr_ttc"] = lr_nc, lr_tt
         return out
 
-    def _fut_term(self, O, g, ce_x, he_x, ce_now, eh_now, ho, Lo, Wo, c0, pi_s, fwd_hold, valid, tt, w_fut_tot, eps):
+    def _fut_term(self, O, g, ce_x, he_x, ce_now, eh_now, ho, Lo, Wo, c0, pi_s, fwd_hold, valid, tt, w_fut_tot, eps,
+                  want_log: bool = False):
         """rel_modes 'cv+fut': sum_m w_fut_m sigmoid(-sep_m / eps) nb_fut_m valid [B, Q, D, N] (module docstring);
-        the futures' positions / separations / forward offsets without graph, one mode at a time (memory)."""
+        the futures' positions / separations / forward offsets without graph, one mode at a time (memory).  want_log:
+        also its log (running logaddexp of the same terms in log space, read()'s log r) -> (sum, log sum)."""
         if "fut" not in O or "pi_fut" not in O:
             raise ValueError("RelationReader rel_modes 'cv+fut' needs the student rows' futures ('fut' / 'pi_fut': "
                              "student_object_rows(..., traj=, traj_cls=) = online2.student_rel_rows with the det head's "
@@ -320,5 +344,11 @@ class RelationReader(nn.Module):
                 fwd_sel = torch.where(ps.detach() > 0.5, fwd_hold.detach(), fwd_m)
                 sg_m = torch.sigmoid((fwd_sel - BEHIND_M) / 0.3)
             nb_m = ps + (1 - ps) * sg_m
-            out = out + (w_fut_tot * pif[..., m])[:, None, None, :] * torch.sigmoid(-s_m / eps) * nb_m * vf
+            wm = (w_fut_tot * pif[..., m])[:, None, None, :]
+            out = out + wm * torch.sigmoid(-s_m / eps) * nb_m * vf
+            if want_log:
+                lt = torch.log((wm * nb_m * vf).clamp(min=1e-30)) + TF.logsigmoid(-s_m / eps)
+                lout = lt if m == 0 else torch.logaddexp(lout, lt)
+        if want_log:
+            return out, lout
         return out

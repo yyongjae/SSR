@@ -1088,7 +1088,7 @@ def test_l_edit_bernoulli_targets_mask_and_gradients():
         tz = torch.arange(LQR.NT, dtype=torch.float64)[::2] * LQR.DT
         y, known = RL2.rel_object_targets(rr["states"].reshape(2, cols.shape[1], -1, 6), tz, gt, m)
         mk = RL2.rel_object_mask(relm["valid"], m, known, y)
-        want = RL2.rel_object_bce(rr["r_nc"], rr["r_ttc"], y, mk)
+        want = RL2.rel_object_bce(rr["r_nc"], rr["r_ttc"], y, mk, rr.get("lr_nc"), rr.get("lr_ttc"))
     assert abs(float(want) - logs["v5/edit_bce"]) < 1e-6
     # duplicates (G_DUP) masked, ghosts kept with y = 0
     dup = (m == RL2.G_DUP)[:, None, :, None].expand_as(mk)
@@ -1342,3 +1342,72 @@ def test_zadapter_floors_the_hazard_channels_sigma():
     z = torch.tensor([[-0.9, -0.65, 0.56, 0.0, 1.0, 1.0]])
     zn = za.normalise(z)
     assert abs(float(zn[0, 4]) - (1.0 - 0.0075) / 0.25) < 1e-5 and float(zn[0, 3]) == 0.0
+
+
+def test_report102_n1_relation_bce_keeps_the_gradient_of_a_deeply_missed_positive():
+    """report 102 N1: a matched cut-in whose lateral velocity the student missed (r ~ 1e-7, GT y = 1): the relation BCE
+    (L_rel / L_rel,cv / L_edit) must give a finite loss and a non-zero, correcting gradient on the box velocity code
+    (the probability clamp at 1e-4 zeroed it); the training term _v5_rel_terms uses the reader's log r."""
+    import math
+    from types import SimpleNamespace
+    import torch
+    from navsim.agents.para_ssr.ck.v5 import refine_loss as R
+    from navsim.agents.para_ssr.ck.v5.student_objects import student_object_rows
+    from navsim.agents.para_ssr.ck.v5.relation import RelationReader
+    from navsim.agents.para_ssr.ck.v5.config import V5Cfg
+    from navsim.agents.para_ssr.ck.v4 import lqr as L
+    from navsim.agents.para_ssr.refiner import gt_future as G
+    from navsim.agents.para_ssr.ck.online2 import CKE2E2
+    torch.manual_seed(23)
+    c = torch.zeros(1, 1, 10)
+    c[0, 0, :2] = torch.tensor([-8., 14.])
+    c[0, 0, 2], c[0, 0, 3], c[0, 0, 5] = math.log(1.9), math.log(4.5), math.log(1.6)
+    h = math.atan2(-2., 3.)
+    yaw = -h - math.pi
+    c[0, 0, 6:8] = torch.tensor([math.sin(yaw), math.cos(yaw)])
+    c[0, 0, 8:10] = torch.tensor([0., 3.])
+    c.requires_grad_(True)
+    traj = torch.zeros(1, 1, 6, 8, 2)
+    traj[..., 1] = 1.5
+    O = student_object_rows(c, torch.tensor([[[4., -6, -6, -6, -6, -6, -6]]]), torch.zeros(1, 1, 256), 96,
+                            traj=traj, traj_cls=torch.zeros(1, 1, 6))
+    k = torch.arange(G.N_KF) * G.KF_DT
+    kf = torch.zeros(1, 1, G.N_KF, 6)
+    first = torch.zeros(1, 1, 6)
+    meta = torch.zeros(1, 1, 5, dtype=torch.long)
+    kf[0, 0, :, G.KF_X], kf[0, 0, :, G.KF_Y], kf[0, 0, :, G.KF_H] = 14 + 3 * k, 8 - 2 * k, h
+    kf[0, 0, :, G.KF_VX], kf[0, 0, :, G.KF_VY], kf[0, 0, :, G.KF_PRESENT] = 3, -2, 1
+    first[0, 0, G.FI_L], first[0, 0, G.FI_W], first[0, 0, G.FI_VX], first[0, 0, G.FI_VY] = 4.5, 1.9, 3, -2
+    meta[0, 0, G.MT_AGENT], meta[0, 0, G.MT_LAST] = 1, G.N_KF - 1
+    gt = dict(kf=kf, first=first, meta=meta, valid=torch.ones(1, 1, dtype=torch.bool), n_kf=torch.tensor([G.N_KF]))
+    kt = torch.arange(1, 9) * .5
+    draft = torch.stack([6 * kt, torch.zeros_like(kt), torch.zeros_like(kt)], -1)[None]
+    full_states = L.simulate(draft, torch.tensor([[6., 0.]]), dtype=torch.float32)
+    states = full_states[:, ::2]
+    t = torch.arange(L.NT, dtype=torch.float64)[::2] * L.DT
+    g = R.match_t0(O['c0'], O['valid'], O['group'] < 2, gt)
+    y, known = R.rel_object_targets(states[None], t, gt, g)
+    mask = R.rel_object_mask(O['valid'], g, known, y)
+    assert bool(mask.any()) and float(y[mask].max()) == 1.0
+    rr = RelationReader(V5Cfg(relation='student', rel_ca=False, rel_modes='cv+fut', top_feats='v2'))
+    out = rr(O, states, t, torch.zeros(1, dtype=torch.long))
+    assert float(out['r_nc'].max()) < 1e-4                                       # the missed positive
+    torch.testing.assert_close(torch.exp(out['lr_nc']), out['r_nc'], rtol=1e-3, atol=1e-12)
+    loss = R.rel_object_bce(out['r_nc'][None], out['r_ttc'][None], y, mask, out['lr_nc'][None], out['lr_ttc'][None])
+    gc, ge = torch.autograd.grad(loss, (c, rr.log_eps), retain_graph=True)
+    assert math.isfinite(float(loss)) and float(loss) > 9.21                     # beyond the old clamp's -log(1e-4)
+    assert float(gc[0, 0, 8].abs()) > 0.1 and float(ge.abs()) > 0.1              # lateral velocity code + eps move
+    # the old clamped path (no log r) is unchanged and still zero here: the training term must use the log path
+    lc = R.rel_object_bce(out['r_nc'][None], out['r_ttc'][None], y, mask)
+    assert float(torch.autograd.grad(lc, c, retain_graph=True)[0].abs().max()) == 0.0
+    fake = SimpleNamespace(cfg=SimpleNamespace(v5=dict(lambda_rel=.5, lambda_rel_cv=.25, rel_max_parents=8)))
+    hk = dict(rel_r_nc=out['r_nc'][None], rel_r_ttc=out['r_ttc'][None], rel_lr_nc=out['lr_nc'][None],
+              rel_lr_ttc=out['lr_ttc'][None], exec_states=full_states[None],
+              parent_index=torch.zeros(1, 1, dtype=torch.long), is_self=torch.ones(1, 1, dtype=torch.bool))
+    tl = CKE2E2._v5_rel_terms(fake, torch.zeros(()), hk, O, g, torch.tensor([0]), gt, t, 2, {})
+    tg = torch.autograd.grad(tl, c)[0]
+    assert math.isfinite(float(tl)) and float(tg[0, 0, 8].abs()) > 0.05
+    # negatives: a safe object far away gives a finite, ~0 loss
+    yn = torch.zeros_like(y)
+    ln = R.rel_object_bce(out['r_nc'][None], out['r_ttc'][None], yn, mask, out['lr_nc'][None], out['lr_ttc'][None])
+    assert math.isfinite(float(ln)) and float(ln) < 1e-3

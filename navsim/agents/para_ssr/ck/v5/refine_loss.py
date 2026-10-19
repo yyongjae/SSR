@@ -490,13 +490,24 @@ def rel_object_mask(valid: Tensor, g: Tensor, known: Tensor, y: Tensor, cols: Op
     return m
 
 
-def rel_object_bce(r_nc: Tensor, r_ttc: Tensor, y: Tensor, mask: Tensor) -> Tensor:
+def rel_object_bce(r_nc: Tensor, r_ttc: Tensor, y: Tensor, mask: Tensor, lr_nc: Optional[Tensor] = None,
+                   lr_ttc: Optional[Tensor] = None) -> Tensor:
     """masked mean BCE(r, y) of the per-object relation r [n, K, N] (NC, TTC) against y [n, K, N, 2] (float32,
-    autocast off; 0 with an empty mask, in the graph of r)."""
+    autocast off; 0 with an empty mask, in the graph of r).  With the reader's log r (lr_nc / lr_ttc, RelationReader
+    'student'): -[y log r + (1 - y) log(1 - r)] with the positive term in log space (report 102 N1: the probability
+    clamp at 1e-4 zeroed the gradient of a deeply missed positive; logsigmoid keeps ~1 / eps per metre) and the
+    negative term log1p(-r) (r clamped below 1 - 1e-6 only); without it the clamped probability BCE as before."""
     with torch.autocast(device_type=y.device.type, enabled=False):
-        r = torch.stack([r_nc, r_ttc], -1).float().clamp(1e-4, 1 - 1e-4)
         mf = mask.float()
-        return (F.binary_cross_entropy(r, y.float(), reduction="none") * mf).sum() / mf.sum().clamp(min=1.0)
+        yf = y.float()
+        if lr_nc is None or lr_ttc is None:
+            r = torch.stack([r_nc, r_ttc], -1).float().clamp(1e-4, 1 - 1e-4)
+            return (F.binary_cross_entropy(r, yf, reduction="none") * mf).sum() / mf.sum().clamp(min=1.0)
+        r = torch.stack([r_nc, r_ttc], -1).float()
+        lr = torch.stack([lr_nc, lr_ttc], -1).float().clamp(max=0.0)
+        l1m = torch.log1p(-r.clamp(max=1.0 - 1e-6))
+        bce = -(yf * lr + (1.0 - yf) * l1m)
+        return (torch.where(mask, bce, torch.zeros_like(bce))).sum() / mf.sum().clamp(min=1.0)
 
 
 def parent_sibling_cols(parent_index: Tensor, is_self: Tensor, max_parents: int) -> Tensor:

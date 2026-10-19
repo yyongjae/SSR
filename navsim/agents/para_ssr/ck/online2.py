@@ -2424,7 +2424,7 @@ class CKE2E2:
         st = rr["states"].reshape(n, R, *rr["states"].shape[1:])
         y, known = RL.rel_object_targets(st, tz, gt, g)
         mk = RL.rel_object_mask(O["valid"], g, known, y, colm)
-        l_edit = RL.rel_object_bce(rr["r_nc"], rr["r_ttc"], y, mk)
+        l_edit = RL.rel_object_bce(rr["r_nc"], rr["r_ttc"], y, mk, rr.get("lr_nc"), rr.get("lr_ttc"))
         inner = inner + q["lambda_edit"] * l_edit
         with torch.no_grad():
             mf = mk.float()
@@ -2460,11 +2460,13 @@ class CKE2E2:
         cc = gk(cols)
         stz = gk(hk["exec_states"][idx][:, :, ::zs])
         r_nc, r_tt = gk(hk["rel_r_nc"][idx]), gk(hk["rel_r_ttc"][idx])
+        lr_nc = gk(hk["rel_lr_nc"][idx]) if "rel_lr_nc" in hk else None                # log r (report 102 N1)
+        lr_tt = gk(hk["rel_lr_ttc"][idx]) if "rel_lr_ttc" in hk else None
         y, known = RL.rel_object_targets(stz, tz, gt, g)
         y_cv, _ = RL.rel_object_targets(stz, tz, gt, g, motion="cv")
         mk = RL.rel_object_mask(O["valid"], g, known, y, cc)
-        l_rel = RL.rel_object_bce(r_nc, r_tt, y, mk)
-        l_cv = RL.rel_object_bce(r_nc, r_tt, y_cv, mk)
+        l_rel = RL.rel_object_bce(r_nc, r_tt, y, mk, lr_nc, lr_tt)
+        l_cv = RL.rel_object_bce(r_nc, r_tt, y_cv, mk, lr_nc, lr_tt)
         if q["lambda_rel"] > 0:
             inner = inner + q["lambda_rel"] * l_rel
         if q["lambda_rel_cv"] > 0:

@@ -40,6 +40,15 @@ Edits (refiner v4 corrector A, v4.corrector; v4_3 computed edits, v4.edits compu
   another device can flip a boundary decision: run infer_check on the dump's device), and eval's headline is the
   selection over 96 + K with the val-chosen, navtest-frozen beta / variant set (eval_ck2 'Edits'), next to the 96-only
   rows on the same tokens.
+v5 (refiner v5 corrector A_S, ck_e2e2.v4.v5 corrector + infer_refine; CKE2E2.infer emits ck2_v5_traj / ck2_v5_src /
+  ck2_v5_mu = tau1 of the dump-time pool pick): extract builds the student with its v5 modules (config.json 'v5'), dump
+  writes infer/{v5_traj [N, 1, 8, 3], v5_src [N] int16, v5_mu [N, 12]}.npy (opened on the first prediction that has
+  them; the 96-pool ok / done unchanged) and, for relation 'student', the det inputs of the check rows into
+  check_bev.npz (det_code / det_cls / det_hidden: the final det layer), label scores v5_traj -> labels/<split>/v5_<RUN>
+  (K = 1), infer_check replays CKE2E2.infer's v5 branch (score_set with the student's relation rows, refine_drafts of
+  the DUMPED src: v5_traj / v5_mu within tol; the replayed select96 pick's agreement with src is recorded, not
+  required), and eval reports tau1 vs the pool pick it was computed from (eval_ck2 'v5', paired bootstrap).  A student
+  without the v5 outputs writes / reads none of these files (every output as before).
 
 Checkpoint pin and cache identity (report 48 F1):
   --ckpt X resolves X ('last' | epoch:<E> | <path>), hashes the FILE and pins it in <RUN>/eval/ckpt.json (written only
@@ -117,6 +126,12 @@ EDIT_SPECS = {"edit_traj": ((8, 3), np.float32, np.nan), "edit_src": ((), np.int
 PRED_TO_EDIT = {"ck2_edit_traj": "edit_traj", "ck2_edit_src": "edit_src", "ck2_edit_u": "edit_u",
                 "ck2_edit_score_logit": "edit_score_logit", "ck2_edit_valid": "edit_valid",
                 "ck2_edit_kind": "edit_kind"}
+# refiner v5 corrector A_S (ck_e2e2.v4.v5 corrector + infer_refine): tau1 of the dump-time pool pick (K = 1 for
+# label_cands), the pick's pool column and the corrector controls (a prediction without the keys writes no file)
+V5_SPECS = {"v5_traj": ((1, 8, 3), np.float32, np.nan), "v5_src": ((), np.int16, -1),
+            "v5_mu": ((12,), np.float32, np.nan)}
+PRED_TO_V5 = {"ck2_v5_traj": "v5_traj", "ck2_v5_src": "v5_src", "ck2_v5_mu": "v5_mu"}
+V5_DET_KEYS = ("det_code", "det_cls", "det_hidden")     # check_bev.npz: the final det layer of the check rows
 
 
 def log(msg: str) -> None:
@@ -278,8 +293,11 @@ def extract_ck_v43(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, A
     ck_cfg = dict(ck_cfg or {})
     seed = int(ck_cfg.get("seed", 0) or 0)
     c = CKE2E2Config.from_any({"v4": dict(ck_cfg.get("v4") or {})})
-    v4, cv = c.v4_net(), int(c.v4["corridor_version"])
-    net = CKNet("S", seed, None, score_hidden=256, lead_aux=False, corridor_version=cv, v4=v4)
+    v4, cv, v5 = c.v4_net(), int(c.v4["corridor_version"]), c.v5_net()
+    # refiner v5 student (ck_e2e2.v4.v5 block, = online2.build_student_ck2): its relation / corrector modules (off: the
+    # v4_3 call unchanged)
+    net = CKNet("S", seed, None, score_hidden=256, lead_aux=False, corridor_version=cv, v4=v4,
+                **({"v5": v5} if v5.on else {}))
     net.load_state_dict(st, strict=True)
     cfg = {"arm": "S", "run": run_name or out_dir.parent.parent.name, "seed": seed, "score_hidden": 256, "lead_aux": 0,
            "k": E1.K, "e2e": True, "source_ckpt": str(ckpt), "source_ckpt_sha16": U.sha256_file(ckpt),
@@ -288,13 +306,16 @@ def extract_ck_v43(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, A
         cfg["corridor_version"] = cv
     if v4.on:
         cfg["v4"] = v4.to_dict()
+    if v5.on:                                    # load_ck rebuilds the v5 modules from config.json 'v5'
+        cfg["v5"] = v5.to_dict()
     out_dir.mkdir(parents=True, exist_ok=True)
     save_ck(out_dir / "ckpt_last.pt", net, cfg)
     U.write_json(out_dir / "config.json", cfg)
     net2, _ = load_ck(out_dir, "last", "cpu")
     a, b = net.state_dict(), net2.state_dict()
     assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a), "load_ck round trip differs"
-    log(f"extracted {len(st)} CK tensors from {ckpt} -> {out_dir} (v4_3 network {v4.readout})")
+    log(f"extracted {len(st)} CK tensors from {ckpt} -> {out_dir} (v4_3 network {v4.readout}"
+        f"{', v5 relation ' + v5.relation + ', corrector ' + str(v5.corrector) if v5.on else ''})")
     return cfg
 
 
@@ -354,6 +375,7 @@ class EvalRootWriter2(E1.EvalRootWriter):
                       INFER_SPECS.items()}
         self.ck_run = ck_run
         self.E: Optional[Dict[str, np.ndarray]] = None              # refiner v4 edits (opened on first use)
+        self.V5: Optional[Dict[str, np.ndarray]] = None             # refiner v5 tau1 (opened on first use)
 
     def _edits(self, K: int) -> Dict[str, np.ndarray]:
         if self.E is None:
@@ -361,6 +383,13 @@ class EvalRootWriter2(E1.EvalRootWriter):
                 self.E = {k: U.open_memmap(self.P.infer / f"{k}.npy", (self.n, K) + s, d, fill=f)
                           for k, (s, d, f) in EDIT_SPECS.items()}
         return self.E
+
+    def _v5(self) -> Dict[str, np.ndarray]:
+        if self.V5 is None:
+            with U.FileLock(self.P.packed / ".lock"):
+                self.V5 = {k: U.open_memmap(self.P.infer / f"{k}.npy", (self.n,) + s, d, fill=f)
+                           for k, (s, d, f) in V5_SPECS.items()}
+        return self.V5
 
     def write(self, rows, pred, status, gt, traj):
         rows = np.asarray(rows, np.int64)
@@ -370,6 +399,12 @@ class EvalRootWriter2(E1.EvalRootWriter):
             for src, dst in PRED_TO_EDIT.items():
                 if src in pred:                     # e.g. edit_valid / edit_kind of an older dump caller: fill kept
                     E[dst][rows] = np.asarray(pred[src]).astype(E[dst].dtype)
+        if "ck2_v5_traj" in pred:                   # refiner v5: tau1 [B, 8, 3] -> [B, 1, 8, 3] (label K = 1)
+            V = self._v5()
+            for src, dst in PRED_TO_V5.items():
+                if src in pred:
+                    x = np.asarray(pred[src])
+                    V[dst][rows] = (x[:, None] if dst == "v5_traj" else x).astype(V[dst].dtype)
         ok = np.isfinite(pred["ck2_cand96"]).reshape(B, -1).all(1)
         ok &= np.isfinite(pred["ck2_score_logit"]).reshape(B, -1).all(1)
         ok &= np.isfinite(pred["ck2_lat_traj"]).reshape(B, -1).all(1)
@@ -386,7 +421,7 @@ class EvalRootWriter2(E1.EvalRootWriter):
 
     def flush(self) -> None:
         super().flush()
-        for a in (self.E or {}).values():
+        for a in list((self.E or {}).values()) + list((self.V5 or {}).values()):
             a.flush()
 
     def finalize_meta(self, extra: Dict[str, Any]) -> None:
@@ -470,11 +505,13 @@ def run_dump_shard(P: Paths, ckpt: Path, tdf, shard: int, nshard: int, batch_siz
     except AttributeError:
         anchors = None
     row_of = {t: int(p) for t, p in zip(todo_toks, pos)}
+    v5q = agent._ck_e2e2.cfg.v5                       # refiner v5 relation 'student': the check rows' det inputs too
+    v5_rel = bool(v5q["enabled"] and v5q["relation"] != "off")
     ds = DV.FeatDS(loader, agent.get_feature_builders(), todo_toks)
     dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, num_workers=workers, collate_fn=DV.collate,
                                      pin_memory=dev.type == "cuda", prefetch_factor=2 if workers else None)
     chk_path = P.infer / "check_bev.npz"
-    chk_bev, chk_rows = [], []
+    chk_bev, chk_rows, chk_det = [], [], {}
     n, n_bad, max_top1, t1 = 0, 0, 0.0, time.time()
     for btok, feats, gt in dl:
         fg = {k: v.to(dev, dtype=torch.float32 if v.is_floating_point() else v.dtype, non_blocking=True)
@@ -487,8 +524,10 @@ def run_dump_shard(P: Paths, ckpt: Path, tdf, shard: int, nshard: int, batch_siz
         max_top1 = max(max_top1, check_pool(pr, anchors))
         rows = np.array([row_of[t] for t in btok], np.int64)
         # + the refiner v4 edits when the student makes them (before: the edit keys never reached the writer)
+        # + the refiner v5 tau1 of the pick when the student emits it (ck2_v5_*; absent: nothing new is written)
         npd = {k: pr[k].detach().float().cpu().numpy() if pr[k].is_floating_point() else pr[k].cpu().numpy()
-               for k in list(PRED_TO_PACKED) + list(PRED_TO_INFER) + [k for k in PRED_TO_EDIT if k in pr]}
+               for k in list(PRED_TO_PACKED) + list(PRED_TO_INFER) + [k for k in PRED_TO_EDIT if k in pr]
+               + [k for k in PRED_TO_V5 if k in pr]}
         ok = W.write(rows, npd, fg["status_feature"].float().cpu().numpy(), gt.numpy().astype(np.float32),
                      pr["trajectory"].float().cpu().numpy())
         n_bad += int((~ok).sum())
@@ -498,10 +537,14 @@ def run_dump_shard(P: Paths, ckpt: Path, tdf, shard: int, nshard: int, batch_siz
             take = min(N_CHECK_BEV - len(chk_rows), len(rows))
             chk_bev.append(g[:take])
             chk_rows += rows[:take].tolist()
+            if v5_rel:                              # infer_check rebuilds the student's relation rows from these
+                for k, x in zip(V5_DET_KEYS, (pr["all_bbox_preds"][-1], pr["all_cls_scores"][-1], pr["det_hidden"])):
+                    chk_det.setdefault(k, []).append(x[:take].detach().float().cpu().numpy())
             if len(chk_rows) >= min(N_CHECK_BEV, len(pos)):
                 tmp = chk_path.with_name(f".check_bev.tmp{os.getpid()}.npz")
                 with open(tmp, "wb") as f:
-                    np.savez(f, rows=np.asarray(chk_rows, np.int64), bev=np.concatenate(chk_bev, 0).astype(np.float32))
+                    np.savez(f, rows=np.asarray(chk_rows, np.int64), bev=np.concatenate(chk_bev, 0).astype(np.float32),
+                             **{k: np.concatenate(v, 0) for k, v in chk_det.items()})
                 os.replace(tmp, chk_path)
         n += len(rows)
         if n % 400 < len(rows) or n == len(pos):
@@ -576,6 +619,9 @@ def stage_label(P: Paths, a) -> None:
     if (P.infer / "edit_traj.npy").is_file():           # refiner v4 corrector A: the K edits (K from the file shape)
         jobs.append((f"edit_{P.name}", lab + ["--name", f"edit_{P.name}", "--traj", str(P.infer / "edit_traj.npy")],
                      P.infer / "edit_traj.npy"))
+    if (P.infer / "v5_traj.npy").is_file():             # refiner v5: tau1 of the dump-time pick (K = 1)
+        jobs.append((f"v5_{P.name}", lab + ["--name", f"v5_{P.name}", "--traj", str(P.infer / "v5_traj.npy")],
+                     P.infer / "v5_traj.npy"))
     for name, cmd, traj in jobs:
         if (P.labels / name / "labels.npy").is_file() and (P.labels / name / "meta.json").is_file():
             from tools.ck.data import common as CM
@@ -625,8 +671,16 @@ def stage_infer_check(P: Paths, a, tol_logit: float = 3e-2, tol_traj: float = 2e
     cand, fin, par = infer_pool(raw, raw[:, ::6])
     bev_t = torch.from_numpy(bev).to(dev)
     computed = bool(getattr(getattr(net, "v4", None), "computed_edits", False))
+    v5s = bool(getattr(getattr(net, "v5", None), "on", False))
+    got5: Dict[str, Any] = {}
+    info5: Dict[str, Any] = {}
     with torch.no_grad():
-        if getattr(net, "corrector", None) is not None or computed:
+        if v5s and not (getattr(net, "corrector", None) is not None or computed):
+            # refiner v5 student: CKE2E2.infer's v5 branch (score_set with the student's relation rows + the corrector
+            # context, then refine_drafts of the DUMPED pick)
+            o, got5, info5 = _infer_check_v5(P, net, cfg, z, rows, bev_t, cand, par, status, dev)
+            ce = None
+        elif getattr(net, "corrector", None) is not None or computed:
             # refiner v4 corrector A / v4_3 computed edits: the same ops as CKE2E2.infer (score_set + correct_topk or
             # computed_edits on the same parent pass), edits checked too
             ego = ego_inputs(status)
@@ -646,6 +700,7 @@ def stage_infer_check(P: Paths, a, tol_logit: float = 3e-2, tol_traj: float = 2e
         lat = lateral_decode(cand, o["w_lat"], ego_inputs(status)[0], 0.0)
     got = {"score_logit": o["score_logit"], "w_lat": o["w_lat"], "e_lat": lat["e_lat"][..., 2:],
            "lat_traj": lat["traj"]}
+    got.update(got5)
     if ce is not None and (P.infer / "edit_score_logit.npy").is_file():
         got.update(edit_score_logit=ce["edit_score_logit"], edit_traj=ce["edit_traj"])
         src_ref = np.load(P.infer / "edit_src.npy", mmap_mode="r")[rows]
@@ -657,12 +712,58 @@ def stage_infer_check(P: Paths, a, tol_logit: float = 3e-2, tol_traj: float = 2e
         err[k] = float(np.nanmax(np.abs(v.float().cpu().numpy() - ref)))
     tol = {k: (tol_logit if "logit" in k else tol_traj) for k in err}
     res = {"rows": rows.tolist(), "max_abs_err": err, "tol": tol, "device": str(dev),
-           "pass": all(err[k] <= tol[k] for k in err), "ck_run": str(P.ck_run), "checked": EV.kst()}
+           "pass": all(err[k] <= tol[k] for k in err), "ck_run": str(P.ck_run), "checked": EV.kst(),
+           **({"v5": info5} if info5 else {})}
     U.write_json(P.infer / "infer_check.json", res)
     log(f"infer_check {P.split}: pass={res['pass']} {err}")
     if not res["pass"]:
         raise SystemExit("infer_check failed: extracted CK2 run does not reproduce the in-process outputs")
     return res
+
+
+def _infer_check_v5(P: Paths, net, cfg: Dict[str, Any], z, rows: np.ndarray, bev_t, cand, par, status, dev):
+    """stage_infer_check for a refiner v5 student = CKE2E2.infer's v5 branch on the check rows -> (score_set output,
+    {v5_traj [n, 1, 8, 3], v5_mu [n, 12]} when the dump holds v5_traj (refine_drafts of the DUMPED src), info
+    {relation, n_check, src_replay_agree (the replayed select96 pick vs the dumped src: descriptive)})."""
+    import torch
+    from navsim.agents.para_ssr.ck import select2 as S2
+    from navsim.agents.para_ssr.ck.online2 import CKE2E2Config, student_rel_rows
+    from navsim.agents.para_ssr.refiner.e2e import ego_inputs
+    ck_cfg = dict(cfg.get("ck_e2e2") or {})
+    v5q = CKE2E2Config.from_any({"v4": dict(ck_cfg.get("v4") or {})}).v5
+    ego = ego_inputs(status)
+    feat, mem = net.trunk.scene(bev_t, cand.shape[0])
+    pref = net.scene_pref(mem, ego)
+    kw: Dict[str, Any] = {}
+    if net.v5.rel:
+        if not (v5q["enabled"] and v5q["relation"] != "off"):
+            raise SystemExit(f"infer_check: {P.ck_run}/config.json ck_e2e2.v4.v5 ({v5q}) does not describe the net's "
+                             f"relation channel ({net.v5.relation!r}); rerun --stage extract")
+        miss = [k for k in V5_DET_KEYS if k not in z.files]
+        if miss:
+            raise SystemExit(f"infer_check: {P.infer / 'check_bev.npz'} has no {miss} (the det inputs of the check rows "
+                             f"that rebuild a v5 relation 'student' net's object rows); rerun the dump (--fresh)")
+        f = lambda k: torch.from_numpy(np.asarray(z[k], np.float32)).to(dev)            # noqa: E731
+        kw["rel_objs"] = student_rel_rows({"all_bbox_preds": [f("det_code")], "all_cls_scores": [f("det_cls")],
+                                           "det_hidden": f("det_hidden")}, v5q)
+    corr5 = getattr(net, "corrector_v5", None) is not None
+    o = net.score_set(feat, mem, ego, cand, par, pref=pref, return_ctx=corr5, **kw)
+    got: Dict[str, Any] = {}
+    info: Dict[str, Any] = {"relation": net.v5.relation, "n_check": int(len(rows))}
+    if corr5 and (P.infer / "v5_traj.npy").is_file():
+        s5 = np.load(P.infer / "v5_src.npy", mmap_mode="r")[rows].astype(np.int64)
+        if (s5 < 0).any():
+            raise SystemExit(f"infer_check: v5_src of check rows {rows[s5 < 0].tolist()} is -1 (no v5 output dumped)")
+        rf = net.refine_drafts(o, cand.float(), torch.from_numpy(s5).to(dev)[:, None], ego)
+        got = {"v5_traj": rf["tau1"], "v5_mu": rf["mu"][:, 0]}
+        bsel = ck_cfg.get("infer_select") or {"beta": 0.5, "set": "all"}       # = CKE2E2.infer's v5 pick rule
+        v2f = np.load(P.packed / "v2_final.npy", mmap_mode="r")[rows].astype(np.float64)
+        v2im = np.load(P.packed / "v2_im.npy", mmap_mode="r")[rows].astype(np.float64)
+        valid = np.load(P.packed / "valid96.npy", mmap_mode="r")[rows].astype(bool)
+        idx = S2.select96(v2f, v2im, torch.sigmoid(o["score_logit"].float()).cpu().numpy().astype(np.float64), valid,
+                          float(bsel["beta"]), types=S2.VARIANT_SETS[str(bsel["set"])])
+        info["src_replay_agree"] = float(np.mean(np.asarray(idx) == s5))
+    return o, got, info
 
 
 # ----------------------------------------------------------------------------------------------- eval / summary
@@ -709,7 +810,11 @@ def stage_summary(run_dir: Path, sel_w=None, offset=None) -> Dict:
         if m.get("edits"):              # refiner v4 edits: the 96 + K headline + the 96-only rows on the same tokens
             keep |= {m["edits"].get("same_tokens_96"), m["edits"].get("best_96"), m["edits"].get("headline")}
         rows = {r["key"]: r for r in m["rows"] if r["key"] in keep}
-        out["splits"][split] = {"n_eval": m["n_eval"], "n_total": m["n_total"], "n_logs": m["n_logs"],
+        v5s = {}                            # refiner v5 tau1 (eval_ck2 'v5'; absent: the summary as before)
+        if m.get("v5"):
+            v5s = {"v5": {**{k: m["v5"].get(k) for k in ("n_v5", "n_tok", "pick_rule", "d", "src_agree")},
+                          "pdms": {k: r["pdms"] for k, r in m["v5"]["rows"].items()}}}
+        out["splits"][split] = {**v5s, "n_eval": m["n_eval"], "n_total": m["n_total"], "n_logs": m["n_logs"],
                                 "choice": m.get("best") or m.get("fixed_from_val"),
                                 **({"choice_edits": m.get("best_edits") or m.get("fixed_edits_from_val"),
                                     "edits": m["edits"]} if m.get("edits") else {}),
@@ -747,6 +852,12 @@ def stage_summary(run_dir: Path, sel_w=None, offset=None) -> Dict:
                      f"{_pct(r['dac'])} | {_pct(r['ep'])} | {_pct(r['ttc'])} | {_pct(r['comfort'])} | {lead} | "
                      f"{100 * r['frac_changed']:.1f} | {100 * r['frac_lat']:.1f} |")
         L.append("")
+        if sp.get("v5"):                    # refiner v5 tau1 of the dump-time pick (eval_ck2 'v5'), below the table
+            v = sp["v5"]
+            L += [f"refiner v5 tau1 ({v['n_v5']} / {v['n_tok']} 토큰, pick {v['pick_rule']}): PDMS "
+                  + " / ".join(f"{k} {_pct(x)}" for k, x in v["pdms"].items())
+                  + f"; tau1 - pick {EV.fmt_ci(v['d']['tau1-pick'])}, tau1 - pick+lat "
+                    f"{EV.fmt_ci(v['d']['tau1-pick_lat'])}", ""]
     (ev / "summary.md").write_text("\n".join(L) + "\n")
     log(f"summary -> {ev / 'summary.md'}")
     return out

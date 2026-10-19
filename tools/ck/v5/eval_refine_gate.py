@@ -4,15 +4,19 @@ on FIXED drafts, every trajectory scored by the official scorer, paired per toke
 --device cuda (approval + an idle GPU of 0-3); the default CPU route needs no GPU.
 
   cd /workspace/yongjae/SSR-v5 && CUDA_VISIBLE_DEVICES= PYTHONPATH=$PWD OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-      nice -n 10 /venv/ssr/bin/python tools/ck/v5/eval_refine_gate.py --run T=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5T_rel \
-      --which ep2 --split navtrain_val --device cpu --label-workers 32
-  (--split navtrain_val defaults to --tokens heldout12179 = the registered gate set; --limit 4 = a CPU smoke into
-   <out>/<split>/smoke4_<tokens>; the MAP teacher: --run v5M_unk --split navtest, navtest defaults to --tokens all.)
+      nice -n 10 /venv/ssr/bin/python tools/ck/v5/eval_refine_gate.py --run T=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5T_rel2 \
+      --which ep<e> --split navtrain_val --device cpu --label-workers 32
+  (runs only once the training has written that epoch's ckpt_ep<e>.pt; --which last = its current ckpt_last.pt.
+   --split navtrain_val defaults to --tokens heldout12179 = the registered gate set; --limit 4 = a CPU smoke (4 tokens
+   spread over logs, seeded) into <out>/<split>/smoke4_<tokens>; the MAP teacher: --run v5M_unk2 --split navtest,
+   navtest defaults to --tokens all.)
 
 Arms (--run [ROLE=]DIR, repeatable; DIR = a run dir or a name under CK/v5/train | CK/v4/train | CK/ck2/train)
-  ROLE T = the teacher-input refiner A_T (the DET teacher on val; the MAP teacher's gate on navtest uses T too), S =
-  the student-input A_S, GT = the GT-input A_GT (each at most once), or no role (report only, labelled by the run dir
-  name).  A run must be a v5 net with the corrector A (config.json v5
+  ROLE T = the teacher-input refiner A_T (the DET teacher on val; the MAP teacher's gate on navtest uses T too), or no
+  role (report only, labelled by the run dir name).  S (the student-input A_S) and GT (the GT-input A_GT) are REFUSED:
+  their input builders are not wired here, and check_run_cfg admits teacher-input nets only, so an S= / GT= arm would be
+  a teacher net gated as A_S / A_GT.  Two runs with the same dir name are refused (their arm dirs would collide).  A run
+  must be a v5 net with the corrector A (config.json v5
   corrector) on the range readout, arm T (DET, BEVFusion t0 BEV) or M (MAP, ReSMap BEV).  Refused: arm M on
   navtrain_val (no ReSMap cache for val: constants.SPLITS map_teacher False; 0 of the 12,179 held-out tokens are in the
   navtrain ReSMap index -- the MAP gate runs on navtest only), relation 'student' (Stage 1b needs the student's det rows,
@@ -22,11 +26,15 @@ Drafts (--drafts): r34top1 (the only one) = packed/<split>/cand.npy[:, 0] = the 
 Tokens (--tokens): heldout12179 (navtrain_val only) = the registered gate set = eval_range_teacher.p1_registered_rows
   (HO/prep/ho_rows.npy: the 12,179 packed navtrain_val rows outside the F1 6,000, the v4_3 registered P1 token set);
   all = every packed ok row; <file> = .npy of packed rows (int) or tokens (str), or a text file of tokens (one per line).
+  --limit N (smoke, never deciding): N of those rows spread over logs (limit_rows: the logs in a seeded order, one row
+  of each in turn), so a smoke also exercises the log-cluster bootstrap.
 
 Stages (--stage comma list, default infer,label,report; each resumable)
   infer   per arm: the checkpoint ckpt_<--which>.pt (last | ep<e>) is COPIED to <arm>/ckpt_<which>.pt first (a running
           training replaces ckpt_last.pt atomically; the copy is what is evaluated, its sha16 is the identity; a later
-          change of the run's file is reported, never picked up: --fresh re-copies); load_ck(copy) (strict) on --device;
+          change of the run's file is reported, never picked up: --fresh re-copies; <arm>/ckpt_<which>.source.json
+          records the copy's run + sha16, and a copy from another run (or without the record) is refused);
+          load_ck(copy) (strict) on --device;
           CKDataset(split, bev = the arm, k = --score-k, rows, objects = the refiner-v3 object pack rows of the tokens
           (e2e_data2.teacher_v5_rel_cfg: the run's t_pack_root, no augmentation, no targets) when v5.relation is
           'teacher'); trunk.scene -> scene_pref -> score_set(the --score-k first candidates, each its own parent,
@@ -35,7 +43,8 @@ Stages (--stage comma list, default infer,label,report; each resumable)
           mu 0 = the lateral head, 2 tau1), mu.npy f32 [N, 12], done / bev_ok / obj_ok [N] (N = packed rows; NaN / False
           outside the tokens), infer_meta.json.  CUDA: score_set under fp16 autocast (as eval_range_teacher), refine fp32;
           CPU: fp32.  Resume only into outputs of the same identity (INFER_ID_KEYS: run, which, checkpoint sha16, arm,
-          split, drafts, score_k, knockout, amp, v4 / v5 config; the run dir compared resolved).  A token without BEV stays not done (counted).
+          split, drafts, score_k, knockout, amp, v4 / v5 config, code_sha16 = the sources behind the numbers:
+          infer_code_manifest; the run dir compared resolved).  A token without BEV stays not done (counted).
           --knockout objects (report only, design section 2-8 'object off'): obj_mask / frame_valid False -> every
           a_i = 0, H = 0; outputs in <run>@<which>@objoff.  ('dense off' has no code hook: refused.)
   label   tools/ck/data/label_cands.py (score_trajectories.score_token = the official pairwise PDM score per
@@ -44,29 +53,38 @@ Stages (--stage comma list, default infer,label,report; each resumable)
           ok [N, 3], meta.json, shards/}; reused only when label_key.json (traj3 sha16 + rows sha16) is unchanged, else
           rescored from scratch.  Check (label_check.json): column 0 must reproduce the stored draft labels
           CK/labels/<split>/cand[:, 0] (ok equal, |diff| <= LABEL_TOL on every finite column), else SystemExit.
-  report  token set = the selected rows that every arm has done with all three columns labelled ok; the registered
-          set's completeness per input.  Per arm (x 100 units in the deltas): PDMS / NC / DAC / EP / TTC / C / DDC
+  report  token set = the selected rows that every arm has done with all three columns labelled ok (labels of the
+          current traj3 only: label_key.json); the completeness per input (registered set incomplete -> the outputs
+          are written, then a non-zero exit).  Per arm (x 100 units in the deltas): PDMS / NC / DAC / EP / TTC / C / DDC
           means, fail rates and pass rates of draft, tau_base, tau1; paired log-cluster bootstrap (eval_ck.log_bootstrap,
           --bootstrap 2,000, seed 0, ratio over logs) of tau1 - tau_base, tau1 - draft, tau_base - draft; break / fix of
-          tau1 (and tau_base) against both references under both rules -- pdms0: P(new PDMS == 0 | ref PDMS > 0), fix
-          P(new PDMS > 0 | ref PDMS == 0); fails3 (eval_range_teacher.fails3, the v4_3 rule): P(new fails NC / TTC / DAC
-          | ref passes all three); per-key (nc, dac, ttc, ddc, comfort) fail / break / fix counts, EP loss; |mu|
+          tau1 (and tau_base) against both references under both rules -- fails3 (eval_range_teacher.fails3, the v4_3
+          P1 FILTER rule, the gate's): P(new fails NC / TTC / DAC | ref passes all three); pdms0 (reported only): P(new
+          PDMS == 0 | ref PDMS > 0), fix P(new PDMS > 0 | ref PDMS == 0); a rate with a zero denominator is null in the
+          JSON; per-key (nc, dac, ttc, ddc, comfort) fail / break / fix counts, EP loss; |mu|
           (L_inf over the 12 controls) mean, share > MU_THR (0.05), per-control mean |mu|; share of tokens whose tau1
-          moves (> 1 mm) from the draft / from tau_base.  Between arms: tau1_a - tau1_b paired.
-          -> <root>/gate_<arms>[_<tag>].json / .md / _per_token.parquet (+ the printed table).
+          moves (> 1 mm) from the draft / from tau_base.  Between arms, paired per token: the no-edit gains, tau1_a -
+          tau1_b with --noedit draft (the shared draft cancels), (tau1_a - base_a) - (tau1_b - base_b) with base.
+          -> <root>/gate_<tag>.json / .md / _per_token.parquet (+ the printed table); <tag> (report_tag) = the arm
+          labels @ --which + every non-registered option (_objoff, _noedit-base, _break-pdms0, _k16) + _<--tag>, and a
+          report of the same name written for another run / checkpoint copy is not overwritten (--tag or --fresh).
 
 Gate (registered before any v5 result; report 97 section 5-2, the four clauses):
   (a) PDMS(tau1^T) - PDMS(tau1^S) >= +0.30 with the paired CI lower bound > 0;   (needs T and S)
   (b) that difference >= 0.5 x (PDMS(tau1^GT) - PDMS(tau1^S)) (point estimates);  (needs T, S and GT)
-  (c) break(tau1^T vs no edit) <= 1.3 % (--break-rule, default pdms0);
+  (c) break(tau1^T vs no edit) <= 1.3 % (--break-rule, default fails3 = NC / TTC / DAC pass -> fail, the v4_3 P1
+      FILTER rule report 97 ties the 1.3 % to; pdms0 is reported, never decides);
   (d) tau1^T - no edit >= +0.30 with CI lower bound > 0.
-  'no edit' = --noedit: draft (default: tau0, the unmodified r34 top-1, = report 97's "pass -> fail of tokens the draft
-  passed") | base (tau_base, mu = 0 = the arm's lateral head alone).  Both references are always reported.
+  'no edit' = --noedit: draft (default, the registered reference: tau0, the unmodified r34 top-1, = report 97's "pass
+  -> fail of tokens the draft passed") | base (tau_base, mu = 0 = the arm's lateral head alone; report only).  Both
+  references are always reported.
   Verdict PASS iff all four hold, FAIL iff an evaluable clause fails, else INCOMPLETE (a clause lacks its arm: one T run
-  alone can only FAIL or stay INCOMPLETE).  It DECIDES only on navtrain_val --tokens heldout12179 without --limit,
-  --drafts r34top1, no knock-out, with all 12,179 registered tokens in the token set; every other run is 'report only'
-  (with the reason).  Also reported: (GT - T) = "what no teacher gives", the student floor (report 97: tau1^S vs no edit
-  >= 0 with CI lower bound > -0.10, break <= 1.3 %).  Not here: the tier table (T1/T2/T3/DAC) of section 5-1.
+  alone can only FAIL or stay INCOMPLETE -- with S / GT refused, no run of this tool decides yet).  It DECIDES only on
+  navtrain_val --tokens heldout12179 without --limit, --drafts r34top1, no knock-out, --break-rule fails3, --noedit
+  draft, with all 12,179 registered tokens in the token set; every other run is 'report only' (with the reason; the
+  report prints 'Gate (report only): <verdict>').  Also reported: (GT - T) = "what no teacher gives", the student
+  floor (report 97: tau1^S vs no edit >= 0 with CI lower bound > -0.10, break <= 1.3 %).  Not here: the tier table
+  (T1/T2/T3/DAC) of section 5-1.
 """
 from __future__ import annotations
 
@@ -101,25 +119,31 @@ CK = Path("/home/external-user/ssd/yongjae_refiner/ck")
 OUT_ROOT = CK / "v5" / "eval_gate"
 RUN_ROOTS = (CK / "v5" / "train", CK / "v4" / "train", CK / "ck2" / "train")
 SPLITS = ("navtrain_val", "navtest")
-TOKEN_SETS = ("heldout12179", "all")
 REG_TOKENS, REG_SPLIT, N_REGISTERED = "heldout12179", "navtrain_val", 12179
 DRAFTS = ("r34top1",)
 COLS = ("draft", "base", "tau1")            # traj3 / labels column order: tau0, tau_base (mu = 0), tau1
 ROLES = ("T", "S", "GT")
+WIRED_ROLES = ("T",)                        # A_S / A_GT: no input builder here (check_run_cfg admits teacher nets only)
 NOEDIT = ("draft", "base")
 KNOCKOUTS = ("none", "objects")
+REG_NOEDIT, REG_BREAK = "draft", "fails3"   # the registered no-edit reference / break rule (v4_3 P1 FILTER rule)
 N_BOOT, BOOT_SEED = 2000, 0
 GATE_D_MIN, GATE_BREAK_MAX, GATE_GT_FRAC = 0.30, 0.013, 0.5      # report 97 section 5-2
 FLOOR_D_MIN, FLOOR_LO_MIN = 0.0, -0.10                           # the student-channel floor (report only here)
 LABEL_TOL = 1e-6                                                 # draft column vs the stored float32 labels
 MAX_LABEL_WORKERS = 48
 INFER_ID_KEYS = ("run_real", "which", "ckpt_sha16", "arm", "split", "drafts", "score_k", "knockout", "amp", "v4", "v5",
-                 "corridor_version")                    # run_real = the resolved run dir (symlinked paths are equal)
+                 "corridor_version", "code_sha16")      # run_real = the resolved run dir (symlinked paths are equal)
+# the sources behind stage infer's numbers (code_sha16; a directory = every *.py below it except tests / __pycache__),
+# plus this tool's infer functions (infer_code_manifest)
+INFER_CODE = ("navsim/agents/para_ssr/ck", "navsim/agents/para_ssr/refiner", "tools/ck/data/common.py",
+              "tools/ck/data/ck_dataset.py", "tools/ck/data/ck2_dataset.py", "tools/ck/data/obj_pack.py")
 STAGES = ("infer", "label", "report")
 GATE_RULE = ("report 97 section 5-2 (3) gate, registered before any v5 result: PASS iff (a) PDMS(tau1^T) - PDMS(tau1^S) "
              ">= +0.30 with the paired log-bootstrap CI lower bound > 0, (b) that difference >= 0.5 x (PDMS(tau1^GT) - "
-             "PDMS(tau1^S)), (c) break(tau1^T vs no edit) <= 1.3 %, (d) tau1^T - no edit >= +0.30 with CI lower bound > "
-             "0; on navtrain_val held-out 12,179 tokens, fixed r34 top-1 drafts, official scorer, x 100 units.")
+             "PDMS(tau1^S)), (c) break(tau1^T vs no edit) <= 1.3 % (NC / TTC / DAC pass -> fail, the v4_3 P1 FILTER "
+             "rule), (d) tau1^T - no edit >= +0.30 with CI lower bound > 0; no edit = the draft; on navtrain_val "
+             "held-out 12,179 tokens, fixed r34 top-1 drafts, official scorer, x 100 units.")
 
 
 def kst(t: Optional[float] = None) -> str:
@@ -161,14 +185,20 @@ def resolve_run(name: str) -> Path:
 
 
 def parse_runs(specs: Sequence[str]) -> List[Dict[str, Any]]:
-    """--run [ROLE=]DIR values -> [{role (T / S / GT / None), run (Path), label}] (label = role or the run dir name);
-    a role given twice, the same run twice, or two equal labels -> SystemExit."""
+    """--run [ROLE=]DIR values -> [{role (T / None), run (Path), label}] (label = role or the run dir name); role S /
+    GT (no input builder here), a role given twice, the same run twice, two runs with the same dir name (one arm dir)
+    or two equal labels -> SystemExit."""
     out: List[Dict[str, Any]] = []
     for s in specs:
         role, _, name = s.partition("=") if "=" in s else ("", "", s)
         role = role.strip() or None
         if role is not None and role not in ROLES:
             raise SystemExit(f"--run {s!r}: role {role!r} not in {ROLES} (or omit 'ROLE=')")
+        if role is not None and role not in WIRED_ROLES:
+            what = "A_S (student-feature input, Stage 1b)" if role == "S" else "A_GT (GT input)"
+            raise SystemExit(f"--run {s!r}: role {role!r} refused: the {what} input builder is not wired in this tool, "
+                             f"and every run it admits is a teacher-input net (check_run_cfg), which must not be gated "
+                             f"as {role}; roles wired: {WIRED_ROLES} (omit 'ROLE=' for a report-only arm)")
         if not name.strip():
             raise SystemExit(f"--run {s!r}: no run")
         run = resolve_run(name.strip())
@@ -176,9 +206,13 @@ def parse_runs(specs: Sequence[str]) -> List[Dict[str, Any]]:
     roles = [r["role"] for r in out if r["role"]]
     if len(roles) != len(set(roles)):
         raise SystemExit(f"--run: role given twice ({roles})")
-    runs = [str(r["run"]) for r in out]
+    runs = [str(r["run"].resolve()) for r in out]
     if len(runs) != len(set(runs)):
         raise SystemExit(f"--run: the same run given twice ({runs})")
+    names = [r["run"].name for r in out]
+    if len(names) != len(set(names)):
+        raise SystemExit(f"--run: two runs with the same dir name ({runs}): their arm dirs <root>/<name>@<which> would "
+                         f"collide (evaluate them into different --out roots)")
     labels = [r["label"] for r in out]
     if len(labels) != len(set(labels)):
         raise SystemExit(f"--run: two arms with the label {labels} (give roles)")
@@ -245,6 +279,22 @@ def select_rows(split: str, tokens: str, tdf: pd.DataFrame, pok: np.ndarray) -> 
     return r, f"file-{p.stem}-{_sha16_rows(r)[:8]}", info
 
 
+def limit_rows(rows: np.ndarray, logs: np.ndarray, limit: int, seed: int = 0) -> np.ndarray:
+    """--limit N: N of the selected rows (sorted) spread over logs -- the logs in a seeded random order, one row of
+    each in turn (a log's first rows first) -> sorted rows; all rows when limit is 0 or >= len(rows).  logs [N] = the
+    packed rows' log names."""
+    rows = np.asarray(rows, np.int64)
+    if not limit or limit >= len(rows):
+        return rows
+    lg = np.asarray(logs).astype(str)[rows]
+    uniq, inv = np.unique(lg, return_inverse=True)
+    rank = np.empty(len(uniq), np.int64)
+    rank[np.random.default_rng(seed).permutation(len(uniq))] = np.arange(len(uniq))
+    pos = pd.Series(inv).groupby(inv).cumcount().to_numpy()              # the row's index within its log
+    order = np.lexsort((rank[inv], pos))                                  # round 0 of every log, then round 1, ...
+    return np.sort(rows[order[:limit]])
+
+
 def gate_root(out: str, split: str, tag: str, limit: int) -> Path:
     return Path(out) / split / (f"smoke{limit}_{tag}" if limit else tag)
 
@@ -294,21 +344,53 @@ def check_run_cfg(run: Path, cfg: Dict, split: str, knockout: str = "none") -> D
 def freeze_ckpt(run: Path, which: str, ad: Path) -> Dict[str, Any]:
     """<ad>/ckpt_<which>.pt = a copy of <run>/ckpt_<which>.pt made once (the evaluated file; ckpt_last.pt of a running
     training is replaced atomically, so the copy is one consistent version) -> {copy, ckpt_sha16 (of the copy), source,
-    source_sha16_now, copied, source_changed}."""
+    source_sha16_now, copied, source_changed}.  <ad>/ckpt_<which>.source.json records the copy's source (the resolved
+    run dir / ckpt_<which>.pt) and sha16: an existing copy is reused only when that record names this run and the copy
+    still has its sha16 (another run with the same dir name, a copy without the record, an altered copy -> SystemExit:
+    --fresh)."""
     src = run / f"ckpt_{which}.pt"
     if not src.is_file():
         raise SystemExit(f"{src} missing (--which {which}: ckpt_{which}.pt of the run)")
-    cp = ad / f"ckpt_{which}.pt"
-    copied = False
+    cp, rec = ad / f"ckpt_{which}.pt", ad / f"ckpt_{which}.source.json"
+    src_id = str(run.resolve() / src.name)              # the run dir resolved, the file name kept (a symlinked
+    copied = False                                      # ckpt_last.pt -> ckpt_ep<e>.pt still names 'last')
     if not cp.is_file():
         ad.mkdir(parents=True, exist_ok=True)
         tmp = cp.with_name(f".{cp.name}.tmp{os.getpid()}")
         shutil.copyfile(src, tmp)
+        U.write_json(rec, {"source": src_id, "copy_sha16": U.sha256_file(tmp), "copied": kst()})
         os.replace(tmp, cp)
         copied = True
     sha, now = U.sha256_file(cp), U.sha256_file(src)
+    r = U.read_json(rec, None)
+    if r is None or r.get("source") != src_id or r.get("copy_sha16") != sha:
+        raise SystemExit(f"{cp}: the checkpoint copy is not this run's ({src_id}, sha16 {sha}): its source record "
+                         f"{rec} says {r} -- another run with the same dir name, or a copy without / not matching its "
+                         f"record: --fresh (or another --out)")
     return {"copy": str(cp), "ckpt_sha16": sha, "source": str(src), "source_sha16_now": now, "copied": copied,
             "source_changed": bool(now != sha)}
+
+
+def infer_code_manifest() -> Dict[str, str]:
+    """{repo-relative path: sha16} of INFER_CODE (the CK / refiner net packages, the data readers) and {this tool::fn:
+    sha16 of the source} of refine_forward / stage_infer: what code_sha16 (a resume identity key) hashes, so a resume
+    across a code change (committed or not) is refused."""
+    import inspect
+    out: Dict[str, str] = {}
+    for rel in INFER_CODE:
+        p = Path(REPO) / rel
+        fs = (sorted(q for q in p.rglob("*.py") if "__pycache__" not in q.parts and not q.name.startswith("test_"))
+              if p.is_dir() else [p])
+        for f in fs:
+            out[str(f.relative_to(REPO))] = U.sha256_file(f)
+    me = str(Path(__file__).resolve().relative_to(REPO))
+    for fn in (refine_forward, stage_infer):
+        out[f"{me}::{fn.__name__}"] = hashlib.sha256(inspect.getsource(fn).encode()).hexdigest()[:16]
+    return out
+
+
+def code_sha16(manifest: Dict[str, str]) -> str:
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def infer_resume_check(ad: Path, meta: Dict) -> Dict:
@@ -322,6 +404,9 @@ def infer_resume_check(ad: Path, meta: Dict) -> Dict:
         return {}
     js = lambda x: json.loads(json.dumps(x, sort_keys=True, default=str))      # noqa: E731  (tuples vs JSON lists)
     diff = [f"{k} {old.get(k)!r} -> {meta.get(k)!r}" for k in INFER_ID_KEYS if js(old.get(k)) != js(meta.get(k))]
+    mo, mn = old.get("code_manifest") or {}, meta.get("code_manifest") or {}
+    if js(old.get("code_sha16")) != js(meta.get("code_sha16")) and mo:
+        diff.append(f"changed code: {sorted(k for k in set(mo) | set(mn) if mo.get(k) != mn.get(k))[:8]}")
     if diff and has_done:
         raise SystemExit(f"{ad}: resume refused -- the outputs there were written under another identity "
                          f"({'; '.join(diff)}); --fresh or another --out")
@@ -390,13 +475,15 @@ def stage_infer(a, R: Dict, rows: np.ndarray) -> Dict:
     _, tdf, _ = packed(a.split)
     N = len(tdf)
     amp = "fp16 autocast (score_set), refine fp32" if dev.type == "cuda" else "fp32"
+    man = infer_code_manifest()
     meta = dict(label=R["label"], role=R["role"], run=str(run), run_real=str(run.resolve()), which=a.which,
+                code_sha16=code_sha16(man), code_manifest=man,
                 source_ckpt=ck["source"],
                 ckpt=ck["copy"], ckpt_sha16=ck["ckpt_sha16"], source_sha16_at_start=ck["source_sha16_now"],
                 arm=chk["arm"], split=a.split, drafts=a.drafts, score_k=int(a.score_k), knockout=a.knockout, amp=amp,
                 v4=net.v4.to_dict(), v5=net.v5.to_dict(), corridor_version=int(net.corridor_version),
                 objects=(spec or {}).get("cfg"), device=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"),
-                batch=a.batch, n=N, tokens=a.tokens, limit=a.limit, started=kst(t0),
+                batch=a.batch, n=N, tokens=a.tokens, limit=a.limit, started=kst(t0), git_head=U.git_head(),
                 columns=list(COLS), traj3="tau0 (the draft), tau_base (mu = 0: the lateral head), tau1")
     old = infer_resume_check(ad, meta)
     specs = {"traj3": ((N, 3, 8, 3), np.float32, np.nan), "mu": ((N, 12), np.float32, np.nan),
@@ -546,7 +633,7 @@ def stage_label(a, R: Dict, rows: np.ndarray) -> Dict:
 
 # ----------------------------------------------------------------------------------------------- metrics (pure)
 def arm_block(lab3: np.ndarray, logs: np.ndarray, mu: Optional[np.ndarray] = None, traj3: Optional[np.ndarray] = None,
-              noedit: str = "draft", break_rule: str = "pdms0", n_boot: int = N_BOOT) -> Dict[str, Any]:
+              noedit: str = REG_NOEDIT, break_rule: str = REG_BREAK, n_boot: int = N_BOOT) -> Dict[str, Any]:
     """one arm on the token set: lab3 [n, 3, 9] (COLS order), logs [n], mu [n, 12], traj3 [n, 3, 8, 3] ->
     {rows: metrics + pass rates per column, d: paired deltas x 100, brk: tau1 / base vs each reference under each rule,
     keys: per-key counts of tau1 vs each reference, mu, moved, vs_noedit, break_gate}."""
@@ -592,7 +679,8 @@ def _clause(ok: Optional[bool], value, bar: str, why: str = "") -> Dict[str, Any
 def gate_decide(blocks: Dict[str, Dict], roles: Dict[str, Optional[str]], pairs: Dict[str, Dict],
                 deciding_set: bool, context: str = "") -> Dict[str, Any]:
     """the four registered clauses (module docstring 'Gate') from the arm blocks (label -> arm_block), roles (label ->
-    T / S / GT / None) and the paired tau1 differences pairs['A-B'] (boot100 of tau1_A - tau1_B) -> {clauses, verdict
+    T / S / GT / None) and the paired gain differences pairs['A-B'] (boot100 per token of the no-edit gains, A's - B's:
+    tau1_A - tau1_B with the shared draft, (tau1_A - base_A) - (tau1_B - base_B) with --noedit base) -> {clauses, verdict
     PASS / FAIL / INCOMPLETE, deciding (deciding_set and every clause evaluable), context, gt_minus_t, student_floor}."""
     by = {r: lb for lb, r in roles.items() if r}
     T, S, G = by.get("T"), by.get("S"), by.get("GT")
@@ -629,8 +717,10 @@ def gate_decide(blocks: Dict[str, Dict], roles: Dict[str, Optional[str]], pairs:
     else:
         verdict = "FAIL" if any(x is False for x in ev) else "INCOMPLETE"
     deciding = bool(deciding_set and len(ev) == len(cl))
+    nev = [k for k, c in cl.items() if not c["evaluable"]]
+    ctx = "; ".join([x for x in (context, f"not evaluable: {', '.join(nev)}" if nev else "") if x])
     res = {"rule": GATE_RULE, "clauses": cl, "verdict": verdict, "deciding": deciding,
-           "context": ("decision" if deciding else "report only") + (f" ({context})" if context else "")}
+           "context": ("decision" if deciding else "report only") + (f" ({ctx})" if ctx else "")}
     if T and G:
         res["gt_minus_t"] = pair(G, T)
     if S:
@@ -672,6 +762,11 @@ def _arm_arrays(ad: Path, N: int) -> Dict[str, Any]:
     chk = U.read_json(ad / "label_check.json")
     if not chk.get("pass"):
         raise SystemExit(f"{ad}/label_check.json: the draft column check did not pass ({chk})")
+    from tools.ck.data import common as CM
+    key, cur = U.read_json(ad / "label_key.json", {}) or {}, CM.sha16_array(np.load(ad / "traj3.npy", mmap_mode="r"))
+    if key.get("traj_sha16") != cur:
+        raise SystemExit(f"{ad}: the labels were scored on traj3 sha16 {key.get('traj_sha16')}, traj3.npy is now {cur} "
+                         f"(infer resumed after label): rerun --stage label")
     return {"lab": lab, "ok": np.asarray(ok, bool), "done": np.load(ad / "done.npy").astype(bool),
             "traj3": np.load(ad / "traj3.npy", mmap_mode="r"), "mu": np.load(ad / "mu.npy", mmap_mode="r"),
             "meta": U.read_json(ad / "infer_meta.json"), "check": chk,
@@ -704,7 +799,8 @@ def report_md(res: Dict) -> str:
                  + (f" (the run's file CHANGED since: {A['source_sha16_now']})" if A["source_changed"] else
                     " (the run's file unchanged)") + f", relation {A['relation']}, knockout {A['knockout']}, "
                  f"{A['amp']}, score_k {A['score_k']}.")
-    L += ["", f"**Gate: {g['verdict']}** -- {g['context']}.", "", f"Rule: {g['rule']}", "",
+    head = "Gate" if g["deciding"] else "Gate (report only)"
+    L += ["", f"**{head}: {g['verdict']}** -- {g['context']}.", "", f"Rule: {g['rule']}", "",
           "| clause | value | bar | pass |", "|---|---|---|---|"]
     for k, c in g["clauses"].items():
         v = c["value"]
@@ -748,11 +844,56 @@ def report_md(res: Dict) -> str:
         L.append(f"| {lb} | EP mean ref / tau1 / loss | {_f(100 * kc['ep']['mean_ref'])} | {_f(100 * kc['ep']['mean_new'])} "
                  f"| {_f(100 * kc['ep']['loss'])} | |")
     if res["pairs"]:
-        L += ["", "Between arms (tau1_A - tau1_B, paired): " + "; ".join(f"{k} {_ci(v)}" for k, v in res["pairs"].items())
+        pd_ = "tau1_A - tau1_B" if res["noedit"] == "draft" else "(tau1_A - base_A) - (tau1_B - base_B)"
+        L += ["", f"Between arms ({pd_}, paired): " + "; ".join(f"{k} {_ci(v)}" for k, v in res["pairs"].items())
               + "."]
     if res["caveats"]:
         L += ["", "Caveats:"] + [f"- {c}" for c in res["caveats"]]
     return "\n".join(L) + "\n"
+
+
+def report_tag(a, labels: Sequence[str]) -> str:
+    """the report name gate_<tag>.*: the arm labels @ --which, then every option off the registered setting (_objoff,
+    _noedit-<x>, _break-<x>, _k<K>), then _<--tag> -- a follow-up run with another option in the same token root writes
+    its own report, never over the registered one."""
+    t = "+".join(f"{lb}@{a.which}" for lb in labels)
+    if a.knockout == "objects":
+        t += "_objoff"
+    if a.noedit != REG_NOEDIT:
+        t += f"_noedit-{a.noedit}"
+    if a.break_rule != REG_BREAK:
+        t += f"_break-{a.break_rule}"
+    if int(a.score_k) != 1:
+        t += f"_k{int(a.score_k)}"
+    return t + (f"_{a.tag}" if a.tag else "")
+
+
+def report_guard(path: Path, arm_info: Dict[str, Dict], fresh: bool) -> None:
+    """an existing report of the same name is overwritten only when it is about the same arms (label -> run, checkpoint
+    copy sha16), or with --fresh; else SystemExit (e.g. T=v5T_rel then T=v5T_rel2 in one token root)."""
+    old = U.read_json(path, None)
+    if old is None or fresh:
+        return
+    oi = old.get("arm_info") or {}
+    key = lambda A: (A.get("run_real") or A.get("run"), A.get("ckpt_sha16"))           # noqa: E731
+    diff = [f"{lb}: {key(oi.get(lb) or {})} -> {key(A)}" for lb, A in arm_info.items()
+            if key(oi.get(lb) or {}) != key(A)]
+    if diff or set(oi) != set(arm_info):
+        raise SystemExit(f"[report] {path} was written for other arms ({'; '.join(diff) or sorted(oi)}): not "
+                         f"overwritten -- --tag <name> for a separate report, or --fresh")
+
+
+def json_null_nan(x):
+    """a copy with every non-finite float -> None (strict JSON: a rate with a zero denominator is null, not NaN)."""
+    if isinstance(x, dict):
+        return {k: json_null_nan(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [json_null_nan(v) for v in x]
+    if isinstance(x, np.ndarray):
+        return json_null_nan(x.tolist())
+    if isinstance(x, (float, np.floating)):
+        return float(x) if np.isfinite(x) else None
+    return x
 
 
 def stage_report(a, arms: List[Dict], rows: np.ndarray, root: Path, tok_info: Dict) -> Dict:
@@ -788,11 +929,15 @@ def stage_report(a, arms: List[Dict], rows: np.ndarray, root: Path, tok_info: Di
     P = LBL["pdms"]
     pairs = {}
     labels = [R["label"] for R in arms]
+
+    def gain(lb: str) -> np.ndarray:            # the no-edit gain per token (the shared draft cancels in a difference)
+        t = np.asarray(D[lb]["lab"][r, 2, P], np.float64)
+        return t if a.noedit == "draft" else t - np.asarray(D[lb]["lab"][r, 1, P], np.float64)
+
     for i, x in enumerate(labels):
         for y in labels[i + 1:]:
             for p, q in ((x, y), (y, x)):
-                pairs[f"{p}-{q}"] = boot100(np.asarray(D[p]["lab"][r, 2, P]), np.asarray(D[q]["lab"][r, 2, P]), logs,
-                                            a.bootstrap)
+                pairs[f"{p}-{q}"] = boot100(gain(p), gain(q), logs, a.bootstrap)
     reasons = []
     if not registered:
         reasons.append(f"not the registered token set ({a.split} --tokens {a.tokens}{', --limit' if a.limit else ''}; "
@@ -803,14 +948,20 @@ def stage_report(a, arms: List[Dict], rows: np.ndarray, root: Path, tok_info: Di
         reasons.append(f"drafts {a.drafts}")
     if a.knockout != "none":
         reasons.append(f"knock-out {a.knockout} (report only)")
-    deciding_set = registered and ts["complete"] and a.drafts == "r34top1" and a.knockout == "none"
+    if a.break_rule != REG_BREAK:
+        reasons.append(f"--break-rule {a.break_rule} (the registered break is {REG_BREAK}: NC / TTC / DAC pass -> fail)")
+    if a.noedit != REG_NOEDIT:
+        reasons.append(f"--noedit {a.noedit} (the registered no-edit reference is the {REG_NOEDIT})")
+    deciding_set = (registered and ts["complete"] and a.drafts == "r34top1" and a.knockout == "none"
+                    and a.break_rule == REG_BREAK and a.noedit == REG_NOEDIT)
     ctx = "; ".join(reasons) if reasons else f"{REG_SPLIT} {REG_TOKENS}, tokens {ts['n']} / {ts['n_selected']}"
     gate = gate_decide(blocks, roles, pairs, deciding_set, ctx)
     arm_info = {}
     for R in arms:
         m = D[R["label"]]["meta"]
         now = U.sha256_file(m["source_ckpt"]) if Path(m["source_ckpt"]).is_file() else None
-        arm_info[R["label"]] = dict(role=R["role"], run=m["run"], which=m["which"], ckpt=m["ckpt"],
+        arm_info[R["label"]] = dict(role=R["role"], run=m["run"], run_real=m.get("run_real"), which=m["which"],
+                                    ckpt=m["ckpt"],
                                     ckpt_sha16=m["ckpt_sha16"], source_ckpt=m["source_ckpt"], source_sha16_now=now,
                                     source_changed=bool(now != m["ckpt_sha16"]), relation=(m.get("v5") or {}).get(
                                         "relation"), knockout=m.get("knockout"), amp=m.get("amp"),
@@ -826,9 +977,11 @@ def stage_report(a, arms: List[Dict], rows: np.ndarray, root: Path, tok_info: Di
     res = {"split": a.split, "tokens": a.tokens, "token_info": tok_info, "drafts": a.drafts, "limit": a.limit,
            "arms": labels, "roles": roles, "arm_info": arm_info, "noedit": a.noedit, "break_rule": a.break_rule,
            "n_boot": int(a.bootstrap), "token_set": ts, "n_tokens": int(len(r)), "n_logs": int(len(set(logs))),
-           "blocks": blocks, "pairs": pairs, "gate": gate, "caveats": caveats, "created": kst(), "root": str(root)}
-    tag = "+".join(labels) + (f"_{a.tag}" if a.tag else "")
-    U.write_json(root / f"gate_{tag}.json", res)
+           "blocks": blocks, "pairs": pairs, "gate": gate, "caveats": caveats, "created": kst(), "root": str(root),
+           "git_head": U.git_head(), "tool": str(Path(__file__).resolve())}
+    tag = report_tag(a, labels)
+    report_guard(root / f"gate_{tag}.json", arm_info, bool(a.fresh))
+    U.write_json(root / f"gate_{tag}.json", json_null_nan(res))
     md = report_md(res)
     (root / f"gate_{tag}.md").write_text(md)
     pt = pd.DataFrame({"row": r, "token": tdf.token.astype(str).to_numpy()[r], "log": logs})
@@ -840,6 +993,9 @@ def stage_report(a, arms: List[Dict], rows: np.ndarray, root: Path, tok_info: Di
     pt.to_parquet(root / f"gate_{tag}_per_token.parquet", index=False)
     print(md, flush=True)
     log(f"[report] -> {root / f'gate_{tag}.json'} / .md / _per_token.parquet")
+    if registered and not ts["complete"]:             # the registered split cannot decide: non-zero exit after writing
+        raise SystemExit(f"[report] the registered token set is incomplete ({ts['n']} of {ts['n_selected']}; missing "
+                         f"by input {ts['missing_by_input']}): report only, the outputs are written")
     return res
 
 
@@ -851,7 +1007,8 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--split", choices=SPLITS, required=True)
     ap.add_argument("--tokens", default=None, help=f"{REG_TOKENS} (default on navtrain_val) | all (default on navtest) "
                                                    f"| <.npy rows / tokens, or a text file of tokens>")
-    ap.add_argument("--limit", type=int, default=0, help="first N selected tokens (smoke) into <out>/<split>/smoke<N>_*")
+    ap.add_argument("--limit", type=int, default=0, help="N selected tokens spread over logs (seeded; smoke, report "
+                                                          "only) into <out>/<split>/smoke<N>_*")
     ap.add_argument("--drafts", choices=DRAFTS, default="r34top1")
     ap.add_argument("--device", default="cuda", help="cuda (approval + one idle GPU of 0-3) | cpu")
     ap.add_argument("--approved", action="store_true", help="--device cuda: the user approved this GPU run (or "
@@ -864,16 +1021,19 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--label-workers", type=int, default=32, help=f"label_cands workers (<= {MAX_LABEL_WORKERS})")
     ap.add_argument("--out", default=str(OUT_ROOT))
     ap.add_argument("--stage", default=",".join(STAGES), help=f"comma list of {STAGES}")
-    ap.add_argument("--noedit", choices=NOEDIT, default="draft",
-                    help="the gate's no-edit reference: draft (tau0) | base (tau_base, mu = 0); both are reported")
-    ap.add_argument("--break-rule", choices=BREAK_RULES, default="pdms0",
-                    help="the gate's break: pdms0 (PDMS > 0 -> 0) | fails3 (NC / TTC / DAC pass -> fail); both reported")
+    ap.add_argument("--noedit", choices=NOEDIT, default=REG_NOEDIT,
+                    help="the gate's no-edit reference: draft (tau0, registered) | base (tau_base, mu = 0; report "
+                         "only); both are reported")
+    ap.add_argument("--break-rule", choices=BREAK_RULES, default=REG_BREAK,
+                    help="the gate's break: fails3 (NC / TTC / DAC pass -> fail, the v4_3 P1 FILTER rule, registered) "
+                         "| pdms0 (PDMS > 0 -> 0; report only); both reported")
     ap.add_argument("--knockout", choices=KNOCKOUTS, default="none",
                     help="objects: the relation rows masked (report only; outputs <run>@<which>@objoff)")
     ap.add_argument("--bootstrap", type=int, default=N_BOOT)
-    ap.add_argument("--tag", default="", help="report file suffix gate_<arms>_<tag>.*")
+    ap.add_argument("--tag", default="", help="report file suffix gate_<arms@which>[_<options>]_<tag>.*")
     ap.add_argument("--fresh", action="store_true", help="remove the given arms' outputs (ckpt copy, infer, labels) "
-                                                         "in this token root first")
+                                                         "in this token root first; a report of the same name written "
+                                                         "for other arms / checkpoints may then be overwritten")
     return ap
 
 
@@ -900,7 +1060,7 @@ def main(argv=None) -> Dict:
     _, tdf, pok = packed(a.split)
     rows, ttag, tok_info = select_rows(a.split, a.tokens, tdf, pok)
     if a.limit:
-        rows = rows[: a.limit]
+        rows = limit_rows(rows, tdf.log.astype(str).to_numpy(), a.limit)
     root = gate_root(a.out, a.split, ttag, a.limit)
     for R in arms:
         R["dir"] = arm_dir(root, R["run"], a.which, a.knockout)

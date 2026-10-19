@@ -23,9 +23,10 @@ L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable): a 
   overlap): log S = log p_nc + log p_dac + log(5 p_ttc + 2 p_c + 5 ep) - log 12 with log p = logsigmoid (linear tail:
   a constant 1 / s per metre however deep), and log p_nc additionally carries the IN-PATH SHAPING term
   sum over objects a of 1[a collides] 1[a ahead] min(0, g_a) / s: 'collides' = the counted worst SAT separation with a
-  is < 0 (hard: a soft sigmoid weight leaked onto safe objects, report 101 N1), 'ahead' = a is fully ahead of the ego
-  (signed longitudinal gap >= 0) at its first observed state (a car behind / alongside is never braked for: braking
-  cannot clear it), g_a = min over the states where a overlaps the ego footprint laterally of the SIGNED longitudinal
+  is < 0 (hard: a soft sigmoid weight leaked onto safe objects, report 101 N1), 'ahead' = a's centre is ahead of the
+  ego box centre along the ego heading at the first counted state where they overlap (a car that runs into the ego
+  from behind is never braked for; a car that cuts in from alongside and is then hit is -- the earlier 'fully ahead
+  at its first observed state' missed that case, review 2026-10-20), g_a = min over the states where a overlaps the ego footprint laterally of the SIGNED longitudinal
   gap (a's centre ahead along the ego heading minus both half-extents; no abs, no not-behind cut) -- the worst-state
   SAT term alone is flat in the longitudinal control on a head-on overlap (its least-overlapping axis is lateral), and
   a penetration sum over the states rewards driving THROUGH faster; g_a only grows when the ego progresses less, so
@@ -190,9 +191,14 @@ def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequenc
     lon, lat = lon_lat_gaps(ce[..., None, :], hd[..., None], b0[..., :2], b0[..., 2], b0[..., 3], b0[..., 4])
     obs0 = obs[:, :, :, 0].expand(n, R, Q, A)
     inpath = (lat.detach() < 0) & obs0 & mv[..., 0][..., None]                           # [n, R, Q, A]
-    first = obs0.to(torch.int8).argmax(2)                                               # first observed state [n, R, A]
-    lon_first = torch.gather(lon.detach(), 2, first[:, :, None, :]).squeeze(2)
-    ahead = obs0.any(2) & (lon_first >= 0)                                              # [n, R, A]
+    # 'ahead' = a's centre is ahead of the ego box centre along the ego heading at the FIRST counted state where the ego
+    # overlaps it (delta 0): a car hit after it cut in from alongside is ahead there (review 2026-10-20: the old test
+    # 'fully ahead at its first observed state' left an overtaking cut-in with no braking gradient), a car that runs
+    # into the ego from behind is behind there (and is not counted at all beyond -1.3 m); never-hit objects: False
+    hit0 = (sep[:, :, :, 0].detach() < 0) & count[:, :, :, 0]                            # [n, R, Q, A]
+    first = hit0.to(torch.int8).argmax(2)                                               # first overlapping state [n, R, A]
+    fwd_first = torch.gather(fwd[:, :, :, 0].detach(), 2, first[:, :, None, :]).squeeze(2)
+    ahead = hit0.any(2) & (fwd_first > 0)                                               # [n, R, A]
     return sep, count, lon, inpath, ahead
 
 

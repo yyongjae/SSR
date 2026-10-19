@@ -308,3 +308,70 @@ def test_n1_safe_car_behind_never_rewards_braking():
         m[..., :6] = z
         l, _ = RL.refine_loss(decode_grad(base, m[..., :6], m[..., 6:], v0), base, v0, a0, gt, w)
         assert float(l) > 0
+
+
+# ---- cut-in review (workflow 2026-10-20 05:40 KST): 'ahead' at the first overlap, not at the first observation -------
+def _track_gt(xs, ys):
+    """one car with explicit keyframe positions (0.5 s apart, heading 0, velocities by finite difference)."""
+    from navsim.agents.para_ssr.refiner import gt_future as GF
+    n = GF.N_KF
+    x = torch.tensor(xs[:n], dtype=torch.float32)
+    y = torch.tensor(ys[:n], dtype=torch.float32)
+    vx, vy = torch.gradient(x, spacing=GF.KF_DT)[0], torch.gradient(y, spacing=GF.KF_DT)[0]
+    kf = torch.zeros(1, 1, n, 6)
+    kf[0, 0, :, GF.KF_X], kf[0, 0, :, GF.KF_Y] = x, y
+    kf[0, 0, :, GF.KF_VX], kf[0, 0, :, GF.KF_VY] = vx, vy
+    kf[0, 0, :, GF.KF_PRESENT] = 1.0
+    return {"kf": kf, "first": torch.tensor([[[4.5, 1.9, 0.0, float(vx[0]), float(vy[0]), 0.0]]]),
+            "meta": torch.tensor([[[0, 1, 0, n - 1, 0]]], dtype=torch.long), "valid": torch.ones(1, 1, dtype=torch.bool),
+            "n_kf": torch.tensor([n]), "sdf": torch.full((1, 320, 256), 5.0), "p_pdm": torch.tensor([40.0])}
+
+
+def _overtake_cutin():
+    """alongside at t0 (adjacent lane, centre 3 m ahead of the rear axle), 14 m/s, merges into the ego lane between 1
+    and 2 s, then slows to 4 m/s: the ego at 10 m/s runs into it; braking clears it."""
+    from navsim.agents.para_ssr.refiner import gt_future as GF
+    xs, ys, x = [], [], 3.0
+    for k in range(GF.N_KF):
+        t = k * GF.KF_DT
+        ys.append(3.5 if t <= 1.0 else (0.0 if t >= 2.0 else 3.5 * (2.0 - t)))
+        xs.append(x)
+        x += (14.0 if t < 2.0 else 4.0) * GF.KF_DT
+    return _track_gt(xs, ys)
+
+
+def test_cutin_from_alongside_gets_the_braking_gradient():
+    from navsim.agents.para_ssr.ck.v5 import refine_loss as RL
+    from navsim.agents.para_ssr.ck.v5.corrector import decode_grad
+    gt = _overtake_cutin()
+    w = RL.parse_weights("")
+    base, v0, a0 = _straight(10.0)[None], torch.tensor([10.0]), torch.tensor([0.0])
+    t = torch.arange(LQR.NT, dtype=torch.float64) * LQR.DT
+    T = RL._terms(LQR.simulate(base, torch.tensor([[[10.0, 0.0]]]), dtype=torch.float32), gt, t, w)
+    assert float(T["coll"].max()) == 1.0 and float(T["shape_nc"].min()) < 0      # hit, and braked for
+    mu = torch.zeros(1, 1, 12, requires_grad=True)
+    loss, _ = RL.refine_loss(decode_grad(base, mu[..., :6], mu[..., 6:], v0), base, v0, a0, gt, w)
+    g, = torch.autograd.grad(loss, mu)
+    assert float(g[0, 0, :6].sum()) > 0.1                                        # dL/dz_lon > 0: braking lowers it
+    m = torch.zeros(1, 1, 12)
+    m[..., :6] = -0.3
+    l, _ = RL.refine_loss(decode_grad(base, m[..., :6], m[..., 6:], v0), base, v0, a0, gt, w)
+    assert float(l) < float(loss)
+
+
+def test_car_running_into_the_ego_from_behind_is_never_braked_for():
+    """a faster car 8 m behind (15 m/s vs the ego's 5 m/s) catches up: never counted, no shaping, braking costs EP."""
+    from navsim.agents.para_ssr.ck.v5 import refine_loss as RL
+    from navsim.agents.para_ssr.ck.v5.corrector import decode_grad
+    from navsim.agents.para_ssr.refiner import gt_future as GF
+    gt = _track_gt([-8.0 + 15.0 * k * GF.KF_DT for k in range(GF.N_KF)], [0.0] * GF.N_KF)
+    w = RL.parse_weights("")
+    base, v0, a0 = _straight(5.0)[None], torch.tensor([5.0]), torch.tensor([0.0])
+    t = torch.arange(LQR.NT, dtype=torch.float64) * LQR.DT
+    T = RL._terms(LQR.simulate(base, torch.tensor([[[5.0, 0.0]]]), dtype=torch.float32), gt, t, w)
+    assert float(T["shape_nc"].abs().max()) == 0.0
+    for z in (-0.1, -0.5):
+        m = torch.zeros(1, 1, 12)
+        m[..., :6] = z
+        l, _ = RL.refine_loss(decode_grad(base, m[..., :6], m[..., 6:], v0), base, v0, a0, gt, w)
+        assert float(l) > 0

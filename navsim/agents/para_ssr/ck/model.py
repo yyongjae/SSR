@@ -720,7 +720,14 @@ class CKNet(nn.Module):
         zs = int(self.v5.z_stride)
         from .v4 import lqr as _LQR
         tz = (torch.arange(_LQR.NT, dtype=torch.float32, device=cand.device) * _LQR.DT)[::zs]
-        a = self.corrector_v5(g4(o["ctx"]), g4(o["score_logit"].detach().float()), ego[0], g4(haz["zq"]), tz,
+        zq = g4(haz["zq"])
+        zc = getattr(self.v5, "z_channels", "all")
+        if zc != "all":                     # per-teacher channel mask (V5Cfg.z_channels): zeroed, no gradient
+            keep = torch.zeros(zq.shape[-1], dtype=zq.dtype, device=zq.device)
+            idx = [0, 1, 3] + list(range(4, zq.shape[-1])) if zc == "det" else [2, 3]
+            keep[idx] = 1.0
+            zq = zq * keep
+        a = self.corrector_v5(g4(o["ctx"]), g4(o["score_logit"].detach().float()), ego[0], zq, tz,
                               g4(haz["rel_top"]) if "rel_top" in haz else None)
         src = g4(cand.float())
         wl = g4(o["w_lat"]).detach().float()

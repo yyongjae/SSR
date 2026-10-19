@@ -108,3 +108,55 @@ def test_r3_relation_not_behind_uses_current_ego():
     t = torch.arange(LQR.NT, dtype=torch.float64) * LQR.DT
     out = rr(O, st[:, ::2], t[::2], torch.zeros(1, dtype=torch.long))
     assert float(out["r_ttc"][0, 0]) > 0.5
+
+
+# ---- second review round (2026-10-20) --------------------------------------------------------------------------------
+def test_object_rows_trim_to_valid_slots():
+    """teacher rows: every valid t0 slot up to n (no fixed top-32 cut), trimmed to the batch's last valid slot."""
+    from navsim.agents.para_ssr.ck.v5.relation import object_rows
+    from navsim.agents.para_ssr.ck.temporal.config import D_OBJ
+    T, F, K = 2, 4, 120
+    obj_in = torch.zeros(T, F, K, D_OBJ)
+    mask = torch.zeros(T, F, K, dtype=torch.bool)
+    mask[0, :, :50] = True
+    mask[1, :, :70] = True
+    fv = torch.ones(T, F, dtype=torch.bool)
+    O = object_rows(obj_in, mask, fv, 96)
+    assert O["valid"].shape == (T, 70) and int(O["valid"].sum()) == 120
+    O2 = object_rows(obj_in, mask, fv, 32)
+    assert O2["valid"].shape == (T, 32)
+
+
+def test_rel_ca_off_has_no_ca_parameter():
+    from navsim.agents.para_ssr.ck.v5.config import V5Cfg
+    from navsim.agents.para_ssr.ck.v5.relation import RelationReader
+    rr = RelationReader(V5Cfg(relation="student", rel_ca=False))
+    assert rr.ca_logit is None and all("ca_logit" not in n for n, _ in rr.named_parameters())
+
+
+def test_soft_pdms_prefers_braking_before_a_stopped_car():
+    """L_refine (soft PDMS): braking (variant) before a stopped car 30 m ahead lowers the loss vs the parent (the LQR
+    tracker of a 3 m/s draft from 10 m/s still covers ~20 m)."""
+    from navsim.agents.para_ssr.ck.v5 import refine_loss as RL
+    from navsim.agents.para_ssr.refiner import gt_future as GF
+    gt = _bicycle_gt()
+    gt["kf"][0, 0, :, GF.KF_X] = 30.0
+    gt["kf"][0, 0, :, GF.KF_Y] = 0.0
+    gt["kf"][0, 0, :, GF.KF_H] = 0.0
+    gt["kf"][0, 0, :, GF.KF_VY] = 0.0
+    gt["first"] = torch.tensor([[[4.5, 1.9, 0.0, 0.0, 0.0, 0.0]]])
+    gt["meta"][0, 0, 0] = 0                                                   # vehicle
+    gt["sdf"] = torch.full((1, 320, 256), 5.0)
+    w = RL.parse_weights("")
+    fast, slow = _straight(10.0)[None], _straight(3.0)[None]                 # [1, 1, 8, 3]
+    v0, a0 = torch.tensor([10.0]), torch.tensor([0.0])
+    l_slow, _ = RL.refine_loss(slow, fast, v0, a0, gt, w)                     # tau0 = fast, tau1 = slow
+    l_fast, _ = RL.refine_loss(fast, slow, v0, a0, gt, w)
+    assert float(l_slow) < 0 < float(l_fast)
+
+
+def test_z_channels_mask_zeroes_unsupervised_reads():
+    from navsim.agents.para_ssr.ck.v5.config import V5Cfg
+    assert V5Cfg(z_channels="det").z_channels == "det"
+    with pytest.raises(ValueError):
+        V5Cfg(z_channels="xx").validate(None)

@@ -301,7 +301,8 @@ def get_parser() -> argparse.ArgumentParser:
     # refiner v5 (ck/v5; module docstring 'refiner v5 teachers'); every default = off
     ap.add_argument("--v5-relation", choices=("off", "teacher"), default="off",
                     help="teacher = object relation channel on the BEVFusion rows (arm T; needs --v4-readout range)")
-    ap.add_argument("--v5-n-obj", type=int, default=32, help="t0 object rows read by the relation channel")
+    ap.add_argument("--v5-n-obj", type=int, default=96, help="t0 object rows read by the relation channel (max; trimmed "
+                                                               "to the batch's valid rows)")
     ap.add_argument("--v5-rel-ca", type=int, choices=(0, 1), default=1, help="constant-acceleration mode (past frames)")
     ap.add_argument("--v5-unknown", type=int, choices=(0, 1), default=0, help="unknown-evidence residual input")
     ap.add_argument("--v5-corrector", type=int, choices=(0, 1), default=0, help="corrector A + L_refine(X1)")
@@ -404,8 +405,12 @@ def resolve_v5(a):
     cor = bool(int(getattr(a, "v5_corrector", 0) or 0))
     try:
         a.ref_weights = parse_weights(getattr(a, "ref_w", ""))
-        v5 = V5Cfg(relation=rel, n_obj=int(getattr(a, "v5_n_obj", 32)), rel_ca=bool(int(getattr(a, "v5_rel_ca", 1))),
-                   unknown_ev=unk, corrector=cor, z_stride=int(getattr(a, "v5_z_stride", 2))).validate(v4_cfg_of(a))
+        keys = set(getattr(a, "score_keys", None) or [])
+        det_k, map_k = bool(keys & {"nc", "ttc"}), "dac" in keys
+        zc = "all" if (det_k and map_k) or not keys else ("det" if det_k else "map")
+        v5 = V5Cfg(relation=rel, n_obj=int(getattr(a, "v5_n_obj", 96)), rel_ca=bool(int(getattr(a, "v5_rel_ca", 1))),
+                   unknown_ev=unk, corrector=cor, z_stride=int(getattr(a, "v5_z_stride", 2)),
+                   z_channels=zc).validate(v4_cfg_of(a))
     except ValueError as e:
         raise SystemExit(f"--v5-*: {e}") from None
     if v5.rel and a.arm != "T":
@@ -1440,6 +1445,11 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
         from navsim.agents.para_ssr.ck.v5.config import V5Cfg
         if V5Cfg.from_dict(old.get("v5")) != v5_cfg_of(a):           # old config without the key = off
             raise SystemExit(f"{run}: resume with v5={v5_cfg_of(a).to_dict()!r} but config.json has {old.get('v5')!r}")
+        if v5_cfg_of(a).on:                                          # the v5 loss / init / freeze knobs too
+            for k in ("lambda_ref", "ref_groups", "lambda_rel_a", "lambda_rel_h", "lambda_corner", "v5_init",
+                      "v5_freeze_trunk", "ref_weights"):
+                if k in old and old.get(k) != cfg.get(k):
+                    raise SystemExit(f"{run}: resume with {k}={cfg.get(k)!r} but config.json has {old.get(k)!r}")
         if tcfg.on and old.get("provenance"):      # review fix D5: a resumed arm must keep its code and data
             from tools.ck.v3 import provenance as PV
             cmp = PV.compare({"config.json": old["provenance"], "now": cfg["provenance"]})

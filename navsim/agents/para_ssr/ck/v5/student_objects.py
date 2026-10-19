@@ -48,7 +48,8 @@ def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int,
     bearing = torch.rad2deg(torch.atan2(-y, x)).abs()
     inwin = (x >= 0) & (x <= WIN_X) & (y.abs() <= WIN_Y) & (bearing <= FOV_DEG + 1e-4)
     ok = (score >= float(score_thr)) & inwin & torch.isfinite(code).all(-1)
-    k = min(int(n), Q)
+    k = max(1, min(int(n), Q, int(ok.sum(1).max()) if T else 1))       # trimmed to the batch's largest valid count
+    n = k
     s_sel = torch.where(ok, score, torch.full_like(score, -1.0))
     top = torch.topk(s_sel, k, dim=1)
     qi, valid = top.indices, top.values >= 0

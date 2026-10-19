@@ -16,6 +16,9 @@ corrector   corrector A (ck/v5/corrector.py): 12 decoder controls (z_lon 6 + w_l
             critic context (detached, as v4 A) + the top-3 related objects; tau1 = decode(tau0, mu_lon, w_lat_head +
             mu_lat) (the lateral head is folded in: at init tau1 = today's laterally corrected draft).  Trained by the
             executed-state GT surrogate L_refine(X1), X1 = LQR(tau1) (ck/v5/refine_loss.py).
+z_channels  which per-state reads the corrector sees: 'all'; 'det' (b_nc, b_ttc, unknown, H -- a DET teacher's D field
+            is unsupervised); 'map' (d_min, unknown -- a MAP teacher's B / U fields are unsupervised); the other channels
+            are zeroed (no gradient into fields nothing else trains; review 2026-10-20 f11 / f24).
 z_stride    per-state reads Z at every z_stride-th LQR state (2: t = 0, 0.2, .., 4.0 s, 21 states); the relation runs on
             the same states.
 Sizes: n_obj (t0 rows read, score order), rel_hidden (reliability MLP), corr_hidden / z_hidden (corrector).
@@ -38,7 +41,7 @@ N_TOP_FEAT = 7           # a r_nc, a r_ttc, x / 32, y / 32, vx / 10, vy / 10, t*
 @dataclass(frozen=True)
 class V5Cfg:
     relation: str = "off"
-    n_obj: int = 32
+    n_obj: int = 96
     rel_ca: bool = True
     rel_eps: float = 0.3
     rel_hidden: int = 16
@@ -47,6 +50,7 @@ class V5Cfg:
     corr_hidden: int = 256
     z_hidden: int = 32
     z_stride: int = 2
+    z_channels: str = "all"        # corrector input channels: 'all' | 'det' (no D) | 'map' (D + unknown only)
     version: str = CONFIG_VERSION
 
     @property
@@ -73,6 +77,8 @@ class V5Cfg:
             raise ValueError(f"v5.n_obj {self.n_obj} not in [1, 96]")
         if not (0.01 <= float(self.rel_eps) <= 5.0):
             raise ValueError(f"v5.rel_eps {self.rel_eps} not in [0.01, 5] m")
+        if self.z_channels not in ("all", "det", "map"):
+            raise ValueError(f"v5.z_channels {self.z_channels!r} not in ('all', 'det', 'map')")
         if int(self.z_stride) not in (1, 2, 4, 5):
             raise ValueError(f"v5.z_stride {self.z_stride} not in (1, 2, 4, 5) (41 LQR states)")
         if min(int(self.rel_hidden), int(self.corr_hidden), int(self.z_hidden)) < 4:

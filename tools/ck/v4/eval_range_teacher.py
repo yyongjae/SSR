@@ -17,8 +17,11 @@ Splits
                 v4T10_haz / v4M10_haz /r34 prob16 / prob80 / done of eval_teacher_navtest_r34).
 
 Stages (--stage comma list; resumable per row through done.npy)
-  infer   each given range teacher (--det, --map: run dir or name under CK/ck2/train | CK/v4/train; config.json v4
-          readout 'range'; load_ck(which)) on the pool (--device cuda needs the user's approval, V4_USER_APPROVED=1 or
+  infer   each given range teacher (--det, --map: run dir or name under CK/ck2/train | CK/v4/train | CK/v5/train;
+          config.json v4 readout 'range'; load_ck(which); a refiner v5 DET teacher with the relation channel
+          (v5.relation 'teacher') also reads the tokens' refiner-v3 object pack rows (CKDataset objects =
+          e2e_data2.teacher_v5_rel_cfg, no augmentation) as score_set rel_objs; without it the v4_3 calls are unchanged)
+          on the pool (--device cuda needs the user's approval, V4_USER_APPROVED=1 or
           --approved, and an idle GPU: CUDA_VISIBLE_DEVICES = one of 0-3 using < 1024 MiB by nvidia-smi, else
           refused): the ops of eval_teacher_navtest_r34.teacher_forward (trunk.scene,
           score_set of the 16 (own parents) and of the 80 (their parents = the 16), P_ref query, fp16 autocast on CUDA)
@@ -225,7 +228,7 @@ def resolve_run(name: str) -> Path:
     p = Path(name)
     if p.is_dir():
         return p
-    for q in (CK / "ck2" / "train" / name, CK / "v4" / "train" / name):
+    for q in (CK / "ck2" / "train" / name, CK / "v4" / "train" / name, CK / "v5" / "train" / name):
         if q.is_dir():
             return q
     raise SystemExit(f"teacher run not found: {name}")
@@ -251,17 +254,21 @@ def load_labels(split: str, vd: Path, n: int):
 
 
 # ----------------------------------------------------------------------------------------------- stage infer
-def range_forward(net, bev, cand, status, var, priv=None):
+def range_forward(net, bev, cand, status, var, priv=None, rel_objs=None):
     """eval_teacher_navtest_r34.teacher_forward for a range teacher + its haz slacks / log P_pass:
     -> s16 [T, 16, 5], s80 [T, 80, 5], slack16 / slack80 [T, K, 3] (nc s, ttc s, dac m), lp16 / lp80 [T, K, 3].
-    priv: the batch's ref_obj_* dict for a PRIVILEGED teacher (V4Cfg.rg_priv; None otherwise)."""
+    priv: the batch's ref_obj_* dict for a PRIVILEGED teacher (V4Cfg.rg_priv; None otherwise).  rel_objs: the batch's
+    object pack rows (obj_in / obj_mask / frame_valid) for a refiner v5 teacher with the relation channel (v5.relation
+    'teacher'; None otherwise -- then score_set is called exactly as for a v4_3 teacher, without the keyword)."""
     from navsim.agents.para_ssr.refiner.e2e import ego_inputs
     T = cand.shape[0]
     ego = ego_inputs(status)
     feat, mem = net.trunk.scene(bev, T)
     pref = net.scene_pref(mem, ego)
-    o16 = net.score_set(feat, mem, ego, cand.float(), pref=pref, priv=priv)
-    o80 = net.score_set(feat, mem, ego, var.float(), cand.float().repeat_interleave(NVAR, 1), pref=pref, priv=priv)
+    kw = {} if rel_objs is None else {"rel_objs": rel_objs}
+    o16 = net.score_set(feat, mem, ego, cand.float(), pref=pref, priv=priv, **kw)
+    o80 = net.score_set(feat, mem, ego, var.float(), cand.float().repeat_interleave(NVAR, 1), pref=pref, priv=priv,
+                        **kw)
     import torch
     st = lambda o, ks: torch.stack([o["haz"][k].float() for k in ks], -1)
     return {"s16": o16["score_logit"], "s80": o80["score_logit"],
@@ -373,6 +380,17 @@ def stage_infer(a, role: str, name: str) -> Dict:
         raise SystemExit(f"--{role} {run}: arm {cfg['arm']!r}, expected {want!r}")
     if not is_range_net(net):
         raise SystemExit(f"--{role} {run}: not a range teacher (config.json v4.readout {net.v4.readout!r})")
+    v5 = getattr(net, "v5", None)                    # refiner v5 teacher (None / off: the v4_3 path, unchanged)
+    v5on, rel_on = bool(v5 is not None and v5.on), bool(v5 is not None and v5.rel)
+    objkw = {}
+    if v5on and v5.relation == "student":
+        raise SystemExit(f"--{role} {run}: v5.relation 'student' reads the e2e student's det rows: not an input here")
+    if rel_on:                                       # the relation channel reads the refiner-v3 object pack rows
+        from navsim.agents.para_ssr.ck.e2e_data2 import teacher_v5_rel_cfg
+        tc = teacher_v5_rel_cfg(run)
+        if tc is None:
+            raise SystemExit(f"--{role} {run}: v5.relation {v5.relation!r} but no object pack (config.json t_pack_root)")
+        objkw = {"objects": {"cfg": tc.to_dict(), "aug": False, "targets": False}}
     pdir, tdf, _ = packed(a.split)
     N = len(tdf)
     rows = base_rows(a)
@@ -392,7 +410,8 @@ def stage_infer(a, role: str, name: str) -> Dict:
                 corridor_version=int(net.corridor_version), split=a.split, subset=a.subset, n=N, limit=a.limit,
                 device=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), batch=a.batch,
                 amp="fp16 autocast on CUDA (as eval_teacher_navtest_r34)", variants=str(vd / "traj80.npy"),
-                started=kst(t0))
+                started=kst(t0), **({"v5": v5.to_dict(), "objects": (objkw.get("objects") or {}).get("cfg")}
+                                    if v5on else {}))
     old = infer_resume_check(td, meta)
     specs = {"done": ((N,), np.bool_, False), "bev_ok": ((N,), np.bool_, False),
              "score_logit16": ((N, K16, 5), np.float32, np.nan), "score_logit80": ((N, K80, 5), np.float32, np.nan),
@@ -406,7 +425,12 @@ def stage_infer(a, role: str, name: str) -> Dict:
         f"todo {len(rr)} of {len(rows)}")
     n = n_bad = n_priv_missing = 0
     if len(rr):
-        ds = CKDataset(a.split, bev=want, k=K16, labels=None, gt=False, rows=rr)   # priv: priv_ref (own GT store)
+        ds = CKDataset(a.split, bev=want, k=K16, labels=None, gt=False, rows=rr, **objkw)  # priv: priv_ref (own GT)
+        if getattr(ds, "objects", None) is not None:
+            from tools.ck.data.ck2_dataset import OBJ_BAD_MAX
+            if ds.objects.frac_obj_bad > OBJ_BAD_MAX:   # the training rule (train_ck2.check_obj_bad)
+                raise SystemExit(f"{ds.objects.n_obj_bad} of {len(ds)} tokens have no object rows (obj_ok False) in "
+                                 f"{ds.objects.pack.dir}: more than {100 * OBJ_BAD_MAX:.1f} %")
         dl = DataLoader(ds, batch_size=a.batch, shuffle=False, collate_fn=collate_ck, num_workers=a.workers_io,
                         pin_memory=dev.type == "cuda", prefetch_factor=4 if a.workers_io > 0 else None)
         use_amp = dev.type == "cuda"
@@ -425,9 +449,13 @@ def stage_infer(a, role: str, name: str) -> Dict:
                     if pz:                                      # knock-out: the GT objects are loaded (so the
                         priv["ref_obj_n"].zero_()               # missing count is real) but none is selected ->
                         priv["ref_gt_ok"].zero_()               # priv_channels gives zeros (test_v4_priv)
+                rel = None
+                if rel_on:                                  # refiner v5 relation channel: the tokens' pack rows
+                    from navsim.agents.para_ssr.ck.temporal.config import OBJ_INPUT_KEYS
+                    rel = {k: b[k].to(dev) for k in OBJ_INPUT_KEYS}
                 with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_amp):
                     o = range_forward(net, b["bev"].to(dev, non_blocking=True), cand, b["status"].to(dev).float(), var,
-                                      priv=priv)
+                                      priv=priv, rel_objs=rel)
                 q = prow[bok]
                 g = lambda t: t.float().cpu().numpy()[bok]
                 A["score_logit16"][q], A["score_logit80"][q] = g(o["s16"]), g(o["s80"])

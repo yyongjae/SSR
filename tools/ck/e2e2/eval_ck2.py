@@ -55,6 +55,19 @@ Edits (refiner v4 corrector A / v4_3 computed edits, spec V4_3 M5; only when the
   variant set (choice 'best_edits', same rule as 'best', stored in the frozen eval spec), navtest restores it
   (--fix-from); the representative (headline) row is then the 96 + K one, metrics.json 'edits' holds its paired
   difference vs the 96 row of the same beta / set / lateral mode and vs the 96 choice.
+v5 (refiner v5 corrector A_S, ck_e2e2.v4.v5 corrector + infer_refine; only when the infer dir holds v5_traj / v5_src
+  and labels/<split>/v5_<run> exists -- every other run's outputs are unchanged, no new key or file): the dump-time
+  pick src [N] (CKE2E2.infer: select2.select96 with ck_e2e2.infer_select's beta / set, else beta 0.5 over 'all', SEL_W,
+  no offset) and tau1 = refine_drafts of that pick (v5_traj [N, 1, 8, 3], label K = 1).  metrics.json 'v5' (+ a
+  table.md section, per_token.parquet columns v5_src / pdms_v5_pick / pdms_v5_tau1) on the 96 token mask & a v5
+  output (src >= 0) labelled ok: rows 'v5 pick' = lab_pool[src] (the pool pick tau1 was computed from = its draft),
+  'v5 pick+lat' = lab_lat[src] (the pick with the learned lateral head, decoder mode A; tau1 at mu = 0 is the same draft
+  in mode B, equal within 1e-4, not bitwise), 'v5 tau1'; the paired log-cluster bootstrap (eval_ck.log_bootstrap,
+  0-1 units) of tau1 - pick (the headline of the block), tau1 - pick+lat and pick - v2; break / fix of tau1 vs both
+  references under both rules (tools/ck/v5/refine_stats: pdms0 = PDMS > 0 -> 0, fails3 = NC / TTC / DAC pass -> fail),
+  per-key counts, |mu| (v5_mu), and src_agree = the share of tokens whose src equals select96 recomputed here from the
+  stored logits with the same rule (descriptive: fp32 GPU sigmoid vs float64 here can flip near-ties).  The v5 rows are
+  NOT in the 96 selection grid and change no choice / frozen spec.
 """
 from __future__ import annotations
 
@@ -306,6 +319,83 @@ def load_edits(root: Path, run: str, split: str, n: int) -> Optional[Dict[str, A
             "ok": np.asarray(ok, bool), "k": int(K), "label_dir": str(ld)}
 
 
+def load_v5(root: Path, run: str, split: str, n: int) -> Optional[Dict[str, Any]]:
+    """The refiner v5 output of an eval root split (module docstring 'v5'): None when the infer dir has no v5_traj /
+    v5_src (a student without the v5 corrector: every output as before); SystemExit when dumped but not labelled
+    (eval_e2e2 --stage label scores them).  -> {src [n] int64 (-1 none), mu [n, 12] | None, lab [n, 9] f64, ok [n],
+    label_dir}."""
+    inf = root / "infer" / run / split
+    if not ((inf / "v5_traj.npy").is_file() and (inf / "v5_src.npy").is_file()):
+        return None
+    ld = root / "labels" / split / f"v5_{run}"
+    if not ((ld / "labels.npy").is_file() and (ld / "ok.npy").is_file()):
+        raise SystemExit(f"{inf}: the v5 tau1 was dumped but {ld} has no labels (eval_e2e2 --stage label scores it)")
+    src = np.load(inf / "v5_src.npy").astype(np.int64)
+    lab = np.load(ld / "labels.npy", mmap_mode="r")
+    ok = np.load(ld / "ok.npy", mmap_mode="r")
+    if src.shape != (n,) or tuple(lab.shape) != (n, 1, len(Cn.LABEL_COLS)) or tuple(ok.shape) != (n, 1):
+        raise SystemExit(f"{inf}: v5_src {src.shape} / labels {lab.shape} / ok {ok.shape} do not match [{n}] / "
+                         f"[{n}, 1, {len(Cn.LABEL_COLS)}] / [{n}, 1]")
+    mu = None
+    if (inf / "v5_mu.npy").is_file():
+        mu = np.load(inf / "v5_mu.npy").astype(np.float64)
+        if mu.shape[0] != n:
+            raise SystemExit(f"{inf}: v5_mu {mu.shape} does not match [{n}, 12]")
+    return {"src": src, "mu": mu, "lab": np.asarray(lab[:, 0], np.float64), "ok": np.asarray(ok[:, 0], bool),
+            "label_dir": str(ld)}
+
+
+def v5_pick_rule(root: Path) -> Optional[Dict[str, Any]]:
+    """the dump-time pick rule of CKE2E2.infer's v5 output: ck_e2e2.infer_select (beta, set) of the extracted CK run's
+    config.json, else beta 0.5 over 'all' (SEL_W, no offset); None when <root>/../ck_run/config.json is absent."""
+    ck = U.read_json(root.parent / "ck_run" / "config.json", None)
+    if ck is None:
+        return None
+    sel = (ck.get("ck_e2e2") or {}).get("infer_select") or {"beta": 0.5, "set": "all"}
+    return {"beta": float(sel["beta"]), "set": str(sel["set"]), "w": "SEL_W", "offset": None,
+            "source": "ck_e2e2.infer_select" if (ck.get("ck_e2e2") or {}).get("infer_select") else "default"}
+
+
+def v5_block(lab_pool: np.ndarray, lab_lat: np.ndarray, V: Dict[str, Any], logs: np.ndarray, n_boot: int = 2000,
+             seed: int = 0, prob96: Optional[np.ndarray] = None, valid96: Optional[np.ndarray] = None,
+             v2_final16: Optional[np.ndarray] = None, v2_im16: Optional[np.ndarray] = None,
+             pick_rule: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """module docstring 'v5' on arrays restricted to the eval tokens: lab_pool / lab_lat [n, 96, 9], V = load_v5
+    restricted to the same tokens ({src [n], mu [n, 12] | None, lab [n, 9], ok [n]}), logs [n]; prob96 / valid96 /
+    v2_final16 / v2_im16 + pick_rule -> src_agree (select96 recomputed).  -> {n_tok, n_v5, n_no_src, n_unlabelled,
+    rows, d (0-1 units), brk, keys, mu, src_agree, pick_rule}."""
+    from tools.ck.v5 import refine_stats as RS
+    L = Cn.LBL
+    P = L["pdms"]
+    src = np.asarray(V["src"], np.int64)
+    n = len(src)
+    lab5 = np.asarray(V["lab"], np.float64)
+    lab_ok = np.asarray(V["ok"], bool) & np.isfinite(lab5[:, :7]).all(1)
+    m = (src >= 0) & lab_ok
+    ar = np.arange(n)
+    sc = np.clip(src, 0, S2.G_K - 1)
+    pick, pick_lat, v2 = lab_pool[ar, sc][m], lab_lat[ar, sc][m], lab_pool[:, 0][m]
+    tau1, lg = lab5[m], np.asarray(logs)[m]
+    rows = {"v5 pick": row_metrics(pick, None), "v5 pick+lat": row_metrics(pick_lat, None),
+            "v5 tau1": row_metrics(tau1, None)}
+    d = {"tau1-pick": log_bootstrap(tau1[:, P] - pick[:, P], lg, n_boot, seed),
+         "tau1-pick_lat": log_bootstrap(tau1[:, P] - pick_lat[:, P], lg, n_boot, seed),
+         "pick-v2": log_bootstrap(pick[:, P] - v2[:, P], lg, n_boot, seed)}
+    brk = {f"tau1_vs_{nm}": {r: RS.break_fix(ref, tau1, r) for r in RS.BREAK_RULES}
+           for nm, ref in (("pick", pick), ("pick_lat", pick_lat))}
+    keys = {"tau1_vs_pick": RS.key_counts(pick, tau1), "tau1_vs_pick_lat": RS.key_counts(pick_lat, tau1)}
+    out = {"n_tok": int(n), "n_v5": int(m.sum()), "n_no_src": int((src < 0).sum()),
+           "n_unlabelled": int(((src >= 0) & ~lab_ok).sum()), "rows": rows, "d": d, "brk": brk, "keys": keys,
+           "mu": RS.mu_stats(np.asarray(V["mu"])[m]) if V.get("mu") is not None else None,
+           "pick_rule": pick_rule, "src_agree": None,
+           "token_rule": "the 96 token mask & a v5 output (src >= 0) whose tau1 label is ok"}
+    if pick_rule is not None and prob96 is not None:
+        idx = S2.select96(v2_final16, v2_im16, prob96, valid96, float(pick_rule["beta"]),
+                          S2.VARIANT_SETS[pick_rule["set"]])
+        out["src_agree"] = float(np.mean(np.asarray(idx)[m] == src[m])) if m.any() else float("nan")
+    return out
+
+
 def lead_mask_of(split: str, tokens: Sequence[str], lead_root: Path = CK_DATA / "lead"):
     p = lead_root / f"{split}.parquet"
     if not p.is_file():
@@ -464,6 +554,19 @@ def table_md(res: Dict[str, Any]) -> str:
               f"측방 {be.get('lat_mode')}; navtrain_val에서 선택, navtest는 고정). 같은 토큰의 96 행 대비 ΔPDMS "
               f"{fmt_ci(e.get('d_vs_96_same'))} (같은 β/집합), {fmt_ci(e.get('d_vs_96_best'))} (96 선택 행 "
               f"{e.get('best_96')}). 편집 선택 비율 {100 * (e.get('edit_pick_rate') or 0):.1f}%.", ""]
+    if res.get("v5"):                                    # refiner v5 tau1 of the dump-time pick (module docstring)
+        v = res["v5"]
+        rw, dd = v["rows"], v["d"]
+        bp = v["brk"]["tau1_vs_pick"]
+        L += [f"refiner v5 tau1 (pick rule {v.get('pick_rule')}; 토큰 {v['n_v5']} / {v['n_tok']}, src 없음 "
+              f"{v['n_no_src']}, 라벨 없음 {v['n_unlabelled']}): PDMS pick {100 * rw['v5 pick']['pdms']:.2f} / pick+lat "
+              f"{100 * rw['v5 pick+lat']['pdms']:.2f} / tau1 {100 * rw['v5 tau1']['pdms']:.2f}; tau1 - pick "
+              f"{fmt_ci(dd['tau1-pick'])}, tau1 - pick+lat {fmt_ci(dd['tau1-pick_lat'])}, pick - v2 "
+              f"{fmt_ci(dd['pick-v2'])}; break vs pick pdms0 {bp['pdms0']['n_break']}/{bp['pdms0']['den']}, fails3 "
+              f"{bp['fails3']['n_break']}/{bp['fails3']['den']} (fix {bp['fails3']['n_fix']}/{bp['fails3']['fix_den']})"
+              + (f"; |mu| > {v['mu']['thr']:g} {100 * v['mu']['frac_gt_thr']:.1f}%" if v.get("mu") else "")
+              + (f"; src = select96 재계산 {100 * v['src_agree']:.1f}%" if v.get("src_agree") is not None else "")
+              + ".", ""]
     L += ["| 행 | PDMS | ΔPDMS [95% CI] | NC | DAC | EP | TTC | C | NC 실패 | DAC 실패 | TTC 실패 | 앞차 감속 NC/TTC 실패 (n) | "
           "Δ앞차 실패 [95% CI] | 바뀐 비율 | 측방 적용 | 변형 선택 비율 |", "|" + "---|" * 16]
     for r in res["rows"]:
@@ -533,6 +636,7 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
     logs = tdf.log.astype(str).to_numpy()[sel]
     lead, lead_src = lead_mask_of(split, toks, lead_root)
     E = load_edits(root, run, split, n)                  # refiner v4 edits (None: every output as before)
+    V5 = load_v5(root, run, split, n)                    # refiner v5 tau1 (None: every output as before)
     E_sel, e_info, fixed_e = None, None, None
     if E is not None:
         pe = sigmoid(E["logit"])
@@ -626,6 +730,11 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
             Pk = Cn.LBL["pdms"]
             e_info["d_vs_96_best"] = log_bootstrap(che[:, Pk] - ch96[:, Pk], logs, n_boot, 0)
         out_d["edits"] = e_info
+    if V5 is not None:                                   # refiner v5 tau1 vs the pool pick it was computed from
+        out_d["v5"] = v5_block(lab_p[sel], lab_l[sel], {k: (v[sel] if isinstance(v, np.ndarray) else v)
+                                                        for k, v in V5.items()}, logs, n_boot, 0, sigmoid(logit[sel]),
+                               valid96[sel], v2f[sel], v2im[sel], v5_pick_rule(root))
+        out_d["v5"]["label_dir"] = V5["label_dir"]
     U.write_json(out / "metrics.json", out_d)
     (out / "table.md").write_text(table_md(out_d))
     rep = out_d.get("representative")
@@ -642,6 +751,11 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
         else:
             pt["sel_lat"] = S2.use_lat(idx, r["lat_mode"])
             pt["pdms_sel"] = S2.chosen_labels(lab_p[sel], lab_l[sel], idx, r["lat_mode"])[:, P]
+    if V5 is not None:                                   # refiner v5: the dump-time pick and its tau1 (NaN: none)
+        s5 = V5["src"][sel]
+        pt["v5_src"] = s5
+        pt["pdms_v5_pick"] = np.where(s5 >= 0, lab_p[sel][np.arange(len(sel)), np.clip(s5, 0, S2.G_K - 1), P], np.nan)
+        pt["pdms_v5_tau1"] = np.where((s5 >= 0) & V5["ok"][sel], V5["lab"][sel][:, P], np.nan)
     pt.to_parquet(out / "per_token.parquet", index=False)
     print(f"[{kst()}] eval_ck2 {run}/{split}: {len(sel)}/{n} tokens, {len(rows)} rows -> {out}", flush=True)
     return out_d

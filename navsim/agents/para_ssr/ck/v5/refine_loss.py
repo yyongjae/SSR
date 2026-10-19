@@ -3,20 +3,26 @@ per-state GT block targets of the relation hazard H, the reliability targets of 
 GT is a TARGET only (never a network input): the batch's ref_* (GTLoader: refiner.gt_future objects 360 deg / 5 s with
 the metric-cache presence rule, the official DAC SDF) and the object pack's matched GT futures (fc_xyh / fc_state).
 
-L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable), per draft (mean over drafts):
-  road  mean over states x corners of softplus((m_road - SDF(corner)) / s) s       (SDF at the official footprint corners;
-        corners outside the SDF grid skipped)
-  obj   mean over states of max over GT objects of softplus((m_obj - sep) / s) s     (sep = SAT separation of the official
-        footprint at state n and the GT box at t_n; counted when the object is observed (metric-cache rule), the ego
-        moves (|v| > 0.05 m/s) and the object is not behind (centre >= -1.3 m along the heading from the CURRENT ego
-        box at state n, also for the TTC projections) unless static / stopped: the at-fault proxy of the range field B)
-  ttc   the same with the footprint projected |v| delta (0.3 / 0.6 / 0.9 s) along the heading against the GT boxes at
-        t_n + delta, margin 0, max over delta
-  prog  relu(min(1, S0 / P) - min(1, S1 / P)), S = executed 4 s path length (lqr.executed_progress), P = max(pdm_progress,
-        5 m): progress LOST is penalised, progress gained is not credited (add.md: no decelerate-to-win)
-  cmf   official comfort thresholds (pdm_comfort_metrics) on X1's finite differences: relu(a - 2.40) + relu(-4.05 - a) +
-        relu(|v yaw_rate| - 4.89) + relu(|jerk_lon| - 4.13) + relu(|yaw_rate| - 0.95) + relu(|yaw_acc| - 1.93), means
-  loss = sum_k w_k term_k (weights REF_W; caller adds w_u mean(mu^2))
+L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable): a SOFT PDMS of the executed rollout,
+  S_hat = p_nc p_dac (5 p_ttc + 2 p_c + 5 ep) / 12 (the official PDMS structure: NC and DAC multiply, TTC / comfort /
+  EP are the weighted average), with soft passes of the WORST state (not means over the states -- review 2026-10-20:
+  state-averaged hazards against a per-draft progress fraction ranked braking that fixes a collision as worse, PT-6
+  agreement 0.55-0.65):
+    p_nc  = sigmoid(min sep / s)   min over the moving states and the counted GT objects at t_n (SAT separation of the
+          official footprint; counted: observed (metric-cache rule), not behind the CURRENT ego box (centre >= -1.3 m
+          along its heading) unless static / stopped)
+    p_ttc = sigmoid(min sep / s)   the same with the footprint projected |v| delta (0.3 / 0.6 / 0.9 s) along the heading
+          against the GT boxes at t_n + delta
+    p_dac = sigmoid(min SDF / s)   min over the states x 4 corners of the official DAC SDF (corners off the SDF grid skipped)
+    p_c   = sigmoid(-v_max / 0.5)  v_max = the largest official-comfort violation of X1 (pdm_comfort_metrics with its
+          Savitzky-Golay filters as fixed linear operators: lon accel w41 p2 in [-4.05, 2.40], lon jerk w41 d1 of a w8-
+          smoothed a < 4.13, yaw rate w5 d1 < 0.95, yaw accel w5 p3 d2 < 1.93; the official lateral check reads
+          ACCELERATION_Y = 0 and never fails)
+    ep    = min(1, S_exec / P)     executed 4 s path length over the token's pdm_progress_eff (>= 5 m)
+  loss = mean over drafts of log(S_hat(X0) + 1e-3) - log(S_hat(X1) + 1e-3) (relative to the baseline tau0 the caller
+  passes = the corrector's mu = 0 draft; log keeps the gradient of a deep overlap alive), s = 0.1 m.
+  A weight 0 in w ('obj', 'ttc', 'road', 'prog', 'cmf') turns that factor off (p = 1; the MAP teacher has no object
+  input: obj = ttc = 0); 'u' is the caller's mu^2 weight.
 Stats (no grad) compare X1 with X0 = LQR(tau0) -- the callers pass tau0 = the corrector's baseline (mu = 0: today's
 laterally corrected draft, CKNet.refine_drafts 'tau_base'), so *0 vs *1 is the corrector's own change; L_prog uses the
 same baseline (progress lost relative to it).
@@ -36,8 +42,8 @@ from ..temporal.raster import sat_sep
 from ..v4 import lqr as LQR
 
 Tensor = torch.Tensor
-REF_W = {"road": 1.0, "obj": 1.0, "ttc": 0.5, "prog": 1.0, "cmf": 0.1, "u": 1e-3}
-M_ROAD, M_OBJ, SCALE = 0.1, 0.2, 0.1          # [m]
+REF_W = {"road": 1.0, "obj": 1.0, "ttc": 1.0, "prog": 1.0, "cmf": 1.0, "u": 1e-3}   # factor switches + mu^2
+SCALE = 0.1                                   # [m] soft pass sigmoid(margin / SCALE)
 BEHIND_M = -1.3
 STOP_NC, STOP_TTC = 0.05, 5e-3
 TTC_D = (0.3, 0.6, 0.9)
@@ -110,42 +116,70 @@ def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequenc
     return sep, count
 
 
+_CMF_OPS: Dict[str, Tensor] = {}
+
+
+def _cmf_ops(dev) -> Dict[str, Tensor]:
+    """official comfort filters (pdm_comfort_metrics) as fixed 41 x 41 float64 operators (savgol mode 'interp' is linear in
+    the signal; reproduces the official per-metric verdicts on LQR rollouts, review 2026-10-20 f7)."""
+    key = str(dev)
+    if key not in _CMF_OPS:
+        import numpy as np
+        from scipy.signal import savgol_filter
+        E = np.eye(LQR.NT)
+        ops = {"a": savgol_filter(E, 41, 2, axis=0),
+               "j": savgol_filter(E, 41, 2, deriv=1, delta=LQR.DT, axis=0) @ savgol_filter(E, 8, 2, axis=0),
+               "r": savgol_filter(E, 5, 2, deriv=1, delta=LQR.DT, axis=0),
+               "y": savgol_filter(E, 5, 3, deriv=2, delta=LQR.DT, axis=0)}
+        _CMF_OPS[key] = {k: torch.from_numpy(v).to(dev) for k, v in ops.items()}
+    return _CMF_OPS[key]
+
+
 def _comfort(X: Tensor) -> Tensor:
-    """X [..., 41, 6] -> mean comfort penalty [...] (module docstring)."""
-    a, v, h = X[..., 4], X[..., 3], X[..., 2]
-    yr = LQR.principal_value(h[..., 1:] - h[..., :-1]) / LQR.DT
-    ya = (yr[..., 1:] - yr[..., :-1]) / LQR.DT
-    lat = v[..., :-1] * yr
-    jk = (a[..., 1:] - a[..., :-1]) / LQR.DT
-    return (F.relu(a - CMF["lon_max"]).mean(-1) + F.relu(CMF["lon_min"] - a).mean(-1)
-            + F.relu(lat.abs() - CMF["lat"]).mean(-1) + F.relu(jk.abs() - CMF["jerk_lon"]).mean(-1)
-            + F.relu(yr.abs() - CMF["yaw_rate"]).mean(-1) + F.relu(ya.abs() - CMF["yaw_acc"]).mean(-1))
+    """X [..., 41, 6] -> the largest official-comfort violation [...] (> 0 = fails; module docstring)."""
+    M = _cmf_ops(X.device)
+    Xd = X.double()
+    a = Xd[..., 4]
+    h = Xd[..., 2]
+    hu = torch.cat([h[..., :1], h[..., :1] + torch.cumsum(LQR.principal_value(h[..., 1:] - h[..., :-1]), -1)], -1)
+    la, lj, yr, ya = a @ M["a"].T, a @ M["j"].T, hu @ M["r"].T, hu @ M["y"].T
+    v = torch.stack([(la - CMF["lon_max"]).amax(-1), (CMF["lon_min"] - la).amax(-1),
+                     (lj.abs() - CMF["jerk_lon"]).amax(-1), (yr.abs() - CMF["yaw_rate"]).amax(-1),
+                     (ya.abs() - CMF["yaw_acc"]).amax(-1)], -1)
+    return v.amax(-1).float()
 
 
-def _terms(X: Tensor, gt: Dict[str, Tensor], t: Tensor, w: Dict[str, float], S0: Optional[Tensor]) -> Dict[str, Tensor]:
+def _terms(X: Tensor, gt: Dict[str, Tensor], t: Tensor, w: Dict[str, float]) -> Dict[str, Tensor]:
+    """soft PDMS factors of rollouts X [n, R, 41, 6] -> dict of [n, R] (module docstring) + hard stats."""
     n, R, Q = X.shape[:3]
     out: Dict[str, Tensor] = {}
-    sp = lambda x, m: F.softplus((m - x) / SCALE) * SCALE                               # noqa: E731
+    sg = lambda x: torch.sigmoid(x / SCALE)                                             # noqa: E731
+    one = X.new_ones(n, R)
     cor = ego_corners(X[..., :3])                                                       # [n, R, Q, 4, 2]
     val, ok = sample_sdf(gt["sdf"], cor.reshape(n, -1, 2))
     val, ok = val.reshape(n, R, Q * 4), ok.reshape(n, R, Q * 4)
-    okf = ok.float()
-    out["road"] = (sp(val, M_ROAD) * okf).sum(-1) / okf.sum(-1).clamp(min=1.0)
-    out["offroad"] = ((val < 0) & ok).any(-1).float()
-    if w.get("obj", 0.0) or w.get("ttc", 0.0) or S0 is None:
+    dmin = torch.where(ok, val, torch.full_like(val, 10.0)).amin(-1)
+    out["offroad"] = (dmin < 0).float()
+    out["p_dac"] = sg(dmin) if w.get("road", 0.0) else one
+    if w.get("obj", 0.0) or w.get("ttc", 0.0):
         sep, cnt = object_sep(X, t, gt, (0.0,) + TTC_D)
-        pen = torch.where(cnt[..., 0, :], sp(sep[..., 0, :], M_OBJ), torch.zeros_like(sep[..., 0, :]))
-        out["obj"] = pen.amax(-1).mean(-1)
-        pt = torch.where(cnt[..., 1:, :], sp(sep[..., 1:, :], 0.0), torch.zeros_like(sep[..., 1:, :]))
-        out["ttc"] = pt.amax(-1).amax(-1).mean(-1)
-        out["coll"] = ((sep[..., 0, :] < 0) & cnt[..., 0, :]).flatten(2).any(-1).float()
-        out["ttc_hit"] = ((sep[..., 1:, :] < 0) & cnt[..., 1:, :]).flatten(2).any(-1).float()
+        big = torch.full_like(sep, 10.0)
+        s_nc = torch.where(cnt[..., 0, :], sep[..., 0, :], big[..., 0, :]).flatten(2).amin(-1)
+        s_tt = torch.where(cnt[..., 1:, :], sep[..., 1:, :], big[..., 1:, :]).flatten(2).amin(-1)
+        out["coll"] = (s_nc < 0).float()
+        out["ttc_hit"] = (s_tt < 0).float()
+        out["p_nc"] = sg(s_nc) if w.get("obj", 0.0) else one
+        out["p_ttc"] = sg(s_tt) if w.get("ttc", 0.0) else one
+    else:
+        out["p_nc"], out["p_ttc"] = one, one
     S = LQR.executed_progress(X)[0]                                                     # [n, R]
     out["S"] = S
-    if S0 is not None:
-        P = gt["p_pdm"].float().clamp(min=5.0)[:, None]
-        out["prog"] = F.relu(torch.clamp(S0 / P, max=1.0) - torch.clamp(S / P, max=1.0))
-    out["cmf"] = _comfort(X)
+    P = gt["p_pdm"].float().clamp(min=5.0)[:, None]
+    out["ep"] = torch.clamp(S / P, max=1.0) if w.get("prog", 0.0) else one
+    cv = _comfort(X)
+    out["cmf_fail"] = (cv > 0).float()
+    out["p_c"] = torch.sigmoid(-cv / 0.5) if w.get("cmf", 0.0) else one
+    out["S_hat"] = out["p_nc"] * out["p_dac"] * (5 * out["p_ttc"] + 2 * out["p_c"] + 5 * out["ep"]) / 12.0
     return out
 
 
@@ -159,30 +193,41 @@ def refine_loss(tau1: Tensor, tau0: Tensor, v0: Tensor, a0: Tensor, gt: Dict[str
         t = torch.arange(LQR.NT, dtype=torch.float64, device=dev) * LQR.DT
         with torch.no_grad():
             X0 = LQR.simulate(tau0.float(), ego, dtype=torch.float32)
-            T0 = _terms(X0, gt, t, dict(w, obj=1.0, ttc=1.0), None)
+            T0 = _terms(X0, gt, t, w)
         X1 = LQR.simulate(tau1.float(), ego, dtype=torch.float32)
-        T1 = _terms(X1, gt, t, w, T0["S"])
-        loss = tau1.new_zeros((), dtype=torch.float32)
-        for k in ("road", "obj", "ttc", "prog", "cmf"):
-            if w.get(k, 0.0) and k in T1:
-                loss = loss + float(w[k]) * torch.nan_to_num(T1[k], nan=0.0, posinf=1e3).mean()
-        st = {f"ref_{k}": float(T1[k].detach().mean()) for k in ("road", "obj", "ttc", "prog", "cmf") if k in T1}
-        for k in ("offroad", "coll", "ttc_hit"):
-            if k in T1:
-                st[f"ref_{k}1"] = float(T1[k].detach().mean())
-            st[f"ref_{k}0"] = float(T0[k].mean())
+        T1 = _terms(X1, gt, t, w)
+        L = torch.log(T0["S_hat"] + 1e-3) - torch.log(T1["S_hat"] + 1e-3)
+        loss = torch.nan_to_num(L, nan=0.0, posinf=10.0, neginf=-10.0).mean()
+        st = {f"ref_{k}{i}": float(T[k].detach().mean()) for i, T in (("0", T0), ("1", T1))
+              for k in ("S_hat", "p_nc", "p_dac", "p_ttc", "ep", "p_c", "offroad", "cmf_fail")}
+        H0, H1 = T0, T1
+        if "coll" not in T0:                    # object factors off (MAP): the hazard stats still reported
+            with torch.no_grad():
+                hw = dict(w, obj=1.0, ttc=1.0)
+                H0, H1 = _terms(X0, gt, t, hw), _terms(X1.detach(), gt, t, hw)
+        for i, H in (("0", H0), ("1", H1)):
+            st[f"ref_coll{i}"] = float(H["coll"].mean())
+            st[f"ref_ttc_hit{i}"] = float(H["ttc_hit"].mean())
         st["ref_dS"] = float((T1["S"] - T0["S"]).detach().mean())
         st["ref_n"] = float(n * R)
     return loss, st
 
 
 @torch.no_grad()
-def gt_state_block(states: Tensor, t: Tensor, gt: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
+def gt_state_block(states: Tensor, t: Tensor, gt: Dict[str, Tensor], fov_deg: Optional[float] = None
+                   ) -> Tuple[Tensor, Tensor]:
     """per-state GT block targets of the relation hazard: states [n, K, Q, 6] at t [Q] -> y [n, K, Q, 2] (NC: overlap
     at delta 0; TTC: overlap at any delta of (0, 0.3, 0.6, 0.9) s; counted objects only) float, known [n, K, Q] bool
-    (all times <= the token's annotated horizon)."""
+    (all times <= the token's annotated horizon).  Only GT objects the t0 detections could explain count: observed at
+    t0 with the centre inside the detector window (x in [0, 32], |y| <= 32; + |bearing| <= fov_deg for the student's
+    camera head) -- the relation reads t0 detections only, an object absent at t0 or outside the window is an
+    irreducible positive that would inflate eps / a_i (review 2026-10-20 f6)."""
     sep, cnt = object_sep(states.float(), t, gt, (0.0,) + TTC_D)
-    hit = (sep < 0) & cnt                                                               # [n, K, Q, D, A]
+    c0, _, obs0 = gt_t0_objects(gt)
+    win = obs0 & (c0[..., 0] >= 0) & (c0[..., 0] <= 32.0) & (c0[..., 1].abs() <= 32.0)
+    if fov_deg is not None:
+        win = win & (torch.rad2deg(torch.atan2(c0[..., 1], c0[..., 0])).abs() <= float(fov_deg) + 1e-4)
+    hit = (sep < 0) & cnt & win[:, None, None, None, :]                                   # [n, K, Q, D, A]
     y = torch.stack([hit[..., 0, :].any(-1), hit.any(-1).any(-1)], -1).float()
     t_av = ((gt["n_kf"].double() - 1) * GF.KF_DT).clamp(max=GF.T_MAX)                  # [n]
     known = (t.to(states.device).double()[None] + max(TTC_D) <= t_av[:, None] + 1e-6)  # [n, Q]

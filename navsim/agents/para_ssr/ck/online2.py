@@ -231,7 +231,7 @@ def _d_v5() -> Dict[str, Any]:
     # teachers' (DET: b_nc, b_ttc (+ H_nc, H_ttc with both relation channels); MAP: d_min; masked SmoothL1 on states
     # that are readable for both and KD-ok, ramped like the other KD terms), infer_refine = inference also emits tau1 of
     # the deployed pick (ck2_v5_traj).
-    return {"enabled": False, "relation": "off", "n_obj": 32, "score_thr": 0.3, "unknown_ev": False,
+    return {"enabled": False, "relation": "off", "n_obj": 96, "score_thr": 0.3, "unknown_ev": False,
             "corrector": False, "z_stride": 2, "lambda_ref": 1.0, "ref_w": "", "ref_cols": 16, "lambda_rel_a": 0.2,
             "lambda_rel_h": 0.5, "rel_h_cols": 16, "z_kd": False, "lambda_zkd_det": 0.5, "lambda_zkd_map": 0.5,
             "infer_refine": True}
@@ -2063,7 +2063,7 @@ class CKE2E2:
             if q["lambda_rel_h"] > 0 and hk["zq"].shape[-1] >= 6:
                 Kh = max(1, min(int(q["rel_h_cols"]), K))
                 H = hk["zq"][idx][:, :Kh, :, -2:].float().clamp(1e-4, 1 - 1e-4)
-                yb, known = RL.gt_state_block(hk["exec_states"][idx][:, :Kh, ::zs], tz, gt)
+                yb, known = RL.gt_state_block(hk["exec_states"][idx][:, :Kh, ::zs], tz, gt, fov_deg=80.0)
                 mk = known.float()[..., None].expand_as(H)
                 l_h = (F.binary_cross_entropy(H, yb, reduction="none") * mk).sum() / mk.sum().clamp(min=1.0)
                 inner = inner + q["lambda_rel_h"] * l_h

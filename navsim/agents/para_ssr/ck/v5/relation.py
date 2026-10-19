@@ -56,7 +56,13 @@ def object_rows(obj_in: Tensor, obj_mask: Tensor, frame_valid: Tensor, n: int) -
     obj_in, obj_mask, frame_valid = obj_in.float(), obj_mask.bool(), frame_valid.bool()
     T, _, K, _ = obj_in.shape
     hist = ca_history(obj_in, obj_mask, frame_valid)
-    k = min(int(n), K)
+    v0m = effective_mask(obj_mask, frame_valid)[:, 0]                                   # [T, K]
+    any_slot = v0m.any(0)
+    k_valid = int(torch.nonzero(any_slot).max()) + 1 if bool(any_slot.any()) else 1
+    # every valid t0 row up to n, trimmed to the batch's last valid slot (rows are a score-sorted prefix; review
+    # 2026-10-20 f1: the old top-32 cut dropped ~16 % of matched agents, ~30 % of pedestrians)
+    k = max(1, min(int(n), K, k_valid))
+    n = k
     x0 = obj_in[:, 0, :k]
     valid = effective_mask(obj_mask, frame_valid)[:, 0, :k]
     cls1h = x0[..., COL["cls0"]:COL["cls0"] + N_CLS]
@@ -94,7 +100,8 @@ class RelationReader(nn.Module):
         self.n_obj = int(cfg.n_obj)
         self.use_ca = bool(cfg.rel_ca)
         self.log_eps = nn.Parameter(torch.tensor(math.log(float(cfg.rel_eps))))
-        self.ca_logit = nn.Parameter(torch.zeros(2))                       # vehicle, VRU
+        # CA mode weight per group (vehicle, VRU); only built with the CA mode (an unused parameter breaks DDP)
+        self.ca_logit = nn.Parameter(torch.zeros(2)) if self.use_ca else None
         h = int(cfg.rel_hidden)
         self.source = str(cfg.relation)                                    # 'teacher' (pack rows) | 'student' (det head)
         if self.source == "student":

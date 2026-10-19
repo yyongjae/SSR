@@ -61,7 +61,7 @@ def test_recipe_and_ck_leaves(tmp_path):
     assert _get(ov, "agent.config.plan_score_file").endswith("/planning_vb/pdm_score_256")      # v2 keeps WoTE labels
     assert _get(ov, "experiment_name") == "ck2e2e_test" and _get(ov, "wandb.name") == "ck2e2e_test"
     assert _get(ov, "wandb.project") == "para-ssr-v2" and _get(ov, "wandb.group") == "ck2e2e"
-    assert _get(ov, "wandb.tags") == "[ck2e2e,main]"
+    assert _get(ov, "wandb.tags") == "[ck2e2e,bevkd]"                  # refiner-v4: the yaml default is the bevkd arm
     assert _get(ov, "output_dir") == f"{tmp_path}/ck2e2e_test/train/"
     # doubled per-mb constants and the user decisions
     c = "agent.config.ck_e2e2."
@@ -69,7 +69,7 @@ def test_recipe_and_ck_leaves(tmp_path):
             "n_var_step": "32", "lambda_score": "1.0", "lambda_kd_score": "0.5", "onpolicy_from_epoch": "5",
             "label_lag": "1", "variants.ext": "straight", "variants.speeds": "[-1.0,-0.5,0.5]",
             "variants.lats": "[-0.5,0.5]", "variants.combine": "separate", "teacher_amp": "true",
-            "teacher_which": "last", "bev_kd.enabled": "false", "infer_select": "null",
+            "teacher_which": "last", "bev_kd.enabled": "true", "bev_kd.teachers": "[det,map]", "infer_select": "null",
             "io_dir": f"{tmp_path}/ck2e2e_test/ck_e2e2", "teacher_det_run": str(SMOKE_T)}
     for k, v in want.items():
         assert _get(ov, c + k) == v, k
@@ -110,8 +110,10 @@ def test_bevkd_arm_set_file(tmp_path):
                  "cap_map": "null"}.items():
         assert _get(ov, c + k) == v, k
     assert _get(ov, "wandb.tags") == "[ck2e2e,bevkd]" and L2.arm_of(ck) == "bevkd"
-    # everything else identical to the main run (same recipe / seed / data order)
-    ov_m, _, _ = _ov(tmp_path)
+    # everything else identical to the main run (same recipe / seed / data order); refiner-v4: main = main_arm.set
+    ov_m, ck_m, _ = _ov(tmp_path, L2.LU.read_lines(str(L2.MAIN_SET)))
+    assert L2.arm_of(ck_m) == "main" and _get(ov_m, "wandb.tags") == "[ck2e2e,main]"
+    assert _get(ov_m, c + "enabled") == "false" and _get(ov_m, c + "teachers") == "[det]"
     diff = sorted(set(ov) ^ set(ov_m))
     assert all(o.startswith(("++agent.config.ck_e2e2.bev_kd.enabled=", "++agent.config.ck_e2e2.bev_kd.teachers=",
                              "wandb.tags=")) for o in diff), diff
@@ -120,7 +122,8 @@ def test_bevkd_arm_set_file(tmp_path):
     bk = teachers["bev_kd"]
     assert set(bk) == {"det", "map"} and bk["det"]["norm"] == str(SMOKE_T / "norm.npz") \
         and bk["map"]["norm"] == str(SMOKE_M / "norm_map.npz") and len(bk["map"]["sha16"]) == 16
-    assert "bev_kd" not in _ov(tmp_path)[2]                                     # main run: no arm, no record
+    assert "bev_kd" not in _ov(tmp_path, L2.LU.read_lines(str(L2.MAIN_SET)))[2]   # main run: no arm, no record
+    assert set(_ov(tmp_path)[2]["bev_kd"]) == {"det", "map"}                     # refiner-v4 default = bevkd
     # a MAP teacher run without norm_map.npz: refused before anything starts
     nm = tmp_path / "noNormM"
     nm.mkdir()
@@ -222,6 +225,9 @@ def test_teacher_ep_target_must_match_student(tmp_path):
         (d / "config.json").write_text(json.dumps(cfg))
         os.symlink(src / "ckpt_last.pt", d / "ckpt_last.pt")
         shutil.copy(src / "done.json", d / "done.json")
+        for nf in ("norm.npz", "norm_map.npz"):           # refiner-v4: the default (bevkd) arm needs the BEV z-scores
+            if (src / nf).is_file():
+                shutil.copy(src / nf, d / nf)
         runs[name] = d
     rec = L2.teacher_check(str(runs["T"]), str(runs["M"]), mode="strict", deep=False, ep_target="decoupled")
     assert rec["det"]["ep_target"] == rec["map"]["ep_target"] == "decoupled"
@@ -329,11 +335,15 @@ def test_train_e2e2_dry_run(tmp_path):
     sets = tmp_path / "smoke_teachers.set"
     sets.write_text("\n".join(SMOKE_SETS) + "\n")
     base = {"E2E_ROOT": str(tmp_path / "root"), "E2E_DRY_RUN": "1", "E2E_CK_SET": str(sets), "RUN": "dry_main"}
-    r = _sh(dict(base, CK2_E2E_APPROVED="1"), "start", "--gpus", "0,1")
+    r = _sh(dict(base, CK2_E2E_APPROVED="1", ARM="main"), "start", "--gpus", "0,1")
     assert r.returncode == 0, r.stderr[-2000:]
     out = r.stdout
     assert "+trainer.params.devices=2" in out and "trainer.params.accumulate_grad_batches=16" in out
     assert "++agent.config.ck_e2e2.bev_kd.enabled=false" in out and "dry run: nothing launched (arm main" in out
+    # refiner-v4: no ARM = the bevkd arm (yaml default)
+    r0 = _sh(dict(base, CK2_E2E_APPROVED="1", RUN="dry_default"), "start", "--gpus", "0,1")
+    assert r0.returncode == 0, r0.stderr[-2000:]
+    assert "++agent.config.ck_e2e2.bev_kd.enabled=true" in r0.stdout and "arm bevkd" in r0.stdout
     R = tmp_path / "root/dry_main"
     assert not (R / "launch/train.pid").exists() and not (R / "train").exists() and not (R / "labeler").exists()
     assert (R / "launch_dryrun/teachers.json").is_file() and (R / "launch_dryrun/ck_e2e2_effective.json").is_file()

@@ -3,7 +3,7 @@
 
   labeler2.py --io-dir <RUN>/ck_e2e2 [--world-size 2] [--workers 32] [--poll 30] [--max-epoch 28] [--exit-when-done]
               [--train-pid-file <RUN>/launch/train.pid] [--retry-errors] [--once] [--limit-chunks N] [--skip-invalid]
-              [--pid-file F] [--exit-file F]
+              [--no-time-idx] [--pid-file F] [--exit-file F]
 
 = tools/ck/e2e/labeler.py (class Labeler subclassed; lock, markers, errors.jsonl, DONE.json, status.json, exit codes,
   hard-exit pool kill, fake scorer and score_one are inherited unchanged) with the CK2 formats:
@@ -15,6 +15,17 @@ Input   rec/ep{E}/r{R}/c_<attempt>_<seq>.npz written by e2e_data2.CandRecorder2 
 Output  lab/ep{E}/{traj, labels, cand_ok, valid, row_state}.npy + meta.json (format 'ck2_96') via
         e2e_data2.open_generation2 / write_generation_rows2: traj = the recorded trajectories (bitwise), valid = the
         recorded validity, labels / cand_ok from score_one (ok = SCORE_COLS finite), row_state 1 written last.
+        refiner v4 (default on; --no-time-idx = the old output exactly): + the optional lab/ep{E}/time_idx.npy int8
+        [N, 96, 3] (navsim/agents/para_ssr/ck/time_idx.py: cols nc, ttc, dac = score_token nc_time_idx / ttc_time_idx
+        / dac_time_idx, n = 0..40 at 0.1 s, -1 none, -2 unscored / not ok), written with the row data before row_state
+        (meta.json optional_files).  The pool runs score_one2 = score_one + the time indices of the SAME score_token call
+        (labels / ok bit-identical); the indices travel back with the result and are stashed per task key until the
+        row is written.  A generation created by an older labeler gets the file (all -2) only when this labeler writes
+        new rows into it; its earlier rows stay -2 (unknown).
+        refiner v4 corrector A: a chunk with the optional edit block (e2e_data2.REC2_EDIT_KEYS: edit_traj [n, 8, 8, 3],
+        edit_src, edit_u, edit_valid) is scored in the SAME score_token call as its 96 (96 + 8 trajectories; per-
+        trajectory results are batch-independent), the 96 results go to the generation as before, the 8 to the
+        optional edit_* files (e2e_data2.GEN2_EDIT_FILES; invalid edits stay unscored, edit_ok False).
 Defaults --workers 32 (user), --world-size 2 (2-GPU run), --max-epoch 28.  CPU only, OMP_NUM_THREADS=1, os.nice(5).
 """
 from __future__ import annotations
@@ -34,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))   # repo root of th
 from tools.ck.e2e import labeler as L1  # noqa: E402  (pins navsim + the official scorer)
 from navsim.agents.para_ssr.ck import e2e_data as ED  # noqa: E402
 from navsim.agents.para_ssr.ck import e2e_data2 as D2  # noqa: E402
+from navsim.agents.para_ssr.ck import time_idx as TI  # noqa: E402
 
 import numpy as np  # noqa: E402
 
@@ -43,30 +55,93 @@ DEFAULT_WORKERS = 32
 DEFAULT_WORLD = 2
 DEFAULT_MAX_EPOCH = 28
 _t = L1._t
+TIDX_FILE = "time_idx"                                  # e2e_data2.GEN2_OPT_FILES name
+
+
+# ----------------------------------------------------------------------------------------------- worker side (v4)
+def fake_time_idx(trajs: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """Deterministic stand-in time indices (tests only) consistent with the fake labels: per TIDX_COLS column j
+    (label column nc / ttc / dac) idx = (floor(|sum traj| * 1000) + 7 j) % 41 where the label < 1, else -1 (none).
+    trajs [K, 8, 3], labels [K, 9] -> int8 [K, 3]."""
+    s = np.asarray(trajs, np.float64).reshape(len(trajs), -1).sum(1)
+    base = np.floor(np.abs(s) * 1000.0).astype(np.int64)
+    lab = np.asarray(labels, np.float64).reshape(len(trajs), -1)
+    out = np.empty((len(trajs), TI.N_TIDX), np.int64)
+    for j, li in enumerate(TI.TIDX_LABEL_IDX):
+        out[:, j] = np.where(lab[:, li] < 1.0, (base + 7 * j) % TI.N_STATES, TI.NONE)
+    return out.astype(TI.DTYPE)
+
+
+def score_one2(task) -> tuple:
+    """score_one + first-failure time indices: task = (key, token, trajs [K,8,3] f32, metric-cache path) -> (key,
+    labels [K,9] f32 | None, ok [K] | None, error, sec_load, sec_score, tidx int8 [K,3] | None) (TIDX_COLS; -2 for
+    non-finite (unscored) and not-ok candidates).  Official path: the ONE score_token call of score_one on the finite
+    trajectories (labels / ok computed by the same expressions, bit-identical); fake path (tests): score_one +
+    fake_time_idx on its ok candidates."""
+    if L1._W.get("mode", "official") != "official":
+        key, lab, ok, err, s_load, s_score = L1.score_one(task)
+        if lab is None:
+            return key, lab, ok, err, s_load, s_score, None
+        tid = TI.unknown((len(lab),))
+        if ok.any():
+            tid[ok] = fake_time_idx(np.asarray(task[2], np.float32)[ok], lab[ok])
+        return key, lab, ok, err, s_load, s_score, tid
+    key, tok, trajs, mcp = task
+    t0 = time.time()
+    try:
+        trajs = np.asarray(trajs, np.float32)
+        k = len(trajs)
+        lab = np.full((k, len(L1.LABEL_COLS)), np.nan, np.float32)
+        ok = np.zeros(k, bool)
+        tid = TI.unknown((k,))
+        fin = np.isfinite(trajs).reshape(k, -1).all(1)
+        mc = L1.ST.load_metric_cache(mcp)
+        tl = time.time()
+        if fin.any():
+            res = L1.ST.score_token(mc, trajs[fin])
+            lab[fin] = np.array([[r[c] for c in L1.LABEL_COLS] for r in res], np.float64).astype(np.float32)
+            ok[fin] = np.isfinite(np.array([[r[c] for c in L1.SCORE_COLS] for r in res], np.float64)).all(1)
+            tid[fin] = TI.sanitize(TI.from_labels_shards(res), ok[fin])
+        return key, lab, ok, "", tl - t0, time.time() - tl, tid
+    except Exception as e:
+        return key, None, None, (repr(e) + " | " + traceback.format_exc()[-400:])[:800], time.time() - t0, 0.0, None
 
 
 class Labeler2(L1.Labeler):
     """Labeler for 96-column records / generations (see the module docstring)."""
 
     def __init__(self, io_dir, world_size: int = DEFAULT_WORLD, workers: int = DEFAULT_WORKERS,
-                 skip_invalid: bool = False, **kw):
+                 skip_invalid: bool = False, time_idx: bool = True, **kw):
         kw.setdefault("max_epoch", DEFAULT_MAX_EPOCH)
         super().__init__(io_dir, world_size, workers, **kw)
         self.skip_invalid = bool(skip_invalid)
+        self.time_idx = bool(time_idx)                   # refiner v4: optional generation file time_idx.npy
         self.valid: Dict[tuple, np.ndarray] = {}         # key -> [96] bool, alongside self.traj
+        self.tidx: Dict[tuple, np.ndarray] = {}          # key -> [96, 3] int8 of scored, not yet written tasks
+        self.edit: Dict[tuple, Dict[str, np.ndarray]] = {}   # refiner v4: key -> the row's edit block (traj/src/u/valid)
+
+    def score_fn(self):
+        return score_one2 if self.time_idx else L1.score_one
 
     # ------------------------------------------------------------------- files
     def gen(self, epoch: int) -> dict:
+        """Generation of epoch (opened once).  time_idx on: a NEW generation is created with the optional time_idx
+        file; an existing one is opened with it only if the file is already there (status / skip paths never add
+        files to old generations; _write adds it before the first new row)."""
         if epoch not in self.gens:
-            mode = "r+" if L1.generation_ready(self.io, epoch) else "w+"
-            g = D2.open_generation2(self.io, epoch, self.n_rows, mode)
+            ready = L1.generation_ready(self.io, epoch)
+            mode = "r+" if ready else "w+"
+            has_f = (ED.gen_dir(self.io, epoch) / f"{TIDX_FILE}.npy").is_file()
+            opt = (TIDX_FILE,) if self.time_idx and (not ready or has_f) else ()
+            g = D2.open_generation2(self.io, epoch, self.n_rows, mode, optional=opt)
             self.gens[epoch] = g
-            self.log(f"[{_t()}] generation ep{epoch:03d} opened ({mode}, {D2.GEN2_FORMAT}) rows done "
-                     f"{int(np.count_nonzero(np.asarray(g['row_state']) == 1))}")
+            self.log(f"[{_t()}] generation ep{epoch:03d} opened ({mode}, {D2.GEN2_FORMAT}{', time_idx' if opt else ''})"
+                     f" rows done {int(np.count_nonzero(np.asarray(g['row_state']) == 1))}")
         return self.gens[epoch]
 
     # ------------------------------------------------------------------- task flow
-    def _queue(self, ep: int, ckey: str, i: int, r: int, trajs: np.ndarray, valid: Optional[np.ndarray] = None):
+    def _queue(self, ep: int, ckey: str, i: int, r: int, trajs: np.ndarray, valid: Optional[np.ndarray] = None,
+               edit: Optional[Dict[str, np.ndarray]] = None):
         key = (ep, ckey, i, r)
         self.rows_busy.add((ep, r))
         self.traj[key] = np.ascontiguousarray(trajs, np.float32)            # written to the generation as recorded
@@ -74,6 +149,11 @@ class Labeler2(L1.Labeler):
         task_traj = self.traj[key]
         if self.skip_invalid and not self.valid[key].all():
             task_traj = np.where(self.valid[key][:, None, None], task_traj, np.float32(np.nan)).astype(np.float32)
+        if edit is not None:                       # refiner v4: + the 8 edits in the same score_token call
+            self.edit[key] = edit
+            et = np.where(np.asarray(edit["valid"], bool)[:, None, None], np.asarray(edit["traj"], np.float32),
+                          np.float32(np.nan)).astype(np.float32)
+            task_traj = np.concatenate([task_traj, et], 0)
         lg = self.logs[r]
         mcp = f"fake:{self.tok[r]}" if (self.scorer == "fake" and lg == "__fake__") else \
             str(L1.CM.mc_path(self.split, lg, self.tok[r]))
@@ -85,6 +165,13 @@ class Labeler2(L1.Labeler):
         trajs = np.asarray(d["traj"], np.float32)
         assert trajs.ndim == 4 and trajs.shape[1:] == (G_K, 8, 3), f"{trajs.shape}: not [n, {G_K}, 8, 3]"
         return d, trajs, np.asarray(d["valid"], bool)
+
+    @staticmethod
+    def _edit_of(d, i: int) -> Optional[Dict[str, np.ndarray]]:
+        if "edit_traj" not in d:
+            return None
+        return {"traj": np.asarray(d["edit_traj"][i], np.float32), "src": np.asarray(d["edit_src"][i], np.int16),
+                "u": np.asarray(d["edit_u"][i], np.float32), "valid": np.asarray(d["edit_valid"][i], bool)}
 
     def take_chunk(self, c: dict):
         ep, path = int(c["epoch"]), str(c["path"])
@@ -108,16 +195,22 @@ class Labeler2(L1.Labeler):
                 st["n_skip"] += 1
                 self.tot["tok_skip"] += 1
             else:
-                self._queue(ep, path, i, r, trajs[i], valid[i])
+                self._queue(ep, path, i, r, trajs[i], valid[i], self._edit_of(d, i))
                 st["n_tasks"] += 1
         if st["n_tasks"] == 0:
             self._finish_chunk(st)
 
     def _handle(self, res):
         key = res[0]
+        if len(res) == 7:                           # score_one2: stash the time indices before the base may write
+            if res[6] is not None and key in self.inflight:
+                self.tidx[key] = np.asarray(res[6], np.int8)
+            res = res[:6]
         super()._handle(res)
         if key not in self.traj:                    # error path (or written): drop the companion validity
             self.valid.pop(key, None)
+            self.tidx.pop(key, None)
+            self.edit.pop(key, None)
 
     def _write(self, ep: int):
         """Scored rows of epoch ep -> generation (write_generation_rows2: data, flush, row_state, flush)."""
@@ -126,9 +219,40 @@ class Labeler2(L1.Labeler):
         if not buf:
             return
         rows = np.array([k[3] for k, _, _ in buf], np.int64)
-        w = D2.write_generation_rows2(self.gen(ep), rows, np.stack([self.traj[k] for k, _, _ in buf]),
-                                      np.stack([b[1] for b in buf]), np.stack([b[2] for b in buf]),
-                                      np.stack([self.valid[k] for k, _, _ in buf]))
+        g = self.gen(ep)
+        tid = None
+        if self.time_idx:
+            if TIDX_FILE not in g:                  # generation of an older labeler: add the file (all -2) now
+                g = self.gens[ep] = D2.open_generation2(self.io, ep, self.n_rows, "r+", optional=(TIDX_FILE,))
+                self.log(f"[{_t()}] generation ep{ep:03d}: optional {TIDX_FILE}.npy added (earlier rows -2)")
+            tid = np.stack([self.tidx.get(k, TI.unknown((G_K,)))[:G_K] for k, _, _ in buf])
+        eds = None
+        if any(k in self.edit for k, _, _ in buf):  # refiner v4: split the 96 + 8 results, write the edit block
+            if any(f not in g for f in D2.GEN2_EDIT_FILES):
+                opt = ((TIDX_FILE,) if self.time_idx else ()) + D2.GEN2_EDIT_FILES
+                g = self.gens[ep] = D2.open_generation2(self.io, ep, self.n_rows, "r+", optional=opt)
+                self.log(f"[{_t()}] generation ep{ep:03d}: optional edit files added")
+            KE = D2.EDIT_K
+            nan_lab = np.full((KE, len(L1.LABEL_COLS)), np.nan, np.float32)
+            eds = {"edit_traj": [], "edit_labels": [], "edit_ok": [], "edit_src": [], "edit_u": []}
+            for k, lab, ok in buf:
+                e = self.edit.get(k)
+                if e is None or len(lab) < G_K + KE:
+                    eds["edit_traj"].append(np.full((KE, 8, 3), np.nan, np.float32))
+                    eds["edit_labels"].append(nan_lab)
+                    eds["edit_ok"].append(np.zeros(KE, bool))
+                    eds["edit_src"].append(np.full(KE, -1, np.int16))
+                    eds["edit_u"].append(np.full((KE, D2.N_U), np.nan, np.float32))
+                    continue
+                eds["edit_traj"].append(np.asarray(e["traj"], np.float32))
+                eds["edit_labels"].append(np.asarray(lab[G_K:G_K + KE], np.float32))
+                eds["edit_ok"].append(np.asarray(ok[G_K:G_K + KE], bool) & np.asarray(e["valid"], bool))
+                eds["edit_src"].append(np.asarray(e["src"], np.int16))
+                eds["edit_u"].append(np.asarray(e["u"], np.float32))
+            eds = {k: np.stack(v) for k, v in eds.items()}
+        w = D2.write_generation_rows2(g, rows, np.stack([self.traj[k] for k, _, _ in buf]),
+                                      np.stack([b[1][:G_K] for b in buf]), np.stack([b[2][:G_K] for b in buf]),
+                                      np.stack([self.valid[k] for k, _, _ in buf]), time_idx=tid, edits=eds)
         for (key, _, _), wrote in zip(buf, w):
             st = self.chunks[key[1]]
             if wrote:
@@ -141,6 +265,8 @@ class Labeler2(L1.Labeler):
                 self.tot["tok_skip"] += 1
             self.traj.pop(key, None)
             self.valid.pop(key, None)
+            self.tidx.pop(key, None)
+            self.edit.pop(key, None)
             self.rows_busy.discard((ep, key[3]))
 
     # ------------------------------------------------------------------- retry
@@ -174,7 +300,7 @@ class Labeler2(L1.Labeler):
                     if g["row_state"][r] == 1 or (ep, r) in self.rows_busy or int(d["row"][i]) != r:
                         continue
                     self.chunks[ckey] = st
-                    self._queue(ep, ckey, i, r, trajs[i], valid[i])
+                    self._queue(ep, ckey, i, r, trajs[i], valid[i], self._edit_of(d, i))
                     st["n_tasks"] += 1
                     n += 1
         self.log(f"[{_t()}] retry-errors: {n} rows queued")
@@ -217,6 +343,8 @@ def main(argv=None) -> int:
     ap.add_argument("--scorer", default="official", choices=("official", "fake"), help="'fake' = tests only")
     ap.add_argument("--skip-invalid", action="store_true",
                     help="leave valid == False (lateral duplicate) columns unscored (default: label all 96)")
+    ap.add_argument("--no-time-idx", action="store_true",
+                    help="do not write the optional time_idx.npy (refiner v4; default: written)")
     ap.add_argument("--pid-file", default="")
     ap.add_argument("--exit-file", default="")
     a = ap.parse_args(argv)
@@ -225,7 +353,8 @@ def main(argv=None) -> int:
     if a.pid_file:
         Path(a.pid_file).parent.mkdir(parents=True, exist_ok=True)
         Path(a.pid_file).write_text(f"{os.getpid()}\n")
-    lab = Labeler2(io_dir, a.world_size, a.workers, skip_invalid=a.skip_invalid, poll=a.poll,
+    lab = Labeler2(io_dir, a.world_size, a.workers, skip_invalid=a.skip_invalid, time_idx=not a.no_time_idx,
+                   poll=a.poll,
                    max_epoch=None if a.max_epoch < 0 else a.max_epoch, exit_when_done=a.exit_when_done,
                    train_pid_file=a.train_pid_file, retry_errors=a.retry_errors, once=a.once,
                    limit_chunks=a.limit_chunks, n_rows=a.n_rows, tokens=a.tokens, split=a.split, scorer=a.scorer,
@@ -236,7 +365,7 @@ def main(argv=None) -> int:
         lab._stop = True
     signal.signal(signal.SIGTERM, _term)
     print("navsim", L1.LCD.navsim.__file__, "| score_trajectories", L1.ST.__file__, "| e2e_data2", D2.__file__,
-          "| labeler2 skip_invalid", lab.skip_invalid, flush=True)
+          "| labeler2 skip_invalid", lab.skip_invalid, "| time_idx", lab.time_idx, flush=True)
     code = 1
     try:
         code = lab.run()

@@ -150,11 +150,21 @@ def extract_ck(ckpt: Path, out_dir: Path, run_name: str = "", ck_cfg: Optional[D
         raise SystemExit(f"{ckpt}: no '{STUDENT_PREFIX}*' keys (not a ck_e2e checkpoint)")
     ck_cfg = dict(ck_cfg or {})
     seed = int(ck_cfg.get("seed", 0) or 0)
-    net = CKNet("S", seed, None, score_hidden=256, lead_aux=False)
+    # refiner v4 student (ck_e2e2.v4 block): network cfg + corridor version, recorded so load_ck rebuilds it
+    from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+    v4b = dict(ck_cfg.get("v4") or {})
+    v4 = V4Cfg.from_dict({k: v4b[k] for k in ("readout", "pref_head", "time_free", "lat_haz", "horizon", "corrector",
+                                              "corr_k") if k in v4b})
+    cv = int(v4b.get("corridor_version", 1) or 1)
+    net = CKNet("S", seed, None, score_hidden=256, lead_aux=False, corridor_version=cv, v4=v4)
     net.load_state_dict(st, strict=True)
     cfg = {"arm": "S", "run": run_name or out_dir.parent.parent.name, "seed": seed, "score_hidden": 256, "lead_aux": 0,
            "k": K, "e2e": True, "source_ckpt": str(ckpt), "source_ckpt_sha16": U.sha256_file(ckpt),
            "n_tensors": len(st), "ck_e2e": ck_cfg, "extracted_utc": time.strftime("%F %T", time.gmtime())}
+    if cv != 1:
+        cfg["corridor_version"] = cv
+    if v4.on:
+        cfg["v4"] = v4.to_dict()
     out_dir.mkdir(parents=True, exist_ok=True)
     save_ck(out_dir / "ckpt_last.pt", net, cfg)
     U.write_json(out_dir / "config.json", cfg)

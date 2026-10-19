@@ -96,8 +96,14 @@ def cfg2(tmp: Path, **over) -> O.CKE2E2Config:
          # off for these fixtures so tests may set either ep_target
          "teacher_ep_check": False,
          # no KD calibration files exist for the smoke teachers (kd_calib tests pass their own files)
-         "kd_calib": {"enabled": False}}
+         "kd_calib": {"enabled": False},
+         # refiner-v4: the yaml / dataclass default is the bevkd arm; the CK2 harness pins the ck2e2e_main arm
+         # (BEV KD off, teachers [det]) and a test's partial bev_kd dict is merged on top of it
+         "bev_kd": {"enabled": False, "teachers": ["det"]}}
+    bk = over.pop("bev_kd", None)
     d.update(over)
+    if bk is not None:
+        d["bev_kd"] = {**d["bev_kd"], **bk}
     return O.CKE2E2Config.from_any(d)
 
 

@@ -22,6 +22,9 @@ Model: navsim.agents.para_ssr.ck.model.load_ck(<CK_DATA>/ck2/train/<teacher>, 'l
   ops as CKNet.forward (trunk.scene once per token, trunk.candidates on the 16 candidates and, with the same scene
   features, on the 80 variants), fp16 autocast as train_ck2 eval; lateral decode = ck/correct.correct(cand,
   z_lon = 0 (forced), w_lat, v0 = |(vx, vy)|, slope 0) for every candidate and variant.
+  refiner v4 teachers (config.json 'v4': hazard / evidence / the v4_3 'range' readout): CKNet.score_set with the
+  variants reading their parent candidate's corridor (parents = the 16 repeated, deduplicated by score_set; the range
+  readout reads each candidate at its executed LQR states); infer_meta.json records the teacher's v4 cfg.
 Variants: ck/variants.make_variants(cand16, v0 = hypot(status[4], status[5]) NaN -> 0, speeds (-1, -0.5, 0.5),
   lats (-0.5, 0.5), combine 'separate', ext 'straight', float64 decode) -> traj80 [N,80,8,3], column j = k * 5 + (v - 1),
   v = 1..5 = a-1.0, a-0.5, a+0.5, l-0.5, l+0.5 (select2.VNAMES[1:]); valid80 [N,80] (False = lateral variant of a
@@ -191,9 +194,9 @@ def resolve_run(teacher: str) -> Path:
     p = Path(teacher)
     if p.is_dir():
         return p
-    q = CK_DATA / "ck2" / "train" / teacher
-    if q.is_dir():
-        return q
+    for q in (CK_DATA / "ck2" / "train" / teacher, CK_DATA / "v4" / "train" / teacher):   # CK2 / refiner v4 teachers
+        if q.is_dir():
+            return q
     raise SystemExit(f"teacher run not found: {teacher}")
 
 
@@ -204,6 +207,12 @@ def teacher_forward(net, bev, cand, status, var):
     ego = ego_inputs(status)
     v0, a0, eds, cmd = ego
     feat, mem = net.trunk.scene(bev, T)
+    if getattr(net, "v4_readout", None) is not None:      # refiner v4 teacher: variants read their parent's corridor
+        pref = net.scene_pref(mem, ego)
+        o16 = net.score_set(feat, mem, ego, cand.float(), pref=pref)
+        o80 = net.score_set(feat, mem, ego, var.float(), cand.float().repeat_interleave(NVAR, 1), pref=pref)
+        return {"s16": o16["score_logit"], "s80": o80["score_logit"], "w16": o16["w_lat"], "w80": o80["w_lat"],
+                "z16": o16["z_lon"], "z80": o80["z_lon"], "v0": v0}
     o16 = net.trunk.candidates(feat, mem, cand.float(), v0, a0, eds, cmd)
     o80 = net.trunk.candidates(feat, mem, var.float(), v0, a0, eds, cmd)
     return {"s16": net.score(o16, T, cand.shape[1]), "s80": net.score(o80, T, var.shape[1]),
@@ -226,7 +235,9 @@ def sanity_checks(net, b, var, dev) -> Dict:
     out = {}
     with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
         mine = teacher_forward(net, b["bev"], b["cand"], b["status"], var)
-        ref = net(b["bev"], b["cand"], b["status"], extra=var, decode=False)
+        # the variants' parents (c = k * NVAR + v -> identity k), as teacher_forward (ignored by the mean readout)
+        ref = net(b["bev"], b["cand"], b["status"], extra=var, decode=False,
+                  extra_parent=b["cand"].float().repeat_interleave(NVAR, 1))
     out["fwd_score16_maxdiff"] = float((mine["s16"] - ref["score_logit"]).abs().max())
     out["fwd_score80_maxdiff"] = float((mine["s80"] - ref["extra_score_logit"]).abs().max())
     out["fwd_wlat16_maxdiff"] = float((mine["w16"] - ref["w_lat"]).abs().max())
@@ -289,7 +300,8 @@ def stage_infer(a) -> Dict:
                 device=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), batch=a.batch,
                 workers=a.workers, amp="fp16 autocast (as train_ck2 eval)", z_lon="forced 0 in the lateral decode",
                 lat_slope=0.0, bev_norm=str(run / ("norm.npz" if arm == "T" else "norm_map.npz")),
-                variants=str(vd / "traj80.npy"), started=kst(t0))
+                variants=str(vd / "traj80.npy"), v4=cfg.get("v4"), corridor_version=cfg.get("corridor_version"),
+                started=kst(t0))
     print(f"[infer] {a.teacher} arm {arm} ({ck_file.name}) -> {td}: todo {len(rr)} of {len(rows)}", flush=True)
     sanity = None
     n, n_bad = 0, 0
@@ -623,7 +635,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="CK2 teacher navtest reference A (v2 r34 top-16)",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--stage", default="infer,select", help=f"comma list of {STAGES}")
-    ap.add_argument("--teacher", default=None, help="ck2T | ck2M | run dir (stages infer / select / eval)")
+    ap.add_argument("--teacher", default=None,
+                    help="run name under CK_DATA/ck2/train or CK_DATA/v4/train (stages infer / select / eval)")
     ap.add_argument("--which", default="last", help="checkpoint (user: last epoch)")
     ap.add_argument("--out-root", default=str(OUT_ROOT))
     ap.add_argument("--limit", type=int, default=0, help="first N packed rows -> <out-root>/smoke<N> (sanity)")

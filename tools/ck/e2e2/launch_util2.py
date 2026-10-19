@@ -33,6 +33,25 @@ ck_e2e2.kd_calib.enabled every configured file (kd_calib.det / .map) must exist 
 ck/kd_calib.check_calib: arm, run, which, the ckpt sha16 of teacher_check, ep_target, every KD key of that teacher
 fitted); a missing file is refused with the fit_kd_calib.py command to run after the teacher has finished.  Recorded
 (file sha16, a / b per key, held-out NLL / ECE) in teachers.json ('kd_calib').
+Temporal DET teacher guard (refiner-v3, docs/refiner_v3/STEP2_E2E.md; tools/ck/e2e2/v3teacher_arm.set): a teacher whose
+config.json has temporal.on must be the DET teacher (arm T) and NOT privileged (oracle forecaster / gt source refused
+in both modes); teacher_check records under det['temporal'] its cfg, the sha16 of the temporal-branch / forecaster
+weights in the checkpoint (deep), the pre-trained forecaster file (fc_init sha), the ca_scales file and the training
+provenance of the teacher.  kd_objects_check (both modes) opens the object pack the e2e target builder will read
+(e2e_data2.KDObjRows: split = basename of warmup.packed, ObjPack with the packed token order) and REFUSES a pack whose
+build.json sha256 differs from the one the teacher was trained on (config.json provenance data.packs.<split>) -> recorded
+as teachers.json 'kd_objects' (pack record + equality).  CK2 teachers: no new key, nothing opened (records unchanged).
+smoke-check2 with a temporal DET teacher (effective teacher_det_run temporal.on) adds the gate temporal_smoke_checks:
+teachers.json det.temporal + kd_objects recorded and ck2/kd_obj_ok_frac logged with mean >= 0.999 (CK2: unchanged).
+refiner v4_3 (tools/ck/e2e2/v4_3_arm.set, ARM=v4_3; arm_of 'v4_3' for a range readout): apply_sets2 declares the
+optional v4 keys a set line names (absent from ck_e2e2.yaml: older arms unchanged); placeholder_check refuses any
+ck_e2e2 value still holding the arm file's /PLACEHOLDER/ (teacher runs / KD calibration files of the range teachers,
+set by the user's E2E_CK_SET file); kd_constraint_check (v4.kd_constraint.enabled) refuses non-range teachers, teachers on
+another grid (corridor version, time bins) than the student, teachers whose rg_stopped_aware differs from the student's
+(Phase 0b R2 B semantics: an R2 student needs R2 teachers and vice versa) and an occ_channels group missing on the
+student or the DET teacher -- the runtime rule and message (online2.constraint_teacher_problems / CONSTRAINT_REFUSAL) on
+the runs' config.json -- and records them as teachers.json 'kd_constraint' (rg_read of both sides recorded; it may
+differ, rg_read_differs names the teachers whose read is not the student's).
 """
 from __future__ import annotations
 
@@ -55,6 +74,10 @@ LaunchError = LU.LaunchError
 PY = LU.PY
 CK2_YAML = HERE / "ck_e2e2.yaml"
 BEVKD_SET = HERE / "bevkd_arm.set"
+MAIN_SET = HERE / "main_arm.set"          # refiner-v4: the ck2e2e_main arm (BEV KD off; the yaml default is bevkd)
+V4_SET = HERE / "v4_arm.set"              # refiner v4 student
+V4_3_SET = HERE / "v4_3_arm.set"          # refiner v4_3 student (range critic + computed edits + constraint KD)
+PLACEHOLDER = "/PLACEHOLDER/"             # an arm-file value that must be replaced before a launch (refused)
 CK_DATA = "/home/external-user/ssd/yongjae_refiner/ck"
 E2E_ROOT = f"{CK_DATA}/ck2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/ck2/e2e_smoke"
@@ -103,6 +126,11 @@ def check_paths(ck: Dict[str, Any]) -> None:
 
 
 def arm_of(ck: Dict[str, Any]) -> str:
+    v4 = ck.get("v4") or {}
+    if str(v4.get("readout", "mean")) == "range":
+        return "v4_3"
+    if str(v4.get("readout", "mean")) != "mean" or str(v4.get("pref_head", False)).lower() in ("true", "1"):
+        return "v4"
     return "bevkd" if bool((ck.get("bev_kd") or {}).get("enabled")) else "main"
 
 
@@ -119,6 +147,103 @@ def lon_head_zero(ckpt_path: Path) -> Tuple[bool, str]:
     w, b = sd[f"trunk.lon_head.{idx[-1]}.weight"], sd.get(f"trunk.lon_head.{idx[-1]}.bias")
     mx = max(float(w.abs().max()), float(b.abs().max()) if b is not None else 0.0)
     return mx == 0.0, f"trunk.lon_head.{idx[-1]} max |w| {mx:g}"
+
+
+def _state_sha16(sd: Dict[str, Any], prefix: str) -> Optional[str]:
+    """sha16 of the tensors under `prefix` of a state dict (sorted names, dtype, shape, bytes); None if none
+    (= online2._tensor_sha16 of the module's own state dict, whose keys lack the prefix)."""
+    import hashlib
+    ks = sorted(k for k in sd if k.startswith(prefix))
+    if not ks:
+        return None
+    h = hashlib.sha256()
+    for k in ks:
+        v = sd[k].detach().cpu().contiguous()
+        h.update(k[len(prefix):].encode())
+        h.update(str(v.dtype).encode())
+        h.update(str(tuple(v.shape)).encode())
+        h.update(v.numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def temporal_record(rd: Path, cfg: Dict[str, Any], ck: Path, deep: bool = True) -> Optional[Dict[str, Any]]:
+    """Temporal-branch record of a teacher run (None when its config.json has no temporal.on): cfg, privileged flag,
+    checkpoint state sha16 of the branch / forecaster (deep), fc_init / ca_scales file records
+    (tools/ck/v3/provenance) and the teacher's training provenance (packs, ca_scales, fc_init) for the comparisons."""
+    from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+    tc = TemporalCfg.from_dict(cfg.get("temporal"))
+    if not tc.on:
+        return None
+    from tools.ck.v3 import provenance as PV
+    rec: Dict[str, Any] = {"cfg": tc.to_dict(), "privileged": tc.privileged}
+    if deep:
+        import torch
+        sd = torch.load(ck, map_location="cpu", weights_only=False)
+        sd = sd.get("model", sd)
+        rec["branch_state_sha16"] = _state_sha16(sd, "temporal.")
+        rec["forecaster_state_sha16"] = _state_sha16(sd, "temporal.forecaster.")
+    rec["fc_init"] = PV.fc_init_record(tc.fc_init) if tc.fc_init else None
+    if deep and tc.fc_init and Path(tc.fc_init).is_file() and rec.get("forecaster_state_sha16"):
+        # frozen pre-trained forecaster: the checkpoint's forecaster must be the fc_init weights (sha16 of its
+        # 'forecaster' state dict, same scheme)
+        import torch
+        fi = torch.load(tc.fc_init, map_location="cpu", weights_only=False)
+        fsd = fi.get("forecaster") if isinstance(fi, dict) else None
+        if isinstance(fsd, dict):
+            rec["fc_init"]["forecaster_state_sha16"] = _state_sha16(fsd, "")
+            rec["forecaster_equals_fc_init"] = rec["fc_init"]["forecaster_state_sha16"] == rec["forecaster_state_sha16"]
+    rec["ca_scales"] = PV.ca_record(tc.ca_scales)
+    prov = (cfg.get("provenance") or {}).get("data") or {}
+    rec["train_provenance"] = {"packs": {s: (r or {}).get("build_sha256") for s, r in (prov.get("packs") or {}).items()},
+                               "ca_scales_sha256": (prov.get("ca_scales") or {}).get("sha256"),
+                               "fc_init_sha256": (prov.get("fc_init") or {}).get("sha256")}
+    warn = []
+    tp = rec["train_provenance"]
+    if rec["fc_init"] and tp["fc_init_sha256"] and rec["fc_init"].get("sha256") != tp["fc_init_sha256"]:
+        warn.append("fc_init file changed since the teacher was trained (the checkpoint's own forecaster weights are "
+                    "used; recorded only)")
+    if tc.fc_frozen and rec.get("forecaster_equals_fc_init") is False:
+        warn.append("frozen forecaster weights in the checkpoint differ from the fc_init file (recorded only)")
+    if tp["ca_scales_sha256"] and rec["ca_scales"].get("sha256") != tp["ca_scales_sha256"]:
+        warn.append("ca_scales file changed since the teacher was trained (a CA branch carries its scales in the "
+                    "checkpoint; recorded only)")
+    rec["warnings"] = warn
+    return rec
+
+
+def kd_objects_check(c, teachers: Dict[str, Any]) -> Dict[str, Any]:
+    """Object pack of a temporal DET teacher (empty dict for a CK2 teacher): opens e2e_data2.KDObjRows(teacher cfg,
+    warmup.packed) exactly as the target builder will (structure, token order), records it (tools/ck/v3/provenance
+    pack_record) and REFUSES (LaunchError) a pack whose build.json sha256 differs from the one recorded in the
+    teacher's training provenance for that split (the KD objects must be the rows the teacher was trained on)."""
+    from navsim.agents.para_ssr.ck import e2e_data2 as D2
+    tc = D2.teacher_temporal(c.teacher_det_run)
+    if not tc.on:
+        return {}
+    from tools.ck.v3 import provenance as PV
+    if tc.privileged:
+        raise LaunchError(f"teacher det {c.teacher_det_run}: PRIVILEGED temporal run")
+    try:
+        ko = D2.KDObjRows(tc, c.warmup["packed"])
+    except (ValueError, FileNotFoundError, ImportError) as e:
+        raise LaunchError(f"temporal DET teacher {c.teacher_det_run}: object pack for the e2e rows: {e}") from None
+    rec = PV.pack_record(ko.pack.dir)
+    rec.update(ko.describe())
+    want = (((teachers.get("det") or {}).get("temporal") or {}).get("train_provenance") or {}).get("packs", {}).get(
+        ko.split)
+    if want is None:
+        cfg = json.loads((Path(c.teacher_det_run) / "config.json").read_text())
+        want = ((((cfg.get("provenance") or {}).get("data") or {}).get("packs") or {}).get(ko.split) or {}).get(
+            "build_sha256")
+    rec["teacher_train_pack_sha256"] = want
+    if want is None:
+        raise LaunchError(f"temporal DET teacher {c.teacher_det_run}: config.json provenance records no object pack "
+                          f"for {ko.split} (cannot prove the KD objects are the teacher's training rows)")
+    if rec.get("build_sha256") != want:
+        raise LaunchError(f"temporal DET teacher {c.teacher_det_run}: object pack {ko.pack.dir} build.json sha256 "
+                          f"{rec.get('build_sha256')} != {want} recorded when the teacher was trained (pack rebuilt?)")
+    rec["same_as_teacher_training"] = True
+    return rec
 
 
 def teacher_check(det_run: str, map_run: str, which: str = "last", mode: str = "strict",
@@ -179,6 +304,23 @@ def teacher_check(det_run: str, map_run: str, which: str = "last", mode: str = "
             rec["lon_head"] = why
             if not ok:
                 raise LaunchError(f"teacher {name} {rd}: {why} (not a CK2 run: z_lon must be 0)")
+        # refiner-v3 temporal teacher (its config.json; CK2 runs: no key added)
+        try:
+            from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+            tcfg = TemporalCfg.from_dict(cfg.get("temporal"))
+        except ValueError as e:
+            raise LaunchError(f"teacher {name} {rd}: config.json temporal: {e}") from None
+        if tcfg.on:
+            if tcfg.privileged:
+                raise LaunchError(f"teacher {name} {rd}: PRIVILEGED temporal run (forecaster {tcfg.forecaster!r}, "
+                                  f"source {tcfg.source!r}): analysis only, never a KD teacher")
+            if name != "det":
+                raise LaunchError(f"teacher {name} {rd}: temporal branch on a MAP teacher is not supported")
+            try:
+                tcfg.validate(arm)
+            except (ValueError, NotImplementedError) as e:
+                raise LaunchError(f"teacher {name} {rd}: temporal cfg: {e}") from None
+            rec["temporal"] = temporal_record(rd, cfg, ck, deep)
         out[name] = rec
     if kd_calib is not None:
         out["kd_calib"] = kd_calib_record(kd_calib, out, det_run, map_run, which, kd_keys)
@@ -253,6 +395,77 @@ def kd_calib_record(kd_calib: Optional[Dict[str, Any]], teachers: Dict[str, Any]
             raise LaunchError(f"ck_e2e2.kd_calib.{name}: {e}") from None
         out[name] = info
     return out
+
+
+def apply_sets2(ck: Dict[str, Any], sets: Sequence[str]) -> Dict[str, Any]:
+    """launch_util.apply_sets with the OPTIONAL v4_3 keys of the v4 block (online2._d_v4_opt): a set line naming one
+    (v4.<key>=..., v4.kd_constraint.<key>=...) first declares it at its default -- they are absent from ck_e2e2.yaml so
+    the older arms' effective dicts / override lists stay unchanged -- then the lines are applied as before."""
+    import copy
+    from navsim.agents.para_ssr.ck.online2 import _d_v4_opt
+    opt = _d_v4_opt()
+    out = copy.deepcopy(ck)
+    for ln in sets:
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        parts = ln.split("=", 1)[0].strip().split(".")
+        if len(parts) >= 2 and parts[0] == "v4" and parts[1] in opt and isinstance(out.get("v4"), dict):
+            out["v4"].setdefault(parts[1], copy.deepcopy(opt[parts[1]]))
+    return LU.apply_sets(out, sets)
+
+
+def placeholder_check(ck: Dict[str, Any]) -> None:
+    """Refuse an effective ck_e2e2 dict that still holds an arm file's PLACEHOLDER value (v4_3_arm.set: the KD
+    calibration files of its R2 teachers v4T10_rng2 / v4M10_rng2 are set by the user's E2E_CK_SET file once those
+    teachers exist; the teacher runs themselves are named and refused by teacher_check until they have finished)."""
+    kc_on = str((ck.get("kd_calib") or {}).get("enabled", True)).lower() in ("true", "1")
+    bad = [k for k, v in LU.flatten(ck) if isinstance(v, str) and PLACEHOLDER in v
+           and (kc_on or not k.startswith("kd_calib."))]               # unused calibration paths when it is off
+    if bad:
+        raise LaunchError(f"ck_e2e2 {bad} still hold the arm file's placeholder ({PLACEHOLDER}...): set them (e.g. "
+                          f"E2E_CK_SET=<file> with teacher_det_run=<range DET run> / teacher_map_run=<range MAP run> / "
+                          f"kd_calib.det|map=<their calibration files> or kd_calib.enabled=false) before a launch")
+
+
+def kd_constraint_check(c) -> Dict[str, Any]:
+    """refiner v4_3 constraint KD (ck_e2e2.v4.kd_constraint.enabled; {} when off): both teacher runs must have the 'range'
+    readout (config.json v4), and the runtime rule online2.constraint_teacher_problems must hold on their config.json:
+    the student's grid (corridor_version, ev_tbins, ev_tbin_s: the fields are distilled cell by cell), the student's
+    B semantics (rg_stopped_aware) on both teachers, occ_channels' groups on the student and the DET teacher -- else
+    LaunchError with the runtime message (online2.CONSTRAINT_REFUSAL + the mismatches, the text
+    online2.check_constraint_teachers raises when the teachers are loaded).  rg_read is not part of the rule (the
+    recorded v4_3 decision, constraint_teacher_problems): recorded per side, rg_read_differs = the teachers whose read
+    is not the student's.  -> record (teachers.json 'kd_constraint')."""
+    if not c.kd_constraint["enabled"]:
+        return {}
+    from navsim.agents.para_ssr.ck.online2 import CONSTRAINT_REFUSAL, constraint_teacher_problems
+    from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+    sn = c.v4_net()
+    want = {"corridor_version": int(c.v4["corridor_version"]), "ev_tbins": int(sn.ev_tbins),
+            "ev_tbin_s": float(sn.ev_tbin_s)}
+    rec: Dict[str, Any] = {"cfg": dict(c.kd_constraint), "student_grid": want,
+                           "student_r2": {"rg_read": str(sn.rg_read), "rg_stopped_aware": bool(sn.rg_stopped_aware)}}
+    tlist = []
+    for name, run in (("det", c.teacher_det_run), ("map", c.teacher_map_run)):
+        cfg = json.loads((Path(run) / "config.json").read_text())
+        try:
+            v4 = V4Cfg.from_dict(cfg.get("v4"))
+        except ValueError as e:
+            raise LaunchError(f"teacher {name} {run}: config.json v4: {e}") from None
+        got = {"corridor_version": int(cfg.get("corridor_version") or 1), "ev_tbins": int(v4.ev_tbins),
+               "ev_tbin_s": float(v4.ev_tbin_s)}
+        if not v4.range:
+            raise LaunchError(f"teacher {name} {run}: v4.readout {v4.readout!r}; ck_e2e2.v4.kd_constraint needs range "
+                              f"teachers (train_ck2.py --v4-readout range, tools/ck/v4/run_teachers.sh READOUT=range)")
+        tlist.append((name, run, v4, got["corridor_version"]))
+        rec[name] = dict(got, readout=v4.readout, exec_model=v4.exec_model, rg_read=str(v4.rg_read),
+                         rg_stopped_aware=bool(v4.rg_stopped_aware))
+    bad = constraint_teacher_problems(sn, want["corridor_version"], str(c.kd_constraint["occ_channels"]), tlist)
+    if bad:
+        raise LaunchError(CONSTRAINT_REFUSAL + "; ".join(bad))
+    rec["rg_read_differs"] = [n for n, _, v4, _ in tlist if str(v4.rg_read) != str(sn.rg_read)]
+    return rec
 
 
 def kd_calib_check(c, teachers: Dict[str, Any]) -> Dict[str, Any]:
@@ -365,8 +578,9 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
     run = Path(run_dir).name
     ck = scale_mb_counters(load_ck2_yaml(ck_yaml), len(gpus))
     ck["io_dir"] = f"{run_dir}/{IO_SUB}"
-    ck = LU.apply_sets(ck, ck_sets)
+    ck = apply_sets2(ck, ck_sets)
     check_paths(ck)
+    placeholder_check(ck)
     c = ck2_from_any(ck)
     if not c.enabled:
         raise LaunchError("ck_e2e2.enabled is false")
@@ -379,6 +593,12 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
     bk = bevkd_norms(c)
     if bk:
         teachers["bev_kd"] = bk
+    kq = kd_constraint_check(c)                        # refiner v4_3 constraint KD only (off: no key)
+    if kq:
+        teachers["kd_constraint"] = kq
+    ko = kd_objects_check(c, teachers)                 # temporal DET teacher only (refiner-v3)
+    if ko:
+        teachers["kd_objects"] = ko
     teachers["warmup_sources"] = warmup_check(c)
     base = recipe2(run, run_dir, len(gpus), workers, max_epochs, wandb, arm_of(ck))
     base += [f"++agent.config.ck_e2e2.{k}={LU.hydra_value(v)}" for k, v in LU.flatten(ck)]
@@ -643,6 +863,44 @@ def gen_roundtrip2(io: Path, epochs: Sequence[int]) -> Dict[int, Any]:
     return out
 
 
+def temporal_smoke_checks(R: Path, recs: Sequence[Dict[str, Any]], min_obj_ok: float = 0.999) -> Dict[str, Any]:
+    """Smoke gate of the refiner-v3 temporal DET teacher (review finding 2): {} unless the run's effective
+    teacher_det_run (launch/ck_e2e2_effective.json) has temporal.on.  Then teachers.json must record det.temporal
+    (non-privileged, branch / forecaster sha16, no warnings) and kd_objects.same_as_teacher_training, and the steps must
+    log ck2/kd_obj_ok_frac (= the temporal KD path ran) with mean >= min_obj_ok (the train pack has no obj_ok False
+    row; tokens without a packed row are bounded by strict_rows)."""
+    eff = R / "launch/ck_e2e2_effective.json"
+    try:
+        det = json.loads(eff.read_text()).get("teacher_det_run") if eff.is_file() else None
+    except Exception:       # noqa: BLE001
+        det = None
+    try:
+        from navsim.agents.para_ssr.ck import e2e_data2 as D2
+        on = bool(det) and D2.teacher_temporal(det).on
+    except Exception as e:  # noqa: BLE001  (an unreadable temporal cfg must fail the gate, not skip it)
+        return {"_info": {"teacher_det_run": det, "error": f"{type(e).__name__}: {e}"}, "temporal_cfg_readable": False}
+    if not on:
+        return {}
+    tj = R / "launch/teachers.json"
+    try:
+        tch = json.loads(tj.read_text()) if tj.is_file() else {}
+    except Exception:       # noqa: BLE001
+        tch = {}
+    tr = (tch.get("det") or {}).get("temporal") or {}
+    ko = tch.get("kd_objects") or {}
+    vals = [LU._num(r.get("ck2/kd_obj_ok_frac")) for r in recs if "ck2/kd_obj_ok_frac" in r]
+    vals = [v for v in vals if v is not None]
+    info = {"teacher_det_run": det, "kd_obj_ok_frac_n": len(vals), "kd_obj_ok_frac_mean": LU._mean(vals),
+            "kd_obj_ok_frac_min": min(vals) if vals else None, "kd_objects_build_sha256": ko.get("build_sha256"),
+            "forecaster_state_sha16": tr.get("forecaster_state_sha16"), "warnings": tr.get("warnings")}
+    return {"_info": info,
+            "temporal_teacher_recorded": bool(tr) and (tr.get("cfg") or {}).get("on") is True
+            and tr.get("privileged") is False and bool(tr.get("branch_state_sha16"))
+            and bool(tr.get("forecaster_state_sha16")) and not tr.get("warnings"),
+            "kd_objects_same_as_teacher_training": ko.get("same_as_teacher_training") is True,
+            "kd_obj_ok_frac_logged_ge_0999": bool(vals) and (LU._mean(vals) or 0.0) >= min_obj_ok}
+
+
 def smoke_check2(run_dir: str, ngpu: int = NGPU, onpolicy_epochs: Sequence[int] = (2,),
                  gen_epochs: Sequence[int] = (1,)) -> Dict[str, Any]:
     R = Path(run_dir)
@@ -688,6 +946,10 @@ def smoke_check2(run_dir: str, ngpu: int = NGPU, onpolicy_epochs: Sequence[int] 
         checks["bevkd_teachers_logged"] = bool(want) and sorted(res["bevkd"]) == sorted(want)
         checks["bevkd_lam_pos_every_teacher"] = bool(want) and all(
             ((res["bevkd"].get(t) or {}).get("lam_max") or 0.0) > 0.0 for t in want)
+    tchk = temporal_smoke_checks(R, recs)               # refiner-v3 temporal DET teacher only (CK2: {} -> unchanged)
+    if tchk:
+        res["temporal"] = tchk.pop("_info")
+        checks.update(tchk)
     res["checks"] = checks
     res["pass"] = all(checks.values())
     return res

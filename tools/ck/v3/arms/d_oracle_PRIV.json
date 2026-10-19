@@ -1,0 +1,26 @@
+{
+ "version": "v3_arm_1",
+ "arm": "d",
+ "name": "v3T10_d_oracle_PRIV",
+ "role": "OPTIONAL analysis upper bound, PRIVILEGED: forecasts = matched GT futures of the BEVFusion t0 objects (GTt world, M = 1); never a decision input, never a KD teacher (load_ck refuses it)",
+ "recipe": "recipe_ck2T10.json",
+ "privileged": true,
+ "requires_user_approval": true,
+ "gates": [],
+ "temporal": {
+  "on": true,
+  "source": "bevfusion",
+  "forecaster": "oracle_gt",
+  "n_modes": 1,
+  "lambda_fc": 1.0,
+  "fc_backprop": false,
+  "p_frame_drop": 0.1,
+  "p_obj_drop": 0.05,
+  "v_noise": 0.3,
+  "pack_root": "/home/external-user/ssd/yongjae_refiner/ck/v3/objpack_k96",
+  "ca_scales": "/home/external-user/ssd/yongjae_refiner/ck/v3/ca_scales.json",
+  "version": "v3_temporal_1",
+  "fc_init": "",
+  "fc_train": "frozen"
+ }
+}

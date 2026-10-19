@@ -244,18 +244,46 @@ def perturb_batch(tau0: torch.Tensor, v0: torch.Tensor, a0: torch.Tensor, frac: 
 
 
 # ----------------------------------------------------------------------------------------------- GT loading
+# GTLoader sources per split, relative to data_root (refiner v4_3, docs/refiner_v4/V4_3_SPEC.md M6 'GT data'):
+#   navtrain_train  the E2E / stage-T stores, unchanged: objects/{train,navtrain,dev}/<tok>.npz, sdf/navtrain/<tok>.npz
+#   navtrain_val    ck/v3/gt_objects/navtrain_val (tools/ck/v3/setup_gt_objects.sh: gt_future_v1, 18,179 tokens) +
+#                   sdf/navtrain_val (tools/ck/v4/build_sdf_split.py: the navtrain SDF code path, official DAC layers)
+#   navtest         ck/v3/gt_objects/navtest (gt_future_v1 from the test logs, 12,146) + sdf/navtest (same builder)
+# e2e_side (centerline / p_pdm) and HUMAN_NPZ exist for the train list only, so on val / navtest ref_gt_ok (= objects AND
+# sdf AND side, the surrogate's rule) stays False; there the per-part flags ref_obj_ok / ref_sdf_ok / ref_side_ok (bool
+# []) say which parts are real.  Teacher BEV caches: the split's ck.constants SPLITS teacher_subset.
+GT_SOURCES = {
+    "navtrain_train": {"objects": ("objects/train", "objects/navtrain", "objects/dev"), "sdf": "sdf/navtrain",
+                       "teacher_subset": "navtrain"},
+    "navtrain_val": {"objects": ("ck/v3/gt_objects/navtrain_val",), "sdf": "sdf/navtrain_val",
+                     "teacher_subset": "navtrain"},
+    "navtest": {"objects": ("ck/v3/gt_objects/navtest",), "sdf": "sdf/navtest", "teacher_subset": "navtest"},
+}
+GT_PART_KEYS = ("ref_obj_ok", "ref_sdf_ok", "ref_side_ok")
+
+
 class GTLoader:
     """Per-token GT for the surrogate (and the teachers' BEVs for KD), padded to fixed shapes; used inside the target
-    builder (dataloader workers).  Caches are opened lazily per process."""
+    builder (dataloader workers).  Caches are opened lazily per process.
 
-    def __init__(self, data_root, teacher_runs: Sequence[str] = (), human_path: bool = False):
+    split: a GT_SOURCES key (default 'navtrain_train' = the original stores; its batches are unchanged bit for bit).
+    part_flags: also return GT_PART_KEYS (None -> only for the held-out splits, so the train batch keys stay as they
+    were)."""
+
+    def __init__(self, data_root, teacher_runs: Sequence[str] = (), human_path: bool = False,
+                 split: str = "navtrain_train", part_flags: Optional[bool] = None):
         from . import data as RD
 
+        if split not in GT_SOURCES:
+            raise ValueError(f"GTLoader split {split!r} not in {sorted(GT_SOURCES)}")
         self.root = Path(data_root)
-        # the three object stores are disjoint and together cover the E2E train_logs list (19,732 + 58,743 + 6,634 =
-        # 85,109; the stage-T dev tokens exist only in objects/dev)
-        self.src = SimpleNamespace(objects=[self.root / "objects" / d for d in ("train", "navtrain", "dev")],
-                                   sdf=self.root / "sdf" / "navtrain")
+        self.split = split
+        gs = GT_SOURCES[split]
+        # navtrain_train: the three object stores are disjoint and together cover the E2E train_logs list (19,732 +
+        # 58,743 + 6,634 = 85,109; the stage-T dev tokens exist only in objects/dev)
+        self.src = SimpleNamespace(objects=[self.root / d for d in gs["objects"]], sdf=self.root / gs["sdf"])
+        self.teacher_subset = gs["teacher_subset"]
+        self.part_flags = (split != "navtrain_train") if part_flags is None else bool(part_flags)
         self.teacher_arms = [teacher_arm(r) for r in teacher_runs]
         self._caches = None
         self.human_path = bool(human_path)   # kd_draft_source human_mix: + ref_human_path / ref_human_nreg
@@ -268,7 +296,8 @@ class GTLoader:
             from . import data as RD
             from .resmap_cache import ResmapCache
 
-            self._caches = [RD.TeacherCache.for_subset("navtrain") if a == "T" else ResmapCache.for_subset("navtrain")
+            sub = self.teacher_subset
+            self._caches = [RD.TeacherCache.for_subset(sub) if a == "T" else ResmapCache.for_subset(sub)
                             for a in self.teacher_arms]
         return self._caches
 
@@ -296,6 +325,7 @@ class GTLoader:
         from . import data as RD
 
         d, ok = self._empty(), True
+        part = dict.fromkeys(GT_PART_KEYS, False)     # per-part presence (returned only with part_flags)
         try:
             o = RD._read_objects(self.src, token)
             if o is None:
@@ -303,23 +333,29 @@ class GTLoader:
             else:
                 d.update({k: o[k] for k in ("obj_kf", "obj_first", "obj_meta", "obj_n", "obj_n_kf", "obj_R",
                                             "obj_ego_kf")})
+                part["ref_obj_ok"] = True
             s = RD._read_sdf(self.src, token)
             if s is None:
                 ok = False
             else:
                 d["sdf"] = s["sdf"]
+                part["ref_sdf_ok"] = True
             p = self.root / SIDE_DIR / token[:2] / f"{token}.npz"
             if p.is_file():
                 with np.load(p, allow_pickle=False) as z:
                     d["cl_xy"], d["cl_valid"] = z["cl_xy"].astype(np.float32), z["cl_valid"].astype(bool)
                     d["cl_n"], d["p_pdm"] = np.int32(z["cl_n"]), np.float64(z["p_pdm"])
-                ok = ok and bool(np.isfinite(d["p_pdm"])) and int(d["cl_n"]) >= 2
+                part["ref_side_ok"] = bool(np.isfinite(d["p_pdm"])) and int(d["cl_n"]) >= 2
+                ok = ok and part["ref_side_ok"]
             else:
                 ok = False
         except Exception:
             d, ok = self._empty(), False
+            part = dict.fromkeys(GT_PART_KEYS, False)
         out = {f"ref_{k}": torch.as_tensor(np.asarray(v)) for k, v in d.items()}
         out["ref_gt_ok"] = torch.tensor(bool(ok))
+        if self.part_flags:
+            out.update({k: torch.tensor(bool(v)) for k, v in part.items()})
         if self.human_path:              # a missing / unreadable HUMAN_NPZ raises (human_mix must not run silently without it)
             hp, hn = self._human_path(token)
             out["ref_human_path"], out["ref_human_nreg"] = torch.as_tensor(np.array(hp)), torch.tensor(int(hn))

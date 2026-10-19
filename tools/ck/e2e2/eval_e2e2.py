@@ -33,6 +33,13 @@ Stages (each resumable; --stage all = this order; layout = tools/ck/e2e/eval_e2e
                inherited, a given value must equal it, and the navtest dump must be from the same ckpt sha16.
   summary      <RUN>/eval/summary.{json,md} (times in KST) of the (--sel-w, --calib-offset) result dirs; each split's
                checkpoint comes from its own metrics.json and a val / navtest checkpoint mismatch is refused.
+Edits (refiner v4 corrector A, v4.corrector; v4_3 computed edits, v4.edits computed): dump writes the K edits of
+  CKE2E2.infer next to the 96 (infer/{edit_traj, edit_src, edit_u, edit_score_logit, edit_valid, edit_kind}.npy), label
+  scores edit_traj -> labels/<split>/edit_<RUN>, infer_check replays correct_topk / computed_edits (shortlist edit_src
+  exact; edit_traj / edit_score_logit within tol -- a computed edit is a bisection on thresholded fields, so a dump on
+  another device can flip a boundary decision: run infer_check on the dump's device), and eval's headline is the
+  selection over 96 + K with the val-chosen, navtest-frozen beta / variant set (eval_ck2 'Edits'), next to the 96-only
+  rows on the same tokens.
 
 Checkpoint pin and cache identity (report 48 F1):
   --ckpt X resolves X ('last' | epoch:<E> | <path>), hashes the FILE and pins it in <RUN>/eval/ckpt.json (written only
@@ -100,6 +107,16 @@ PRED_TO_PACKED = {"ck2_cand96": "cand96", "ck2_valid96": "valid96", "ck2_cand_id
                   "ck2_v2_final": "v2_final", "ck2_v2_im": "v2_im", "ck2_v2_sim": "v2_sim"}
 PRED_TO_INFER = {"ck2_score_logit": "score_logit", "ck2_w_lat": "w_lat", "ck2_e_lat": "e_lat",
                  "ck2_lat_traj": "lat_traj"}
+# refiner v4 corrector A (v4.corrector) / v4_3 computed edits (v4.edits computed): the K edits of the critic's top-K,
+# written next to the 96 (edit_valid: selectable -- a computed-edit filler slot is not, nor (without the corrector) a
+# no-edit slot = its source column bitwise; edit_kind: the rule's kind 0 none / 1 lon / 2 lat / 3 both, -1 a corrector
+# edit; a prediction without a key leaves its fill)
+EDIT_SPECS = {"edit_traj": ((8, 3), np.float32, np.nan), "edit_src": ((), np.int16, -1),
+              "edit_u": ((12,), np.float32, np.nan), "edit_score_logit": ((5,), np.float32, np.nan),
+              "edit_valid": ((), np.bool_, False), "edit_kind": ((), np.int8, -1)}
+PRED_TO_EDIT = {"ck2_edit_traj": "edit_traj", "ck2_edit_src": "edit_src", "ck2_edit_u": "edit_u",
+                "ck2_edit_score_logit": "edit_score_logit", "ck2_edit_valid": "edit_valid",
+                "ck2_edit_kind": "edit_kind"}
 
 
 def log(msg: str) -> None:
@@ -246,13 +263,54 @@ def hydra_ck2_cfg(P: Paths) -> Dict[str, Any]:
     return OmegaConf.to_container(ck, resolve=False) if ck is not None else {}
 
 
+def extract_ck_v43(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, Any]) -> Dict:
+    """eval_e2e.extract_ck for a refiner v4_3 student: the same output (load_ck run dir, arm S, strict round trip), the
+    network built from CKE2E2Config.v4_net() -- every v4 network key incl. the optional v4_3 ones (readout 'range'
+    needs exec_model / ev_tbins / ev_tbin_s ..., which eval_e2e.extract_ck does not pass)."""
+    import torch
+    from navsim.agents.para_ssr.ck.model import CKNet, load_ck, save_ck
+    from navsim.agents.para_ssr.ck.online2 import CKE2E2Config
+    sd = torch.load(ckpt, map_location="cpu", weights_only=False)
+    sd = sd.get("state_dict", sd)
+    st = {k[len(E1.STUDENT_PREFIX):]: v for k, v in sd.items() if k.startswith(E1.STUDENT_PREFIX)}
+    if not st:
+        raise SystemExit(f"{ckpt}: no '{E1.STUDENT_PREFIX}*' keys (not a ck_e2e checkpoint)")
+    ck_cfg = dict(ck_cfg or {})
+    seed = int(ck_cfg.get("seed", 0) or 0)
+    c = CKE2E2Config.from_any({"v4": dict(ck_cfg.get("v4") or {})})
+    v4, cv = c.v4_net(), int(c.v4["corridor_version"])
+    net = CKNet("S", seed, None, score_hidden=256, lead_aux=False, corridor_version=cv, v4=v4)
+    net.load_state_dict(st, strict=True)
+    cfg = {"arm": "S", "run": run_name or out_dir.parent.parent.name, "seed": seed, "score_hidden": 256, "lead_aux": 0,
+           "k": E1.K, "e2e": True, "source_ckpt": str(ckpt), "source_ckpt_sha16": U.sha256_file(ckpt),
+           "n_tensors": len(st), "ck_e2e": ck_cfg, "extracted_utc": time.strftime("%F %T", time.gmtime())}
+    if cv != 1:
+        cfg["corridor_version"] = cv
+    if v4.on:
+        cfg["v4"] = v4.to_dict()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_ck(out_dir / "ckpt_last.pt", net, cfg)
+    U.write_json(out_dir / "config.json", cfg)
+    net2, _ = load_ck(out_dir, "last", "cpu")
+    a, b = net.state_dict(), net2.state_dict()
+    assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a), "load_ck round trip differs"
+    log(f"extracted {len(st)} CK tensors from {ckpt} -> {out_dir} (v4_3 network {v4.readout})")
+    return cfg
+
+
 def extract_ck2(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, Any]) -> Dict:
     """eval_e2e.extract_ck (agent.ck_student.* -> load_ck run, strict round trip) + CK2 fields in config.json; the lon
     head of the extracted student must be all zero (z_lon = 0)."""
     from navsim.agents.para_ssr.ck.model import load_ck
+    from navsim.agents.para_ssr.ck.online2 import V4_NET_OPT_KEYS
     if not ck_cfg or not str(ck_cfg.get("enabled", "")).lower() in ("true", "1"):
         log(f"warning: training config has no enabled ck_e2e2 ({ck_cfg and ck_cfg.get('enabled')})")
-    cfg = E1.extract_ck(ckpt, out_dir, run_name, {"seed": int((ck_cfg or {}).get("seed", 0) or 0)})
+    sub = {"seed": int((ck_cfg or {}).get("seed", 0) or 0),
+           **({"v4": dict(ck_cfg["v4"])} if (ck_cfg or {}).get("v4") else {})}
+    if any(k in (sub.get("v4") or {}) for k in V4_NET_OPT_KEYS):
+        cfg = extract_ck_v43(ckpt, out_dir, run_name, sub)       # refiner v4_3 network keys (eval_e2e reads v4_2's)
+    else:
+        cfg = E1.extract_ck(ckpt, out_dir, run_name, sub)
     net, _ = load_ck(out_dir, "last", "cpu")
     lw = net.trunk.lon_head[-1]
     lon_max = max(float(lw.weight.abs().max()), float(lw.bias.abs().max()))
@@ -295,10 +353,23 @@ class EvalRootWriter2(E1.EvalRootWriter):
             self.I = {k: U.open_memmap(P.infer / f"{k}.npy", (n,) + s, d, fill=f) for k, (s, d, f) in
                       INFER_SPECS.items()}
         self.ck_run = ck_run
+        self.E: Optional[Dict[str, np.ndarray]] = None              # refiner v4 edits (opened on first use)
+
+    def _edits(self, K: int) -> Dict[str, np.ndarray]:
+        if self.E is None:
+            with U.FileLock(self.P.packed / ".lock"):
+                self.E = {k: U.open_memmap(self.P.infer / f"{k}.npy", (self.n, K) + s, d, fill=f)
+                          for k, (s, d, f) in EDIT_SPECS.items()}
+        return self.E
 
     def write(self, rows, pred, status, gt, traj):
         rows = np.asarray(rows, np.int64)
         B = len(rows)
+        if "ck2_edit_traj" in pred:
+            E = self._edits(int(np.asarray(pred["ck2_edit_traj"]).shape[1]))
+            for src, dst in PRED_TO_EDIT.items():
+                if src in pred:                     # e.g. edit_valid / edit_kind of an older dump caller: fill kept
+                    E[dst][rows] = np.asarray(pred[src]).astype(E[dst].dtype)
         ok = np.isfinite(pred["ck2_cand96"]).reshape(B, -1).all(1)
         ok &= np.isfinite(pred["ck2_score_logit"]).reshape(B, -1).all(1)
         ok &= np.isfinite(pred["ck2_lat_traj"]).reshape(B, -1).all(1)
@@ -312,6 +383,11 @@ class EvalRootWriter2(E1.EvalRootWriter):
         self.A["ok"][rows] = ok
         self.I["done"][rows] = ok
         return ok
+
+    def flush(self) -> None:
+        super().flush()
+        for a in (self.E or {}).values():
+            a.flush()
 
     def finalize_meta(self, extra: Dict[str, Any]) -> None:
         self.flush()
@@ -410,8 +486,9 @@ def run_dump_shard(P: Paths, ckpt: Path, tdf, shard: int, nshard: int, batch_siz
                 pr.update(agent._ck_e2e2.infer(agent.ck_student, fg, pr))
         max_top1 = max(max_top1, check_pool(pr, anchors))
         rows = np.array([row_of[t] for t in btok], np.int64)
+        # + the refiner v4 edits when the student makes them (before: the edit keys never reached the writer)
         npd = {k: pr[k].detach().float().cpu().numpy() if pr[k].is_floating_point() else pr[k].cpu().numpy()
-               for k in list(PRED_TO_PACKED) + list(PRED_TO_INFER)}
+               for k in list(PRED_TO_PACKED) + list(PRED_TO_INFER) + [k for k in PRED_TO_EDIT if k in pr]}
         ok = W.write(rows, npd, fg["status_feature"].float().cpu().numpy(), gt.numpy().astype(np.float32),
                      pr["trajectory"].float().cpu().numpy())
         n_bad += int((~ok).sum())
@@ -496,6 +573,9 @@ def stage_label(P: Paths, a) -> None:
              P.packed / "cand96.npy"),
             (f"lat96_{P.name}", lab + ["--name", f"lat96_{P.name}", "--traj", str(P.infer / "lat_traj.npy")],
              P.infer / "lat_traj.npy")]
+    if (P.infer / "edit_traj.npy").is_file():           # refiner v4 corrector A: the K edits (K from the file shape)
+        jobs.append((f"edit_{P.name}", lab + ["--name", f"edit_{P.name}", "--traj", str(P.infer / "edit_traj.npy")],
+                     P.infer / "edit_traj.npy"))
     for name, cmd, traj in jobs:
         if (P.labels / name / "labels.npy").is_file() and (P.labels / name / "meta.json").is_file():
             from tools.ck.data import common as CM
@@ -517,7 +597,7 @@ def stage_label(P: Paths, a) -> None:
 def stage_infer_check(P: Paths, a, tol_logit: float = 3e-2, tol_traj: float = 2e-3) -> Dict:
     import torch
     from navsim.agents.para_ssr.ck.model import load_ck
-    from navsim.agents.para_ssr.ck.online2 import lateral_decode, student_forward2
+    from navsim.agents.para_ssr.ck.online2 import infer_pool, lateral_decode, student_forward2
     from navsim.agents.para_ssr.refiner.e2e import ego_inputs
     f = P.infer / "check_bev.npz"
     if not f.is_file():
@@ -538,13 +618,39 @@ def stage_infer_check(P: Paths, a, tol_logit: float = 3e-2, tol_traj: float = 2e
     else:
         dev = torch.device("cpu")
     net, cfg = load_ck(P.ck_run, "last", str(dev))
-    cand = torch.from_numpy(np.load(P.packed / "cand96.npy", mmap_mode="r")[rows].astype(np.float32)).to(dev)
+    raw = torch.from_numpy(np.load(P.packed / "cand96.npy", mmap_mode="r")[rows].astype(np.float32)).to(dev)
     status = torch.from_numpy(np.load(P.packed / "status.npy", mmap_mode="r")[rows].astype(np.float32)).to(dev)
+    # the pool exactly as CKE2E2.infer scores it: sanitised candidates + each candidate's parent (refiner v4 parent-pass
+    # readouts read the scene on the parent's corridor; the mean readout ignores the parents)
+    cand, fin, par = infer_pool(raw, raw[:, ::6])
+    bev_t = torch.from_numpy(bev).to(dev)
+    computed = bool(getattr(getattr(net, "v4", None), "computed_edits", False))
     with torch.no_grad():
-        o = student_forward2(net, torch.from_numpy(bev).to(dev), cand, status)
+        if getattr(net, "corrector", None) is not None or computed:
+            # refiner v4 corrector A / v4_3 computed edits: the same ops as CKE2E2.infer (score_set + correct_topk or
+            # computed_edits on the same parent pass), edits checked too
+            ego = ego_inputs(status)
+            feat, mem = net.trunk.scene(bev_t, cand.shape[0])
+            pref = net.scene_pref(mem, ego)
+            corr = getattr(net, "corrector", None) is not None
+            o = net.score_set(feat, mem, ego, cand, par, pref=pref, return_ctx=corr,
+                              **({"return_pctx": True} if computed else {}))
+            valid = torch.from_numpy(np.load(P.packed / "valid96.npy", mmap_mode="r")[rows].astype(bool)).to(dev)
+            if computed:
+                ce = net.computed_edits(feat, mem, ego, cand, par, o, pref=pref, valid=valid & fin)
+            else:
+                ce = net.correct_topk(feat, mem, ego, cand, par, o, pref=pref, valid=valid & fin)
+        else:
+            o = student_forward2(net, bev_t, cand, status, cand_parent=par)
+            ce = None
         lat = lateral_decode(cand, o["w_lat"], ego_inputs(status)[0], 0.0)
     got = {"score_logit": o["score_logit"], "w_lat": o["w_lat"], "e_lat": lat["e_lat"][..., 2:],
            "lat_traj": lat["traj"]}
+    if ce is not None and (P.infer / "edit_score_logit.npy").is_file():
+        got.update(edit_score_logit=ce["edit_score_logit"], edit_traj=ce["edit_traj"])
+        src_ref = np.load(P.infer / "edit_src.npy", mmap_mode="r")[rows]
+        if not np.array_equal(ce["src_idx"].cpu().numpy(), src_ref):
+            raise SystemExit("infer_check failed: the corrector shortlist (edit_src) differs from the dump")
     err = {}
     for k, v in got.items():
         ref = np.load(P.infer / f"{k}.npy", mmap_mode="r")[rows].astype(np.float32)
@@ -600,9 +706,13 @@ def stage_summary(run_dir: Path, sel_w=None, offset=None) -> Dict:
         ck_by[split] = {k: (m.get("model") or {}).get(k) for k in ("ckpt", "ckpt_sha16", "ep_target", "code_sha16")}
         keep = {"v2", "v2_lat", "oracle16", "oracle96", "oracle96_lat", m.get("representative"),
                 "sel b=1 set=all lat=on"}
+        if m.get("edits"):              # refiner v4 edits: the 96 + K headline + the 96-only rows on the same tokens
+            keep |= {m["edits"].get("same_tokens_96"), m["edits"].get("best_96"), m["edits"].get("headline")}
         rows = {r["key"]: r for r in m["rows"] if r["key"] in keep}
         out["splits"][split] = {"n_eval": m["n_eval"], "n_total": m["n_total"], "n_logs": m["n_logs"],
                                 "choice": m.get("best") or m.get("fixed_from_val"),
+                                **({"choice_edits": m.get("best_edits") or m.get("fixed_edits_from_val"),
+                                    "edits": m["edits"]} if m.get("edits") else {}),
                                 "representative": m.get("representative"), "rows": rows,
                                 "infer_check": U.read_json(ev / "root/infer" / name / split / "infer_check.json"),
                                 "model": ck_by[split],
@@ -624,7 +734,10 @@ def stage_summary(run_dir: Path, sel_w=None, offset=None) -> Dict:
          f"{out['calib_offset_values'] or 'OFF'}. 공식 채점(score_token, "
          "LQR) [실측]. β·변형 집합·측방 모드는 navtrain_val에서만 골랐다. ★ = 대표 행. oracle·β=1 행은 서술용. 단위 0-100.", ""]
     for split, sp in out["splits"].items():
-        L += [f"## {split}", "", f"토큰 {sp['n_eval']} / {sp['n_total']}, log {sp['n_logs']}. 선택: {sp['choice']}", "",
+        ce_ = (f" 96+K 선택: {sp['choice_edits']} (대표 행 = 96+K, 같은 토큰의 96 행 대비 ΔPDMS "
+               f"{EV.fmt_ci((sp.get('edits') or {}).get('d_vs_96_same'))})" if sp.get("edits") else "")
+        L += [f"## {split}", "", f"토큰 {sp['n_eval']} / {sp['n_total']}, log {sp['n_logs']}. 선택: {sp['choice']}{ce_}",
+              "",
               "| 행 | PDMS | ΔPDMS vs v2 [95% CI] | NC | DAC | EP | TTC | C | 앞차 감속 NC/TTC 실패 (n) | 바뀐 비율 | 측방 적용 |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
         for k, r in sp["rows"].items():

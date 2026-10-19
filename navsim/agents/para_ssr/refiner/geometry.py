@@ -42,7 +42,9 @@ Path model (DraftPath)
   Beyond S_end (last vertex): circular-arc extension from V_end with the tangent of Gamma_sm at S_end and curvature
              kappa_ext (0 = straight unless extend() was called; 'const_curv' = the spline's end curvature, i.e. the
              last segment's, clipped to kappa_limit(v_end); C2 junction).  eval() flags s > S_end ('beyond') and
-             s > S_end + ext_len ('beyond_ext').
+             s > S_end + ext_len ('beyond_ext').  extend(arc_len=L) (refiner-fix B1, corridor version 2) ends the
+             arc after L and continues straight along the tangent there; arc_len=None keeps the original
+             never-ending arc (bit-identical).
 
 Deviations from IMPL_SPEC §3.1 (documented, interfaces unchanged)
   * "parameterised by arc length": the parameter is the chord arc length (the scorer's), not the spline's own arc
@@ -196,7 +198,7 @@ class DraftPath:
       merge_eps: knot merge threshold [m] for the smooth frame.
     Attributes (B = batch, K = N + 1 vertices):
       V [B,K,2], H [B,K] (unwrapped vertex headings, H[:,0] = 0), S [B,K], ell [B,K-1], keep [B,K] (spline knots),
-      S_end [B], kappa_ext [B], ext_len [B].
+      S_end [B], kappa_ext [B], ext_len [B], ext_arc [B] or None.
     """
 
     def __init__(self, poses, n_valid=None, merge_eps: float = MERGE_EPS, dtype=None, end_bc: str = END_BC):
@@ -235,6 +237,7 @@ class DraftPath:
         self._fit()
         self.kappa_ext = P.new_zeros(B)
         self.ext_len = P.new_zeros(B)
+        self.ext_arc = None          # [B] curved length of the extension (extend(arc_len=)); None = the arc never ends
 
     # ------------------------------------------------------------------------------------------- fitting
     def _fit(self):
@@ -376,7 +379,7 @@ class DraftPath:
         Sk1 = torch.gather(S, 1, k + 1)
         return Sk + (Sk1 - Sk) * (torch.clamp(t, min=0.0) - k.to(S.dtype) * T_POSE) / T_POSE
 
-    def extend(self, length, policy: str = "const_curv", v=None) -> "DraftPath":
+    def extend(self, length, policy: str = "const_curv", v=None, arc_len=None) -> "DraftPath":
         """Set the extension beyond S_end (in place, returns self).
 
         policy 'const_curv': circular arc starting with the tangent of Gamma_sm at S_end and the curvature of the
@@ -386,9 +389,14 @@ class DraftPath:
             chords (architecture_draft_v0 M4 rule; kept for comparison).
         policy 'straight': kappa = 0.
         length: [B] or float, the extension length that counts as "allowed" (eval flags s > S_end + length).
+        arc_len: None (default: the arc continues for every s > S_end, the original behaviour) or [B] / float: the
+            curvature applies only for s - S_end <= arc_len; beyond, the path continues STRAIGHT along the tangent at
+            S_end + arc_len (corridor version 2, refiner-fix B1: no loops past the look-ahead).
         """
         B, dt, dev = self.B, self.S.dtype, self.S.device
         self.ext_len = torch.broadcast_to(as_tensor(length, dtype=dt, device=dev), (B,)).clone()
+        self.ext_arc = (None if arc_len is None else
+                        torch.clamp(torch.broadcast_to(as_tensor(arc_len, dtype=dt, device=dev), (B,)), min=0.0).clone())
         if policy == "straight":
             self.kappa_ext = torch.zeros(B, dtype=dt, device=dev)
             return self
@@ -442,17 +450,32 @@ class DraftPath:
         beyond = s > self.S_end[:, None]
         u = torch.clamp(s - self.S_end[:, None], min=0.0)
         ke = self.kappa_ext[:, None]
-        th = self.theta_end[:, None] + 0.5 * ke * u
-        sc = u * torch.sinc(ke * u / TWO_PI)
-        xy_e = self.V[:, -1][:, None] + torch.stack([sc * torch.cos(th), sc * torch.sin(th)], -1)
-        th_t = self.theta_end[:, None] + ke * u
-        T_e = torch.stack([torch.cos(th_t), torch.sin(th_t)], -1)
-        head_e = self.H[:, -1][:, None] + ke * u
+        if self.ext_arc is None:
+            # original: the arc continues for every s > S_end
+            th = self.theta_end[:, None] + 0.5 * ke * u
+            sc = u * torch.sinc(ke * u / TWO_PI)
+            xy_e = self.V[:, -1][:, None] + torch.stack([sc * torch.cos(th), sc * torch.sin(th)], -1)
+            th_t = self.theta_end[:, None] + ke * u
+            T_e = torch.stack([torch.cos(th_t), torch.sin(th_t)], -1)
+            head_e = self.H[:, -1][:, None] + ke * u
+            ke_s = ke.expand(B, M)
+        else:
+            # arc for u <= ext_arc, then straight along the tangent at S_end + ext_arc (extend(arc_len=))
+            uc = torch.minimum(u, self.ext_arc[:, None])
+            us = u - uc
+            th = self.theta_end[:, None] + 0.5 * ke * uc
+            sc = uc * torch.sinc(ke * uc / TWO_PI)
+            th_t = self.theta_end[:, None] + ke * uc
+            T_e = torch.stack([torch.cos(th_t), torch.sin(th_t)], -1)
+            xy_e = (self.V[:, -1][:, None] + torch.stack([sc * torch.cos(th), sc * torch.sin(th)], -1)
+                    + us[..., None] * T_e)
+            head_e = self.H[:, -1][:, None] + ke * uc
+            ke_s = torch.where(us > 0, torch.zeros_like(us), ke.expand(B, M))
         b2 = beyond[..., None]
         xy = torch.where(b2, xy_e, xy)
         T = torch.where(b2, T_e, T)
         head = torch.where(beyond, head_e, head)
-        kappa = torch.where(beyond, ke.expand(B, M), kappa)
+        kappa = torch.where(beyond, ke_s, kappa)
         g = torch.where(beyond, torch.ones_like(g), g)
         g_s = torch.where(beyond, torch.zeros_like(g_s), g_s)
         kappa_s = torch.where(beyond, torch.zeros_like(kappa_s), kappa_s)

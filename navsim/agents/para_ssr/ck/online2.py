@@ -43,6 +43,13 @@ Student CK loss (added after the v2 grad balancer, outside it; ParaSSRAgent.comp
   No longitudinal head: trunk.lon_head is zeroed + frozen and every decode passes z_lon = 0 explicitly (student and
   teachers); trunk.gate_head is frozen.  No tau'_KD, no rescore KD, no control KD on c_lon.
   KD is off for a token without a DET or MAP BEV (combine_teacher kd_ok = det ok & map ok).
+Temporal DET teacher (refiner-v3, docs/refiner_v3/STEP2_E2E.md; decided by the DET teacher run's OWN config.json
+  temporal cfg, no ck_e2e2 key): load_ck rebuilds the temporal branch (a PRIVILEGED run is refused), the target builder
+  adds the teacher's CLEAN causal object rows of the train object pack (e2e_data2.KDObjRows: kd_obj_in_0 /
+  kd_obj_mask_0 / kd_frame_valid_0 / kd_obj_ok_0) and TeacherPair2.run feeds exactly OBJ_INPUT_KEYS to the DET
+  teacher's TemporalBranch.scene + hook (= CKNet.forward(..., objs=) of train_ck2 / infer_val_v3, fp16 autocast on CUDA
+  as their evaluations); kd_obj_ok_0 False -> the DET teacher's ok False -> KD off for the token.  The MAP teacher and
+  the student (CK2, no temporal branch) are unchanged; a non-temporal DET teacher runs the old code path bit for bit.
 BEV-KD arm (bev_kd.enabled; ck/bev_kd_arm.py): + adapter_weight * sum_t L_t(GradScale(bev_embed, lam_t / adapter_weight))
   over bev_kd.teachers (arm: [det, map], user 2026-10-08 ~20:40 KST), one RatioController per teacher (lam_t * |dL_t/dBEV|
   ~ ratio x |g_plan|, measured per teacher on the v2 'gnorm/plan' micro-batches, all-reduced); returned inside the CK
@@ -54,6 +61,38 @@ Non-finite: a non-finite L_CK2 is replaced by 0 * sum(student params) (counted);
 Inference (eval, infer_outputs): ck2_* outputs over the 96-candidate pool (v2 top-16 x 6 variants, c = k * 6 + v):
   CK2 logits, the learned lateral control / offsets and every column's laterally corrected trajectory; the selection
   (ck/select2.py: old ck_final blended with v2 by beta, lateral applied after selection) happens in the evaluation.
+refiner v4_3 (docs/refiner_v4/V4_3_SPEC.md M5 / M6; every option OFF by default = the paths above unchanged):
+  the v4_3 knobs are OPTIONAL keys of the v4 block (_d_v4_opt: absent from the defaults / ck_e2e2.yaml, so the older
+    arms' configs are unchanged); v4.readout 'range' + its keys (exec_model, ev_tbins, ev_tbin_s, ep_evidence, vmax)
+    pass through to V4Cfg;
+  v4.edits 'computed': infer adds the computed edits of the critic's top-edit_k parents of the 96 pool (CKNet.
+    computed_edits on the same parent pass) as ck2_edit_* (+ ck2_edit_valid, ck2_edit_kind; extra candidates, never a
+    gate; ck2_edit_valid False for filler slots and, without the corrector, for no-edit slots: kind 0 = the source
+    column bitwise); on-policy steps record the edits of the KD set (computed_edits_rec, same validity rule) in the rec2
+    edit block, labeler2 labels them with the 96, and LabelStore2(with_edits) puts them in the next epochs' BCE label
+    set (as the corrector's edits; the AWR term only with v4.corrector); logs v4/edit_rec_{valid,lon,lat,both}_frac and
+    v4/edit_clear_frac (the made edits that read inside the predicted tube);
+  infer_select.edits (optional; required when the student emits edits): true = ck2_traj / ck2_sel_idx over the 96 + K
+    (select96_edits = eval_ck2's 96 + K rule; an edit pick is the edit itself, no lateral head), false = the 96 only;
+  v4.kd_score_scope 'near': NC score KD only on tokens whose nearest lead (lead_ttc0) has ttc0 < NEAR_TTC_S, DAC score KD
+    only on candidates whose parent's min executed corner SDF (parent_min_corner_sdf) < NEAR_SDF_M, from the ref_* GT
+    (tokens without GT excluded; a batch without the ref_* keys is a ValueError); other KD keys unrestricted
+    (score_kd_near: each key's KL is the mean over its own mask, so the per-candidate NC / DAC weight is ~1 / (near
+    fraction) times the 'all' weight while each key's total weight stays lambda_kd_score / n_keys);
+  v4.kd_constraint: + r * (lambda_occ * BCE(student B, sigmoid(DET teacher B)) (occ_channels 'BU': + the U channel,
+    'BBp': + the Bp channel (R2 only), 'all': B, U, Bp) + lambda_margin * Huber(student D, MAP teacher D) on
+    s <= map_range_m) on the student's unique parents of the KD set (constraint_kd), teacher fields from
+    TeacherPair2.run(fields=kd_constraint_request(occ_channels)) (the requested groups; range teachers on the student's
+    grid with the student's rg_stopped_aware only -- rg_read may differ, recorded at launch: check_constraint_teachers
+    at runtime, the same rule and message at launch, launch_util2.kd_constraint_check);
+  v4.rg_read / v4.rg_stopped_aware (Phase 0b R2): V4Cfg keys of the student's range readout (any4 read; the B target
+    rule of its GT field aux + the Bp group that its TTC reads (V4Cfg docstring); the computed edits read the same way,
+    ck/v4/edits.py); rg_stopped_aware is also required of both teachers for the constraint KD (an R2 student with R2
+    teachers distils the stopped-aware B as B), rg_read is not (how a field is read, not what a cell holds);
+  v4.rg_gt_aux {enabled, lambda, max_parents}: + lambda * (BCE(student B / U (/ Bp), GT) + Huber(student D, GT SDF)) on the
+    student's first max_parents unique own-parent rows of the KD set (range_targets.gt_field_aux, the range teachers'
+    aux), GT computed online from the batch's ref_obj_* / ref_sdf: a training TARGET only (never an input), tokens
+    without GT masked, independent of kd_constraint.
 """
 from __future__ import annotations
 
@@ -77,10 +116,10 @@ from .online import N_ROWS, _sanitize_traj, bev_sgrid, label_supply_warning, stu
 # SPEC s1-3 names).
 from . import cands2 as C2  # noqa: E402
 from .cands2 import online_variants, v0_from_status  # noqa: E402,F401
-from .e2e_data2 import (EP_TARGET_DEFAULT, G_K, GROUP_VAR, K16, N_NEAR_MID, NV, SRC_FALLBACK,  # noqa: E402,F401
-                        SRC_NAMES, SRC_NODATA, SRC_OLDER, SRC_PREV, STREAM_LAB, STREAM_NOW, STREAM_WU,
-                        TEACHER_DET_RUN, TEACHER_MAP_RUN, VAR_SAMPLING, VNAMES, CandRecorder2, draw_cols, sample_cols,
-                        type_balanced_cols, uniform_cols)
+from .e2e_data2 import (EP_TARGET_DEFAULT, G_K, GROUP_VAR, K16, KD_OBJ_INPUT, KD_OBJ_KEYS, KD_OBJ_OK,  # noqa: E402,F401
+                        N_NEAR_MID, NV, SRC_FALLBACK, SRC_NAMES, SRC_NODATA, SRC_OLDER, SRC_PREV, STREAM_LAB,
+                        STREAM_NOW, STREAM_WU, TEACHER_DET_RUN, TEACHER_MAP_RUN, VAR_SAMPLING, VNAMES, CandRecorder2,
+                        draw_cols, sample_cols, teacher_temporal, type_balanced_cols, uniform_cols)
 from .ep_target import EP_TARGETS  # noqa: E402
 from .kd_calib import calib_path  # noqa: E402
 
@@ -105,7 +144,10 @@ def _d_lat_kd() -> Dict[str, Any]:
 def _d_warmup() -> Dict[str, Any]:
     return {"packed": f"{_CK}/packed/navtrain_train", "raw_labels": f"{_CK}/labels/navtrain_train/raw256",
             "var_dir": f"{_CK}/ck2/labels/navtrain_train/var_separate_sampler16_accstraight", "sampler_seed": 0,
-            "n_var": 32, "sur_groups": "near_mid", "lat_kd_groups": "near_mid"}
+            "n_var": 32, "sur_groups": "near_mid", "lat_kd_groups": "near_mid",
+            # refiner v4 (optional): first-failure time-index sidecars of raw_labels / var_dir
+            # (tools/ck/v4/build_time_idx.py) and the label-derived P_ref of the warm-up rows
+            "raw_tidx": None, "var_tidx": None, "pref": False}
 
 
 def _d_onpolicy_label() -> Dict[str, Any]:
@@ -122,7 +164,9 @@ def _d_kd_calib() -> Dict[str, Any]:
 def _d_bev_kd() -> Dict[str, Any]:
     # ratio_<t> / cap_<t>: optional per-teacher overrides of ratio / cap (None = the shared value) for that teacher's
     # RatioController (bev_kd_arm.controllers_from_cfg)
-    return {"enabled": False, "teachers": ["det"], "distance": "mse", "init": "zero", "ln": True, "target_clip": None,
+    # refiner-v4 default (user 2026-10-15: the ck2e2e_bevkd setting = BEV KD from both teachers); the ck2e2e_main arm
+    # (enabled false, teachers [det]) is tools/ck/e2e2/main_arm.set
+    return {"enabled": True, "teachers": ["det", "map"], "distance": "mse", "init": "zero", "ln": True, "target_clip": None,
             "ratio": 0.1, "cap": 0.25, "m": 0.9, "w_max": None, "start_mb": 10600, "adapter_weight": 1.0,
             "lr_mult": 3.0, "weight_decay": 0.01, "ratio_det": None, "ratio_map": None, "cap_det": None,
             "cap_map": None}
@@ -131,10 +175,88 @@ def _d_bev_kd() -> Dict[str, Any]:
 BEV_KD_PER_TEACHER = ("ratio_det", "ratio_map", "cap_det", "cap_map")
 
 
+def _d_v4() -> Dict[str, Any]:
+    # refiner v4 (ck/v4): network readout (V4Cfg keys) + student loss weights + corridor version + KD routing.
+    # Defaults = off (the CK2 / refiner-v3 student, bit for bit); tools/ck/e2e2/v4_arm.set turns the v4 design on.
+    return {"readout": "mean", "pref_head": False, "time_free": True, "lat_haz": True, "horizon": 4.0,
+            "lambda_pref": 0.1, "lambda_station": 0.5, "lambda_ev": 0.5, "corridor_version": 1,
+            "kd_parent_only": False, "corrector": False, "corr_k": 8, "lambda_awr": 0.1}
+
+
+def _d_v4_opt() -> Dict[str, Any]:
+    # refiner v4_3 (docs/refiner_v4/V4_3_SPEC.md; tools/ck/e2e2/v4_3_arm.set): OPTIONAL keys of the v4 block.  They are
+    # neither in the defaults nor in ck_e2e2.yaml, so every older arm's effective ck_e2e2 dict, override list and
+    # to_dict stay exactly as before; a dict / set file that names one adds it (launch_util2.apply_sets2 declares it
+    # at this default before applying the set lines) and CKE2E2Config.v4_opt reads it (absent = this default).
+    #   exec_model .. edit_dlat: V4Cfg v4_3 keys (read by the 'range' readout only; defaults = V4Cfg's);
+    #   kd_score_scope 'all' (old) | 'near' (NC score KD on tokens whose nearest lead has ttc0 < NEAR_TTC_S, DAC score
+    #     KD on candidates whose parent's min executed corner SDF < NEAR_SDF_M; both from the ref_* GT, train only);
+    #   kd_constraint: the constraint KD block (_d_kd_constraint);
+    #   rg_read / rg_stopped_aware: V4Cfg's Phase 0b R2 keys (range readout: B / U read 'nearest' | 'any4'; the B
+    #     target of the student's own GT field aux = the stopped-aware blocked field);
+    #   rg_gt_aux: the student's own GT field aux block (_d_rg_gt_aux).
+    return {"exec_model": "plan", "ev_tbins": 10, "ev_tbin_s": 0.25, "ep_evidence": False, "vmax": "off",
+            "edits": "off", "edit_k": 8, "edit_dt": 0.2, "edit_dlat": 0.3, "kd_score_scope": "all",
+            "kd_constraint": _d_kd_constraint(), "rg_read": "nearest", "rg_stopped_aware": False,
+            "rg_gt_aux": _d_rg_gt_aux()}
+
+
+V4_NET_KEYS = ("readout", "pref_head", "time_free", "lat_haz", "horizon", "corrector", "corr_k")
+V4_NET_OPT_KEYS = ("exec_model", "ev_tbins", "ev_tbin_s", "ep_evidence", "vmax", "edits", "edit_k", "edit_dt",
+                   "edit_dlat", "rg_read", "rg_stopped_aware")   # optional v4 keys passed to V4Cfg when present
+
+
+def _d_kd_constraint() -> Dict[str, Any]:
+    # refiner v4_3 M6 constraint KD (docs/refiner_v4/V4_3_SPEC.md; constraint_kd), ck_e2e2.v4.kd_constraint: the DET
+    # teacher's blocked field groups (sigmoid of its range logits; occ_channels = CN_GROUPS: 'B' = the B channel only =
+    # spec M6 "DET B BCE", the default (the stopped-aware B for an R2 student / teacher pair, the plain not-behind B
+    # otherwise); 'BU' = + the TTC overlap channel U; 'BBp' = + the plain not-behind Bp that an R2 readout's TTC reads
+    # below the 2 m switch (rg_stopped_aware students only); 'all' = B, U, Bp (R2 only).  Options beyond 'B' are not
+    # confirmed by the user: with 'B' the student's U (/ Bp), read by its TTC key and by the edits' TTC windows, learns
+    # from the TTC label BCE (and rg_gt_aux) only) -> the student's logits, BCE (lambda_occ), and the MAP teacher's
+    # margin D -> the student's D, Huber (lambda_margin) on the stations s <= map_range_m (the ReSMap BEV's front
+    # reach), both on the student's unique parents of the KD set and masked by the teacher's per-token ok.  enabled
+    # false = no term (old KD exactly).
+    return {"enabled": False, "lambda_occ": 0.5, "lambda_margin": 0.5, "map_range_m": 32.0, "occ_channels": "B"}
+
+
+def _d_rg_gt_aux() -> Dict[str, Any]:
+    # refiner v4_3 (c) student GT range aux (ck_e2e2.v4.rg_gt_aux; range_targets.gt_field_aux, the range teachers'
+    # train_ck2.range_gt_aux): the student's OWN B / U logits (BCE) and margin D (Huber) on its first max_parents unique
+    # own-parent rows of the KD set, against the GT fields computed online from the batch's ref_obj_* / ref_sdf (the
+    # B target rule = v4.rg_stopped_aware); train time only, tokens without GT (ref_gt_ok False) masked, weight lambda
+    # (not ramped: a GT term, not KD), independent of kd_constraint.  The GT objects / SDF are TARGETS only, never an
+    # input of the student.  enabled false = no term (the old loss exactly).
+    return {"enabled": False, "lambda": 0.5, "max_parents": 8}
+
+
+KD_SCORE_SCOPES = ("all", "near")
+# constraint KD field groups (kd_constraint.occ_channels -> the distilled groups, in this order); a range net's groups:
+# B (occ_logit_u; the stopped-aware B with rg_stopped_aware), U (ovl_logit_u), Bp (bp_logit_u, rg_stopped_aware only)
+CN_GROUPS = {"B": ("B",), "BU": ("B", "U"), "BBp": ("B", "Bp"), "all": ("B", "U", "Bp")}
+OCC_CHANNELS = tuple(CN_GROUPS)
+FIELD_GROUP_KEY = {"B": "occ_logit_u", "U": "ovl_logit_u", "Bp": "bp_logit_u"}    # score_set haz key of each group
+FIELDS_TRUE = ("B", "U")           # teacher_forward(return_fields=True) / run(fields=True): the original B | U dict
+NEAR_TTC_S = 4.0                   # [s] kd_score_scope 'near': NC KD where the nearest lead's ttc0 < this
+NEAR_SDF_M = 1.0                   # [m] kd_score_scope 'near': DAC KD where the parent's min executed corner SDF < this
+# the targets kd_score_scope 'near' reads (lead_ttc0 + parent_min_corner_sdf); absent -> ValueError (_near_scope)
+NEAR_REF_KEYS = ("ref_gt_ok", "ref_obj_kf", "ref_obj_first", "ref_obj_meta", "ref_obj_n", "ref_obj_n_kf", "ref_cl_xy",
+                 "ref_cl_valid", "ref_sdf")
+LEAD_CLASSES = (0, 2)              # refiner.gt_future.CLASS_NAMES: vehicle, bicycle (tools/ck/data/lead_split.py rule)
+LEAD_LAT_M, LEAD_DH_RAD, LEAD_GAP_MAX, LEAD_EGO_FRONT = 1.8, math.radians(60.0), 80.0, 4.049
+TTC0_NONE = 99.0                   # [s] ttc0 without a closing lead (lead_split.py convention)
+CK_MARGIN_CLIP = 5.0               # [m] margin targets clipped like losses.evidence_aux / train_ck2's range aux
+RANGE_U_KEYS = ("occ_logit_u", "ovl_logit_u", "margin_u", "bp_logit_u")   # score_set range haz keys per PARENT row
+                                                                           # (not per candidate; bp: rg_stopped_aware)
+
+
 _NESTED2 = {"variants": _d_variants, "lat_kd": _d_lat_kd, "warmup": _d_warmup, "onpolicy_label": _d_onpolicy_label,
-            "bev_kd": _d_bev_kd, "kd_calib": _d_kd_calib}
+            "bev_kd": _d_bev_kd, "kd_calib": _d_kd_calib, "v4": _d_v4}
 KD_CALIB_TEACHERS = ("det", "map")
 _INFER_SELECT_KEYS = ("beta", "set", "lat_mode")
+# optional: edits (bool) = select over the 96 pool + the student's K edits (select96_edits, eval_ck2's 96 + K rule);
+# required when the student emits edits (v4.corrector / v4.edits computed), absent = the old 96-only selection
+_INFER_SELECT_OPT = ("edits",)
 
 
 def _b(v) -> bool:
@@ -147,6 +269,12 @@ def _opt_float(v) -> Optional[float]:
 
 def _opt_str(v) -> Optional[str]:
     return None if v is None or (isinstance(v, str) and v.strip().lower() in ("none", "null", "")) else str(v)
+
+
+def _mode_str(v) -> str:
+    """mode strings whose value may be 'off' (v4.vmax / v4.edits): YAML 1.1 (PyYAML, the launcher's set-file parser)
+    reads an unquoted off as False -> 'off'."""
+    return "off" if v is False else str(v)
 
 
 def _str_list(v) -> List[str]:
@@ -203,6 +331,7 @@ class CKE2E2Config:
     infer_select: Optional[Dict[str, Any]] = None
     strict_rows: float = 0.999
     bev_kd: Dict[str, Any] = field(default_factory=_d_bev_kd)
+    v4: Dict[str, Any] = field(default_factory=_d_v4)
 
     # ------------------------------------------------------------------------------------------ parse
     @classmethod
@@ -233,7 +362,8 @@ class CKE2E2Config:
                     v = {}
                 if not isinstance(v, dict):
                     raise ValueError(f"ck_e2e2.{k} must be a mapping, got {v!r}")
-                bad = sorted(set(v) - set(base))
+                allowed = set(base) | (set(_d_v4_opt()) if k == "v4" else set())   # v4: + the optional v4_3 keys
+                bad = sorted(set(v) - allowed)
                 if bad:
                     raise ValueError(f"ck_e2e2.{k}: unknown key(s) {bad}")
                 base.update(v)
@@ -244,9 +374,10 @@ class CKE2E2Config:
                     continue
                 if not isinstance(v, dict):
                     raise ValueError(f"ck_e2e2.infer_select must be a mapping or null, got {v!r}")
-                bad = sorted(set(v) - set(_INFER_SELECT_KEYS))
-                if bad or set(v) != set(_INFER_SELECT_KEYS):
-                    raise ValueError(f"ck_e2e2.infer_select needs exactly {list(_INFER_SELECT_KEYS)}, got {sorted(v)}")
+                bad = sorted(set(v) - set(_INFER_SELECT_KEYS) - set(_INFER_SELECT_OPT))
+                if bad or not set(_INFER_SELECT_KEYS) <= set(v):
+                    raise ValueError(f"ck_e2e2.infer_select needs exactly {list(_INFER_SELECT_KEYS)} (+ optional "
+                                     f"{list(_INFER_SELECT_OPT)}), got {sorted(v)}")
                 kw[k] = dict(v)
             else:
                 kw[k] = v
@@ -284,7 +415,9 @@ class CKE2E2Config:
         w = dict(self.warmup)
         self.warmup = {"packed": str(w["packed"]), "raw_labels": str(w["raw_labels"]), "var_dir": str(w["var_dir"]),
                        "sampler_seed": int(w["sampler_seed"]), "n_var": int(w["n_var"]),
-                       "sur_groups": str(w["sur_groups"]), "lat_kd_groups": str(w["lat_kd_groups"])}
+                       "sur_groups": str(w["sur_groups"]), "lat_kd_groups": str(w["lat_kd_groups"]),
+                       "raw_tidx": _opt_str(w.get("raw_tidx")), "var_tidx": _opt_str(w.get("var_tidx")),
+                       "pref": _b(w.get("pref", False))}
         o = dict(self.onpolicy_label)
         self.onpolicy_label = {"n_orig": int(o["n_orig"]), "n_var": int(o["n_var"]), "fallback": str(o["fallback"])}
         b = dict(self.bev_kd)
@@ -297,9 +430,39 @@ class CKE2E2Config:
                        **{k: _opt_float(b[k]) for k in BEV_KD_PER_TEACHER}}
         kc = dict(self.kd_calib)
         self.kd_calib = {"enabled": _b(kc["enabled"]), **{t: _opt_str(kc[t]) for t in KD_CALIB_TEACHERS}}
+        q = dict(self.v4)
+        self.v4 = {"readout": str(q["readout"]), "pref_head": _b(q["pref_head"]), "time_free": _b(q["time_free"]),
+                   "lat_haz": _b(q["lat_haz"]), "horizon": float(q["horizon"]), "lambda_pref": float(q["lambda_pref"]),
+                   "lambda_station": float(q["lambda_station"]), "lambda_ev": float(q["lambda_ev"]),
+                   "corridor_version": int(q["corridor_version"]),
+                   "kd_parent_only": _b(q["kd_parent_only"]), "corrector": _b(q["corrector"]),
+                   "corr_k": int(q["corr_k"]), "lambda_awr": float(q["lambda_awr"])}
+        cast = {"exec_model": str, "ev_tbins": int, "ev_tbin_s": float, "ep_evidence": _b, "vmax": _mode_str,
+                "edits": _mode_str, "edit_k": int, "edit_dt": float, "edit_dlat": float, "kd_score_scope": str,
+                "rg_read": str, "rg_stopped_aware": _b}
+        for k_, f_ in cast.items():                    # refiner v4_3 optional keys: only those given (_d_v4_opt)
+            if k_ in q:
+                self.v4[k_] = f_(q[k_])
+        if "kd_constraint" in q:
+            kq = dict(_d_kd_constraint(), **dict(q["kd_constraint"] or {}))
+            bad = sorted(set(kq) - set(_d_kd_constraint()))
+            if bad:
+                raise ValueError(f"ck_e2e2.v4.kd_constraint: unknown key(s) {bad}")
+            self.v4["kd_constraint"] = {"enabled": _b(kq["enabled"]), "lambda_occ": float(kq["lambda_occ"]),
+                                        "lambda_margin": float(kq["lambda_margin"]),
+                                        "map_range_m": float(kq["map_range_m"]), "occ_channels": str(kq["occ_channels"])}
+        if "rg_gt_aux" in q:
+            gq = dict(_d_rg_gt_aux(), **dict(q["rg_gt_aux"] or {}))
+            bad = sorted(set(gq) - set(_d_rg_gt_aux()))
+            if bad:
+                raise ValueError(f"ck_e2e2.v4.rg_gt_aux: unknown key(s) {bad}")
+            self.v4["rg_gt_aux"] = {"enabled": _b(gq["enabled"]), "lambda": float(gq["lambda"]),
+                                    "max_parents": int(gq["max_parents"])}
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
+            if "edits" in s:                 # optional (absent: the old dict exactly)
+                self.infer_select["edits"] = _b(s["edits"])
         self.io_dir = "" if self.io_dir is None else str(self.io_dir)
         self.teacher_det_run = "" if self.teacher_det_run in (None, "none", "None") else str(self.teacher_det_run)
         self.teacher_map_run = "" if self.teacher_map_run in (None, "none", "None") else str(self.teacher_map_run)
@@ -312,6 +475,30 @@ class CKE2E2Config:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def v4_opt(self, key: str):
+        """an optional v4_3 key of the v4 block (_d_v4_opt), its default when absent."""
+        return self.v4[key] if key in self.v4 else _d_v4_opt()[key]
+
+    @property
+    def kd_score_scope(self) -> str:
+        """refiner v4_3 M6 score-KD scope (v4.kd_score_scope; 'all' when absent)."""
+        return str(self.v4_opt("kd_score_scope"))
+
+    @property
+    def kd_constraint(self) -> Dict[str, Any]:
+        """refiner v4_3 M6 constraint KD block (v4.kd_constraint; off when absent)."""
+        return self.v4_opt("kd_constraint")
+
+    @property
+    def rg_gt_aux(self) -> Dict[str, Any]:
+        """refiner v4_3 (c) student GT range aux block (v4.rg_gt_aux; off when absent)."""
+        return self.v4_opt("rg_gt_aux")
+
+    def v4_net(self):
+        """V4Cfg of the student network (ck/v4/config.py; the v4 block's network keys + the optional v4_3 ones given)."""
+        from .v4.config import V4Cfg
+        return V4Cfg.from_dict({k: self.v4[k] for k in V4_NET_KEYS + V4_NET_OPT_KEYS if k in self.v4})
 
     @property
     def compute_dtype(self) -> torch.dtype:
@@ -377,6 +564,14 @@ class CKE2E2Config:
         if self.infer_select is not None:
             if not 0.0 <= self.infer_select["beta"] <= 1.0:
                 raise ValueError("ck_e2e2.infer_select.beta must be in [0, 1]")
+            emits = bool(self.v4["corrector"]) or self.v4_opt("edits") == "computed"
+            if "edits" not in self.infer_select and emits:
+                raise ValueError("ck_e2e2.infer_select: this student emits edits (v4.corrector / v4.edits computed); "
+                                 "set infer_select.edits true (96 + K, eval_ck2's headline rule with the val-chosen "
+                                 "beta / set) or false (the 96 pool only)")
+            if self.infer_select.get("edits") and not emits:
+                raise ValueError("ck_e2e2.infer_select.edits true needs a student with edits (v4.corrector or "
+                                 "v4.edits computed)")
         bk = self.bev_kd
         if bk["enabled"]:
             from .bev_kd import DISTANCES, INITS, TEACHERS
@@ -398,6 +593,43 @@ class CKE2E2Config:
                 if k.split("_", 1)[1] not in bk["teachers"]:
                     raise ValueError(f"ck_e2e2.bev_kd.{k} is set but teacher {k.split('_', 1)[1]!r} is not in "
                                      f"bev_kd.teachers {bk['teachers']}")
+        q = self.v4
+        try:
+            self.v4_net()
+        except ValueError as e:
+            raise ValueError(f"ck_e2e2.v4: {e}") from None
+        from ..refiner.corridor import CORRIDOR_VERSIONS
+        if q["corridor_version"] not in CORRIDOR_VERSIONS:
+            raise ValueError(f"ck_e2e2.v4.corridor_version must be in {CORRIDOR_VERSIONS}, got {q['corridor_version']}")
+        if q["corrector"] and q["corr_k"] != 8:
+            raise ValueError("ck_e2e2.v4.corrector: corr_k must be 8 (= e2e_data2.EDIT_K, the recorded edit block)")
+        if self.v4_opt("edits") == "computed" and self.v4_opt("edit_k") != 8:
+            raise ValueError("ck_e2e2.v4.edits computed: edit_k must be 8 (= e2e_data2.EDIT_K, the recorded edit block)")
+        if q["lambda_pref"] < 0 or q["lambda_station"] < 0 or q["lambda_ev"] < 0 or q["lambda_awr"] < 0:
+            raise ValueError(f"ck_e2e2.v4 lambda_pref / lambda_station must be >= 0, got {q}")
+        if self.kd_score_scope not in KD_SCORE_SCOPES:
+            raise ValueError(f"ck_e2e2.v4.kd_score_scope must be one of {KD_SCORE_SCOPES}, got {self.kd_score_scope!r}")
+        kq = self.kd_constraint
+        if kq["enabled"]:
+            if q["readout"] != "range":
+                raise ValueError(f"ck_e2e2.v4.kd_constraint needs the student readout 'range' (its B / U / D fields), got "
+                                 f"v4.readout {q['readout']!r}")
+            if not (kq["lambda_occ"] >= 0 and kq["lambda_margin"] >= 0 and kq["map_range_m"] > 0):
+                raise ValueError(f"ck_e2e2.v4.kd_constraint needs lambda_occ, lambda_margin >= 0 and map_range_m > 0, got "
+                                 f"{kq}")
+            if kq["occ_channels"] not in OCC_CHANNELS:
+                raise ValueError(f"ck_e2e2.v4.kd_constraint.occ_channels must be one of {OCC_CHANNELS}, got "
+                                 f"{kq['occ_channels']!r}")
+            if "Bp" in CN_GROUPS[kq["occ_channels"]] and not _b(self.v4_opt("rg_stopped_aware")):
+                raise ValueError(f"ck_e2e2.v4.kd_constraint.occ_channels {kq['occ_channels']!r} distils the Bp group: "
+                                 f"R2 only (needs v4.rg_stopped_aware true; 'B' / 'BU' otherwise)")
+        gq = self.rg_gt_aux
+        if gq["enabled"]:
+            if q["readout"] != "range":
+                raise ValueError(f"ck_e2e2.v4.rg_gt_aux needs the student readout 'range' (its B / U / D fields), got "
+                                 f"v4.readout {q['readout']!r}")
+            if not (gq["lambda"] >= 0 and gq["max_parents"] >= 1):
+                raise ValueError(f"ck_e2e2.v4.rg_gt_aux needs lambda >= 0 and max_parents >= 1, got {gq}")
         kc = self.kd_calib
         if kc["enabled"]:
             if all(kc[t] is None for t in KD_CALIB_TEACHERS):
@@ -416,6 +648,18 @@ class CKE2E2Config:
                 arm = json.loads(cj.read_text()).get("arm")
                 if arm != want:
                     raise ValueError(f"ck_e2e2.{key} {run}: config.json arm {arm!r}, expected {want!r}")
+                # refiner-v3 temporal teacher (its own config.json; off for every CK2 run): DET only, never privileged
+                tc = teacher_temporal(run)
+                if tc.on:
+                    if key != "teacher_det_run":
+                        raise ValueError(f"ck_e2e2.{key} {run}: temporal branch on a MAP teacher is not supported")
+                    if tc.privileged:
+                        raise ValueError(f"ck_e2e2.{key} {run}: PRIVILEGED temporal run (forecaster {tc.forecaster!r}, "
+                                         f"source {tc.source!r}) can never be a KD teacher")
+                    try:
+                        tc.validate(want)
+                    except (ValueError, NotImplementedError) as e:
+                        raise ValueError(f"ck_e2e2.{key} {run}: temporal cfg: {e}") from None
         # the warm-up variant label files must be the same variant definition (speeds, lats, combine, s_on_frac,
         # names, accel extension)
         if (Path(self.warmup["var_dir"]) / "build.json").is_file():
@@ -467,7 +711,12 @@ def build_student_ck2(cfg: CKE2E2Config, apply_prior: bool = True):
     from .model import CKNet
 
     cfg = CKE2E2Config.from_any(cfg)
-    net = CKNet("S", int(cfg.seed), score_hidden=256, lead_aux=False)
+    kw: Dict[str, Any] = {}                    # refiner v4 / refiner-fix B1 (defaults: the CK2 call, unchanged)
+    if cfg.v4["corridor_version"] != 1:
+        kw["corridor_version"] = int(cfg.v4["corridor_version"])
+    if cfg.v4_net().on:
+        kw["v4"] = cfg.v4_net()
+    net = CKNet("S", int(cfg.seed), score_hidden=256, lead_aux=False, **kw)
     net.trunk.adapter.bev_grad_scale = float(cfg.bev_grad_scale)
     frozen = freeze_lon_gate(net)
     rep: Dict[str, Any] = {"source": None, "score_prior": None, "score_prior_source": None, "frozen": frozen}
@@ -490,7 +739,243 @@ def lateral_decode(cand: torch.Tensor, w_lat: torch.Tensor, v0: torch.Tensor, sl
     return correct(cand.float(), torch.zeros_like(w), w, v0, slope)
 
 
+def _parents_or_self(cand: torch.Tensor, parent: Optional[torch.Tensor]) -> torch.Tensor:
+    return cand.float() if parent is None else parent.float()
+
+
+def split_haz(haz: Dict[str, torch.Tensor], lo: int, hi: Optional[int] = None) -> Dict[str, torch.Tensor]:
+    """The score_set 'haz' dict of the candidate columns [lo, hi) of a set: per-candidate tensors sliced on dim 1, the
+    range readout's per-PARENT-row fields (RANGE_U_KEYS, [T, U, ...]) kept whole -- their rows are what parent_index
+    [T, K] (sliced like a candidate tensor) points at."""
+    return {k: (v if k in RANGE_U_KEYS else v[:, lo:hi]) for k, v in haz.items()}
+
+
+def _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra_parent,
+                        return_pctx: bool = False) -> Dict:
+    """student_forward2 for a refiner v4 student (hazard readout and / or P_ref head): ONE score_set over cat(cand,
+    extra) with cat(parents) (None = itself) -> the student_forward2 keys + haz / extra_haz (split_haz: [B, K(2), ...]
+    candidate tensors, the range readout's per-parent fields whole) + pref_logp [B] (None without the P_ref head).
+    return_pctx (refiner v4_3 computed edits, recording): + 'pctx' / 'parent_index_all' of that score_set (the parent
+    pass of the whole set; edits re-scored on it) and 'scene'."""
+    B, K = cand.shape[:2]
+    allc = cand.float() if extra is None else torch.cat([cand.float(), extra.float()], 1)
+    allp = None
+    if student.v4_readout is not None and (cand_parent is not None or extra_parent is not None):
+        allp = _parents_or_self(cand, cand_parent)
+        if extra is not None:
+            allp = torch.cat([allp, _parents_or_self(extra, extra_parent)], 1)
+    pref = student.scene_pref(mem, ego)
+    corr = getattr(student, "corrector", None) is not None
+    kw = {"return_pctx": True} if return_pctx else {}                 # off: the old call exactly
+    o = student.score_set(feat, mem, ego, allc, allp, pref=pref, return_ctx=corr, **kw)
+    sc, w = o["score_logit"], o["w_lat"].float()
+    out = {"score_logit": sc[:, :K], "extra_score_logit": None if extra is None else sc[:, K:],
+           "w_lat": w[:, :K], "w_lat_extra": None if extra is None else w[:, K:], "score_all": sc, "w_lat_all": w,
+           "ego": ego, "pref_logp": pref}
+    if "haz" in o:
+        out["haz"] = split_haz(o["haz"], 0, K)
+        out["extra_haz"] = None if extra is None else split_haz(o["haz"], K)
+    if corr:                                          # corrector A: its context and the scene (recording / AWR)
+        out["ctx_all"] = o["ctx"]
+        out["scene"] = (feat, mem, ego, pref)
+    if return_pctx:                                   # v4_3 computed edits: the set's parent pass (recording)
+        out["pctx"], out["parent_index_all"] = o["pctx"], o["parent_index"]
+        out["scene"] = (feat, mem, ego, pref)
+    return out
+
+
+def label_set_parents(G: Dict[str, torch.Tensor], targets, sampler, dev) -> torch.Tensor:
+    """Parent drafts [B, KG, 8, 3] of the on-policy label set G (refiner v4 hazard readout):
+      generation rows (has): identities (G_vtype 0) are their own parents, a variant's parent is the identity of its
+        top-16 rank k = G_col // 6, i.e. G_traj[:, k] (LabelStore2.lookup puts the 16 identities first in k order);
+      fallback rows (cands2.fill_fallback): anchors are their own parents, a variant's parent is the anchor of its
+        variant-file column (targets ck2_var_anchor[col // 6] -> the AnchorSampler anchor table);
+      rows without data: themselves."""
+    traj = G["G_traj"].to(dev).float()
+    B, KG = traj.shape[:2]
+    vt = G["G_vtype"].to(dev).long()
+    col = G["G_col"].to(dev).long()
+    has = G["has"].to(dev).bool().reshape(B, 1)
+    var = vt > 0
+    k = (col.clamp(min=0) // NV).clamp(max=K16 - 1)
+    gen_par = torch.gather(traj, 1, k[..., None, None].expand(B, KG, *traj.shape[2:]))
+    anc = sampler.anchors_t(dev)
+    va = targets["ck2_var_anchor"].to(dev).long()                                 # [B, 16] anchor ids
+    fb_par = anc[torch.gather(va, 1, k)]                                          # [B, KG, 8, 3]
+    par = torch.where((var & has)[..., None, None], gen_par, traj)
+    par = torch.where((var & ~has & (col >= 0))[..., None, None], fb_par.to(traj.dtype), par)
+    return par
+
+
+def _keep_parent(cand_s: torch.Tensor, parent: torch.Tensor, good: torch.Tensor) -> torch.Tensor:
+    """Candidates replaced by the fallback (not good) are their own parents; non-finite parents too."""
+    g = good.bool() & torch.isfinite(parent).flatten(2).all(-1)
+    return torch.where(g[..., None, None], parent.float(), cand_s.float())
+
+
+def infer_pool(traj96: torch.Tensor, top16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The 96 pool as CKE2E2.infer scores it (also tools/ck/e2e2/eval_e2e2.stage_infer_check): traj96 [B, 96, 8, 3]
+    (c = k * 6 + v, may hold NaN), top16 [B, 16, 8, 3] (the identities, traj96[:, ::6]) -> (candidates with
+    non-finite ones replaced by v2's trajectory top16[:, 0], finite mask [B, 96], each candidate's parent draft
+    [B, 96, 8, 3] (its rank's identity; a replaced candidate is its own parent))."""
+    cand, fin = _sanitize_traj(traj96, top16[:, 0])
+    return cand, fin, _keep_parent(cand, top16.float().repeat_interleave(NV, 1), fin)
+
+
+def select96_edits(v2_final16, v2_im16, prob96, valid96, prob_e, src_e, use_e, beta: float,
+                   types: Optional[Sequence[int]] = None, offset=None, w=None) -> np.ndarray:
+    """Selection over the 96 pool + K edits (refiner v4 corrector A / v4_3 computed edits; the ONE implementation of
+    tools/ck/e2e2/eval_ck2.select_edits and of infer_select.edits): v2_final16 / v2_im16 [N, 16], prob96 [N, 96, 5]
+    and prob_e [N, K, 5] (sigmoid scores, CK_KEYS order), valid96 [N, 96], src_e [N, K] (96-column of each edit's
+    source), use_e [N, K] (selectable).  The 96 score as select2.select96 (allowed columns of `types`, default the 'all'
+    set); edit j scores blend(v2_final[src // 6], ck_final(p_e, im[src // 6]), beta) (the source's parent's v2 final /
+    im).  -> idx [N] int64: < 96 = a pool column (select96's choice when no edit wins), 96 + j = edit slot j.  Ties ->
+    the pool (identities first, select2.TIE_ORDER), then the lower edit slot.  numpy in / out."""
+    from . import select2 as S2
+    from .constants import SEL_W
+    from .select import blend, ck_final
+    types = S2.VARIANT_SETS["all"] if types is None else types
+    w = SEL_W if w is None else w
+    s96 = S2.pool_scores(v2_final16, v2_im16, prob96, beta, w, offset)
+    ok = S2.allowed_mask(valid96, types) & np.isfinite(s96)
+    s96 = np.where(ok, s96, -np.inf)[:, S2.TIE_ORDER]
+    par = np.clip(np.asarray(src_e, np.int64), 0, S2.G_K - 1) // S2.NV
+    v2f = np.take_along_axis(np.asarray(v2_final16, np.float64), par, 1)
+    im = np.take_along_axis(np.asarray(v2_im16, np.float64), par, 1)
+    se = blend(v2f, ck_final(S2.apply_offset(np.asarray(prob_e, np.float64), offset), im, w), beta)
+    se = np.where(np.asarray(use_e, bool) & np.isfinite(se), se, -np.inf)
+    j = np.argmax(np.concatenate([s96, se], 1), 1)
+    return np.where(j < S2.G_K, S2.TIE_ORDER[np.minimum(j, S2.G_K - 1)], j).astype(np.int64)
+
+
 # ----------------------------------------------------------------------------------------------- teachers
+def is_range_net(net) -> bool:
+    """a CK net with the refiner v4_3 'range' readout (its B / U / D fields per parent)."""
+    v4 = getattr(net, "v4", None)
+    return getattr(net, "v4_readout", None) is not None and v4 is not None and bool(getattr(v4, "range", False))
+
+
+def net_field_groups(v4) -> Tuple[str, ...]:
+    """the blocked-field groups a range readout of V4Cfg v4 outputs: B, U (+ Bp with rg_stopped_aware)."""
+    return ("B", "U", "Bp") if bool(getattr(v4, "rg_stopped_aware", False)) else ("B", "U")
+
+
+def field_groups(spec) -> Tuple[str, ...]:
+    """A teacher field request (teacher_forward return_fields / TeacherPair2.run fields) -> the group names in order:
+    True = FIELDS_TRUE ('B', 'U': the original dict), an occ_channels name (CN_GROUPS: 'B' / 'BU' / 'BBp' / 'all') or
+    a sequence of distinct 'B' / 'U' / 'Bp' (ValueError otherwise)."""
+    if spec is True:
+        return FIELDS_TRUE
+    if isinstance(spec, str):
+        if spec not in CN_GROUPS:
+            raise ValueError(f"field groups {spec!r} not in {OCC_CHANNELS}")
+        return CN_GROUPS[spec]
+    g = tuple(str(x) for x in spec)
+    if not g or len(set(g)) != len(g) or any(x not in FIELD_GROUP_KEY for x in g):
+        raise ValueError(f"field groups {spec!r}: distinct names of {tuple(FIELD_GROUP_KEY)}")
+    return g
+
+
+def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optional[Dict[str, torch.Tensor]] = None,
+                    parents: Optional[torch.Tensor] = None, return_fields=False):
+    """The KD teacher ops under the caller's autocast / no_grad: trunk.scene once, trunk.candidates on `cand`, score
+    -> (score logits [B,K,5] f32, w_lat [B,K,6]).  A temporal teacher (net.temporal, refiner-v3) additionally runs
+    TemporalBranch.scene(objs) once and binds its hook to this candidate set -- the order and ops of
+    CKNet.forward(bev, cand, status, decode=False, objs=objs) (train_ck2.forward / infer_val_v3).  objs must be given
+    iff the teacher has a temporal branch (ValueError otherwise: a silently dropped branch / stray input).
+    return_fields (refiner v4_3 constraint KD; range teachers only, ValueError otherwise): True (the B | U groups, the
+    original dict), an occ_channels name ('B' / 'BU' / 'BBp' / 'all') or a sequence of group names (field_groups;
+    'Bp' only from an rg_stopped_aware teacher, ValueError otherwise) -> (score, w_lat, fields): fields = {blk_u
+    [B, U, 48, 17, G M] f32 (the requested groups' logits of the teacher's unique parents of `cand`, concatenated in
+    the request's order: B = occ_logit_u (the teacher's own B: the stopped-aware one with rg_stopped_aware), U =
+    ovl_logit_u, Bp = bp_logit_u), groups (the G names, that order), margin_u [B, U, 48, 17] (m), parent_index [B, K]
+    (candidate -> row), s_u [B, U, 48] (station arc lengths, m)} of the same score_set (scores unchanged by the extra
+    outputs)."""
+    B, K = cand.shape[:2]
+    temporal = getattr(net, "temporal", None)
+    if temporal is None and objs is not None:
+        raise ValueError("teacher_forward: objs given to a teacher without a temporal branch")
+    if temporal is not None and objs is None:
+        raise ValueError("teacher_forward: this teacher has a temporal branch: its causal object rows are required")
+    if return_fields and not is_range_net(net):
+        raise ValueError("teacher_forward: range fields requested from a teacher without the v4_3 'range' readout "
+                         f"(v4.readout {getattr(getattr(net, 'v4', None), 'readout', 'mean')!r}): constraint KD "
+                         "needs range teachers")
+    groups = field_groups(return_fields) if return_fields else None
+    if groups is not None:
+        miss = [g for g in groups if g not in net_field_groups(net.v4)]
+        if miss:
+            raise ValueError(f"teacher_forward: field group(s) {miss} requested from a teacher with the groups "
+                             f"{net_field_groups(net.v4)} (Bp: rg_stopped_aware teachers only)")
+    feat, mem = net.trunk.scene(bev, B)
+    if getattr(net, "v4_readout", None) is not None:    # refiner v4 teacher: hazard readout on the parents' corridors
+        kw = {"return_pctx": True} if return_fields else {}
+        o = net.score_set(feat, mem, ego, cand, parents, pref=net.scene_pref(mem, ego), **kw)
+        if not return_fields:
+            return o["score_logit"], o["w_lat"]
+        h = o["haz"]
+        U = h["occ_logit_u"].shape[1]
+        fields = {"blk_u": torch.cat([h[FIELD_GROUP_KEY[g]] for g in groups], -1).float(), "groups": groups,
+                  "margin_u": h["margin_u"].float(), "parent_index": o["parent_index"].long(),
+                  "s_u": o["pctx"]["rg_frame"]["s"].float().reshape(B, U, -1)}
+        return o["score_logit"], o["w_lat"], fields
+    tf = None if temporal is None else temporal.hook(temporal.scene(objs), B, K)
+    o = net.trunk.candidates(feat, mem, cand, *ego, tfeat=tf)
+    return net.score(o, B, K), o["w_lat"]
+
+
+def kd_objs_of(targets, device=None) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """(objs = {obj_in, obj_mask, frame_valid} -- exactly ck.temporal.config.OBJ_INPUT_KEYS --, obj_ok [B]) of the DET
+    teacher from the e2e targets (e2e_data2.KDObjRows keys).  KeyError when the target builder did not emit them."""
+    from .temporal.config import OBJ_INPUT_KEYS
+    miss = [k for k in KD_OBJ_KEYS + (KD_OBJ_OK,) if k not in targets]
+    if miss:
+        raise KeyError(f"temporal DET teacher: targets lack {miss} (CK2E2ETargetBuilder without the teacher's object "
+                       f"rows?)")
+    objs = {KD_OBJ_INPUT[k]: (targets[k] if device is None else targets[k].to(device)) for k in KD_OBJ_KEYS}
+    assert tuple(objs) == tuple(OBJ_INPUT_KEYS), (tuple(objs), OBJ_INPUT_KEYS)
+    ok = targets[KD_OBJ_OK].reshape(-1).bool()
+    return objs, (ok if device is None else ok.to(device))
+
+
+def _tensor_sha16(sd: Dict[str, torch.Tensor]) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for k in sorted(sd):
+        v = sd[k].detach().cpu().contiguous()
+        h.update(k.encode())
+        h.update(str(v.dtype).encode())
+        h.update(str(tuple(v.shape)).encode())
+        h.update(v.numpy().tobytes() if v.dtype != torch.bfloat16 else v.float().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def temporal_teacher_info(net) -> Optional[Dict[str, Any]]:
+    """Record of a teacher's temporal branch (None when off): cfg dict, sha16 of the loaded branch / forecaster state
+    (the checkpoint's weights actually used) and of the cfg.fc_init file (pre-trained forecaster), ca_b."""
+    t = getattr(net, "temporal", None)
+    if t is None:
+        return None
+    tc = net.temporal_cfg
+    rec: Dict[str, Any] = {"cfg": tc.to_dict(), "branch_state_sha16": _tensor_sha16(t.state_dict())}
+    if t.forecaster is not None:
+        rec["forecaster_state_sha16"] = _tensor_sha16(t.forecaster.state_dict())
+    if getattr(t, "ca_b", None) is not None:
+        rec["ca_b"] = [[float(x) for x in r] for r in t.ca_b.detach().cpu().tolist()]
+    if tc.fc_init:
+        p = Path(tc.fc_init)
+        if p.is_file():
+            import hashlib
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for b in iter(lambda: f.read(1 << 22), b""):
+                    h.update(b)
+            rec["fc_init"] = {"path": str(p), "sha16": h.hexdigest()[:16]}
+        else:
+            rec["fc_init"] = {"path": str(p), "missing": True}
+    return rec
+
+
 class TeacherPair2:
     """Frozen CK2 DET (arm T) + MAP (arm M) teachers (ck.model.load_ck of tools/ck/train_ck2 runs), run online on the
     student's candidates.  Plain python object (not an nn.Module attribute of the agent: not in the state_dict / DDP /
@@ -501,11 +986,19 @@ class TeacherPair2:
     calib (ck_e2e2.kd_calib when enabled; None = no calibration, the old path): {'det': file | None, 'map': file |
     None} of tools/ck/e2e2/fit_kd_calib.py; each file must match its loaded teacher (kd_calib.check_calib: arm, run,
     which, ckpt sha16, ep_target, and every KD key of kd_keys this teacher is a source of fitted) or construction
-    fails.  run() then uses z' = a_k z + b_k (per key) as the teacher's score logits."""
+    fails.  run() then uses z' = a_k z + b_k (per key) as the teacher's score logits.
+    Temporal DET teacher (refiner-v3): load_ck rebuilds it from its config.json (refuses a PRIVILEGED run: the
+    PermissionError is re-raised naming the teacher); a temporal MAP teacher is refused.  run(..., objs_det=,
+    obj_ok_det=) is then required (teacher_forward; kd_obj_ok False -> ok False for the token); self.temporal_info
+    records the cfg and the forecaster / branch state sha16 (None for a CK2 teacher).
+    fields (refiner v4_3 constraint KD; default False = the old object): both teachers must have the 'range' readout
+    (ValueError otherwise) and run(..., fields=True | groups) also returns their blocked-field groups (True: B | U, or
+    the requested ones) and D fields (teacher_forward return_fields)."""
 
     def __init__(self, det_run: str, map_run: str, which: str = "last", device="cpu", amp: bool = True,
                  require_done: bool = True, ep_target: Optional[str] = None,
-                 calib: Optional[Dict[str, Optional[str]]] = None, kd_keys: Optional[Sequence[str]] = None):
+                 calib: Optional[Dict[str, Optional[str]]] = None, kd_keys: Optional[Sequence[str]] = None,
+                 fields: bool = False):
         from .ep_target import check_ep_target, run_ep_target
         from .model import load_ck
 
@@ -535,7 +1028,12 @@ class TeacherPair2:
                     raise ValueError(f"teacher {name} {run}: ep_target {got!r} (config.json; missing = 'official') "
                                      f"!= the student's ck_e2e2.ep_target {want!r} (label BCE and EP KD would "
                                      f"disagree)")
-            net, cfg = load_ck(run, which, device="cpu")
+            try:
+                net, cfg = load_ck(run, which, device="cpu")       # refuses a PRIVILEGED (temporal oracle / gt) run
+            except PermissionError as e:
+                raise PermissionError(f"teacher {name} {run}: {e} -- never a KD teacher") from None
+            if getattr(net, "temporal", None) is not None and name != "det":
+                raise ValueError(f"teacher {name} {run}: temporal branch on a MAP teacher is not supported")
             lw = net.trunk.lon_head[-1]
             if bool(lw.weight.detach().abs().max() > 0) or bool(lw.bias.detach().abs().max() > 0):
                 raise ValueError(f"teacher {name} {run}: trunk.lon_head last layer is not all zero (not a CK2 run)")
@@ -544,10 +1042,20 @@ class TeacherPair2:
             nets[name] = (net.to(self.device), cfg)
         self.det, self.det_cfg = nets["det"]
         self.map, self.map_cfg = nets["map"]
+        self.fields = bool(fields)
+        if self.fields:                       # refiner v4_3 constraint KD: range teachers only
+            bad = [f"{n} {self.runs[n]} (v4.readout {getattr(net.v4, 'readout', 'mean')!r})"
+                   for n, net in (("det", self.det), ("map", self.map)) if not is_range_net(net)]
+            if bad:
+                raise ValueError("TeacherPair2: constraint KD needs teachers with the v4_3 'range' readout; refused: "
+                                 + "; ".join(bad))
         self.amp = bool(amp)
         self.ep_target = eps                 # each teacher run's EP target (config.json)
         self.ckpt = {k: getattr(n, "init_report", {}).get("ckpt_sha16") for k, n in (("det", self.det),
                                                                                     ("map", self.map))}
+        # refiner-v3: the DET teacher's temporal branch (None = CK2 teacher, the old path)
+        self.det_temporal = getattr(self.det, "temporal", None) is not None
+        self.temporal_info = temporal_teacher_info(self.det)
         # KD calibration (Platt on the logits, per teacher and key); None = off (old path, nothing applied)
         self.calib: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None
         self.calib_info: Dict[str, Any] = {}
@@ -564,7 +1072,7 @@ class TeacherPair2:
                 try:
                     a, b, info = load_teacher_calib(path, run=self.runs[name], which=which,
                                                     ckpt_sha16=self.ckpt[name], ep_target=eps[name], arm=arm,
-                                                    kd_keys=kd_keys)
+                                                    kd_keys=kd_keys, family=True)
                 except (ValueError, FileNotFoundError) as e:
                     raise ValueError(f"teacher {name} {self.runs[name]}: KD calibration refused: {e}") from None
                 cal[name] = (torch.from_numpy(a).to(self.device), torch.from_numpy(b).to(self.device))
@@ -585,34 +1093,66 @@ class TeacherPair2:
         return self
 
     @torch.no_grad()
-    def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None) -> Dict[str, torch.Tensor]:
+    def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None, objs_det=None,
+            obj_ok_det=None, parents: Optional[torch.Tensor] = None,
+            family: Optional[torch.Tensor] = None, fields=False) -> Dict[str, torch.Tensor]:
         """bev_* [B, 256, 50, 100] (f16 cache), ok_* [B], cand [B, K, 8, 3] (finite), status [B, 8], cand_ok [B, K]
         -> kd_score_prob f32 [B,K,5] (combine_teacher: nc/ttc DET, dac MAP, ep/comfort mean), kd_e_lat f32 [B,K,6]
         = 0.5 (e_DET + e_MAP) (decode z_lon = 0, slope 0), kd_ok bool [B,K] = DET ok & MAP ok (per token) & finite
         logits / offsets of both & cand_ok; e_det / e_map [B,K,6], p_det / p_map [B,K,5] (logging).
         With calibration (self.calib) each teacher's logits are a_k z + b_k BEFORE the sigmoid / combination (p_det /
-        p_map are then the calibrated probabilities); the lateral outputs are unchanged."""
+        p_map are then the calibrated probabilities); the lateral outputs are unchanged.
+        Temporal DET teacher only (self.det_temporal): objs_det = {obj_in [B,3,96,17], obj_mask [B,3,96], frame_valid
+        [B,3]} (kd_objs_of: exactly OBJ_INPUT_KEYS) and obj_ok_det [B] are required; DET ok = ok_det & obj_ok_det.
+        A CK2 DET teacher: both must be None (the old path, bit for bit).
+        fields (refiner v4_3 constraint KD; the pair must be built with fields=True): True (the B | U groups) or the
+        requested groups (an occ_channels name / group names, field_groups; the same request to both teachers) ->
+        + fields_det / fields_map (teacher_forward fields of the parents of `cand`, with their 'groups'; from the same
+        forward, the scores are unchanged) and the per-token teacher ok ok_det_tok / ok_map_tok [B] (ok_det / ok_map
+        as passed & finite returned fields; the temporal object-row ok never applies: range teachers have no temporal
+        branch, is_range_net)."""
         from ..refiner.e2e import ego_inputs
         from .kd import combine_teacher
 
+        if fields and not self.fields:
+            raise ValueError("TeacherPair2.run(fields=True): the pair was built without fields=True (range teachers "
+                             "not checked)")
         dev = self.device
         cand = cand.detach().float().to(dev)
         B, K = cand.shape[:2]
+        if self.det_temporal:
+            if objs_det is None or obj_ok_det is None:
+                raise ValueError("TeacherPair2.run: the DET teacher has a temporal branch: objs_det and obj_ok_det "
+                                 "(its causal object rows, kd_objs_of(targets)) are required")
+            objs_det = {k: v.to(dev) for k, v in objs_det.items()}
+            ok_det = ok_det.reshape(-1).bool().to(dev) & obj_ok_det.reshape(-1).bool().to(dev)
+        elif objs_det is not None or obj_ok_det is not None:
+            raise ValueError("TeacherPair2.run: object rows given but the DET teacher has no temporal branch")
         ego = ego_inputs(status.detach().float().to(dev))
         v0 = ego[0]
         ac = torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=self.amp and dev.type == "cuda")
-        logits, ws = [], []
-        for net, bev in ((self.det, bev_det), (self.map, bev_map)):
+        logits, ws, flds = [], [], []
+        for net, bev, objs in ((self.det, bev_det, objs_det), (self.map, bev_map, None)):
             with ac:
-                feat, mem = net.trunk.scene(bev.to(dev).float(), B)
-                o = net.trunk.candidates(feat, mem, cand, *ego)
-                s = net.score(o, B, K)
-            logits.append(s.float())
-            ws.append(o["w_lat"].float())
+                r = teacher_forward(net, bev.to(dev).float(), cand, ego, objs,
+                                    None if parents is None else parents.detach().float().to(dev),
+                                    **({"return_fields": fields} if fields else {}))
+            logits.append(r[0].float())
+            ws.append(r[1].float())
+            if fields:
+                flds.append(r[2])
         if self.calib is not None:            # KD calibration: Platt on the logits, per teacher and key
             for i, name in enumerate(("det", "map")):
                 ab = self.calib.get(name)
-                if ab is not None:
+                if ab is None:
+                    continue
+                if ab[0].dim() == 2:          # refiner v4 I2: per variant family (rows KD_FAMILIES) [6, 5]
+                    if family is None:
+                        raise ValueError(f"TeacherPair2.run: teacher {name} has a per-family KD calibration; the "
+                                         f"candidates' family (vtype 0..5) is required")
+                    f = family.to(dev).long().clamp(0, ab[0].shape[0] - 1)
+                    logits[i] = logits[i] * ab[0][f] + ab[1][f]
+                else:
                     logits[i] = logits[i] * ab[0] + ab[1]
         # ONE batched decode for both teachers (correct() is launch-bound; candidates decode independently)
         dec = lateral_decode(torch.cat([cand, cand], 1), torch.cat(ws, 1), v0, 0.0)
@@ -630,16 +1170,24 @@ class TeacherPair2:
         if cand_ok is not None:
             kd_ok = kd_ok & cand_ok.bool().to(dev)
         e_mean = 0.5 * (e_det + e_map)
-        return {"kd_score_prob": comb["kd_score_prob"].float(), "kd_e_lat": e_mean, "kd_ok": kd_ok,
-                "e_det": e_det, "e_map": e_map, "p_det": torch.sigmoid(logits[0]), "p_map": torch.sigmoid(logits[1])}
+        out = {"kd_score_prob": comb["kd_score_prob"].float(), "kd_e_lat": e_mean, "kd_ok": kd_ok,
+               "e_det": e_det, "e_map": e_map, "p_det": torch.sigmoid(logits[0]), "p_map": torch.sigmoid(logits[1])}
+        if fields:                            # refiner v4_3 constraint KD
+            for (name, okt), f in zip((("det", ok_det), ("map", ok_map)), flds):
+                fin = (torch.isfinite(f["blk_u"]).flatten(1).all(1) & torch.isfinite(f["margin_u"]).flatten(1).all(1))
+                out[f"fields_{name}"] = f
+                out[f"ok_{name}_tok"] = okt.reshape(-1).bool().to(dev) & fin
+        return out
 
 
 # ----------------------------------------------------------------------------------------------- student forward
 def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status: torch.Tensor,
-                     extra: Optional[torch.Tensor] = None) -> Dict:
+                     extra: Optional[torch.Tensor] = None, cand_parent: Optional[torch.Tensor] = None,
+                     extra_parent: Optional[torch.Tensor] = None, return_pctx: bool = False) -> Dict:
     """One trunk.scene + ONE trunk.candidates over cat(cand, extra) (candidates are processed independently) ->
     score_logit [B,K,5] f32, extra_score_logit [B,K2,5] | None, w_lat [B,K,6], w_lat_extra [B,K2,6] | None,
-    score_all / w_lat_all (every candidate), ego.  No decode here (callers use lateral_decode, z_lon = 0)."""
+    score_all / w_lat_all (every candidate), ego.  No decode here (callers use lateral_decode, z_lon = 0).
+    return_pctx: refiner v4 parent-pass students only (_student_forward_v4)."""
     from ..refiner.e2e import ego_inputs
 
     B, K = cand.shape[:2]
@@ -648,6 +1196,9 @@ def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status
     allc = cand.float() if extra is None else torch.cat([cand.float(), extra.float()], 1)
     KA = allc.shape[1]
     feat, mem = student.trunk.scene(bev_grid, B)
+    if getattr(student, "v4_readout", None) is not None or getattr(student, "pref_head", None) is not None:
+        return _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra_parent,
+                                   return_pctx=return_pctx and getattr(student, "v4_readout", None) is not None)
     o = student.trunk.candidates(feat, mem, allc, v0, a0, eds, cmd)
     sc = student.score(o, B, KA)
     w = o["w_lat"].float()
@@ -691,6 +1242,277 @@ def _dist_mean_many(xs: Sequence[float], device) -> List[float]:
     t = torch.tensor([float(x) for x in xs], dtype=torch.float64, device=dev)
     dist.all_reduce(t)
     return [float(v) / dist.get_world_size() for v in t.tolist()]
+
+
+# ----------------------------------------------------------------------------------------------- refiner v4_3 M6
+def kd_constraint_request(occ_channels: str):
+    """TeacherPair2.run's fields request for occ_channels: True (the original B | U dict; constraint_kd then runs the
+    original ops bit for bit) for 'B' / 'BU', else the occ_channels name (its groups, field_groups)."""
+    return True if CN_GROUPS[str(occ_channels)] in (("B",), FIELDS_TRUE) else str(occ_channels)
+
+
+CONSTRAINT_REFUSAL = ("constraint KD refused (the teachers' fields are distilled cell by cell: their geometry, time "
+                      "bins and B semantics must be the student's): ")
+
+
+def constraint_teacher_problems(sn, student_cv: int, occ_channels: str,
+                                teachers: Sequence[Tuple[str, str, Any, int]]) -> List[str]:
+    """The constraint-KD compatibility rule, shared by the runtime check (check_constraint_teachers, the loaded nets) and
+    the launch check (tools/ck/e2e2/launch_util2.kd_constraint_check, the runs' config.json): sn = the student's V4Cfg,
+    student_cv its corridor version, occ_channels the distilled groups (CN_GROUPS), teachers = [(name 'det' | 'map',
+    run, V4Cfg, corridor_version)] -> the mismatches ([] = compatible), each naming the teacher:
+      * grid: corridor version (the grid geometry) and time bins (ev_tbins x ev_tbin_s) of every teacher = the
+        student's;
+      * B semantics: rg_stopped_aware of every teacher = the student's (B = the stopped-aware B of Phase 0b R2 on both
+        sides, or the plain not-behind B on both; the student's rg_gt_aux trains B with its own rule);
+      * NOT rg_read (the recorded v4_3 decision, tests/test_v4_r2.py::test_constraint_teachers_b_semantics_check: the
+        read is how the net consumes a field, not what a cell holds; the cells are distilled as cells, so a teacher's
+        read may differ from the student's -- launch_util2.kd_constraint_check records both sides' rg_read.  Caveat:
+        a teacher's B is also shaped by its label / station BCE through its own read (any4: the 2 x 2 OR), so its
+        cells are not only its GT field target; requiring the same read is a user decision, not taken);
+      * groups: occ_channels' groups exist on the student and on the DET teacher (Bp: rg_stopped_aware only)."""
+    want = (int(student_cv), int(sn.ev_tbins), float(sn.ev_tbin_s))
+    bad: List[str] = []
+    groups = CN_GROUPS.get(str(occ_channels))
+    if groups is None:
+        bad.append(f"occ_channels {occ_channels!r} not in {OCC_CHANNELS}")
+    elif any(g not in net_field_groups(sn) for g in groups):
+        bad.append(f"student: occ_channels {occ_channels!r} distils {list(groups)}, the student's fields are "
+                   f"{list(net_field_groups(sn))} (Bp: rg_stopped_aware only)")
+    for name, run, tv, tcv in teachers:
+        got = (int(tcv), int(tv.ev_tbins), float(tv.ev_tbin_s))
+        if got != want:
+            bad.append(f"{name} {run}: grid (corridor_version, ev_tbins, ev_tbin_s) {got} != the student's {want}")
+        if bool(tv.rg_stopped_aware) != bool(sn.rg_stopped_aware):
+            bad.append(f"{name} {run}: rg_stopped_aware {bool(tv.rg_stopped_aware)} != the student's "
+                       f"{bool(sn.rg_stopped_aware)} (B semantics: the R2 stopped-aware B vs the plain not-behind B)")
+        if name == "det" and groups is not None and any(g not in net_field_groups(tv) for g in groups):
+            bad.append(f"{name} {run}: occ_channels {occ_channels!r} distils {list(groups)}, the teacher's fields are "
+                       f"{list(net_field_groups(tv))} (Bp: rg_stopped_aware only)")
+    return bad
+
+
+def check_constraint_teachers(tp: "TeacherPair2", cfg: CKE2E2Config) -> None:
+    """Constraint KD reads the teachers' fields cell by cell on the student's parent grid: constraint_teacher_problems
+    on the loaded nets (grid and rg_stopped_aware of both teachers = the student's, occ_channels' groups on the student
+    and the DET teacher; rg_read may differ) -> ValueError (CONSTRAINT_REFUSAL + the mismatches) otherwise.  For an R2
+    student with R2 teachers the distilled B is the stopped-aware B on both sides."""
+    bad = constraint_teacher_problems(cfg.v4_net(), int(cfg.v4["corridor_version"]),
+                                      str(cfg.kd_constraint["occ_channels"]),
+                                      [(name, tp.runs[name], net.v4, int(net.corridor_version))
+                                       for name, net in (("det", tp.det), ("map", tp.map))])
+    if bad:
+        raise ValueError(CONSTRAINT_REFUSAL + "; ".join(bad))
+
+
+def parent_rows(pidx_s: torch.Tensor, m: torch.Tensor, U: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unique parent rows of a candidate set: pidx_s [B, K] (candidate -> row of [B, U]), m [B, K] candidates that
+    count -> (rep [B, U] long: the first counted candidate k of each row (K where none), has [B, U] bool)."""
+    B, K = pidx_s.shape
+    k = torch.arange(K, device=pidx_s.device)[None].expand(B, K)
+    kk = torch.where(m.bool(), k, torch.full_like(k, K))
+    rep = torch.full((B, U), K, dtype=torch.long, device=pidx_s.device)
+    rep = rep.scatter_reduce(1, pidx_s.long(), kk, reduce="amin", include_self=True)
+    return rep, rep < K
+
+
+def constraint_kd(haz: Dict[str, torch.Tensor], T: Dict[str, torch.Tensor], cand_ok: torch.Tensor,
+                  kc: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """refiner v4_3 M6 constraint KD (spec V4_3 M6; ck_e2e2.kd_constraint) on the student's unique parents of the KD set.
+    haz = the student's split_haz of the KD set (range readout: occ_logit_u / ovl_logit_u (/ bp_logit_u with
+    rg_stopped_aware) [B, U, 48, 17, M], margin_u [B, U, 48, 17] (m) per parent row, parent_index [B, K]); T =
+    TeacherPair2.run(..., fields=<occ_channels> | True) on the same KD candidates and parents (fields_det / fields_map
+    with their own parent_index and 'groups' (absent = ('B', 'U'), the fields=True dict), ok_det_tok / ok_map_tok
+    [B]); cand_ok [B, K] the counted KD candidates.  Row pairing: student row u <- its first counted candidate k <- the
+    teacher's row parent_index_t[k] (the same parent draft, bitwise; each teacher deduplicated it on its own).
+      occ:    BCE(student logits, sigmoid(DET teacher logits)) - H(target) (= the Bernoulli KL, gradient of the BCE) over
+              every cell and bin of the groups CN_GROUPS[occ_channels] ('B' the B channel -- the stopped-aware B of an
+              R2 pair --, 'BU' + the TTC overlap channel U, 'BBp' + the plain not-behind Bp, 'all' B, U, Bp; each group
+              student <- the same group of the teacher), mean over the rows of DET-ok tokens (ValueError if a group is
+              missing on either side);
+      margin: Huber(student D, MAP teacher D clipped +-CK_MARGIN_CLIP m, delta 1 m) over the cells of stations
+              s_j <= map_range_m (the teacher row's arc lengths), MAP-ok tokens.
+    -> (l_occ, l_margin, stats); zeros (graph-connected) when nothing is selected.  BCE / Huber only (no ranking or
+    margin loss)."""
+    import torch.nn.functional as F
+    from .losses import bernoulli_entropy
+    Bo, Bu, D = haz["occ_logit_u"], haz["ovl_logit_u"], haz["margin_u"]
+    B, U = Bo.shape[:2]
+    M = Bo.shape[-1]
+    zero = Bo.sum() * 0.0 + Bu.sum() * 0.0 + D.sum() * 0.0
+    dev = Bo.device
+    pidx = haz["parent_index"].long().to(dev)
+    st: Dict[str, float] = {}
+    out = []
+    for name in ("det", "map"):
+        f = T[f"fields_{name}"]
+        m = cand_ok.bool().to(dev) & T[f"ok_{name}_tok"].bool().to(dev)[:, None]
+        rep, has = parent_rows(pidx, m, U)
+        b, u = torch.nonzero(has, as_tuple=True)
+        st[f"cn_{name}_rows"] = float(b.numel())
+        if b.numel() == 0:
+            out.append(zero)
+            continue
+        ut = f["parent_index"].long().to(dev)[b, rep[b, u]]                       # the teacher's row of the same parent
+        if name == "det":
+            want = CN_GROUPS[str(kc["occ_channels"])]
+            tg = tuple(f.get("groups", FIELDS_TRUE))                              # the teacher's returned groups
+            miss = ([f"student {g}" for g in want if FIELD_GROUP_KEY[g] not in haz]
+                    + [f"teacher {g}" for g in want if g not in tg])
+            if miss:
+                raise ValueError(f"constraint_kd: occ_channels {kc['occ_channels']!r} needs the groups {list(want)}; "
+                                 f"missing {miss} (teacher fields {list(tg)})")
+            if tg == FIELDS_TRUE and want in (("B",), FIELDS_TRUE):   # B | U teacher dict: the original ops, bitwise
+                s_log = torch.cat([Bo[b, u], Bu[b, u]], -1).float()                # [P, 48, 17, 2M]
+                t_log = f["blk_u"].to(dev)[b, ut].float()
+                if want == ("B",):
+                    s_log, t_log = s_log[..., :M], t_log[..., :M]
+            else:                                                       # any other request: group by group
+                s_log = torch.cat([haz[FIELD_GROUP_KEY[g]][b, u] for g in want], -1).float()   # [P, 48, 17, G M]
+                t_all = f["blk_u"].to(dev)[b, ut].float()
+                t_log = t_all if tg == want else torch.cat([t_all[..., tg.index(g) * M:(tg.index(g) + 1) * M]
+                                                            for g in want], -1)
+            p = torch.sigmoid(t_log).detach()
+            per = F.binary_cross_entropy_with_logits(s_log, p, reduction="none") - bernoulli_entropy(p)
+            out.append(per.mean())
+            st["cn_occ_kl"] = float(out[-1].detach())
+            st["cn_occ_rate_t"] = float((p > 0.5).float().mean())
+        else:
+            ds = D[b, u].float()                                                  # [P, 48, 17]
+            dt = f["margin_u"].to(dev)[b, ut].float().clamp(-CK_MARGIN_CLIP, CK_MARGIN_CLIP).detach()
+            near = (f["s_u"].to(dev)[b, ut].float() <= float(kc["map_range_m"]))[..., None].expand_as(ds)
+            per = F.huber_loss(ds, dt, delta=1.0, reduction="none")
+            nf = near.float()
+            out.append((per * nf).sum() / nf.sum().clamp(min=1.0))
+            st["cn_margin_huber"] = float(out[-1].detach())
+            st["cn_margin_cells_frac"] = float(nf.mean())
+    return out[0], out[1], st
+
+
+@torch.no_grad()
+def lead_ttc0(targets, status: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Nearest-lead time to collision at t0 from the batch's ref_* GT (kd_score_scope 'near'), the rule of
+    tools/ck/data/lead_split.py (extract_lead.py, report 43) on the GT loader's data: objects of class vehicle / bicycle
+    observed at t = 0 (gt_future query rule), projected on the route centerline (ref_cl_xy vertices in N; nearest vertex
+    + along-offset, heading of the vertex's segment, arc length relative to the projection of the t0 rear axle):
+    |lat| <= 1.8 m, |heading - centerline heading| <= 60 deg, gap = s - L / 2 - 4.049 m in (-1, 80] m; lead = the
+    smallest s; ttc0 = gap / (v_e - v_lon) if v_e - v_lon > 0.1 m/s and gap > 0 else TTC0_NONE (v_e = |(vx, vy)| of
+    status[4:6], v_lon = the lead's velocity (first appearance, = its t0 value when annotated at t0) along the
+    centerline).  Differences from the parquet: the GT loader's centerline crop (vertices, not the 0.5 m resampling)
+    and object set (tracks within R of t0).  -> (ttc0 [B] s (TTC0_NONE without a closing lead or GT), has_gt [B])."""
+    from ..refiner import gt_future as GF
+    from .v4 import range_targets as RT
+    ok = targets["ref_gt_ok"].reshape(-1).bool()
+    dev = ok.device
+    B = ok.shape[0]
+    ttc = torch.full((B,), TTC0_NONE, dtype=torch.float64, device=dev)
+    need = ("ref_obj_kf", "ref_obj_first", "ref_obj_meta", "ref_obj_n", "ref_obj_n_kf", "ref_cl_xy", "ref_cl_valid")
+    if not ok.any() or any(k not in targets for k in need):
+        return ttc, ok & False
+    ref = {k: targets[k].to(dev) for k in need}
+    tok = torch.nonzero(ok, as_tuple=True)[0]
+    boxes, obs, _, _ = RT.gt_boxes_from_ref(ref, tok, t_grid=np.zeros(1), device=dev)        # [n, A, 1, 5]
+    A = boxes.shape[1]
+    meta = ref["ref_obj_meta"][tok][:, :A].long()
+    vel = ref["ref_obj_first"][tok][:, :A, 3:5].double()
+    cls_ok = (meta[..., GF.MT_CLASS][..., None] == torch.as_tensor(LEAD_CLASSES, device=dev)).any(-1)
+    xy, hd, L = boxes[:, :, 0, :2].double(), boxes[:, :, 0, 2].double(), boxes[:, :, 0, 3].double()
+    # only the possible leads are projected (class, observed at t0, centre within reach): [n, A] -> [n, Q]
+    pre = obs[:, :, 0].bool() & cls_ok & (xy.norm(dim=-1) <= LEAD_GAP_MAX + 40.0)
+    Q = int(max(int(pre.sum(1).max()), 1))
+    oi = torch.sort((~pre).to(torch.uint8), dim=1, stable=True).indices[:, :Q]             # candidates first
+    gq = lambda a: torch.gather(a, 1, oi.reshape(*oi.shape, *([1] * (a.dim() - 2))).expand(*oi.shape, *a.shape[2:]))
+    pre, xy, hd, L, vel = gq(pre), gq(xy), gq(hd), gq(L), gq(vel)
+    cl = ref["ref_cl_xy"][tok].double()                                                   # [n, CL, 2]
+    clv = ref["ref_cl_valid"][tok].bool()
+    nxt = torch.cat([cl[:, 1:], cl[:, -1:]], 1)
+    seg = nxt - cl
+    seg_ok = clv & torch.cat([clv[:, 1:], torch.zeros_like(clv[:, :1])], 1) & (seg.norm(dim=-1) > 1e-6)
+    # vertices without a following segment take the previous segment's direction
+    seg = torch.where(seg_ok[..., None], seg, torch.cat([seg[:, :1], seg[:, :-1]], 1))
+    e = seg / seg.norm(dim=-1, keepdim=True).clamp(min=1e-9)
+    s_v = torch.cat([torch.zeros_like(cl[:, :1, 0]), torch.cumsum((cl[:, 1:] - cl[:, :-1]).norm(dim=-1)
+                                                                  * (clv[:, 1:] & clv[:, :-1]), 1)], 1)
+
+    def project(p):                                                                       # p [n, Q, 2]
+        d2 = ((p[:, :, None] - cl[:, None]) ** 2).sum(-1)
+        d2 = torch.where(clv[:, None], d2, torch.full_like(d2, math.inf))
+        i = d2.argmin(-1)                                                                 # [n, Q]
+        g = lambda a: torch.gather(a, 1, i[..., None].expand(*i.shape, a.shape[-1]))
+        rel = p - g(cl)
+        ee = g(e)
+        along = (rel * ee).sum(-1)
+        lat = -ee[..., 1] * rel[..., 0] + ee[..., 0] * rel[..., 1]
+        return torch.gather(s_v, 1, i) + along, lat, torch.atan2(ee[..., 1], ee[..., 0])
+
+    s0, _, _ = project(torch.zeros(len(tok), 1, 2, dtype=torch.float64, device=dev))
+    s, lat, ch = project(xy)
+    s = s - s0
+    dh = torch.atan2(torch.sin(hd - ch), torch.cos(hd - ch)).abs()
+    gap = s - 0.5 * L - LEAD_EGO_FRONT
+    cand = pre & (lat.abs() <= LEAD_LAT_M) & (dh <= LEAD_DH_RAD) & (gap > -1.0) & (gap <= LEAD_GAP_MAX)
+    s_m = torch.where(cand, s, torch.full_like(s, math.inf))
+    j = s_m.argmin(-1)
+    has = torch.isfinite(s_m.gather(1, j[:, None])[:, 0])
+    ar = torch.arange(len(tok), device=dev)
+    v_lon = (vel[ar, j] * torch.stack([torch.cos(ch[ar, j]), torch.sin(ch[ar, j])], -1)).sum(-1)
+    st = status[tok].double().to(dev)
+    v_e = torch.hypot(st[:, 4], st[:, 5])
+    dv = v_e - v_lon
+    g = gap[ar, j]
+    t0 = torch.where(has & (dv > 0.1) & (g > 0), g / dv.clamp(min=1e-9), torch.full_like(g, TTC0_NONE))
+    ttc[tok] = t0
+    return ttc, ok
+
+
+@torch.no_grad()
+def parent_min_corner_sdf(targets, status: torch.Tensor, parents: torch.Tensor) -> torch.Tensor:
+    """min over the 41 EXECUTED states (ck/v4/lqr.simulate from status[4] / status[6], the official tracker) x the 4
+    official corners of the token's DAC SDF (ref_sdf, sdf.sample_sdf; unreadable corners skipped) of every parent
+    parents [B, K, 8, 3] -> [B, K] m (+inf without GT / a readable corner).  kd_score_scope 'near' (DAC)."""
+    from ..refiner.sdf import ego_corners, sample_sdf
+    from .v4 import lqr as LQR
+    B, K = parents.shape[:2]
+    dev = parents.device
+    out = torch.full((B, K), math.inf, dtype=torch.float32, device=dev)
+    if "ref_sdf" not in targets or "ref_gt_ok" not in targets:
+        return out
+    ok = targets["ref_gt_ok"].reshape(-1).bool().to(dev)
+    tok = torch.nonzero(ok, as_tuple=True)[0]
+    if tok.numel() == 0:
+        return out
+    p = parents[tok].float().reshape(-1, 8, 3)
+    fin = torch.isfinite(p).flatten(1).all(1)
+    p = torch.where(fin[:, None, None], p, torch.zeros_like(p))
+    st = status[tok].float().to(dev)
+    ego = torch.stack([torch.nan_to_num(st[:, 4]), torch.nan_to_num(st[:, 6])], -1).repeat_interleave(K, 0)
+    ex = LQR.simulate(p, ego, dtype=torch.float32)                                       # [n K, 41, 6]
+    cor = ego_corners(ex[..., :3]).reshape(len(tok), K, -1, 2)
+    v, val = sample_sdf(targets["ref_sdf"].to(dev), cor.reshape(len(tok), -1, 2), tok)
+    v = torch.where(val, v.float(), torch.full_like(v.float(), math.inf)).reshape(len(tok), K, -1).min(-1).values
+    out[tok] = torch.where(fin.reshape(len(tok), K), v, torch.full_like(v, math.inf))
+    return out
+
+
+def score_kd_near(s_kd: torch.Tensor, p_t: torch.Tensor, ok: torch.Tensor, keys: Sequence[str],
+                  nc_tok: torch.Tensor, dac_cand: torch.Tensor) -> torch.Tensor:
+    """kd_score_scope 'near': losses.score_kd_bce with a mask per key -- nc: ok & nc_tok [B] (nearest lead ttc0 <
+    NEAR_TTC_S), dac: ok & dac_cand [B, K] (parent's min executed corner SDF < NEAR_SDF_M), other keys ok -- each key's
+    Bernoulli KL averaged over its own candidates (0 without any), then the mean over the keys (= score_kd_bce when
+    every mask equals ok).  s_kd / p_t [B, K, n_keys] in the order of keys.
+    Weighting (by definition, not normalised to the 'all' count): each key keeps the total weight 1 / n_keys of the
+    'all' term, concentrated on its near candidates, so a near candidate's NC / DAC KL weighs ~1 / (near fraction of
+    the KD candidates) times its weight under scope 'all' (logged: v4/kd_near_nc_frac, v4/kd_near_dac_frac)."""
+    from . import losses as L
+    terms = []
+    for i, k in enumerate(keys):
+        m = ok.bool()
+        if k == "nc":
+            m = m & nc_tok.bool().to(m.device)[:, None]
+        elif k == "dac":
+            m = m & dac_cand.bool().to(m.device)
+        terms.append(L.score_kd_bce(s_kd[..., i:i + 1], p_t[..., i:i + 1], m))
+    return torch.stack(terms).mean()
 
 
 # ----------------------------------------------------------------------------------------------- main helper
@@ -771,22 +1593,38 @@ class CKE2E2:
         if self._teachers is None:
             c = self.cfg
             kc = c.kd_calib
+            kw = {"fields": True} if c.kd_constraint["enabled"] else {}      # off: the old call exactly
             self._teachers = TeacherPair2(c.teacher_det_run, c.teacher_map_run, c.teacher_which, device,
                                           c.teacher_amp, c.teacher_require_done,
                                           ep_target=c.ep_target if c.teacher_ep_check else None,
                                           calib=({"det": kc["det"], "map": kc["map"]} if kc["enabled"] else None),
-                                          kd_keys=c.kd_score_keys)
+                                          kd_keys=c.kd_score_keys, **kw)
+            if kw:
+                check_constraint_teachers(self._teachers, c)
             if self._teachers.calib_info:
                 print("[ck_e2e2] KD calibration: " + "; ".join(
                     f"{t} {i['path']} (sha16 {i['sha16']}, ckpt {i['ckpt_sha16']}, keys {i['fitted_keys']})"
                     for t, i in self._teachers.calib_info.items()), flush=True)
+            if self._teachers.temporal_info is not None:
+                ti = self._teachers.temporal_info
+                print(f"[ck_e2e2] temporal DET teacher {c.teacher_det_run}: forecaster {ti['cfg']['forecaster']} "
+                      f"(fc_train {ti['cfg']['fc_train']}), branch sha16 {ti['branch_state_sha16']}, forecaster sha16 "
+                      f"{ti.get('forecaster_state_sha16')}, fc_init {ti.get('fc_init')}", flush=True)
         return self._teachers.to(device)
 
     def labels(self):
         if self._labels is None:
             from .e2e_data2 import LabelStore2
+            q = self.cfg.v4
+            kw = {}                                   # refiner v4 extras (off: the CK2 store, unchanged)
+            if q["readout"] == "hazard" and q["lambda_station"] > 0:
+                kw["with_tidx"] = True
+            if q["pref_head"]:
+                kw["with_pref"] = True
+            if q["corrector"] or self.cfg.v4_opt("edits") == "computed":     # corrector A / v4_3 computed edits
+                kw["with_edits"] = True
             self._labels = LabelStore2(self.cfg.io_dir, n_rows=N_ROWS, packed=self.cfg.warmup["packed"],
-                                       var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target)
+                                       var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target, **kw)
         return self._labels
 
     def sampler(self):
@@ -860,7 +1698,11 @@ class CKE2E2:
         wu = W["wu_ok"].bool()
         B = cand.shape[0]
         vv = targets["ck2_var_valid"].reshape(B, K16, NV)
+        par = _keep_parent(cand, self.sampler().anchors_t(dev)[W["parent_anchor"].to(dev).long()],
+                           W["teacher_ok"] & fin)
         return {"cand": cand, "cand_ok": W["teacher_ok"] & fin, "extra": None, "y": W["y"],
+                "cand_parent": par, "extra_parent": None, "vtype_kd": W["vtype"].to(dev).long(),
+                "tidx_lab": W.get("tidx"), "pref": W.get("pref"),
                 "ok_lab": W["ok"] & fin, "vtype_lab": W["vtype"], "grp": grp, "sur_pos": sur_pos,
                 "sur_tok_ok": wu, "lat_mask": lat_mask, "kd_tok_ok": wu, "wu_ok": wu,
                 "var_valid_frac": float(vv[:, :, 1:].float().mean()),
@@ -898,7 +1740,16 @@ class CKE2E2:
         G = self.label_set(rows, toks, targets, dev)
         G_traj, G_fin = _sanitize_traj(G["G_traj"].float(), fallback, G["G_ok"].bool())
         B, Kc = cand.shape[:2]
+        tc = top["cand"].float()
+        kd_par = torch.gather(tc, 1, P["parent"].to(dev).long()[..., None, None].expand(-1, -1, *tc.shape[2:]))
+        if "E_ok" in G:
+            return self._with_edits(cand, fin, P, G, G_traj, G_fin, kd_par, targets, top, V, dev)
         return {"cand": cand, "cand_ok": P["ok"] & fin, "extra": G_traj, "y": G["G_y"].float(),
+                "cand_parent": _keep_parent(cand, kd_par, P["ok"] & fin),
+                "extra_parent": _keep_parent(G_traj, label_set_parents(G, targets, self.sampler(), dev),
+                                             G["G_ok"].bool() & G_fin),
+                "vtype_kd": P["vtype"].to(dev).long(),
+                "tidx_lab": G.get("G_tidx"), "pref": G.get("G_pref"),
                 "ok_lab": G["G_ok"].bool() & G_fin, "vtype_lab": G["G_vtype"].long(),
                 "sur_pos": torch.arange(K16, device=dev)[None].expand(B, -1),
                 "sur_tok_ok": torch.ones(B, dtype=torch.bool, device=dev),
@@ -906,6 +1757,209 @@ class CKE2E2:
                 "kd_tok_ok": torch.ones(B, dtype=torch.bool, device=dev), "src": G["G_src"].long(),
                 "var_valid_frac": float(V["valid96"].reshape(B, K16, NV)[:, :, 1:].float().mean()),
                 "top": top, "V": V}
+
+    def _with_edits(self, cand, fin, P, G, G_traj, G_fin, kd_par, targets, top, V, dev) -> Dict[str, Any]:
+        """current_batch of a student whose generations carry edits (refiner v4 corrector A, or the v4_3 computed
+        edits): the label set G + the generation's recorded edits (their official labels: the critic's BCE also
+        learns the edits; parents = their source's identity), and the AWR inputs S['E'] (recorded sources, parents,
+        controls, PDMS of edits / sources / G; used by the corrector's AWR only)."""
+        B, Kc = cand.shape[:2]
+        KG = G_traj.shape[1]
+        E = {k: v.to(dev) for k, v in G.items() if k.startswith("E_") or k == "G_pdms"}
+        e_ok = E["E_ok"].bool()
+        g_par = _keep_parent(G_traj, label_set_parents(G, targets, self.sampler(), dev), G["G_ok"].bool() & G_fin)
+        extra = torch.cat([G_traj, E["E_traj"].float()], 1)
+        tid = G.get("G_tidx")
+        if tid is not None:
+            tid = torch.cat([tid, torch.full((B, e_ok.shape[1], tid.shape[-1]), -2, dtype=tid.dtype, device=dev)], 1)
+        return {"cand": cand, "cand_ok": P["ok"] & fin, "extra": extra,
+                "y": torch.cat([G["G_y"].float(), E["E_y"].float()], 1),
+                "cand_parent": _keep_parent(cand, kd_par, P["ok"] & fin),
+                "extra_parent": torch.cat([g_par, E["E_src_par"].float()], 1),
+                "vtype_kd": P["vtype"].to(dev).long(), "tidx_lab": tid, "pref": G.get("G_pref"),
+                "ok_lab": torch.cat([G["G_ok"].bool() & G_fin, e_ok], 1),
+                "vtype_lab": torch.cat([G["G_vtype"].long(), torch.full_like(e_ok, NV, dtype=torch.long)], 1),
+                "sur_pos": torch.arange(K16, device=dev)[None].expand(B, -1),
+                "sur_tok_ok": torch.ones(B, dtype=torch.bool, device=dev),
+                "lat_mask": torch.ones(B, Kc, dtype=torch.bool, device=dev),
+                "kd_tok_ok": torch.ones(B, dtype=torch.bool, device=dev), "src": G["G_src"].long(),
+                "var_valid_frac": float(V["valid96"].reshape(B, K16, NV)[:, :, 1:].float().mean()),
+                "top": top, "V": V, "E": E, "n_G": KG,
+                "kd_col96": torch.cat([torch.arange(K16, device=dev)[None].expand(B, -1) * NV,
+                                       P["cols"].to(dev).long()], 1)}
+
+    def corrector_edits(self, student, out: Dict, S: Dict, s_kd: torch.Tensor) -> Optional[Dict[str, torch.Tensor]]:
+        """refiner v4 A, recording: the corrector's sampled edits of the top EDIT_K KD candidates (the current top-16
+        + sampled variants, critic-only selection score) -> {traj [B,8,8,3], src [B,8] (96-column), u [B,8,12],
+        valid [B,8]} for CandRecorder2.add, or None (no corrector / no KD column map)."""
+        from .v4.corrector import critic_select_score, decode_edits
+        if getattr(student, "corrector", None) is None or "kd_col96" not in S or "ctx_all" not in out:
+            return None
+        Kc = S["cand"].shape[1]
+        feat, mem, ego, pref = out["scene"]
+        sc = critic_select_score(s_kd.detach())
+        sc = torch.where(S["cand_ok"].bool(), sc, torch.full_like(sc, -1e9))
+        k = int(self.cfg.v4["corr_k"])
+        idx = torch.topk(sc, k, dim=1).indices
+        B = idx.shape[0]
+        g = lambda a: torch.gather(a, 1, idx.reshape(B, k, *([1] * (a.dim() - 2))).expand(B, k, *a.shape[2:]))
+        src = g(S["cand"].float())
+        ctx = torch.cat([g(out["ctx_all"][:, :Kc]), g(s_kd.detach().float()),
+                         (ego[0].float() / 15.0).reshape(B, 1, 1).expand(B, k, 1)], -1)
+        with torch.no_grad():
+            a = student.corrector.act(ctx.detach(), sample=True)
+        traj = decode_edits(src, a["u"], ego[0])
+        valid = g(S["cand_ok"].bool()) & torch.isfinite(traj).flatten(2).all(-1)
+        return {"traj": traj.detach(), "src": torch.gather(S["kd_col96"], 1, idx), "u": a["u"].detach(),
+                "valid": valid}
+
+    def computed_edits_rec(self, student, out: Dict, S: Dict, s_kd: torch.Tensor) -> Optional[Dict[str, torch.Tensor]]:
+        """refiner v4_3 M5, recording (= corrector_edits' block for the labeler): CKNet.computed_edits of the KD set
+        (the current top-16 + sampled variants; sources = its top EDIT_K PARENT columns, i.e. identities, by the
+        critic-only selection score -- the deployment beta is chosen at evaluation) on the predicted fields of this
+        step's forward (out 'pctx' / 'parent_index_all': the edits are re-scored on that parent pass, no grad) ->
+        {traj [B,8,8,3], src [B,8] (96-column of the source), u [B,8,12] (0 without the corrector), valid [B,8]}, or
+        None (edits off / no KD column map / no parent context).  valid = an eligible source (not a filler slot),
+        finite, and an actual edit (edit_kind > 0) unless the corrector adds its residual: a no-edit slot is its source
+        bitwise, whose label the generation already holds (scoring it again would only duplicate a BCE row)."""
+        if not student.v4.computed_edits or "kd_col96" not in S or "pctx" not in out:
+            return None
+        Kc = S["cand"].shape[1]
+        feat, mem, ego, pref = out["scene"]
+        pool_out = {"score_logit": s_kd.detach(), "haz": out["haz"], "pctx": out["pctx"],
+                    "parent_index": out["parent_index_all"][:, :Kc]}
+        if "ctx_all" in out:
+            pool_out["ctx"] = out["ctx_all"][:, :Kc]
+        dev = s_kd.device
+        with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16,
+                                             enabled=bool(self.cfg.amp and dev.type == "cuda")):
+            ce = student.computed_edits(feat, mem, ego, S["cand"].float(), S["cand_parent"].float(), pool_out,
+                                        valid=S["cand_ok"].bool(), pref=pref,
+                                        sample=getattr(student, "corrector", None) is not None)
+        traj = ce["edit_traj"].float()
+        valid = ce["src_valid"].bool() & torch.isfinite(traj).flatten(2).all(-1)
+        if getattr(student, "corrector", None) is None:
+            valid = valid & (ce["edit_kind"] > 0)
+        return {"traj": traj.detach(), "src": torch.gather(S["kd_col96"], 1, ce["src_idx"]), "u": ce["u"].detach(),
+                "valid": valid, "kind": ce["edit_kind"], "clear": ce["edit_clear"]}
+
+    # -------------------------------------------------------------------------------------- refiner v4_3 KD scope
+    @staticmethod
+    def _near_scope(targets, status: torch.Tensor, S: Dict, logs: Dict[str, float]
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """kd_score_scope 'near' masks from the ref_* GT (train time only; a token without GT is excluded from both):
+        nc_tok [B] = nearest lead ttc0 < NEAR_TTC_S (lead_ttc0), dac_cand [B, K] = the KD candidate's parent has a min
+        executed corner SDF < NEAR_SDF_M (parent_min_corner_sdf).  Logs v4/kd_near_*.  ValueError when the batch lacks
+        any NEAR_REF_KEYS (the e2e target builder always emits them; a missing key would silently zero NC / DAC KD)."""
+        dev = S["cand"].device
+        tg = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in (targets or {}).items() if k.startswith("ref_")}
+        st = status.to(dev)
+        miss = [k for k in NEAR_REF_KEYS if k not in tg]
+        if miss:
+            raise ValueError(f"ck_e2e2.v4.kd_score_scope 'near' needs the GT loader's ref_* targets; missing {miss}")
+        ttc0, gt = lead_ttc0(tg, st)
+        nc_tok = gt & (ttc0 < NEAR_TTC_S)
+        par = S.get("cand_parent")
+        par = S["cand"] if par is None else par
+        msdf = parent_min_corner_sdf(tg, st, par.float())
+        dac = gt[:, None] & (msdf < NEAR_SDF_M)
+        logs.update({"v4/kd_near_nc_frac": float(nc_tok.float().mean()), "v4/kd_near_dac_frac": float(dac.float().mean()),
+                     "v4/kd_near_gt_frac": float(gt.float().mean())})
+        return nc_tok, dac
+
+    # -------------------------------------------------------------------------------------- refiner v4 terms
+    def _v4_terms(self, inner: torch.Tensor, out: Dict, S: Dict, logs: Dict[str, float], targets=None,
+                  student=None, s_lab: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """+ lambda_pref * Huber(log1p P_ref) (out pref_logp; target S 'pref' [B] m, else the GT loader's ref_p_pdm on
+        ref_gt_ok tokens), + lambda_ev * (occupancy BCE + margin Huber) of the evidence readout on the KD set's own-
+        parent candidates (GT-ok tokens), + lambda_station * censored station BCE of the hazard readout on the label set
+        (out extra_haz (on-policy) / haz (warm-up), S 'tidx_lab' [B, KL, 3]); absent inputs -> unchanged.
+        Logs v4/*."""
+        from .v4 import losses as V4L
+        q = self.cfg.v4
+        targets = targets or {}
+        if out.get("pref_logp") is not None and q["lambda_pref"] > 0:
+            tgt, ok = None, S.get("kd_tok_ok")
+            if S.get("pref") is not None:
+                tgt = S["pref"].float().reshape(-1)
+            elif "ref_p_pdm" in targets and "ref_gt_ok" in targets:
+                dev = out["pref_logp"].device
+                tgt = targets["ref_p_pdm"].float().reshape(-1).to(dev)
+                g = targets["ref_gt_ok"].bool().reshape(-1).to(dev)
+                ok = g if ok is None else ok.bool() & g
+            if tgt is not None:
+                lp = V4L.pref_loss(out["pref_logp"], tgt, ok)
+                logs["v4/pref_huber"] = _f(lp)
+                inner = inner + q["lambda_pref"] * lp
+        hk = out.get("haz")
+        # evidence readout only: the range readout's occ_logit has other time bins / semantics (its fields are trained
+        # by the constraint KD, kd_constraint, and optionally by its own GT field aux, rg_gt_aux below)
+        if hk is not None and "occ_logit" in hk and "occ_logit_u" not in hk and q["lambda_ev"] > 0:
+            dev = hk["occ_logit"].device
+            ref = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in targets.items() if k in V4L.EV_REF_KEYS}
+            l_occ, l_m, s_ev = V4L.evidence_aux(hk, ref)
+            logs.update({f"v4/{k}": float(v) for k, v in s_ev.items()})
+            inner = inner + q["lambda_ev"] * (l_occ + l_m)
+        gq = self.cfg.rg_gt_aux
+        if gq["enabled"] and hk is not None and "occ_logit_u" in hk:      # refiner v4_3 (c): the student's own fields
+            l_go, l_gm, s_g = self._rg_gt_aux(hk, S, targets, student)
+            logs.update({f"v4/{k}": float(v) for k, v in s_g.items()})
+            logs["v4/rg_gt_occ"], logs["v4/rg_gt_margin"] = _f(l_go), _f(l_gm)
+            inner = inner + gq["lambda"] * (l_go + l_gm)
+        if S.get("E") is not None and student is not None and getattr(student, "corrector", None) is not None \
+                and q["lambda_awr"] > 0 and s_lab is not None:
+            inner = inner + q["lambda_awr"] * self._awr(student, out, S, s_lab, logs)
+        haz = out.get("extra_haz") if S.get("extra") is not None else out.get("haz")
+        if haz is not None and "a_nc" in haz and S.get("tidx_lab") is not None and q["lambda_station"] > 0:
+            l_st, st = V4L.station_bce(haz, S["tidx_lab"].long(), S["y"].float(), S["ok_lab"].bool())
+            logs.update({f"v4/{k}": float(v) for k, v in st.items()})
+            inner = inner + q["lambda_station"] * l_st
+        return inner
+
+    def _rg_gt_aux(self, haz: Dict[str, torch.Tensor], S: Dict, targets, student
+                   ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+        """ck_e2e2.v4.rg_gt_aux: range_targets.gt_field_aux of the student's KD-set fields (haz = out['haz'], its
+        own-parent rows of S['cand']) against the GT of the batch's ref_* (losses.EV_REF_KEYS; tokens without GT
+        masked; a batch without them -> zero terms and rg_n 0), B target rule = the student's rg_stopped_aware, bins =
+        its ev_tbin_s, grid = v4.corridor_version.  -> (l_occ, l_margin, stats rg_*)."""
+        from .v4 import losses as V4L
+        from .v4 import range_targets as RT
+        v4n = getattr(student, "v4", None) or self.cfg.v4_net()
+        dev = haz["occ_logit_u"].device
+        ref = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in (targets or {}).items() if k in V4L.EV_REF_KEYS}
+        gq = self.cfg.rg_gt_aux
+        return RT.gt_field_aux(haz, S["cand"].to(dev), ref, tbin_s=float(v4n.ev_tbin_s),
+                               max_parents=int(gq["max_parents"]), corridor_version=int(self.cfg.v4["corridor_version"]),
+                               stopped_aware=bool(v4n.rg_stopped_aware))
+
+    def _awr(self, student, out: Dict, S: Dict, s_lab: torch.Tensor, logs: Dict[str, float]) -> torch.Tensor:
+        """AWR of the corrector on the generation's recorded edits (official labels, report 61 credit): log pi(u) of
+        the recorded controls under the current policy for the recorded sources; credit over the label set G + the
+        edits with the current critic-only selection scores (detached), A_loc against the source's official PDMS."""
+        from .v4.corrector import awr_loss, credit, critic_select_score
+        E, nG = S["E"], int(S["n_G"])
+        feat, mem, ego, pref = out["scene"]
+        # fp32 outside the loss's autocast: the scene features come from student_forward2 (fp16 under amp), the
+        # re-score runs here after that scope has closed (review 79 F8)
+        feat, mem = feat.float(), mem.float()
+        with torch.autocast(device_type=feat.device.type, enabled=False):
+            logp = student.corrector_logp(feat, mem, ego, E["E_src_traj"].float(), E["E_src_par"].float(),
+                                          E["E_u"].float(), pref=None if pref is None else pref.float())
+        s_all = critic_select_score(s_lab.detach())
+        KE = E["E_ok"].shape[1]
+        R_all = torch.cat([E["G_pdms"].float(), E["E_pdms"].float()], 1)
+        ok_all = S["ok_lab"].bool()
+        cols = (nG + torch.arange(KE, device=s_all.device))[None].expand(s_all.shape[0], -1)
+        c = credit(s_all, R_all, ok_all, cols, R_src=E["E_src_pdms"].float())
+        l = awr_loss(logp, c["A"], c["ok"])
+        n = int(c["ok"].sum())
+        logs["v4/awr"] = _f(l)
+        logs["v4/awr_n"] = float(n)
+        if n:
+            logs["v4/awr_A_mean"] = float(c["A"][c["ok"]].mean())
+            logs["v4/awr_Aloc_mean"] = float(c["A_loc"][c["ok"]].mean())
+            logs["v4/edit_better_frac"] = float((c["A_loc"][c["ok"]] > 1e-6).float().mean())
+        return l
 
     # -------------------------------------------------------------------------------------- inference
     @torch.no_grad()
@@ -921,16 +1975,70 @@ class CKE2E2:
         status = features["status_feature"].float().to(dev)
         v0 = ego_inputs(status)[0]
         V = C2.online_variants(top["cand"], v0_from_status(status), self.cfg.variants)
-        cand, fin = _sanitize_traj(V["traj96"], top["cand"][:, 0])
+        cand, fin, par = infer_pool(V["traj96"], top["cand"])                 # c = k * 6 + v -> parent k
+        ce = None
+        computed = bool(getattr(getattr(student, "v4", None), "computed_edits", False))
+        corr = getattr(student, "corrector", None) is not None
+        valid = V["valid96"] & fin
         with torch.autocast(device_type=dev.type, enabled=False):
-            out = student_forward2(student, bev_sgrid(bev.float()), cand, status)
+            if corr or computed:
+                # refiner v4 corrector A: score the 96 (+ corrector context), edit the critic's top-k, re-score;
+                # v4_3 computed edits (M5): the rule edits of the critic's top-edit_k parents on the predicted fields
+                # of the same parent pass (+ the corrector's residual when both are on)
+                ego = ego_inputs(status)
+                feat, mem = student.trunk.scene(bev_sgrid(bev.float()), cand.shape[0])
+                pref = student.scene_pref(mem, ego)
+                kw = {"return_pctx": True} if computed else {}           # corrector only: the old call exactly
+                po = student.score_set(feat, mem, ego, cand, par, pref=pref, return_ctx=corr, **kw)
+                out = {"score_logit": po["score_logit"], "w_lat": po["w_lat"]}
+                if computed:
+                    ce = student.computed_edits(feat, mem, ego, cand, par, po, pref=pref, valid=valid)
+                else:
+                    ce = student.correct_topk(feat, mem, ego, cand, par, po, pref=pref, valid=valid)
+            else:
+                out = student_forward2(student, bev_sgrid(bev.float()), cand, status, cand_parent=par)
         lat = lateral_decode(cand, out["w_lat"], v0, 0.0)
         res = {"ck2_cand_idx": top["idx"], "ck2_v2_final": top["final"], "ck2_v2_im": top["im"],
-               "ck2_v2_sim": top["sim"], "ck2_cand96": V["traj96"], "ck2_valid96": V["valid96"] & fin,
+               "ck2_v2_sim": top["sim"], "ck2_cand96": V["traj96"], "ck2_valid96": valid,
                "ck2_score_logit": out["score_logit"].float(), "ck2_w_lat": out["w_lat"].float(),
                "ck2_e_lat": lat["e_lat"][..., 2:].float(), "ck2_lat_traj": lat["traj"].float()}
+        if ce is not None:          # the K edits (no lateral head on top: the corrector's / the rule's own controls)
+            et = ce["edit_traj"].float()
+            fin_e = torch.isfinite(et).flatten(2).all(-1)
+            if computed:            # not selectable: a filler slot (src_valid False, an excluded pool column bitwise)
+                ev, kind = ce["src_valid"].bool() & fin_e, ce["edit_kind"].to(torch.int8)
+                if not corr:        # and a no-edit slot (kind 0: its source column bitwise, = computed_edits_rec's
+                    ev = ev & (ce["edit_kind"] > 0)   # rule) -- its re-score ties the pool's only up to GEMM batch-
+                    #                 shape noise on GPU, so a selectable copy would randomly drop the lateral head
+                    #                 (an edit pick is submitted as is); with the corrector it carries its residual
+            else:                   # corrector A: every shortlisted (valid) source edited; no rule kind (-1)
+                ev = torch.gather(valid, 1, ce["src_idx"]) & fin_e
+                kind = torch.full(ev.shape, -1, dtype=torch.int8, device=ev.device)
+            res.update(ck2_edit_traj=et, ck2_edit_src=ce["src_idx"].long(), ck2_edit_u=ce["u"].float(),
+                       ck2_edit_score_logit=ce["edit_score_logit"].float(), ck2_edit_valid=ev, ck2_edit_kind=kind)
         sel = self.cfg.infer_select
-        if sel is not None:
+        if sel is not None and ((ce is not None and "edits" not in sel) or (ce is None and sel.get("edits"))):
+            raise ValueError(f"ck_e2e2.infer_select: the student {'emits' if ce is not None else 'has no'} edits, "
+                             f"infer_select.edits is {sel.get('edits')!r} (CKE2E2Config.validate rule: explicit "
+                             f"true = 96 + K / false = 96 only when the student emits edits)")
+        if sel is not None and sel.get("edits"):
+            # 96 + K (eval_ck2's headline rule, select96_edits): an edit pick submits the edit itself (its own
+            # controls, no lateral head on top), a pool pick as select2.final_traj; ck2_sel_idx 96 + j = edit slot j
+            from . import select2 as S2
+            cpu = lambda a: a.detach().float().cpu().numpy()                       # noqa: E731
+            idx = select96_edits(cpu(res["ck2_v2_final"]), cpu(res["ck2_v2_im"]),
+                                 cpu(torch.sigmoid(res["ck2_score_logit"])), res["ck2_valid96"].cpu().numpy(),
+                                 cpu(torch.sigmoid(res["ck2_edit_score_logit"])), res["ck2_edit_src"].cpu().numpy(),
+                                 res["ck2_edit_valid"].cpu().numpy(), sel["beta"], S2.VARIANT_SETS[sel["set"]])
+            idx_t = torch.as_tensor(idx, dtype=torch.long, device=dev)
+            is_e = idx_t >= S2.G_K
+            ip = torch.where(is_e, torch.zeros_like(idx_t), idx_t)
+            traj, _src = S2.final_traj(res["ck2_cand96"], res["ck2_lat_traj"], ip, sel["lat_mode"])
+            je = (idx_t - S2.G_K).clamp(0, res["ck2_edit_traj"].shape[1] - 1)
+            et = res["ck2_edit_traj"][torch.arange(idx_t.shape[0], device=dev), je]
+            res["ck2_sel_idx"] = idx_t
+            res["ck2_traj"] = torch.where(is_e[:, None, None], et.to(traj.dtype), traj).float()
+        elif sel is not None:
             from . import select2 as S2
             idx = S2.select96(res["ck2_v2_final"], res["ck2_v2_im"], torch.sigmoid(res["ck2_score_logit"]),
                               res["ck2_valid96"], sel["beta"], types=S2.VARIANT_SETS[sel["set"]])
@@ -981,7 +2089,12 @@ class CKE2E2:
                 rec = (top, C2.online_variants(top["cand"], v0v, c.variants))
         t_var = time.time() - tv
         n_rec = 0
-        if rec is not None and self.recorder is not None:
+        # refiner v4 corrector / v4_3 computed edits: the on-policy record also carries the step's edits -> recorded
+        # after the forward
+        computed = bool(getattr(getattr(student, "v4", None), "computed_edits", False))
+        defer_rec = ((getattr(student, "corrector", None) is not None or computed) and phase == "onpolicy"
+                     and "kd_col96" in S)
+        if rec is not None and self.recorder is not None and not defer_rec:
             top, V = rec
             n_rec = self.recorder.add(rows, V["traj96"], V["valid96"], top["idx"], top["final"], v0v, self.gstep)
             self.cum["rec_tokens"] += n_rec
@@ -989,16 +2102,41 @@ class CKE2E2:
         # ---- teachers (online, every phase) on the step's KD candidates
         tt = time.time()
         tp = self.teachers(dev)
+        tkw: Dict[str, Any] = {}
+        if tp.det_temporal:                             # refiner-v3 temporal DET teacher: its causal object rows
+            objs_det, obj_ok_det = kd_objs_of(targets, dev)
+            tkw = {"objs_det": objs_det, "obj_ok_det": obj_ok_det}
+        if c.kd_constraint["enabled"]:                  # refiner v4_3 constraint KD: the teachers' range fields
+            tkw["fields"] = kd_constraint_request(c.kd_constraint["occ_channels"])
         T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
-                   cand_ok=S["cand_ok"])
+                   cand_ok=S["cand_ok"], parents=S.get("cand_parent"), family=S.get("vtype_kd"), **tkw)
         t_teacher = time.time() - tt
 
         # ---- student forward (one pass over KD candidates + label set)
         ts = time.time()
+        rec_edits = rec is not None and self.recorder is not None and defer_rec
+        fkw = {"return_pctx": True} if (rec_edits and computed) else {}       # off: the old call exactly
         with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=bool(c.amp and dev.type == "cuda")):
-            out = student_forward2(student, bev_sgrid(bev), S["cand"], status, extra=S["extra"])
+            out = student_forward2(student, bev_sgrid(bev), S["cand"], status, extra=S["extra"],
+                                   cand_parent=S.get("cand_parent"), extra_parent=S.get("extra_parent"), **fkw)
         s_kd = out["score_logit"].float()
         s_lab = s_kd if S["extra"] is None else out["extra_score_logit"].float()
+        if rec_edits:
+            top, V = rec
+            ed = (self.computed_edits_rec(student, out, S, s_kd) if computed
+                  else self.corrector_edits(student, out, S, s_kd))
+            if ed is not None and "kind" in ed:
+                kd_, cl_ = ed.pop("kind"), ed.pop("clear")
+                logs["v4/edit_rec_valid_frac"] = float(ed["valid"].float().mean())
+                for code, nm in ((1, "lon"), (2, "lat"), (3, "both")):
+                    logs[f"v4/edit_rec_{nm}_frac"] = float((kd_ == code).float().mean())
+                # the computed edits (kind > 0) whose edit reads inside the predicted tube (NC, TTC, DAC; edits.py
+                # edit_clear) -- noisy predicted fields can leave many outside (0 when no edit was made)
+                ek = kd_ > 0
+                logs["v4/edit_clear_frac"] = float(cl_[ek].float().mean()) if bool(ek.any()) else 0.0
+            n_rec = self.recorder.add(rows, V["traj96"], V["valid96"], top["idx"], top["final"], v0v, self.gstep,
+                                      edits=ed)
+            self.cum["rec_tokens"] += n_rec
         corr = lateral_decode(S["cand"], out["w_lat"], v0, c.lon_st_slope)
         e_s = corr["e_lat"][..., 2:].float()
         Kc = S["cand"].shape[1]
@@ -1025,8 +2163,23 @@ class CKE2E2:
         l_sur_val = _f(l_sur)
         kd_ok = T["kd_ok"].bool() & S["kd_tok_ok"][:, None]
         ki = [CK_KEYS.index(k) for k in c.kd_score_keys]      # user 2026-10-08: comfort excluded from score KD
-        l_ks = L.score_kd_bce(s_kd[..., ki], T["kd_score_prob"][..., ki], kd_ok)
+        kd_ok_s = kd_ok
+        if c.v4["kd_parent_only"]:                            # refiner v4 I2: score KD on the parent columns only
+            kd_ok_s = kd_ok & (S["vtype_kd"] == 0)
+        if c.kd_score_scope == "near":                        # refiner v4_3 M6: NC / DAC KD near the hazard only
+            nc_tok, dac_c = self._near_scope(targets, status, S, logs)
+            l_ks = score_kd_near(s_kd[..., ki], T["kd_score_prob"][..., ki], kd_ok_s, c.kd_score_keys, nc_tok, dac_c)
+        else:
+            l_ks = L.score_kd_bce(s_kd[..., ki], T["kd_score_prob"][..., ki], kd_ok_s)
         inner = inner + (r * c.lambda_kd_score) * l_ks
+        if c.kd_constraint["enabled"]:                        # refiner v4_3 M6: teacher fields -> student fields
+            kq = c.kd_constraint
+            l_co, l_cm, st_c = constraint_kd(out["haz"], T, S["cand_ok"].bool() & S["kd_tok_ok"][:, None], kq)
+            l_cn = kq["lambda_occ"] * l_co + kq["lambda_margin"] * l_cm
+            inner = inner + r * l_cn
+            logs.update({f"v4/{k}": float(v) for k, v in st_c.items()})
+            logs["v4/cn_occ"], logs["v4/cn_margin"] = _f(l_co), _f(l_cm)
+            logs["ck2/wt_kd_constraint"] = c.loss_weight * r * _f(l_cn)
         m_lat = kd_ok & S["lat_mask"]
         l_lat = _masked_l1(e_s, T["kd_e_lat"], m_lat)
         l_lat_val = _f(l_lat)
@@ -1041,8 +2194,13 @@ class CKE2E2:
             self.ema.update(ema_sur, ema_kd)
             w = float(self.ema.weight(self.mb))
         inner = inner + (r * w) * l_lat
+        inner = self._v4_terms(inner, out, S, logs, targets, student, s_lab)
         loss = c.loss_weight * inner
         loss = loss + 0.0 * (out["score_all"].sum() + out["w_lat_all"].sum())
+        if out.get("pref_logp") is not None:
+            loss = loss + 0.0 * out["pref_logp"].sum()
+        if getattr(student, "corrector", None) is not None:      # in the DDP graph every step (AWR terms: _v4_terms)
+            loss = loss + 0.0 * sum(p.sum() for p in student.corrector.parameters())
         loss_val = _f(loss)
         bad_loss = not math.isfinite(loss_val)
         if bad_loss:
@@ -1113,6 +2271,8 @@ class CKE2E2:
             logs["ck2/lat_disagree"] = float(((T["e_det"] - T["e_map"]).abs().mean(-1).nan_to_num(0.0)
                                               * mf).sum()) / den
             logs["ck2/n_cand"] = float(Kc + (0 if S["extra"] is None else S["extra"].shape[1]))
+            if "obj_ok_det" in tkw:                     # temporal DET teacher only (CK2 teachers: logs unchanged)
+                logs["ck2/kd_obj_ok_frac"] = float(tkw["obj_ok_det"].float().mean())
         self.cum["sur_nonfinite"] += int(nonfin)
         logs["ck2/variants_ms"] = 1e3 * t_var
         logs["ck2/teacher_ms"] = 1e3 * t_teacher

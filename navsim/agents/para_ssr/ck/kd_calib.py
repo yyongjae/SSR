@@ -25,6 +25,12 @@ File (JSON, one per teacher run and ckpt, default <CK_DATA>/ck2/kd_calib/<run>__
 params {key: {a, b, status}}, metrics, data, inference, fit_options, code, created.  The student (online2.TeacherPair2)
 and the launcher (launch_util2) refuse a file whose run / which / ckpt sha16 / ep_target / arm differ from the loaded
 teacher, or that does not fit every KD key the teacher is a source of.
+Optional per-variant-family parameters (refiner v4 I2, report 72): params_by_family {family: {key: {a, b, status}}}
+for the six rule-variant families KD_FAMILIES (= select2.VNAMES: id, a-1.0, a-0.5, a+0.5, l-0.5, l+0.5; a column c of
+the 96 pool belongs to family c % 6), fitted per family on candidates the teacher never trained on
+(tools/ck/v4/fit_kd_calib_family.py: a finished student generation, i.e. student top-16 x 6 with official labels).
+'params' is then the identity family's parameters (what a reader without family support applies to every column).
+calib_matrix -> a, b [6, 5] (a record without families: the 'params' row repeated, i.e. the old calibration).
 No tools imports (navsim side).
 """
 from __future__ import annotations
@@ -52,6 +58,7 @@ RIDGE = 1e-6
 N_BINS = 15
 STATUS = ("fitted", "not_fitted")
 KD_CALIB_ROOT = Path(CK_DATA) / "ck2" / "kd_calib"
+KD_FAMILIES = ("id", "a-1.0", "a-0.5", "a+0.5", "l-0.5", "l+0.5")   # = select2.VNAMES (column c -> family c % 6)
 
 
 def calib_path(run: str, which: str = "last", root=None) -> Path:
@@ -329,6 +336,26 @@ def validate_record(rec: Dict[str, Any], where: str = "") -> None:
             fitted.append(k)
     if fitted != list(rec["fitted_keys"]):
         raise ValueError(f"{w}fitted_keys {rec['fitted_keys']} != keys with status 'fitted' {fitted}")
+    if "params_by_family" in rec:
+        F = rec["params_by_family"]
+        if not isinstance(F, dict) or set(F) != set(KD_FAMILIES):
+            raise ValueError(f"{w}params_by_family families {sorted(F) if isinstance(F, dict) else F!r} != "
+                             f"{list(KD_FAMILIES)}")
+        for fam in KD_FAMILIES:
+            if set(F[fam]) != set(CK_KEYS):
+                raise ValueError(f"{w}params_by_family.{fam} keys {sorted(F[fam])} != CK_KEYS")
+            for k in CK_KEYS:
+                p = F[fam][k]
+                a, b, st = p.get("a"), p.get("b"), p.get("status")
+                if st not in STATUS or not (isinstance(a, (int, float)) and isinstance(b, (int, float))
+                                            and math.isfinite(a) and math.isfinite(b) and a > 0):
+                    raise ValueError(f"{w}params_by_family.{fam}.{k}: need a status in {STATUS}, finite a > 0, b")
+                if (st == "fitted") != (k in rec["fitted_keys"]):
+                    raise ValueError(f"{w}params_by_family.{fam}.{k}: status {st!r} vs fitted_keys {rec['fitted_keys']}")
+                if st == "not_fitted" and (a != 1.0 or b != 0.0):
+                    raise ValueError(f"{w}params_by_family.{fam}.{k} is 'not_fitted' but not the identity")
+        if any(F["id"][k]["a"] != P[k]["a"] or F["id"][k]["b"] != P[k]["b"] for k in CK_KEYS):
+            raise ValueError(f"{w}params must equal params_by_family['id'] (readers without family support)")
 
 
 def load_calib(path) -> Dict[str, Any]:
@@ -377,13 +404,32 @@ def calib_vectors(rec: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
     return a, b
 
 
+def has_families(rec: Dict[str, Any]) -> bool:
+    return "params_by_family" in rec
+
+
+def calib_matrix(rec: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+    """(a [6, 5], b [6, 5]) float32, rows KD_FAMILIES, columns CK_KEYS; without params_by_family every row is
+    calib_vectors(rec) (the per-key calibration of every column, unchanged)."""
+    if not has_families(rec):
+        a, b = calib_vectors(rec)
+        return np.tile(a, (len(KD_FAMILIES), 1)), np.tile(b, (len(KD_FAMILIES), 1))
+    F = rec["params_by_family"]
+    a = np.asarray([[F[f][k]["a"] for k in CK_KEYS] for f in KD_FAMILIES], np.float32)
+    b = np.asarray([[F[f][k]["b"] for k in CK_KEYS] for f in KD_FAMILIES], np.float32)
+    return a, b
+
+
 def load_teacher_calib(path, *, run: str, which: str, ckpt_sha16: Optional[str], ep_target: str, arm: str,
-                       kd_keys: Optional[Sequence[str]] = None) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    """load + check_calib -> (a [5], b [5] float32, info for teachers.json / logs)."""
+                       kd_keys: Optional[Sequence[str]] = None, family: bool = False
+                       ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """load + check_calib -> (a [5], b [5] float32, info for teachers.json / logs); family=True and a record with
+    params_by_family -> (a [6, 5], b [6, 5]) (calib_matrix) and info['families'] = True."""
     rec = load_calib(path)
     check_calib(rec, run=run, which=which, ckpt_sha16=ckpt_sha16, ep_target=ep_target, arm=arm, kd_keys=kd_keys,
                 where=str(path))
-    a, b = calib_vectors(rec)
+    fam = bool(family) and has_families(rec)
+    a, b = calib_matrix(rec) if fam else calib_vectors(rec)
     held = {}
     for k in rec["fitted_keys"]:
         h = ((rec.get("metrics") or {}).get(k) or {}).get("heldout") or {}
@@ -394,6 +440,10 @@ def load_teacher_calib(path, *, run: str, which: str, ckpt_sha16: Optional[str],
             "arm": rec["arm"], "ckpt_sha16": rec["ckpt_sha16"], "ep_target": rec["ep_target"],
             "created": rec.get("created"), "fitted_keys": list(rec["fitted_keys"]),
             "params": {k: [rec["params"][k]["a"], rec["params"][k]["b"]] for k in CK_KEYS}, "heldout": held}
+    if fam:
+        info["families"] = True
+        info["params_by_family"] = {f: {k: [rec["params_by_family"][f][k]["a"], rec["params_by_family"][f][k]["b"]]
+                                        for k in CK_KEYS} for f in KD_FAMILIES}
     return a, b, info
 
 

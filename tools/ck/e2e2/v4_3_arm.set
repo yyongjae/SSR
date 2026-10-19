@@ -1,0 +1,50 @@
+# refiner v4_3 student (docs/refiner_v4/V4_3_SPEC.md, user decisions 2026-10-16 KST; ARM=v4_3): BEV KD stays on (yaml
+# default = the ck2e2e_bevkd setting) and
+#   * readout 'range' (M4): B / U blocked-field logits + margin D per unique parent, read at each candidate's EXECUTED
+#     states (exec_model lqr = the official tracker port), 20 bins of 0.25 s, EP head on the detached evidence, P_ref
+#     scene query, corridor version 2;
+#   * Phase 0b R2 (spec 'Phase 0b' / 'Phase 1c'): rg_read any4 (B / U read as the OR of the 2 x 2 cells around each
+#     executed point) + rg_stopped_aware (B = the stopped-aware B that NC reads, + a Bp group = the plain not-behind B
+#     that TTC reads below the 2 m switch) -- the representation of the R2 teachers v4T10_rng2 / v4M10_rng2
+#     (tools/ck/v4/run_teachers.sh READOUT=range R2=1); the computed edits read the fields the same way;
+#   * computed edits (M5): the rule edits of the critic's top-8 parents on the predicted fields, EXTRA candidates only
+#     (never a gate; selection over 96 + 8); recorded with the 96 and labelled by labeler2 (critic BCE on their
+#     official labels); corrector A off (its zero-init residual on the edit is the optional next step);
+#   * KD routing (M6): score KD on nc (<- DET) and dac (<- MAP) only, on the parent columns (kd_parent_only as v4_arm),
+#     scope 'all' ('near' = option); constraint KD: DET blocked field B BCE (spec M6 / user decision: occ_channels=B,
+#     here the stopped-aware B of the R2 pair; occ_channels=BBp also distils the Bp group that the student's TTC reads,
+#     BU / all the U channel -- options the user has not confirmed) + MAP margin Huber (s <= 32 m) on the student's
+#     unique parents of the KD set.
+# Teachers: the R2 RANGE teachers v4T10_rng2 (DET) / v4M10_rng2 (MAP) below (not trained yet: launch_util2 refuses a
+# launch until the runs exist and have finished); the two KD calibration paths are PLACEHOLDERS -- launch_util2 refuses
+# a launch until an E2E_CK_SET file sets kd_calib.det / kd_calib.map (KD calibration of the R2 teachers on nc / dac,
+# fit_kd_calib(_family).py) or kd_calib.enabled=false.  kd_constraint also refuses teachers on another grid (corridor
+# version / time bins) or with another rg_stopped_aware than the student (an R1 teacher for this R2 student); rg_read is
+# recorded per side and may differ (the R2 pair has any4 like this arm).
+# Not trained without the user's approval (GPUs 0-3 only); the Phase 1c decision (P1) gates this run.
+# The v4.exec_model .. v4.kd_constraint / v4.rg_* keys are OPTIONAL v4 keys (online2._d_v4_opt; launch_util2.apply_sets2
+# declares them), absent from ck_e2e2.yaml so the older arms are unchanged.
+v4.readout=range
+v4.exec_model=lqr
+v4.ev_tbins=20
+v4.ev_tbin_s=0.25
+v4.ep_evidence=true
+v4.pref_head=true
+v4.corridor_version=2
+v4.rg_read=any4
+v4.rg_stopped_aware=true
+v4.edits=computed
+v4.edit_k=8
+v4.corrector=false
+v4.kd_parent_only=true
+kd_score_keys=[nc,dac]
+v4.kd_score_scope=all
+v4.kd_constraint.enabled=true
+v4.kd_constraint.lambda_occ=0.5
+v4.kd_constraint.lambda_margin=0.5
+v4.kd_constraint.map_range_m=32.0
+v4.kd_constraint.occ_channels=B
+teacher_det_run=/home/external-user/ssd/yongjae_refiner/ck/v4/train/v4T10_rng2
+teacher_map_run=/home/external-user/ssd/yongjae_refiner/ck/v4/train/v4M10_rng2
+kd_calib.det=/PLACEHOLDER/v4_3/kd_calib_det.json
+kd_calib.map=/PLACEHOLDER/v4_3/kd_calib_map.json

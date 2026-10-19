@@ -34,6 +34,17 @@
 # ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
 #   after the arm file.  Never pkill / pgrep -f: processes are found through the pid files only.
 # Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu, at most 48: 32 / 48), LABELER_POLL (30),
+# ARM=bevkd (refiner-v4 default: ck_e2e2.yaml = the bevkd setting; also adds bevkd_arm.set) | main (main_arm.set: BEV KD
+#   off) | v4 (v4_arm.set: refiner v4 student) | v4_3 (v4_3_arm.set: range critic + computed edits + constraint KD;
+#   its teacher runs / KD calibration files are placeholders, refused until E2E_CK_SET sets them);
+#   E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied after the arm file.  Never pkill / pgrep -f: processes are
+#   found through the pid files only.
+# refiner-v3 temporal DET teacher (docs/refiner_v3/STEP2_E2E.md): E2E_CK_SET=$REPO/tools/ck/e2e2/v3teacher_arm.set
+#   (teacher_det_run = v3T10_a_learned + its kd_calib.det); launch_util2 accepts a temporal teacher only when it is the
+#   DET teacher and not privileged, records its temporal cfg, branch / forecaster weight sha16, fc_init and ca_scales
+#   shas (teachers.json det.temporal) and refuses an object pack whose build.json sha256 differs from the teacher's
+#   training pack (teachers.json kd_objects).  Launch from the SSR-v3 worktree (the temporal model code lives there).
+# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (32), LABELER_POLL (30),
 #   LABELER_MAX_EPOCH (MAX_EPOCHS-2), E2E_NO_LABELER=1, E2E_WANDB=online|offline|disable, E2E_EXTRA=<Hydra override file>,
 #   E2E_SMOKE=1, E2E_WAIT_TIMEOUT, E2E_DRY_RUN=1, WATCHDOG_EVERY (120), LABELER_MAX_RESTARTS (20), LABELER_STALL_S (1200),
 #   E2E_NO_WATCHDOG=1, E2E_NO_DEEP_TEACHER_CHECK=1 (tests: skip loading the teacher ckpts).
@@ -58,7 +69,7 @@ while [ $# -gt 0 ]; do
 done
 RUN=${RUN:?RUN=<run name> is required}
 ARM=${ARM:-main}
-E2E_ROOT=${E2E_ROOT:-/workspace/byounggun/ssr_outputs/ck2_e2e}
+E2E_ROOT=${E2E_ROOT:-/home/external-user/ssd/yongjae_refiner/ck/ck2/e2e}
 R="$E2E_ROOT/$RUN"
 L="$R/launch"; LB="$R/labeler"; IO="$R/ck_e2e2"
 export PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
@@ -100,7 +111,7 @@ grp_kill() {  # grp_kill <pgid_file> <pid_file> <needle> <name>: TERM the group,
 need_gpus() { [ -n "$GPUS" ] || die "--gpus <2 or 4 GPUs of 0-3> is required (e.g. --gpus 0,1 or 0,1,2,3)"; }
 
 case "$R" in *=*) die "run dir $R contains '='";; esac
-case "$ARM" in main|bevkd) ;; *) die "ARM must be main | bevkd (got $ARM)";; esac
+case "$ARM" in main|bevkd|v4|v4_3) ;; *) die "ARM must be main | bevkd | v4 | v4_3 (got $ARM)";; esac
 
 start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   if [ "${E2E_NO_LABELER:-0}" = 1 ]; then log "labeler disabled (E2E_NO_LABELER=1)"; return 0; fi
@@ -210,6 +221,9 @@ do_start() {
   local OA=(overrides --run-dir "$R" --gpus "$GPUS" --workers "${TRAIN_WORKERS:-6}" --max-epochs "${MAX_EPOCHS:-30}"
             --wandb "$WB" --teacher-check "$TMODE" --out "$OUTD/overrides.txt")
   [ "$ARM" = bevkd ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/bevkd_arm.set")
+  [ "$ARM" = main ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/main_arm.set")
+  [ "$ARM" = v4 ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/v4_arm.set")
+  [ "$ARM" = v4_3 ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/v4_3_arm.set")
   [ -n "${E2E_CK_SET:-}" ] && OA+=(--ck-set-file "$E2E_CK_SET")
   [ -n "${E2E_EXTRA:-}" ] && OA+=(--extra-file "$E2E_EXTRA")
   [ -n "$CKPT" ] && OA+=(--resume-ckpt "$CKPT")

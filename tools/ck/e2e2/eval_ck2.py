@@ -40,6 +40,21 @@ Frozen eval spec (report 48 F1-c / F3): the navtrain_val run stores ONE spec in 
   checkpoint sha16 and the ep_target of the navtest dump must equal the spec's, and a --limit val choice cannot fix a
   full navtest -- every mismatch is a SystemExit.  A calibrated run writes <split>[__selw_<name>]__cal_<sha8 of the
   offset values>, so an offset ablation never overwrites the uncalibrated val result.
+Edits (refiner v4 corrector A / v4_3 computed edits, spec V4_3 M5; only when the infer dir holds edit_score_logit /
+  edit_src [N, K] and labels/<split>/edit_<run> exists -- every other run's outputs are unchanged): rows 'sel+edits
+  b= set= lat=' = selection over the 96 + K: the 96 pool scores as 'sel' (allowed columns of the variant set, tie order
+  identities first) and each edit's score blend(v2_final[src // 6], ck_final(p_edit, im[src // 6]), beta) (the source's
+  parent's v2 final / im, as eval_edits / the spec), argmax over 96 + K (ties -> the pool); an edit pick submits the
+  edit itself (its own controls, no lateral head on top) -> its official label.  Selectable edits: edit_valid (computed
+  edits: not a filler slot and, without the corrector, not a no-edit slot; file absent -> every edit with a source),
+  not a bitwise copy of its source pool column (infer/edit_traj vs packed/cand96 when both exist; counted n_edit_dup:
+  a copy's re-score ties its source only up to GEMM batch-shape noise, and picking it would drop the lateral head),
+  finite score, official label ok (an unlabelled edit is not selectable and counted, n_edit_unlabelled).  The token
+  mask stays the 96 one (packed ok & done & every submittable 96 column labelled ok): every 96-only row is on the same
+  tokens.  The navtest run also refuses a val spec of another K (edits_k).  navtrain_val chooses the 96 + K beta /
+  variant set (choice 'best_edits', same rule as 'best', stored in the frozen eval spec), navtest restores it
+  (--fix-from); the representative (headline) row is then the 96 + K one, metrics.json 'edits' holds its paired
+  difference vs the 96 row of the same beta / set / lateral mode and vs the 96 choice.
 """
 from __future__ import annotations
 
@@ -97,17 +112,46 @@ def token_mask(packed_ok, done, valid96, ok_pool, ok_lat) -> np.ndarray:
 
 
 def _key(r: Dict[str, Any]) -> str:
+    if r["variant"] == "sel_edits":
+        return f"sel+edits b={r['beta']:g} set={r['set']} lat={r['lat_mode']}"
     if r["variant"] != "sel":
         return r["variant"]
     return f"sel b={r['beta']:g} set={r['set']} lat={r['lat_mode']}"
 
 
+def select_edits(v2_final16, v2_im16, prob96, valid96, prob_e, src_e, use_e, beta: float,
+                 types: Sequence[int] = S2.VARIANT_SETS["all"], offset=None, w=Cn.SEL_W) -> np.ndarray:
+    """Selection over the 96 pool + K edits (module docstring 'Edits'): prob96 [N, 96, 5], valid96 [N, 96], prob_e
+    [N, K, 5] (the edits' sigmoid scores), src_e [N, K] (96-column of each edit's source), use_e [N, K] (selectable)
+    -> idx [N] int64: < 96 = a pool column (select2.select96's choice when no edit wins), 96 + j = edit slot j.  Ties ->
+    the pool (identities first, select2.TIE_ORDER), then the lower edit slot.  = online2.select96_edits (one
+    implementation, also the agent's infer_select.edits)."""
+    from navsim.agents.para_ssr.ck.online2 import select96_edits
+    return select96_edits(v2_final16, v2_im16, prob96, valid96, prob_e, src_e, use_e, beta, types, offset, w)
+
+
+def chosen_labels_edits(lab_pool: np.ndarray, lab_lat: np.ndarray, lab_e: np.ndarray, idx, lat_mode: str
+                        ) -> Tuple[np.ndarray, np.ndarray]:
+    """labels of the submitted trajectory of select_edits picks: a pool pick as select2.chosen_labels (lateral mode),
+    an edit pick its own label (no lateral head on top) -> (labels [N, C], lateral applied [N])."""
+    ii = np.asarray(idx, np.int64)
+    is_e = ii >= S2.G_K
+    ip = np.where(is_e, 0, ii)
+    ar = np.arange(len(ii))
+    base = S2.chosen_labels(lab_pool, lab_lat, ip, lat_mode)
+    je = np.clip(ii - S2.G_K, 0, max(lab_e.shape[1] - 1, 0))
+    return np.where(is_e[:, None], lab_e[ar, je], base), S2.use_lat(ip, lat_mode) & ~is_e
+
+
 def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray, valid96: np.ndarray,
                   v2_final16: np.ndarray, v2_im16: np.ndarray, logs: np.ndarray, lead_mask: Optional[np.ndarray],
                   combos: Sequence[Tuple[float, str, str]], n_boot: int = 2000, seed: int = 0,
-                  offset=None, extra_rows: bool = True, sel_w="default") -> Dict[str, Any]:
+                  offset=None, extra_rows: bool = True, sel_w="default",
+                  edits: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, Any]:
     """Arrays already restricted to the evaluation tokens.  lab_* [n, 96, 9] (LABEL_COLS), prob96 [n, 96, 5],
     valid96 [n, 96], v2_final16 / v2_im16 [n, 16]; sel_w = select2.select96 weights (SEL_W_SETS name or 4 floats).
+    edits (optional, module docstring 'Edits'): {prob [n, K, 5], src [n, K], use [n, K], lab [n, K, 9]} -> + one
+    'sel_edits' row per combo (paired 'd_pdms_vs96' against the 'sel' row of the same combo, edit_pick_rate).
     -> {'rows': [...], 'idx': {key: [n]}}."""
     w_sel = S2.resolve_w(sel_w)
     L = Cn.LBL
@@ -124,8 +168,11 @@ def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray,
         m.update(row)
         m["frac_changed"] = float(np.mean((idx != 0) | lat)) if n else float("nan")
         m["frac_lat"] = float(np.mean(lat)) if n else float("nan")
-        m["sel_share"] = {S2.VNAMES[t]: float(np.mean(idx % S2.NV == t)) if n else float("nan")
+        pool = idx < S2.G_K
+        m["sel_share"] = {S2.VNAMES[t]: float(np.mean(pool & (idx % S2.NV == t))) if n else float("nan")
                           for t in range(S2.NV)}
+        if row["variant"] == "sel_edits":
+            m["sel_share"]["edit"] = float(np.mean(~pool)) if n else float("nan")
         if row["variant"] != "v2":
             m["d_pdms"] = log_bootstrap(chosen[:, P] - base[:, P], logs, n_boot, seed)
             if lead_mask is not None and lead_mask.any():
@@ -153,6 +200,7 @@ def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray,
         chosen = np.where(lat_b[:, None], lab_lat[ar, ib], lab_pool[ar, ib])
         add({"variant": "oracle96_lat", "beta": None, "set": "all", "lat_mode": "best"}, ib, chosen, lat_b)
     cache: Dict[Tuple[float, str], np.ndarray] = {}
+    cache_e: Dict[Tuple[float, str], np.ndarray] = {}
     for beta, sname, lat_mode in combos:
         k = (float(beta), sname)
         if k not in cache:
@@ -162,21 +210,39 @@ def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray,
         lat = S2.use_lat(idx, lat_mode)
         chosen = S2.chosen_labels(lab_pool, lab_lat, idx, lat_mode)
         add({"variant": "sel", "beta": float(beta), "set": sname, "lat_mode": lat_mode}, idx, chosen, lat)
+        if edits is None:
+            continue
+        if k not in cache_e:                                     # 96 + K (refiner v4 edits, module docstring)
+            cache_e[k] = select_edits(v2_final16, v2_im16, prob96, valid96, edits["prob"], edits["src"],
+                                      edits["use"], beta, S2.VARIANT_SETS[sname], offset, w=w_sel)
+        ie = cache_e[k]
+        ch_e, lat_e = chosen_labels_edits(lab_pool, lab_lat, edits["lab"], ie, lat_mode)
+        add({"variant": "sel_edits", "beta": float(beta), "set": sname, "lat_mode": lat_mode}, ie, ch_e, lat_e)
+        r_e = rows[-1]
+        r_e["edit_pick_rate"] = float(np.mean(ie >= S2.G_K)) if n else float("nan")
+        r_e["d_pdms_vs96"] = log_bootstrap(ch_e[:, P] - chosen[:, P], logs, n_boot, seed)
+        r_e["key_96_same"] = _key({"variant": "sel", "beta": float(beta), "set": sname, "lat_mode": lat_mode})
+        if edits.get("kind") is not None and n:
+            ke = np.asarray(edits["kind"])[np.arange(n), np.clip(ie - S2.G_K, 0, edits["kind"].shape[1] - 1)]
+            r_e["edit_pick_kind"] = {nm: float(np.mean((ie >= S2.G_K) & (ke == c))) for c, nm in
+                                     ((0, "none"), (1, "lon"), (2, "lat"), (3, "both"))}
     return {"rows": rows, "idx": idx_of}
 
 
 CHOOSE_LAT = {"on": ("on",), "any": LAT_PREF}
 
 
-def choose_best(rows: Sequence[Dict[str, Any]], choose_lat: str = "on") -> Optional[Dict[str, Any]]:
+def choose_best(rows: Sequence[Dict[str, Any]], choose_lat: str = "on", variant: str = "sel"
+                ) -> Optional[Dict[str, Any]]:
     """max mean PDMS over the 'sel' rows whose lat_mode is allowed by choose_lat; ties -> SET_PREF order, larger beta,
     LAT_PREF order.  choose_lat 'on' (default) = the user's decision (the learned lateral is applied AFTER selection to
     the selected trajectory): only beta and the variant set are chosen on navtrain_val, the other lateral modes stay
-    descriptive rows; 'any' also lets navtrain_val choose the lateral mode (on / on_except_latvar / off)."""
+    descriptive rows; 'any' also lets navtrain_val choose the lateral mode (on / on_except_latvar / off).
+    variant 'sel_edits': the same rule over the 96 + K rows (the 'best_edits' choice)."""
     if choose_lat not in CHOOSE_LAT:
         raise ValueError(f"choose_lat must be one of {tuple(CHOOSE_LAT)}, got {choose_lat!r}")
     lat_ok = CHOOSE_LAT[choose_lat]
-    sel = [r for r in rows if r["variant"] == "sel" and r["lat_mode"] in lat_ok and r.get("pdms") is not None
+    sel = [r for r in rows if r["variant"] == variant and r["lat_mode"] in lat_ok and r.get("pdms") is not None
            and np.isfinite(r["pdms"])]
     if not sel:
         return None
@@ -196,6 +262,48 @@ def load_labels(d: Path, n: int) -> Tuple[np.ndarray, np.ndarray]:
     if lab.shape[0] != n or lab.shape[1] != S2.G_K:
         raise SystemExit(f"{d}: labels {lab.shape} != [{n}, {S2.G_K}, 9]")
     return np.asarray(lab, np.float64), np.asarray(ok, bool)
+
+
+def load_edits(root: Path, run: str, split: str, n: int) -> Optional[Dict[str, Any]]:
+    """The K edits of an eval root split (module docstring 'Edits'): None when the infer dir has no edit_score_logit /
+    edit_src (a student without edits); SystemExit when they were dumped but not labelled (eval_e2e2 --stage label).
+    -> {logit [n, K, 5], src [n, K] int64, valid [n, K] (edit_valid.npy, else src >= 0), kind [n, K] | None
+    (edit_kind.npy: computed-edit kind, -1 = a corrector edit), dup [n, K] (the edit equals its source pool column
+    bitwise: infer/edit_traj vs packed/cand96[src]; all False when either file is absent), lab [n, K, 9], ok [n, K], k,
+    label_dir}."""
+    inf = root / "infer" / run / split
+    if not ((inf / "edit_score_logit.npy").is_file() and (inf / "edit_src.npy").is_file()):
+        return None
+    ld = root / "labels" / split / f"edit_{run}"
+    if not ((ld / "labels.npy").is_file() and (ld / "ok.npy").is_file()):
+        raise SystemExit(f"{inf}: edits were dumped but {ld} has no labels (eval_e2e2 --stage label scores them); the "
+                         f"96 + K headline needs them")
+    logit = np.load(inf / "edit_score_logit.npy").astype(np.float64)
+    src = np.load(inf / "edit_src.npy").astype(np.int64)
+    K = src.shape[1]
+    lab = np.load(ld / "labels.npy", mmap_mode="r")
+    ok = np.load(ld / "ok.npy", mmap_mode="r")
+    if logit.shape[:2] != (n, K) or tuple(lab.shape[:2]) != (n, K) or tuple(ok.shape[:2]) != (n, K):
+        raise SystemExit(f"{inf}: edit arrays {logit.shape} / src {src.shape} / labels {lab.shape} do not match "
+                         f"[{n}, K]")
+    valid = (np.load(inf / "edit_valid.npy").astype(bool) if (inf / "edit_valid.npy").is_file()
+             else np.ones((n, K), bool)) & (src >= 0)
+    kind = np.load(inf / "edit_kind.npy").astype(np.int64) if (inf / "edit_kind.npy").is_file() else None
+    dup = np.zeros((n, K), bool)
+    et_p, c_p = inf / "edit_traj.npy", root / "packed" / split / "cand96.npy"
+    if et_p.is_file() and c_p.is_file():          # a no-edit slot of an older dump (or a zero residual): no candidate
+        et = np.load(et_p, mmap_mode="r")
+        c96 = np.load(c_p, mmap_mode="r")
+        if tuple(et.shape[:2]) != (n, K) or tuple(c96.shape[:2]) != (n, S2.G_K) or et.shape[2:] != c96.shape[2:]:
+            raise SystemExit(f"{inf}: edit_traj {et.shape} / packed cand96 {c96.shape} do not match "
+                             f"[{n}, K | 96, 8, 3]")
+        sc = np.clip(src, 0, S2.G_K - 1)
+        for a in range(0, n, 4096):                 # bounded memory (4096 x 96 x 8 x 3 f32 = 38 MB)
+            b = min(n, a + 4096)
+            g = np.take_along_axis(np.asarray(c96[a:b]), sc[a:b, :, None, None], 1)
+            dup[a:b] = (np.asarray(et[a:b]) == g).reshape(b - a, K, -1).all(-1) & (src[a:b] >= 0)
+    return {"logit": logit, "src": src, "valid": valid, "kind": kind, "dup": dup, "lab": np.asarray(lab, np.float64),
+            "ok": np.asarray(ok, bool), "k": int(K), "label_dir": str(ld)}
 
 
 def lead_mask_of(split: str, tokens: Sequence[str], lead_root: Path = CK_DATA / "lead"):
@@ -348,6 +456,14 @@ def table_md(res: Dict[str, Any]) -> str:
     if res.get("fixed_from_val"):
         f = res["fixed_from_val"]
         L += [f"val에서 고정: β={f['beta']:g}, {f['set']}, 측방 {f['lat_mode']} (출처 {res['fix_from']})", ""]
+    if res.get("edits"):                                 # refiner v4 edits: 96 + K headline (module docstring)
+        e = res["edits"]
+        be = res.get("best_edits") or res.get("fixed_edits_from_val") or {}
+        L += [f"편집 후보 K={e['k']} (선택 가능 {e['n_edit_usable']} / 유효 {e['n_edit_valid']}, 라벨 없음 "
+              f"{e['n_edit_unlabelled']}, 원본 복사 {e.get('n_edit_dup', 0)}). 96+K 대표 행 {e.get('headline')} (β={be.get('beta')}, {be.get('set')}, "
+              f"측방 {be.get('lat_mode')}; navtrain_val에서 선택, navtest는 고정). 같은 토큰의 96 행 대비 ΔPDMS "
+              f"{fmt_ci(e.get('d_vs_96_same'))} (같은 β/집합), {fmt_ci(e.get('d_vs_96_best'))} (96 선택 행 "
+              f"{e.get('best_96')}). 편집 선택 비율 {100 * (e.get('edit_pick_rate') or 0):.1f}%.", ""]
     L += ["| 행 | PDMS | ΔPDMS [95% CI] | NC | DAC | EP | TTC | C | NC 실패 | DAC 실패 | TTC 실패 | 앞차 감속 NC/TTC 실패 (n) | "
           "Δ앞차 실패 [95% CI] | 바뀐 비율 | 측방 적용 | 변형 선택 비율 |", "|" + "---|" * 16]
     for r in res["rows"]:
@@ -416,17 +532,48 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
     toks = tdf.token.astype(str).to_numpy()[sel]
     logs = tdf.log.astype(str).to_numpy()[sel]
     lead, lead_src = lead_mask_of(split, toks, lead_root)
+    E = load_edits(root, run, split, n)                  # refiner v4 edits (None: every output as before)
+    E_sel, e_info, fixed_e = None, None, None
+    if E is not None:
+        pe = sigmoid(E["logit"])
+        use = E["valid"] & ~E["dup"] & np.isfinite(pe).all(-1) & E["ok"] & np.isfinite(E["lab"]).all(-1)
+        E_sel = {"prob": pe[sel], "src": E["src"][sel], "use": use[sel], "lab": E["lab"][sel],
+                 "kind": None if E["kind"] is None else E["kind"][sel]}
+        e_info = {"k": E["k"], "label_dir": E["label_dir"], "n_tok": int(len(sel)),
+                  "n_edit_valid": int(E["valid"][sel].sum()), "n_edit_usable": int(use[sel].sum()),
+                  "n_edit_dup": int((E["valid"] & E["dup"])[sel].sum()),
+                  "n_edit_unlabelled": int((E["valid"][sel] & ~(E["ok"][sel]
+                                                                & np.isfinite(E["lab"][sel]).all(-1))).sum()),
+                  "token_rule": "the 96 token mask; an edit is selectable when valid, not a bitwise copy of its "
+                                "source column, finite and labelled ok"}
+        if E["kind"] is not None:
+            kv = E["kind"][sel][E["valid"][sel]]
+            e_info["kind_share"] = {nm: float(np.mean(kv == c)) if kv.size else float("nan")
+                                    for c, nm in ((-1, "corrector"), (0, "none"), (1, "lon"), (2, "lat"), (3, "both"))}
     if split == "navtest":
         combos = [(float(fixed["beta"]), fixed["set"], fixed["lat_mode"])]
         if (1.0, "all", "on") not in combos:
             combos.append((1.0, "all", "on"))
+        se = spec_in.get("best_edits")
+        if (E is None) != (se is None):
+            raise SystemExit(f"--fix-from: the val choice was made {'with' if se else 'without'} the 96 + K edits, this "
+                             f"navtest eval root {'has none' if E is None else 'has edits'} (same model and dump "
+                             f"stages for both splits)")
+        if se is not None and int(spec_in.get("edits_k", E["k"])) != int(E["k"]):
+            raise SystemExit(f"--fix-from: the val choice was made with K = {spec_in.get('edits_k')} edits, this "
+                             f"navtest eval root has K = {E['k']} (same model and dump stages for both splits)")
+        if se is not None:
+            fixed_e = dict(se)
+            ce_ = (float(se["beta"]), se["set"], se["lat_mode"])
+            if ce_ not in combos:
+                combos.append(ce_)
     else:
         combos = combos_grid()
         if fix_from:
             src = json.loads(Path(fix_from).read_text())
             fixed = src.get("best")
     res = evaluate_pool(lab_p[sel], lab_l[sel], sigmoid(logit[sel]), valid96[sel], v2f[sel], v2im[sel], logs, lead,
-                        combos, n_boot, 0, offset, sel_w=w_sel)
+                        combos, n_boot, 0, offset, sel_w=w_sel, edits=E_sel)
     rows = res["rows"]
     out_d: Dict[str, Any] = {"run": run, "split": split, "root": str(root), "n_total": int(n), "n_eval": int(len(sel)),
                              "n_logs": int(len(set(logs))), "n_boot": int(n_boot), "lead_src": lead_src,
@@ -437,10 +584,14 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
                              "created": kst(), "fix_from": fix_from or None, "rows": rows,
                              "token_rule": "packed ok & done & identity + valid variant columns labelled ok (pool, lat)",
                              "out_dir": str(out)}
+    sk = lambda d, v="sel": _key({"variant": v, **{k: d[k] for k in ("beta", "set", "lat_mode")}})   # noqa: E731
     if split == "navtest":
         out_d["fixed_from_val"] = fixed
         out_d["eval_spec"] = spec_in                     # the frozen val spec this navtest was evaluated with
-        out_d["representative"] = _key({"variant": "sel", **{k: fixed[k] for k in ("beta", "set", "lat_mode")}})
+        out_d["representative"] = sk(fixed)
+        if fixed_e is not None:                          # the 96 + K headline (val-frozen beta / variant set)
+            out_d["fixed_edits_from_val"] = fixed_e
+            out_d["representative"] = sk(fixed_e, "sel_edits")
     else:
         out_d["best"] = choose_best(rows, choose_lat)
         out_d["choose_lat"] = choose_lat
@@ -452,9 +603,29 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
                 "choose_lat": choose_lat, "sel_w": w_name, "sel_w_values": [float(x) for x in w_sel],
                 "calib_offset_values": out_d["calib_offset_values"], "calib_offset_src": cal_src, "model": cur,
                 "n_eval": int(len(sel)), "n_total": int(n), "token_rule": out_d["token_rule"], "created": kst()}
+        if E is not None:                                # 96 + K choice, frozen with the 96 one (no key otherwise)
+            be = choose_best(rows, choose_lat, "sel_edits")
+            out_d["best_edits"] = be
+            out_d["representative"] = (be or {}).get("key") or out_d["representative"]
+            spec["best_edits"] = be
+            spec["edits_k"] = int(E["k"])
         spec["spec_sha16"] = spec_sha16(spec)
         out_d["eval_spec"] = spec
         U.write_json(out / "eval_spec.json", spec)
+    if E is not None:                                    # the headline vs the 96-only rows on the same tokens
+        hd = out_d["representative"]
+        hr = next((x for x in rows if x["key"] == hd), None)
+        b96 = (out_d.get("best") or out_d.get("fixed_from_val") or {})
+        e_info.update(headline=hd, same_tokens_96=(hr or {}).get("key_96_same"),
+                      best_96=sk(b96) if b96 else None,
+                      d_vs_96_same=(hr or {}).get("d_pdms_vs96"), edit_pick_rate=(hr or {}).get("edit_pick_rate"))
+        if hr is not None and b96 and sk(b96) in res["idx"]:
+            i96 = res["idx"][sk(b96)]
+            ch96 = S2.chosen_labels(lab_p[sel], lab_l[sel], i96, b96["lat_mode"])
+            che, _ = chosen_labels_edits(lab_p[sel], lab_l[sel], E_sel["lab"], res["idx"][hd], hr["lat_mode"])
+            Pk = Cn.LBL["pdms"]
+            e_info["d_vs_96_best"] = log_bootstrap(che[:, Pk] - ch96[:, Pk], logs, n_boot, 0)
+        out_d["edits"] = e_info
     U.write_json(out / "metrics.json", out_d)
     (out / "table.md").write_text(table_md(out_d))
     rep = out_d.get("representative")
@@ -465,8 +636,12 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
         r = next(x for x in rows if x["key"] == rep)
         idx = res["idx"][rep]
         pt["sel_col"] = idx
-        pt["sel_lat"] = S2.use_lat(idx, r["lat_mode"])
-        pt["pdms_sel"] = S2.chosen_labels(lab_p[sel], lab_l[sel], idx, r["lat_mode"])[:, P]
+        if r["variant"] == "sel_edits":                  # sel_col >= 96: edit slot sel_col - 96
+            ch, lt = chosen_labels_edits(lab_p[sel], lab_l[sel], E_sel["lab"], idx, r["lat_mode"])
+            pt["sel_lat"], pt["pdms_sel"] = lt, ch[:, P]
+        else:
+            pt["sel_lat"] = S2.use_lat(idx, r["lat_mode"])
+            pt["pdms_sel"] = S2.chosen_labels(lab_p[sel], lab_l[sel], idx, r["lat_mode"])[:, P]
     pt.to_parquet(out / "per_token.parquet", index=False)
     print(f"[{kst()}] eval_ck2 {run}/{split}: {len(sel)}/{n} tokens, {len(rows)} rows -> {out}", flush=True)
     return out_d

@@ -1,0 +1,15 @@
+{
+ "version": "v3_arm_1",
+ "arm": "c",
+ "name": "ck2T10",
+ "role": "existing baseline (DESCRIPTIVE): ck2T10 trained at 4f29592 + code snapshot (not 8ae8b1d), temporal off; needs a fresh r34 top-16 val dump (infer_val_v3.py) -- the sd_plugin ck2T10 dump is on SafeDrive candidates, not r34",
+ "run_dir": "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10",
+ "git_head": "4f29592b6ae7ec3377b58afcc77a8c99ccd881b6",
+ "infer_dir": "/home/external-user/ssd/yongjae_refiner/ck/v3/infer/ck2T10",
+ "not_r34_do_not_use": "/home/external-user/ssd/yongjae_refiner/ck/ck2/eval/sd_plugin/navtrain_val/ck2T10/r34",
+ "privileged": false,
+ "requires_user_approval": false,
+ "gates": ["G4"],
+ "trained": true,
+ "temporal": {"on": false}
+}

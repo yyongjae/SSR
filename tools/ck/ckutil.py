@@ -4,7 +4,8 @@ pin()          : navsim pinned to the SSR-ck worktree (contract env.navsim_pin);
 ck_data()      : CK data root (core constants.CK_DATA; env CK_DATA_ROOT overrides it for smoke / tests ONLY when the
                  core constants do not already honour it -- see resolve note in ck_data()).
 gpu_guard()    : refuse any physical GPU outside 0-3 (CUDA_VISIBLE_DEVICES must be one of 0,1,2,3 when CUDA is used).
-gpu_guard_ddp(): train_ck2 (DDP): 1..2 distinct GPUs of 0-3, one process per visible GPU.
+gpu_guard_ddp(): train_ck2 (DDP): 1..2 distinct GPUs of 0-3, one process per visible GPU.  CK_ALLOW_GPU45=1 also allows
+                 exactly the pair 4,5 (user 2026-10-12: GPUs 4,5 only for short jobs and only when idle).
 """
 from __future__ import annotations
 

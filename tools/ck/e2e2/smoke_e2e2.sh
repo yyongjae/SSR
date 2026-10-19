@@ -20,6 +20,11 @@
 #       epoch 2 (callback state / EMA / labeler continuity).  GPUs 0,1.
 #   G3  eval_e2e2.py on the G1 main checkpoint: navtrain_val --limit 200 (all stages; grid choice) then navtest
 #       --limit 200 (fixed from val), GPU 0, label workers 32.
+#   G1M main arm ONLY on GPUs 0,1 (G1's main half: 3 epochs x G1_MB mb/rank, labeler2 + watchdog, smoke-check2 ->
+#       result_G1M_main.json) for one-arm checks while GPUs 2,3 are busy, e.g. the refiner-v3 temporal DET teacher:
+#       SMOKE_CK_SET_EXTRA=<set file> (e.g. tools/ck/e2e2/v3teacher_arm.set) is appended to the generated
+#       g_main.set / g_bevkd.set (every stage of this TAG then uses it).  With a temporal DET teacher smoke-check2 also
+#       gates temporal_teacher_recorded / kd_objects_same_as_teacher_training / kd_obj_ok_frac_logged_ge_0999.
 #   Teachers: the yaml defaults ck2T10dep / ck2M10dep (decoupled EP = ck_e2e2.ep_target; teacher_check refuses a
 #   mismatch) with their KD calibration files (ck_e2e2.kd_calib, yaml default enabled: run fit_kd_calib.py for both
 #   teachers first; train_e2e2.sh refuses a missing / mismatched file).  E2E_SMOKE=1 waives the approval gate below .../e2e_smoke/
@@ -75,6 +80,11 @@ EOF
   { printf '%s\n' "trainer.params.limit_train_batches=$G1_MB"; cat "$SR/g_tokens.txt"; } > "$SR/g_extra.txt"
   printf '%s\n' record_from_epoch=1 onpolicy_from_epoch=2 record_until_epoch=2 label_refresh_every_mb=20 \
     lat_kd.start_mb=200 > "$SR/g_main.set"
+  if [ -n "${SMOKE_CK_SET_EXTRA:-}" ]; then
+    [ -f "$SMOKE_CK_SET_EXTRA" ] || { log "SMOKE_CK_SET_EXTRA=$SMOKE_CK_SET_EXTRA is not a file"; return 1; }
+    grep -v '^[[:space:]]*#' "$SMOKE_CK_SET_EXTRA" | grep -v '^[[:space:]]*$' >> "$SR/g_main.set"
+    log "smoke ck sets + $SMOKE_CK_SET_EXTRA"
+  fi
   { cat "$SR/g_main.set"; echo bev_kd.start_mb=200; } > "$SR/g_bevkd.set"
 }
 
@@ -117,6 +127,27 @@ G1() {
   # both checks always run (each writes its result json); either failing (or a labeler wait above) fails G1
   check g1_main G1_main --onpolicy-epochs 2 --gen-epochs 1,2 || { log "G1 main check failed"; frc=1; }
   check g1_bevkd G1_bevkd --onpolicy-epochs 2 --gen-epochs 1,2 || { log "G1 bevkd check failed"; frc=1; }
+  return "$frc"
+}
+
+G1M() {
+  write_sets || return 1
+  "$PY" "$LU2" gpu-check --gpus 0,1 > /dev/null || { log "G1M: GPUs 0,1 not free"; return 1; }
+  log "G1M main only (GPUs 0,1): 3 epochs x $G1_MB mb/rank, labeler2 W=32"
+  MAX_EPOCHS=3 LABELER_MAX_EPOCH=2 WATCHDOG_EVERY=30 E2E_EXTRA=$SR/g_extra.txt E2E_CK_SET=$SR/g_main.set \
+    te g1m_main main start --gpus 0,1 || return 1
+  local t0 frc=0 lrc; t0=$(date +%s)
+  while [ ! -f "$SR/g1m_main/launch/train.exit" ]; do
+    [ -f "$SR/g1m_main/ck_e2e2/lab/status.json" ] && { tr -d '\n' < "$SR/g1m_main/ck_e2e2/lab/status.json"; echo; } \
+      >> "$SR/g1m_main/lab_snapshots.jsonl"
+    nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader >> "$SR/g1m_nvsmi.csv" 2>/dev/null
+    [ $(( $(date +%s) - t0 )) -gt "${G1_TIMEOUT:-5400}" ] && { log "G1M timeout: stopping"; te g1m_main main stop;
+                                                                frc=1; break; }
+    sleep 15
+  done
+  E2E_WAIT_TIMEOUT=${LABELER_TIMEOUT:-1800} te g1m_main main wait --labeler; lrc=$?
+  log "G1M labeler exit $lrc"; [ "$lrc" = 0 ] || frc=1
+  check g1m_main G1M_main --onpolicy-epochs 2 --gen-epochs 1,2 || { log "G1M check failed"; frc=1; }
   return "$frc"
 }
 
@@ -178,19 +209,19 @@ EOF
 }
 
 status() {
-  for r in g1_main:main g1_bevkd:bevkd g2:main; do
+  for r in g1_main:main g1_bevkd:bevkd g1m_main:main g2:main; do
     [ -d "$SR/${r%%:*}" ] && te "${r%%:*}" "${r##*:}" status
   done
   ls "$SR"/result_*.json 2>/dev/null
 }
 
-[ $# -gt 0 ] || { sed -n '2,32p' "$0"; exit 2; }
+[ $# -gt 0 ] || { sed -n '2,37p' "$0"; exit 2; }
 ARGS=("$@"); [ "$1" = all ] && ARGS=(G0 G1 G2 G3)
 log "stages ${ARGS[*]} -> $SR"
 FAIL=0
 for s in "${ARGS[@]}"; do
   case "$s" in
-    G0|G1|G2|G3|status) "$s" || { log "$s returned $?"; FAIL=1; };;
+    G0|G1|G1M|G2|G3|status) "$s" || { log "$s returned $?"; FAIL=1; };;
     *) log "unknown stage $s"; exit 2;;
   esac
 done

@@ -57,6 +57,9 @@ warmup:
   n_var: 32                                  # NU07
   sur_groups: near_mid                       # NU15
   lat_kd_groups: near_mid                    # NU16
+  raw_tidx: null                             # refiner v4: time-index sidecar dir of raw_labels (build_time_idx.py)
+  var_tidx: null                             # refiner v4: time-index sidecar dir of var_dir (--merge-accstraight)
+  pref: false                                # refiner v4: label-derived P_ref of the warm-up rows
 record_from_epoch: 4                         # NU21 (old; epoch 4 recorded so epoch 5 has gen 4)
 record_until_epoch: null                     # -> max_epochs - 2 (28)
 onpolicy_from_epoch: 5                       # user (5 warm-up epochs 0-4)
@@ -73,9 +76,9 @@ log_every: 1
 infer_outputs: true
 infer_select: null                           # NU30 (selection happens in eval_ck2)
 strict_rows: 0.999                           # NU38
-bev_kd:                                      # off in the main run; bevkd_arm.set switches the arm on (teachers [det, map])
-  enabled: false
-  teachers: [det]                            # main run: unused (arm off); the arm sets [det, map] (user 2026-10-08 ~20:40 KST)
+bev_kd:                                      # refiner-v4 default ON = the ck2e2e_bevkd setting (user 2026-10-15); main_arm.set = off
+  enabled: true
+  teachers: [det, map]                       # DET (BEVFusion t0) + MAP (ReSMap) BEVs (user 2026-10-08 ~20:40 KST)
   distance: mse                              # NU35
   init: zero                                 # NU35 (one zero-init 1x1 adapter per teacher)
   ln: true
@@ -92,3 +95,32 @@ bev_kd:                                      # off in the main run; bevkd_arm.se
   ratio_map: null
   cap_det: null
   cap_map: null
+v4:                                          # refiner v4 (navsim/agents/para_ssr/ck/v4); all off = the CK2 / v3 student
+  readout: mean                              # mean (CK2) | hazard (station x arrival-time hazard + noisy-OR, parent corridor) | evidence
+  pref_head: false                           # supervised P_ref scene query (labels pdm_progress_eff)
+  time_free: true                            # hazard: parent stations without the parent's schedule channels
+  lat_haz: true                              # hazard: hazard-localised lateral head
+  horizon: 4.0                               # hazard: stations read up to this arrival time [s]
+  lambda_pref: 0.1                           # P_ref Huber weight (pref_head)
+  lambda_station: 0.5                        # censored station BCE weight (hazard + time-index labels)
+  lambda_ev: 0.5                             # evidence readout: occupancy BCE + margin Huber aux weight (GT-ok tokens)
+  corridor_version: 1                        # 1 = original, 2 = refiner-fix B1
+  kd_parent_only: false                      # score KD on the parent (identity) columns only (report 72 I2)
+  corrector: false                           # learned corrector A on the critic's top-corr_k (hazard / evidence readout)
+  corr_k: 8                                  # = e2e_data2.EDIT_K (the recorded edit block)
+  lambda_awr: 0.1                            # corrector AWR weight (official labels of the recorded edits)
+  # refiner v4_3 OPTIONAL v4 keys (online2._d_v4_opt; not listed here so the older arms' effective configs and
+  # override lists stay unchanged; a set file naming one adds it at this default, launch_util2.apply_sets2 --
+  # tools/ck/e2e2/v4_3_arm.set):
+  #   exec_model: plan                 range readout candidate states: plan (8 knots) | lqr (the official tracker port)
+  #   ev_tbins: 10, ev_tbin_s: 0.25    time bins (range: ev_tbins x ev_tbin_s = 5.0 s, e.g. 20 x 0.25)
+  #   ep_evidence: false               range: EP head on the detached evidence + executed progress ratio
+  #   vmax: "off"                      range: off | feature (executed curvature overspeed as a residual input)
+  #   edits: "off"                     off | computed (v4_3 M5 rule edits of the critic's top-edit_k parents)
+  #   edit_k: 8, edit_dt: 0.2, edit_dlat: 0.3   (edit_k = e2e_data2.EDIT_K, the recorded edit block)
+  #   kd_score_scope: all              all | near (NC KD where the lead's ttc0 < 4 s, DAC KD where the parent's min
+  #                                    executed corner SDF < 1 m; ref_* GT, train only)
+  #   kd_constraint: {enabled: false, lambda_occ: 0.5, lambda_margin: 0.5, map_range_m: 32.0, occ_channels: B}
+  #                                    M6 constraint KD: DET sigmoid(B) BCE (occ_channels BU: + U, unconfirmed
+  #                                    option) + MAP D Huber (s <= 32 m) on the
+  #                                    student's unique parents of the KD set (range student + range teachers)

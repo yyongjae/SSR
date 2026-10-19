@@ -76,6 +76,31 @@ Outputs --out-root/<run>/ (default CK_DATA/ck2/train): config.json, norm.npz | n
   train_log.jsonl, val_metrics.jsonl, done.json.  ckpt files hold {'model' (CKNet state dict, no 'module.' prefix),
   'cfg', ...}: model.load_ck(run, 'last' | 'best' | 'ep<e>') and model.build_ck(init_from=run) load them.
   Epoch-end evaluation is crash-safe as in train_ck (eval_pending marker in ckpt_last.pt, missing splits redone).
+
+refiner-v3 temporal branch (docs/refiner_v3/SPEC.md 5.3; --temporal 0 = default = the CK2 trainer unchanged):
+  --temporal 1 --t-forecaster {learned, ca, oracle_gt} [--t-modes (default 6 learned / 1 ca, oracle_gt)] adds
+  ck.temporal.TemporalBranch to CKNet (arm T only).  Datasets get objects = {cfg, aug (train only), targets} (object
+  pack D3/objpack/<source>/<split>, tools/ck/data/obj_pack.py); the model sees only OBJ_INPUT_KEYS (+ the oracle's
+  PRIVILEGED priv_fc_*).  Loss += lambda_fc * temporal.loss.forecast_loss (learned arm only; WTA Laplace NLL + mode
+  CE on the GT future targets, masked).  Optimiser: one AdamW, param groups critic / forecaster ('temporal.forecaster.'),
+  each clipped to --clip; a step with a non-finite grad norm in either group is skipped; grad_norm_fc logged.
+  config.json: temporal (TemporalCfg dict, resume guard), privileged, param_count_temporal_shared /
+  param_count_forecaster.  PRIVILEGED runs (oracle_gt) must be named *_PRIV and tag every val_metrics row.
+  Val rows of a learned run add the forecast metrics fc_nll / fc_minade / fc_minfde (+ fc_* detail).
+
+refiner v4_3 range teachers (docs/refiner_v4/V4_3_SPEC.md M4 / M6; --v4-readout range, every other default unchanged):
+  V4Cfg.range_arm (executed states of the official LQR tracker port, 20 bins of 0.25 s, EP head on the detached
+  evidence; --v4-exec-model / --v4-ev-tbin-s / --v4-ep-evidence / --v4-vmax override it, --v4-pref-head 1 adds the
+  P_ref query).  Loss += lambda_ev * range_gt_aux: GT fields computed online from the batch's ref_* on the anchors' own
+  parent grids (<= --rg-max-parents per GT-ok token) -- DET: blocked field B (not-behind proxy) + the TTC channel U
+  (any overlap), BCE on the known bins; MAP: the official SDF margin, Huber -- with the specialist key masking of v4_2
+  (blocked field for nc / ttc, margin for dac); score BCE on --score-keys as before; the station BCE reads hazard
+  readouts only.  tools/ck/v4/run_teachers.sh READOUT=range launches the pair.
+  Phase 0b representation R2 (docs/refiner_v4/V4_3_SPEC.md; opt-in, defaults unchanged): --v4-rg-read any4 (B / U read
+  as the OR over the 2 x 2 cells around each executed point) and --v4-rg-stopped-aware 1 (the B target of the GT field
+  aux = the stopped-aware blocked field, + a third field group Bp = the plain not-behind B, trained on LON >= -1.3 m,
+  that the readout's TTC reads: R2 changes NC only); both are stored in config.json 'v4' (rg_read / rg_stopped_aware)
+  and part of the --resume check.  run_teachers.sh READOUT=range R2=1 launches v4T10_rng2 / v4M10_rng2 with both.
 """
 from __future__ import annotations
 
@@ -110,11 +135,26 @@ NORM_FILE = TC.NORM_FILE
 TRAIN_EVAL_NAME = TC.TRAIN_EVAL_NAME
 RAW_SUFFIX = "_raw"
 FROZEN_MODULES = ("trunk.lon_head", "trunk.gate_head")
-SUM_KEYS = ("n_gt", "n_bev_bad", "n_anc_ok", "n_var_ok")
+SUM_KEYS = ("n_gt", "n_bev_bad", "n_anc_ok", "n_var_ok", "fc_n_obj", "n_obj_bad")   # fc_*/n_obj: temporal only
 DEFAULT_BEST = {"T": "navtrain_val:pdms_a_b1:max", "M": "none"}
 SUR_GROUPS = ("all", "near", "near_mid")
 SUR_GROUP_MAX = {"all": None, "near": 0, "near_mid": 1}       # anchor_sampler GROUP_NEAR 0 / GROUP_MID 1 / GROUP_STRAT 2
 FAIL_KEYS = ("nc", "dac", "ttc", "comfort")
+FC_PREFIX = "temporal.forecaster."                           # parameters of the learned forecaster (own param group)
+
+
+def run_provenance(a, tcfg) -> Dict:
+    """review fix D5: code / data provenance of this run (tools/ck/v3/provenance.py); decide_step1 compares it."""
+    from tools.ck.v3 import provenance as PV
+    splits = [a.split] + ([a.val_split] if a.val_split and a.val_split != "none" else [])
+    return PV.run_provenance(tcfg, splits=splits)
+
+
+def temporal_cfg_of(a):
+    """TemporalCfg of resolved args (absent attribute = off, e.g. args built by older tests)."""
+    from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+    t = getattr(a, "temporal_cfg", None)
+    return t if t is not None else TemporalCfg()
 
 
 def C():
@@ -180,7 +220,109 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dist-timeout-min", type=float, default=60.0)
     ap.add_argument("--resume", action="store_true", help="continue from ckpt_last.pt if present")
     ap.add_argument("--restart", action="store_true", help="wipe the run dir outputs and start over")
+    ap.add_argument("--corridor-version", type=int, choices=(1, 2), default=1,
+                    help="refiner corridor geometry (refiner/corridor.py 'Version'): 1 = original (default), "
+                         "2 = refiner-fix B1 (arc ends at S_look, straight beyond; straight below 3 m/s)")
+    # refiner v4 (navsim/agents/para_ssr/ck/v4): every default = off (the CK2 / v3 teacher, unchanged)
+    ap.add_argument("--v4-readout", choices=("mean", "hazard", "evidence", "range"), default="mean",
+                    help="mean = CK2 readout (default); hazard = v4 station x arrival-time hazard + noisy-OR on the "
+                         "parent corridor (variants read their parent anchor's stations); evidence = predicted "
+                         "occupancy / drivable margin on the parent grid + the official rules (report 77); range = "
+                         "v4_3 allowed-range critic (blocked field B / U + margin D per parent, read at the executed "
+                         "states; docs/refiner_v4/V4_3_SPEC.md M4; defaults = V4Cfg.range_arm)")
+    ap.add_argument("--v4-exec-model", choices=("plan", "lqr"), default=None,
+                    help="range: candidate states read (default lqr = the official tracker port, ck/v4/lqr.py)")
+    ap.add_argument("--v4-ev-tbin-s", type=float, default=None,
+                    help="range: time bin width [s] (default 0.25; ev_tbins = 5.0 s / bin)")
+    ap.add_argument("--v4-ep-evidence", type=int, choices=(0, 1), default=None,
+                    help="range: EP head on the detached evidence + executed progress ratio (default 1)")
+    ap.add_argument("--v4-vmax", choices=("off", "feature"), default=None,
+                    help="range: executed curvature overspeed as a residual input (default off)")
+    ap.add_argument("--v4-rg-read", choices=("nearest", "any4"), default=None,
+                    help="range: B / U read at the executed points (default nearest; any4 = OR over the 2 x 2 cells, "
+                         "Phase 0b R2)")
+    ap.add_argument("--v4-rg-priv", choices=("off", "far", "out", "all"), default=None,
+                    help="range: PRIVILEGED GT t0-object input channels (V4Cfg.rg_priv: far = front band 32-64 m, "
+                         "out = outside the DET BEV window, all); the run is privileged (name must end with _PRIV, "
+                         "load_ck refuses it as a KD teacher)")
+    ap.add_argument("--v4-rg-stopped-aware", type=int, choices=(0, 1), default=None,
+                    help="range: 1 = the GT field aux trains B on the stopped-aware blocked field (stopped / static "
+                         "objects without the not-behind filter, Phase 0b R2) and adds the Bp group (plain not-behind "
+                         "B) that TTC reads; default 0")
+    ap.add_argument("--rg-max-parents", type=int, default=8,
+                    help="range: own-parent anchors per GT-ok token in the GT field aux (blocked field BCE / margin "
+                         "Huber, weight --lambda-ev)")
+    ap.add_argument("--v4-pref-head", type=int, choices=(0, 1), default=0,
+                    help="1 = supervised P_ref scene query (labels pdm_progress_eff; needs the dataset 'pref' key)")
+    ap.add_argument("--v4-time-free", type=int, choices=(0, 1), default=1,
+                    help="hazard: zero the parent's arrival-time / speed geo channels (default 1)")
+    ap.add_argument("--v4-lat-haz", type=int, choices=(0, 1), default=1, help="hazard: hazard-localised lateral head")
+    ap.add_argument("--v4-horizon", type=float, default=4.0, help="hazard: stations read up to this arrival time [s]")
+    ap.add_argument("--lambda-pref", type=float, default=0.1, help="P_ref Huber weight (only with --v4-pref-head 1)")
+    ap.add_argument("--lambda-station", type=float, default=0.5,
+                    help="censored station BCE weight (hazard readout + first-failure time indices in the batch)")
+    ap.add_argument("--lambda-ev", type=float, default=0.5,
+                    help="evidence readout: weight of the occupancy BCE + margin Huber aux losses (GT-ok tokens); "
+                         "range readout: of its GT field aux (blocked field B / U BCE, SDF margin Huber)")
+    ap.add_argument("--time-idx-root", default="",
+                    help="first-failure time-index sidecars (tools/ck/v4/build_time_idx.py) for the station loss; "
+                         "'' = none (no station loss)")
+    # refiner-v3 temporal branch (SPEC 5.3); every default = off / the TemporalCfg default
+    from navsim.agents.para_ssr.ck.temporal import config as TCF
+    d = TCF.TemporalCfg()
+    ap.add_argument("--temporal", dest="temporal_on", type=int, choices=(0, 1), default=0,
+                    help="1 = add the temporal branch (arm T only; refiner-v3 Step 1)")
+    ap.add_argument("--t-source", choices=TCF.SOURCES, default=d.source, help="object source (Step 1: bevfusion)")
+    ap.add_argument("--t-forecaster", choices=TCF.FORECASTERS, default=d.forecaster)
+    ap.add_argument("--t-modes", type=int, default=None, help="forecast modes (default 6 learned, 1 ca / oracle_gt)")
+    ap.add_argument("--t-lambda-fc", type=float, default=d.lambda_fc, help="forecast loss weight (learned arm)")
+    ap.add_argument("--t-fc-backprop", type=int, choices=(0, 1), default=int(d.fc_backprop),
+                    help="1 = the critic loss also reaches the forecaster (untested option; default 0)")
+    ap.add_argument("--t-frame-drop", type=float, default=d.p_frame_drop, help="train aug: past-frame drop prob")
+    ap.add_argument("--t-obj-drop", type=float, default=d.p_obj_drop, help="train aug: object-slot drop prob")
+    ap.add_argument("--t-vnoise", type=float, default=d.v_noise, help="train aug: velocity noise sigma (m/s)")
+    ap.add_argument("--t-pack-root", default=d.pack_root, help="object pack root (<root>/<source>/<split>)")
+    ap.add_argument("--t-ca-scales", default=d.ca_scales, help="CA Laplace scales json (arms ca / oracle_gt)")
+    ap.add_argument("--t-fc-init", default=d.fc_init,
+                    help="learned arm: pre-trained forecaster (tools/ck/v3/pretrain_forecaster.py <out>/forecaster.pt)")
+    ap.add_argument("--t-fc-train", choices=TCF.FC_TRAIN, default=d.fc_train,
+                    help="learned arm: frozen (default; needs --t-fc-init) | joint (forecast loss trains it)")
     return ap
+
+
+def resolve_temporal(a):
+    """-> TemporalCfg from the --temporal / --t-* flags (off unless --temporal 1), validated against --arm."""
+    from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+    if not int(getattr(a, "temporal_on", 0) or 0):
+        return TemporalCfg()
+    n_modes = a.t_modes if a.t_modes is not None else (6 if a.t_forecaster == "learned" else 1)
+    try:
+        fc_init = str(getattr(a, "t_fc_init", "") or "")
+        fc_train = str(getattr(a, "t_fc_train", "frozen") or "frozen")
+        if a.t_forecaster != "learned" and not fc_init:
+            fc_train = "frozen"                         # ca / oracle_gt: fixed forecasters by construction
+        t = TemporalCfg(on=True, source=a.t_source, forecaster=a.t_forecaster, n_modes=int(n_modes),
+                        lambda_fc=float(a.t_lambda_fc), fc_backprop=bool(a.t_fc_backprop),
+                        p_frame_drop=float(a.t_frame_drop), p_obj_drop=float(a.t_obj_drop),
+                        v_noise=float(a.t_vnoise), pack_root=str(a.t_pack_root), ca_scales=str(a.t_ca_scales),
+                        fc_init=fc_init, fc_train=fc_train)
+        t.validate(a.arm)
+        t.check_trainable()
+    except (ValueError, NotImplementedError) as e:
+        raise SystemExit(f"--temporal: {e}") from None
+    if t.fc_init:
+        fi = Path(t.fc_init)
+        if not fi.is_file():
+            raise SystemExit(f"--t-fc-init {fi}: missing (tools/ck/v3/pretrain_forecaster.py writes <out>/forecaster.pt)")
+        meta = torch.load(fi, map_location="cpu", weights_only=False)
+        if int(meta.get("n_modes", -1)) != int(t.n_modes):
+            raise SystemExit(f"--t-fc-init {fi}: pre-trained with n_modes {meta.get('n_modes')} != --t-modes {t.n_modes}")
+    if t.privileged and not str(a.run).endswith("_PRIV"):
+        raise SystemExit(f"PRIVILEGED temporal run (forecaster {t.forecaster}, source {t.source}): the run name must "
+                         f"end in '_PRIV', got {a.run!r}")
+    if t.forecaster != "learned" and not Path(t.ca_scales).is_file():
+        raise SystemExit(f"--t-ca-scales {t.ca_scales}: missing (CA Laplace scales, tools/ck/v3/fit_ca_scales.py)")
+    return t
 
 
 def resolve_args(a):
@@ -212,7 +354,61 @@ def resolve_args(a):
     if a.workers > 16:
         raise SystemExit("--workers <= 16 per rank")
     parse_best(a.best_metric)
+    a.temporal_cfg = resolve_temporal(a)
+    a.v4_cfg = resolve_v4(a)
+    if a.v4_cfg.rg_priv != "off" and not str(a.run).endswith("_PRIV"):
+        raise SystemExit(f"PRIVILEGED range run (--v4-rg-priv {a.v4_cfg.rg_priv}): the run name must end with _PRIV "
+                         f"(got {a.run!r})")
     return a
+
+
+V4_3_FLAGS = ("v4_exec_model", "v4_ev_tbin_s", "v4_ep_evidence", "v4_vmax", "v4_rg_read",
+              "v4_rg_stopped_aware", "v4_rg_priv")                                            # range readout only (None = default)
+
+
+def resolve_v4(a):
+    """-> V4Cfg from the --v4-* flags (off unless --v4-readout hazard or --v4-pref-head 1).  --v4-readout range: the
+    spec arm V4Cfg.range_arm (exec 'lqr', 20 bins of 0.25 s, ep_evidence) with --v4-exec-model / --v4-ev-tbin-s /
+    --v4-ep-evidence / --v4-vmax / --v4-rg-read / --v4-rg-stopped-aware overriding it and the P_ref head from
+    --v4-pref-head; those flags are refused with another readout (the older readouts' V4Cfg call is unchanged)."""
+    from navsim.agents.para_ssr.ck.v4.config import RANGE_T_END, V4Cfg
+    ro = str(getattr(a, "v4_readout", "mean") or "mean")
+    ph = bool(int(getattr(a, "v4_pref_head", 0) or 0))
+    given = [k for k in V4_3_FLAGS if getattr(a, k, None) is not None]
+    if ro != "range" and given:
+        raise SystemExit(f"--v4-*: {['--' + k.replace('_', '-') for k in given]} only apply to --v4-readout range")
+    if ro == "mean" and not ph:
+        return V4Cfg()
+    try:
+        if ro == "range":
+            tb = 0.25 if getattr(a, "v4_ev_tbin_s", None) is None else float(a.v4_ev_tbin_s)
+            nb = int(round(RANGE_T_END / tb))
+            epe = getattr(a, "v4_ep_evidence", None)
+            sa = getattr(a, "v4_rg_stopped_aware", None)
+            kw = dict(exec_model=getattr(a, "v4_exec_model", None) or "lqr", ev_tbins=nb, ev_tbin_s=tb,
+                      ep_evidence=True if epe is None else bool(int(epe)), vmax=getattr(a, "v4_vmax", None) or "off",
+                      rg_read=getattr(a, "v4_rg_read", None) or "nearest",
+                      rg_stopped_aware=False if sa is None else bool(int(sa)),
+                      rg_priv=getattr(a, "v4_rg_priv", None) or "off")
+            return V4Cfg(readout=ro, pref_head=ph, time_free=bool(int(getattr(a, "v4_time_free", 1))),
+                         lat_haz=bool(int(getattr(a, "v4_lat_haz", 1))), horizon=float(getattr(a, "v4_horizon", 4.0)),
+                         **kw).validate(temporal_cfg_of(a).on)
+        return V4Cfg(readout=ro, pref_head=ph, time_free=bool(int(getattr(a, "v4_time_free", 1))),
+                     lat_haz=bool(int(getattr(a, "v4_lat_haz", 1))),
+                     horizon=float(getattr(a, "v4_horizon", 4.0))).validate(temporal_cfg_of(a).on)
+    except ValueError as e:
+        raise SystemExit(f"--v4-*: {e}") from None
+
+
+V4_ARG_KEYS = ("v4_readout", "v4_pref_head", "v4_time_free", "v4_lat_haz", "v4_horizon", "lambda_pref",
+               "lambda_station", "lambda_ev", "time_idx_root", "v4_cfg") + V4_3_FLAGS + ("rg_max_parents",)
+
+
+def v4_cfg_of(a):
+    """V4Cfg of resolved args (absent attribute = off, e.g. args built by older tests)."""
+    from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+    v = getattr(a, "v4_cfg", None)
+    return v if v is not None else V4Cfg()
 
 
 def parse_best(s: Optional[str]) -> Optional[Tuple[str, str, str]]:
@@ -328,6 +524,28 @@ class DistEpochBatches(torch.utils.data.Sampler):
 
 
 # ----------------------------------------------------------------------------------------------- data
+def objects_spec(a, split: str, train: bool) -> Optional[Dict]:
+    """Dataset `objects` kwarg of the temporal branch (None when off): train -> aug + targets; evals -> no aug,
+    targets when the split's pack has them (navtest has none; the oracle needs them everywhere)."""
+    t = temporal_cfg_of(a)
+    if not t.on:
+        return None
+    if train:
+        return {"cfg": t.to_dict(), "aug": True, "targets": True}
+    from tools.ck.data.obj_pack import ObjPack
+    has = ObjPack(split, source=t.source, root=t.pack_root, targets=False).has_targets
+    return {"cfg": t.to_dict(), "aug": False, "targets": bool(has)}
+
+
+def check_obj_bad(name: str, ds) -> None:
+    """SPEC 5.3 fail loudly: more than 0.5 % of a dataset's tokens without objects (obj_ok False) -> SystemExit."""
+    from tools.ck.data.ck2_dataset import OBJ_BAD_MAX
+    o = getattr(ds, "objects", None)
+    if o is not None and o.frac_obj_bad > OBJ_BAD_MAX:
+        raise SystemExit(f"{name}: {o.n_obj_bad} of {len(ds)} tokens ({100 * o.frac_obj_bad:.2f} %) have no object "
+                         f"rows (obj_ok False) in {o.pack.dir}: more than {100 * OBJ_BAD_MAX:.1f} %")
+
+
 def build_datasets(a) -> Dict:
     """-> {'train': CK2Dataset, 'evals': [(name, kind in {'r34', 'raw'}, dataset)]}."""
     from tools.ck.data.ck2_dataset import CK2Dataset
@@ -335,15 +553,27 @@ def build_datasets(a) -> Dict:
 
     ep = getattr(a, "ep_target", "official")
     ck2 = dict(var_name=a.var_name, seed=a.seed, sampler_seed=a.sampler_seed, ep_target=ep)
-    train = CK2Dataset(a.split, bev=a.arm, n_var=a.n_var, gt=True, limit=a.limit_tokens or 0, **ck2)
+    on = temporal_cfg_of(a).on
+
+    def ob(split, train=False):                    # the objects kwarg only when the branch is on (OFF: no kwarg)
+        return {"objects": objects_spec(a, split, train)} if on else {}
+
+    v4kw = {}                                      # refiner v4 extras (off: the CK2 dataset call, unchanged)
+    if getattr(a, "time_idx_root", ""):
+        v4kw["time_idx_root"] = a.time_idx_root
+    if v4_cfg_of(a).pref_head:
+        v4kw["with_pref"] = True
+    train = CK2Dataset(a.split, bev=a.arm, n_var=a.n_var, gt=True, limit=a.limit_tokens or 0, **ck2,
+                       **ob(a.split, True), **v4kw)
+    egt = v4_cfg_of(a).rg_priv != "off"           # PRIVILEGED teacher: the evals need the GT objects as input too
     evals = []
     if a.val_split and a.val_split != "none":
-        evals.append((a.val_split, "r34", CKDataset(a.val_split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
-                                                    limit=a.val_limit or 0, ep_target=ep)))
+        evals.append((a.val_split, "r34", CKDataset(a.val_split, bev=a.arm, k=C().K_CAND, labels="cand", gt=egt,
+                                                    limit=a.val_limit or 0, ep_target=ep, **ob(a.val_split))))
         if a.val_raw:
             evals.append((a.val_split + RAW_SUFFIX, "raw",
-                          CK2Dataset(a.val_split, bev=a.arm, n_var=a.eval_n_var, gt=False, epoch=0,
-                                     limit=a.val_limit or 0, **ck2)))
+                          CK2Dataset(a.val_split, bev=a.arm, n_var=a.eval_n_var, gt=egt, epoch=0,
+                                     limit=a.val_limit or 0, **ck2, **ob(a.val_split))))
     if a.train_eval_rows:
         tdf = TC.packed_tokens(a.split)
         if tdf is not None:
@@ -351,10 +581,14 @@ def build_datasets(a) -> Dict:
             n_eval = a.train_eval_rows if not a.val_limit else min(a.train_eval_rows, a.val_limit)
             rows = pool[U.log_stratified_rows(tdf["log"].values[pool], n_eval, seed=0)]
             name = TRAIN_EVAL_NAME.format(a.split)
-            evals.append((name, "r34", CKDataset(a.split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
-                                                 rows=rows, ep_target=ep)))
-            evals.append((name + RAW_SUFFIX, "raw", CK2Dataset(a.split, bev=a.arm, n_var=a.eval_n_var, gt=False,
-                                                               epoch=0, rows=rows, **ck2)))
+            evals.append((name, "r34", CKDataset(a.split, bev=a.arm, k=C().K_CAND, labels="cand", gt=egt,
+                                                 rows=rows, ep_target=ep, **ob(a.split))))
+            evals.append((name + RAW_SUFFIX, "raw", CK2Dataset(a.split, bev=a.arm, n_var=a.eval_n_var, gt=egt,
+                                                               epoch=0, rows=rows, **ck2, **ob(a.split))))
+    if on:
+        check_obj_bad(a.split, train)
+        for name, _, ds in evals:
+            check_obj_bad(name, ds)
     return {"train": train, "evals": evals}
 
 
@@ -392,6 +626,42 @@ def trainable(net) -> List[torch.nn.Parameter]:
     return [p for p in net.parameters() if p.requires_grad]
 
 
+def save_eval_logits(path: Path, R: Dict, pend: Dict) -> None:
+    """Atomic npz of a temporal run's r34 eval: score_logit [N, K, 5] float32, packed rows [N], epoch, step."""
+    tmp = path.with_name(f".{path.stem}.tmp{os.getpid()}.npz")
+    np.savez(tmp, logit=np.asarray(R["logit"], np.float32), rows=np.asarray(R["rows"], np.int64),
+             epoch=np.int64(pend["epoch"]), step=np.int64(pend["step"]))
+    os.replace(tmp, path)
+
+
+def load_pretrained_forecaster(net, tcfg) -> Dict:
+    """Learned arm: load cfg.fc_init (pre-training stage output) into net.temporal.forecaster (strict) and, when
+    fc_train is 'frozen' (default), freeze it (requires_grad False: no optimiser group, DDP ignores it)."""
+    fcm = net.temporal.forecaster
+    rep = {"fc_init": tcfg.fc_init or None, "fc_train": tcfg.fc_train}
+    if tcfg.fc_init:
+        meta = torch.load(tcfg.fc_init, map_location="cpu", weights_only=False)
+        fcm.load_state_dict(meta["forecaster"], strict=True)
+        rep.update(sha16=U.sha256_file(tcfg.fc_init), n_modes=meta.get("n_modes"), seed=meta.get("seed"),
+                   step=meta.get("step"), version=meta.get("version"))
+    if tcfg.fc_frozen:
+        for p in fcm.parameters():
+            p.requires_grad_(False)
+    rep["n_trainable"] = int(sum(p.numel() for p in fcm.parameters() if p.requires_grad))
+    return rep
+
+
+def param_groups(net) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+    """(critic, forecaster) trainable parameters; forecaster = names under 'temporal.forecaster.' (learned arm),
+    critic = every other trainable parameter in net.parameters() order.  OFF / CA / oracle: forecaster empty and
+    critic == trainable(net)."""
+    crit, fc = [], []
+    for n, p in net.named_parameters():
+        if p.requires_grad:
+            (fc if n.startswith(FC_PREFIX) else crit).append(p)
+    return crit, fc
+
+
 def setup_model(a, run: Path, train_ds, D: Dist, norm_override=None):
     """-> (CKNet with frozen lon / gate heads, init report).  Rank 0 writes the norm file; every rank builds the net
     from it (DDP then broadcasts rank 0's parameters, incl. the score prior)."""
@@ -413,9 +683,17 @@ def setup_model(a, run: Path, train_ds, D: Dist, norm_override=None):
     D.barrier()
     mean, std, _ = load_norm(dst)
     init = None if a.init_from in (None, "", "none") else a.init_from
-    net = build_ck(a.arm, seed=a.seed, norm=(mean, std), init_from=init, lead_aux=False)
+    tcfg = temporal_cfg_of(a)
+    kw = {"temporal": tcfg} if tcfg.on else {}                     # OFF: the CK2 call, unchanged
+    if int(getattr(a, "corridor_version", 1)) != 1:                # refiner-fix B1 (default 1: the call unchanged)
+        kw["corridor_version"] = int(a.corridor_version)
+    if v4_cfg_of(a).on:                                            # refiner v4 (off: the call unchanged)
+        kw["v4"] = v4_cfg_of(a)
+    net = build_ck(a.arm, seed=a.seed, norm=(mean, std), init_from=init, lead_aux=False, **kw)
     rep = getattr(net, "init_report", None)
     rep = dict(rep) if isinstance(rep, dict) else {"report": str(rep)}
+    if tcfg.on and tcfg.forecaster == "learned":
+        rep["forecaster"] = load_pretrained_forecaster(net, tcfg)
     if a.score_prior and rep.get("kind") != "ck" and D.is0:
         prior = ck2_label_prior(train_ds, a.prior_rows) if hasattr(train_ds, "labels_item") else None
         if prior is not None:
@@ -442,11 +720,38 @@ def mask_bev_ok(batch: Dict) -> Dict:
     return b
 
 
-def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool) -> Dict:
-    """CKNet forward on the model inputs only (bev, cand, status, var_traj); no decode (done with z_lon = 0)."""
+_ANCHORS_T: Dict[str, torch.Tensor] = {}
+
+
+def anchors_on(dev) -> "torch.Tensor":
+    """The AnchorSampler anchor table [256, 8, 3] f32 on `dev` (cached; refiner v4 variant parents)."""
+    key = str(dev)
+    if key not in _ANCHORS_T:
+        from navsim.agents.para_ssr.ck import anchor_sampler as AS
+        _ANCHORS_T[key] = torch.from_numpy(np.asarray(AS.load_anchors(), np.float32)).to(dev)
+    return _ANCHORS_T[key]
+
+
+def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool, tcfg=None) -> Dict:
+    """CKNet forward on the model inputs only (bev, cand, status, var_traj; + OBJ_INPUT_KEYS (+ the oracle's
+    PRIV_INPUT_KEYS) when the temporal branch is on); no decode (done with z_lon = 0).
+    refiner v4 hazard readout: the raw anchors are their own parents, a variant's parent is its anchor
+    (batch var_anchor -> anchor table)."""
     extra = batch["var_traj"].float() if with_var and "var_traj" in batch else None
+    kw = {}
+    core = getattr(net, "module", net)
+    if getattr(core, "v4_readout", None) is not None and extra is not None:
+        kw["extra_parent"] = anchors_on(extra.device)[batch["var_anchor"].to(extra.device).long()]
+    if tcfg is not None and tcfg.on:
+        from navsim.agents.para_ssr.ck.temporal.branch import objs_from_batch
+        kw["objs"] = objs_from_batch(batch, tcfg, dev)
+    v4 = getattr(core, "v4", None)
+    if v4 is not None and v4.range and v4.rg_priv != "off":      # PRIVILEGED teacher: the batch's GT objects as input
+        from navsim.agents.para_ssr.ck.v4.losses import EV_REF_KEYS
+        kw["priv"] = {k: batch[k].to(dev) for k in EV_REF_KEYS if k in batch}
     with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_amp):
-        return net(batch.get("bev"), batch["cand"].float(), batch["status"].float(), extra=extra, decode=False)
+        return net(batch.get("bev"), batch["cand"].float(), batch["status"].float(), extra=extra, decode=False,
+                   **kw)
 
 
 def lateral_decode(cand: torch.Tensor, w_lat: torch.Tensor, v0: torch.Tensor, slope: float) -> Dict:
@@ -521,18 +826,125 @@ def compute_loss(out: Dict, corr: Dict, batch: Dict, a) -> Tuple[torch.Tensor, D
         st["sur_nonfinite"] = float(nonfin)
         st.update({f"t_{k}": float(v) for k, v in (terms or {}).items()})
     loss = loss + 0.0 * out["w_lat"].float().sum()          # lateral head always in the graph (DDP)
+    loss = add_v4_losses(loss, st, out, batch, a)
     st["e_abs"] = float(corr["e_lat"].detach()[..., 2:].abs().mean())
     st["w_lat_abs"] = float(out["w_lat"].detach().float().abs().mean())
     st["z_lon_absmax"] = float(out["z_lon"].detach().float().abs().max())
+    if "t_stats" in out:                                    # temporal branch on (absent when off: stats unchanged)
+        st["loss_ck"] = float(loss.detach())
+        st["t_n_obj"] = float(out["t_stats"]["n_obj"])
+        if "obj_ok" in batch:
+            st["n_obj_bad"] = float((~batch["obj_ok"].bool()).sum())
+        st["t_n_valid"] = float(out["t_stats"].get("n_valid", 0))
+        if "fc" in out:                                     # learned forecaster
+            from navsim.agents.para_ssr.ck.temporal.loss import add_forecast_loss, forecast_loss
+            if temporal_cfg_of(a).fc_frozen:                # pre-trained + frozen: monitor only, no loss term
+                with torch.no_grad():
+                    _, s_fc = forecast_loss(out["fc"], batch["fc_xyh"], batch["fc_state"], batch["obj_mask"][:, 0])
+                st.update(s_fc)
+            else:                                           # joint: + lambda_fc * forecast loss
+                loss = add_forecast_loss(loss, st, out, batch, temporal_cfg_of(a).lambda_fc)
     st["loss"] = float(loss.detach())
     return loss, st
+
+
+def _all_ck_keys():
+    from navsim.agents.para_ssr.ck.constants import CK_KEYS
+    return list(CK_KEYS)
+
+
+def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
+    """refiner v4 terms (absent outputs / batch keys -> unchanged loss and stats):
+      + lambda_pref * Huber(log1p P_ref) (out 'pref_logp', batch 'pref' [T] m, NaN = no target);
+      + lambda_station * censored station BCE (hazard readout 'haz' / 'extra_haz', batch 'anc_tidx' [T, K, 3] /
+        'var_tidx' [T, V, 3], same masks as the score BCE);
+      + lambda_ev * evidence aux (evidence readout: occupancy BCE / drivable-margin Huber);
+      + lambda_ev * range GT field aux (range readout, range_gt_aux: blocked field B / U BCE, SDF margin Huber).
+    Specialist teachers (--score-keys, user 2026-10-08): the station terms are restricted to the hazard keys in
+    score_keys (DET nc,ttc,ep,comfort -> nc, ttc; MAP dac,ep -> dac), the occupancy / blocked-field aux needs nc or ttc
+    and the margin aux dac (review 79 D(c)).  The station BCE reads the hazard readout's a_* only (range: none)."""
+    from navsim.agents.para_ssr.ck.v4 import losses as V4L
+    keys = set(getattr(a, "score_keys", None) or _all_ck_keys())
+    if "pref_logp" in out:
+        tgt, ok = None, batch["bev_ok"].bool().reshape(-1) if "bev_ok" in batch else None
+        if "pref" in batch:
+            tgt = batch["pref"].float().reshape(-1)
+        elif "ref_p_pdm" in batch and "ref_gt_ok" in batch:                # GT loader: pdm_progress_eff
+            tgt = batch["ref_p_pdm"].float().reshape(-1)
+            g = batch["ref_gt_ok"].bool().reshape(-1)
+            ok = g if ok is None else ok & g
+        if tgt is not None:
+            lp = V4L.pref_loss(out["pref_logp"], tgt, ok)
+            st["pref_huber"] = float(lp.detach())
+            loss = loss + float(getattr(a, "lambda_pref", 0.1)) * lp
+        else:
+            loss = loss + 0.0 * out["pref_logp"].sum()
+    ev_on = "haz" in out and "occ_logit" in out["haz"] and float(getattr(a, "lambda_ev", 0.0) or 0.0) > 0
+    if ev_on:
+        ref = {k: batch[k] for k in V4L.EV_REF_KEYS if k in batch}
+        if "bev_ok" in batch and "ref_gt_ok" in ref:
+            ref["ref_gt_ok"] = ref["ref_gt_ok"].bool() & batch["bev_ok"].bool().reshape(-1)
+        w_occ = 1.0 if keys & {"nc", "ttc"} else 0.0
+        w_m = 1.0 if "dac" in keys else 0.0
+        if "occ_logit_u" in out["haz"]:                     # refiner v4_3 range readout: its own GT field aux
+            l_occ, l_m, s_ev = range_gt_aux(out["haz"], batch["cand"], ref, a, need_occ=w_occ > 0, need_margin=w_m > 0)
+        else:                                               # evidence readout (unchanged)
+            l_occ, l_m, s_ev = V4L.evidence_aux(out["haz"], ref)
+        st.update(s_ev)
+        loss = loss + float(a.lambda_ev) * (w_occ * l_occ + w_m * l_m)
+    if "haz" in out and "a_nc" in out["haz"] and float(getattr(a, "lambda_station", 0.0) or 0.0) > 0 \
+            and "anc_tidx" in batch:
+        sets = [(out["haz"], batch["anc_tidx"], batch["y"], batch["y_ok"])]
+        if "extra_haz" in out and "var_tidx" in batch:
+            sets.append((out["extra_haz"], batch["var_tidx"], batch["var_y"], batch["var_ok"]))
+        haz = {k: torch.cat([s[0][k] for s in sets], 1) for k in sets[0][0]}
+        tidx = torch.cat([s[1].to(haz["haz_mask"].device).long() for s in sets], 1)
+        y5 = torch.cat([s[2].float() for s in sets], 1)
+        ok = torch.cat([s[3].bool() for s in sets], 1)
+        l_st, s_st = V4L.station_bce(haz, tidx, y5, ok, keys=keys)
+        st.update(s_st)
+        with torch.no_grad():
+            st.update(V4L.localisation_hit({k: v.detach() for k, v in haz.items()}, tidx, y5, ok))
+        loss = loss + float(a.lambda_station) * l_st
+    return loss
+
+
+def range_gt_aux(haz: Dict, cand: torch.Tensor, ref: Dict, a, need_occ: bool = True, need_margin: bool = True
+                 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """refiner v4_3 range teachers (--v4-readout range; spec V4_3 M4 / M6 'Teachers'): GT field aux on the parent rows of
+    the own-parent candidates (the raw anchors: haz is_self; rows = haz parent_index), the first --rg-max-parents
+    distinct rows per GT-ok token in slot order (the sampler's random order) = range_targets.gt_field_aux (the shared
+    implementation, also the student's ck_e2e2.v4.rg_gt_aux) with the readout's bins (ev_tbin_s), --corridor-version
+    and the target rule of the run's V4Cfg:
+      occ (DET, nc / ttc in --score-keys): blocked field of the GT objects (ref_obj_*, gt_future metric-cache rule,
+          0.1 s samples max-pooled into the readout's M bins) on each parent's grid (heading 'parent') with lon_max:
+          target B = the not-behind at-fault proxy (--v4-rg-stopped-aware 1: the stopped-aware B of Phase 0b R2,
+          stopped / static objects without the not-behind filter; + Bp = LON >= BEHIND_M, the plain B that TTC reads,
+          for bp_logit_u) for occ_logit_u, U = LON > -inf (any overlap: the TTC channel) for ovl_logit_u; BCE over
+          every cell and the KNOWN bins (a bin holding a sample after the
+          token's annotated horizon t_avail is masked);
+      margin (MAP, dac in --score-keys): the official DAC SDF (ref_sdf, sdf.sample_sdf) at the parent grid points,
+          clipped to +-5 m, Huber (delta 1 m) with margin_u; points outside the SDF grid masked (= the margin term of
+          losses.evidence_aux).
+    GT is the TARGET only (never a network input).  haz: forward 'haz' of the anchor set ([T, K, ...] + the per-row
+    occ_logit_u / ovl_logit_u [T, U, 48, 17, M], margin_u [T, U, 48, 17]); cand [T, K, 8, 3]; ref: the batch's ref_*
+    GT (losses.EV_REF_KEYS).  -> (l_occ, l_margin, stats rg_*); zeros (graph-connected) when a term is not needed or
+    nothing is selected.  BCE / Huber only."""
+    from navsim.agents.para_ssr.ck.v4 import range_targets as RT
+    v4 = v4_cfg_of(a)
+    return RT.gt_field_aux(haz, cand, ref, tbin_s=float(v4.ev_tbin_s), max_parents=int(getattr(a, "rg_max_parents", 8)),
+                           corridor_version=int(getattr(a, "corridor_version", 1)), need_occ=need_occ,
+                           need_margin=need_margin, stopped_aware=bool(v4.rg_stopped_aware))
 
 
 def dummy_backward(out: Dict) -> None:
     """DDP: when the step is skipped (non-finite loss on some rank) every rank still runs one backward over the same
     graph (zero-weighted outputs), so the reducer stays in step; the gradients are discarded."""
     terms = [out[k].float().nan_to_num(0.0, 0.0, 0.0).sum() * 0.0 for k in ("score_logit", "extra_score_logit",
-                                                                            "w_lat") if k in out]
+                                                                            "w_lat", "pref_logp") if k in out]
+    if out.get("fc") is not None and out["fc"].mu.requires_grad:   # learned forecaster outputs (not frozen)
+        from navsim.agents.para_ssr.ck.temporal.loss import forecast_touch
+        terms.append(forecast_touch(out["fc"]).nan_to_num(0.0, 0.0, 0.0))
     if terms:
         torch.stack(terms).sum().backward()
 
@@ -672,29 +1084,46 @@ def run_eval(net, ds, kind: str, a, dev, use_amp: bool, D: Dist, collate_fn=None
     keep = (("prob", "y", "y_ok", "y_pdms", "v2_final", "v2_im") if kind == "r34" else
             ("prob", "y", "y_ok", "y_pdms", "anc_group", "anc_idx", "var_prob", "var_y", "var_ok", "var_pdms",
              "var_v", "var_anchor"))
-    acc: Dict[str, list] = {k: [] for k in keep + ("e_abs",)}
+    tcfg = temporal_cfg_of(a)
+    save_logit = tcfg.on and kind == "r34"          # review fix D6: per-token logits for the infer reproduce check
+    acc: Dict[str, list] = {k: [] for k in keep + ("e_abs",) + (("logit", "rows") if save_logit else ())}
     bad, ntok = 0, 0
     slope = C().LON_ST_SLOPE["eval"]
+    fcm, obj_bad = None, 0
+    if tcfg.on and tcfg.forecaster == "learned":
+        from navsim.agents.para_ssr.ck.temporal.metrics import ForecastMetrics
+        fcm = ForecastMetrics()
     if len(shard):
         for batch in dl:
             batch = mask_bev_ok(TC.to_dev(batch, dev))
             bad += TC.n_bev_bad(batch)
             ntok += int(batch["cand"].shape[0])
             with_var = kind == "raw" and "var_traj" in batch
-            out = forward(net, batch, use_amp, dev, with_var)
+            out = forward(net, batch, use_amp, dev, with_var, tcfg)
+            if tcfg.on and "obj_ok" in batch:
+                obj_bad += int((~batch["obj_ok"].bool()).sum())
+            if fcm is not None and out.get("fc") is not None and "fc_xyh" in batch:
+                fcm.update(out["fc"], batch["fc_xyh"], batch["fc_state"], batch["obj_mask"][:, 0])
             corr = lateral_decode(batch["cand"], out["w_lat"], out["ego"][0], slope)
             acc["prob"].append(torch.sigmoid(out["score_logit"].float()).cpu().numpy())
+            if save_logit:
+                acc["logit"].append(out["score_logit"].float().cpu().numpy())
+                acc["rows"].append(batch["rows"].cpu().numpy() if "rows" in batch else
+                                   np.full(int(batch["cand"].shape[0]), -1, np.int64))
             acc["e_abs"].append(corr["e_lat"][..., 2:].abs().mean(-1).float().cpu().numpy().reshape(-1))
             if with_var:
                 acc["var_prob"].append(torch.sigmoid(out["extra_score_logit"].float()).cpu().numpy())
             for k in keep:
-                if k in ("prob", "var_prob"):
+                if k in ("prob", "var_prob", "logit", "rows"):
                     continue
                 if k in batch:
                     acc[k].append(batch[k].cpu().numpy())
     net.train()
     mine = {k: (np.concatenate(v) if v else None) for k, v in acc.items()}
     mine["_bad"], mine["_ntok"] = bad, ntok
+    if tcfg.on:
+        mine["_obj_bad"] = obj_bad
+        mine["_fc"] = fcm.to_tensor().numpy() if fcm is not None else None
     parts = D.all_gather(mine)
     R: Dict[str, np.ndarray] = {}
     for k in acc:
@@ -703,6 +1132,11 @@ def run_eval(net, ds, kind: str, a, dev, use_amp: bool, D: Dist, collate_fn=None
             R[k] = np.concatenate(arrs)
     R["n_bev_bad"] = np.asarray(sum(int(p["_bad"]) for p in parts))
     R["n_tok"] = np.asarray(sum(int(p["_ntok"]) for p in parts))
+    if tcfg.on:
+        R["n_obj_bad"] = np.asarray(sum(int(p["_obj_bad"]) for p in parts))
+        fcs = [p["_fc"] for p in parts if p.get("_fc") is not None]
+        if fcs:
+            R["fc_sums"] = np.sum(np.stack(fcs), 0)
     return R
 
 
@@ -712,6 +1146,11 @@ def eval_metrics(kind: str, R: Dict[str, np.ndarray], var_names=None) -> Dict[st
     m = r34_metrics(R) if kind == "r34" else raw_metrics(R, var_names)
     m["n_tokens"] = int(R["n_tok"])
     m["n_bev_bad"] = int(R["n_bev_bad"])
+    if "n_obj_bad" in R:                                     # temporal branch on
+        m["n_obj_bad"] = int(R["n_obj_bad"])
+    if "fc_sums" in R:                                       # learned forecaster with targets: SPEC 5.3 fc metrics
+        from navsim.agents.para_ssr.ck.temporal.metrics import ForecastMetrics
+        m.update(ForecastMetrics.from_tensor(torch.as_tensor(R["fc_sums"])).result("fc_"))
     return m
 
 
@@ -768,13 +1207,20 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
     collate_fn = collate_fn or collate()
     train_ds = datasets["train"]
     evals = datasets["evals"]
+    tcfg = temporal_cfg_of(a)
     net, init_rep = setup_model(a, run, train_ds, D, norm_override)
     net = net.to(dev)
     params = trainable(net)
+    p_crit, p_fc = param_groups(net)
+    pc = net.param_counts() if hasattr(net, "param_counts") else {}
     use_amp = bool(a.amp) and dev.type == "cuda"
     ck_root = U.ck_data()
     var_names = (getattr(train_ds, "var_meta", None) or {}).get("names")
-    cfg = dict(vars(a), arm=a.arm, seed=a.seed, trainer="train_ck2", git_head=U.git_head(), run_dir=str(run),
+    targs = {k: v for k, v in vars(a).items() if k != "temporal_cfg"}
+    # refiner v4 flags: recorded only when v4 is on (off: the CK2 / v3 config.json keys exactly; the v4 block and
+    # weights are added below)
+    targs = {k: v for k, v in targs.items() if k not in V4_ARG_KEYS or v4_cfg_of(a).on}
+    cfg = dict(targs, arm=a.arm, seed=a.seed, trainer="train_ck2", git_head=U.git_head(), run_dir=str(run),
                device_resolved=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), world_size=D.world,
                tokens_per_rank=b_local, global_batch=a.tokens_per_batch,
                lr_note="lr is not rescaled with the batch; global batches are world-size independent",
@@ -786,15 +1232,41 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                lon_head="removed (zeroed + frozen; decode with z_lon = 0)", kd="off", score_weighting="none",
                ep_target_rule=(EP_RULE if a.ep_target == "decoupled" else "official EP label column"),
                score_hidden=256, lead_aux=0, param_count=int(sum(p.numel() for p in net.parameters())),
-               param_count_trainable=int(sum(p.numel() for p in params)))
+               param_count_trainable=int(sum(p.numel() for p in params)),
+               temporal=tcfg.to_dict(), privileged=int(tcfg.privileged or v4_cfg_of(a).rg_priv != "off"),
+               **({"v4": v4_cfg_of(a).to_dict(), "lambda_pref": float(a.lambda_pref),
+                   "lambda_station": float(a.lambda_station), "lambda_ev": float(a.lambda_ev),
+                   "time_idx_root": str(a.time_idx_root or "")}
+                  if v4_cfg_of(a).on else {}),
+               param_count_temporal_shared=int(pc.get("temporal_shared", 0)),
+               param_count_forecaster=int(pc.get("forecaster", 0)),
+               provenance=run_provenance(a, tcfg))
     old = U.read_json(run / "config.json")
     if old is not None and a.resume:
-        old_default = {"sur_groups": "all", "score_keys": list(Cn.CK_KEYS), "ep_target": "official"}
+        old_default = {"sur_groups": "all", "score_keys": list(Cn.CK_KEYS), "ep_target": "official",
+                       "corridor_version": 1}
         for k in ("arm", "seed", "split", "n_var", "var_name", "sampler_seed", "tokens_per_batch", "init_from",
-                  "lambda_score", "lambda_sur", "sur_groups", "score_keys", "ep_target"):
+                  "lambda_score", "lambda_sur", "sur_groups", "score_keys", "ep_target", "corridor_version"):
             ov = old.get(k, old_default.get(k))
             if ov != cfg.get(k):
                 raise SystemExit(f"{run}: resume with {k}={cfg.get(k)!r} but config.json has {ov!r}")
+        from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+        ot = TemporalCfg.from_dict(old.get("temporal")).normalised().to_dict()   # old config without the key = off
+        if ot != tcfg.normalised().to_dict():
+            raise SystemExit(f"{run}: resume with temporal={cfg['temporal']!r} but config.json has {ot!r}")
+        from navsim.agents.para_ssr.ck.v4.config import V4Cfg
+        if V4Cfg.from_dict(old.get("v4")) != v4_cfg_of(a):           # old config without the key = off
+            raise SystemExit(f"{run}: resume with v4={v4_cfg_of(a).to_dict()!r} but config.json has {old.get('v4')!r}")
+        if tcfg.on and old.get("provenance"):      # review fix D5: a resumed arm must keep its code and data
+            from tools.ck.v3 import provenance as PV
+            cmp = PV.compare({"config.json": old["provenance"], "now": cfg["provenance"]})
+            if cmp["errors"]:
+                raise SystemExit(f"{run}: resume with other code / data than config.json records: {cmp['errors']}")
+    if tcfg.on and (old is None or a.restart):            # D5: refuse a fresh run on inconsistent data
+        from tools.ck.v3 import provenance as PV
+        bad = PV.check_self(cfg["provenance"])
+        if bad:
+            raise SystemExit(f"{run}: provenance check failed: {bad}")
     if D.is0 and (old is None or a.restart):
         U.write_json(run / "config.json", cfg)
     steps_per_epoch = len(TC.EpochBatches(len(train_ds), a.tokens_per_batch, a.seed, 0))
@@ -803,7 +1275,10 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
     total = steps_per_epoch * a.epochs
     if a.max_steps:
         total = min(total, a.max_steps)
-    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=a.wd)
+    if p_fc:                                     # learned forecaster: own param group (clipped separately)
+        opt = torch.optim.AdamW([{"params": p_crit}, {"params": p_fc}], lr=a.lr, weight_decay=a.wd)
+    else:                                        # OFF / CA / oracle: the CK2 optimiser (p_crit == params)
+        opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=a.wd)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, TC.lr_lambda(min(a.warmup_steps, max(1, total // 10))
                                                                 if a.max_steps else a.warmup_steps, total))
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -861,7 +1336,11 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
                     continue
                 R = run_eval(net, ds, kind, a, dev, use_amp, D, collate_fn)
                 m = eval_metrics(kind, R, var_names)
+                if D.is0 and "logit" in R:          # temporal r34 evals: logits of this eval (infer check, D6)
+                    save_eval_logits(run / f"eval_r34_{name}_last.npz", R, pend)
                 TC.check_bev_bad(int(m.get("n_bev_bad", 0)), int(m.get("n_tokens", 0)), f"eval {name}", force=True)
+                if tcfg.privileged or v4_cfg_of(a).rg_priv != "off":
+                    m["privileged"] = 1
                 if D.is0:
                     U.log_jsonl(valp, dict(epoch=pend["epoch"], step=pend["step"], split=name, kind=kind,
                                            partial_epoch=bool(pend["partial"]), **m))
@@ -902,7 +1381,7 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
         bi = bstart
         for batch in dl:
             batch = TC.to_dev(batch, dev)
-            out = forward(model, batch, use_amp, dev, with_var)
+            out = forward(model, batch, use_amp, dev, with_var, tcfg)
             corr = lateral_decode(batch["cand"], out["w_lat"], out["ego"][0], slope)
             loss, st = compute_loss(out, corr, batch, a)
             opt.zero_grad(set_to_none=True)
@@ -915,8 +1394,13 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
             else:
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
-                gn = torch.nn.utils.clip_grad_norm_(params, a.clip if a.clip > 0 else float("inf"))
+                clip = a.clip if a.clip > 0 else float("inf")
+                gn = torch.nn.utils.clip_grad_norm_(p_crit if p_fc else params, clip)
                 st["grad_norm"] = float(gn)
+                if p_fc:                                # forecaster group: own norm, own clip
+                    gn_fc = torch.nn.utils.clip_grad_norm_(p_fc, clip)
+                    st["grad_norm_fc"] = float(gn_fc)
+                    gn = gn + gn_fc                     # non-finite in either group -> skip the step
                 if not math.isfinite(float(gn)):
                     n_skip["grad"] += 1
                     st["skipped"] = 1.0

@@ -291,11 +291,16 @@ class Labeler:
             str(CM.mc_path(self.split, lg, self.tok[r]))
         self.tasks.append((key, self.tok[r], self.traj[key], mcp))
 
+    def score_fn(self):
+        """Pool task function (subclass hook; tools/ck/e2e2/labeler2.Labeler2 returns score_one2 with time indices)."""
+        return score_one
+
     def _submit(self):
+        fn = self.score_fn()
         while self.tasks and len(self.inflight) < self.inflight_max:
             t = self.tasks.popleft()
             self.inflight[t[0]] = time.time()
-            self.pool.apply_async(score_one, (t,), callback=self.results.put,
+            self.pool.apply_async(fn, (t,), callback=self.results.put,
                                   error_callback=lambda e, k=t[0]: self.results.put(
                                       (k, None, None, f"pool error {e!r}", 0.0, 0.0)))
 

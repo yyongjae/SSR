@@ -15,6 +15,16 @@ M3a corridor (per draft, no gradient: the draft is an input)
               0.213); straight if S_8 < 2 m (flag near_stop); flag ext_clipped if the clip was active.
   Stations  : N_ST = 48, spacing ds = max(1 m, S_look / 48), s_j = (j + 0.5) ds, j = 0..47 (station j is the centre of
               the arc-length bin [j ds, (j + 1) ds]; the bins cover [0, 48 ds] >= [0, S_look]).
+  Version   : corridor_geometry(tau0, version).  1 (default, every run before refiner-fix) = the extension above.
+              2 (refiner-fix B1) = (i) the arc ends at S_look and the stations beyond it continue STRAIGHT along the
+              tangent at S_look (with ds = 1 m the 48 stations reach 48 m >> S_look for slow drafts, and the clipped
+              arc of radius >= 4.7 m looped back towards the ego: 34 % of val r34 drafts turned > pi over the 48
+              stations, 70 % of those with v_end < 3 m/s); (ii) drafts with v_end < V_STRAIGHT_EXT = 3 m/s are
+              extended straight: below 3 m/s the clipped end curvature does not track the draft's own turning
+              (val r34, S_8 >= 2 m: corr with the half-draft chord curvature -0.13..+0.24, sign agreement 0.31-0.60,
+              median 4-11x larger, 8 m look-ahead turned 43-98 deg vs 3-5 deg for the draft's last chords;
+              >= 3 m/s corr 0.43-0.54) [measured, ck/v3/diag_bc/corridor_fix/out/m0_threshold.json].
+              Everything else (S_look, ds, stations, channels, flags) is identical.
   Lateral   : N_LAT = 17 offsets d_i = -4.8 + 0.6 i m, i = 0..16 (i = 0 is 4.8 m to the RIGHT, i = 8 on the path,
               i = 16 is 4.8 m to the LEFT), along the left unit normal of the smooth path:
               q_ij = Gamma(s_j) + d_i n(s_j).
@@ -55,6 +65,8 @@ DS_MIN = 1.0              # minimum station spacing [m]
 LOOK_MIN = 8.0            # minimum look-ahead beyond S_8 [m]
 T_LOOK = 1.0              # look-ahead time beyond S_8 [s]
 NEAR_STOP_S = 2.0         # straight extension below this draft length [m] (DraftPath.extend rule)
+CORRIDOR_VERSIONS = (1, 2)  # module docstring 'Version'
+V_STRAIGHT_EXT = 3.0      # [m/s] version 2: straight extension for v_end below this
 S_SCALE, T_SCALE, V_SCALE = 48.0, 4.0, 15.0
 V_EPS = 0.1               # [m/s] floor of v_end in the arrival time beyond S_8
 POOL = 5                  # global token pooling (5 x 5 cells = 3.2 m)
@@ -124,11 +136,14 @@ class CorridorGeom:
     ext_clipped: torch.Tensor  # [B] bool (extension curvature clipped by kappa_limit(v_end))
     kappa_knots: torch.Tensor  # [B, 8] smooth-path curvature at the draft poses k = 1..8 [1/m]
     path: DraftPath
+    version: int = 1           # corridor version (module docstring)
 
 
 @torch.no_grad()
-def corridor_geometry(tau0: torch.Tensor) -> CorridorGeom:
-    """Corridor points and geometric channels for drafts tau0 [B, 8, 3] (N frame)."""
+def corridor_geometry(tau0: torch.Tensor, version: int = 1) -> CorridorGeom:
+    """Corridor points and geometric channels for drafts tau0 [B, 8, 3] (N frame); version 1 | 2 (module docstring)."""
+    if version not in CORRIDOR_VERSIONS:
+        raise ValueError(f"corridor version {version!r} not in {CORRIDOR_VERSIONS}")
     tau0 = tau0.reshape(-1, N_POSE, 3)
     B = tau0.shape[0]
     dev, dt = tau0.device, tau0.dtype
@@ -137,7 +152,11 @@ def corridor_geometry(tau0: torch.Tensor) -> CorridorGeom:
     S8 = S[:, -1]
     v_end = (S8 - S[:, -2]) / T_POSE
     S_look = S8 + torch.clamp(v_end * T_LOOK, min=LOOK_MIN)
-    path.extend(S_look - S8, "const_curv", v=v_end)
+    if version == 1:
+        path.extend(S_look - S8, "const_curv", v=v_end)
+    else:
+        path.extend(S_look - S8, "const_curv", v=v_end, arc_len=S_look - S8)
+        path.kappa_ext = torch.where(v_end < V_STRAIGHT_EXT, torch.zeros_like(path.kappa_ext), path.kappa_ext)
     ext_clipped = (path.kappa_end.abs() > kappa_limit(v_end)) & (S8 >= NEAR_STOP_S)
     ds = torch.clamp(S_look / N_ST, min=DS_MIN)
     s = (torch.arange(N_ST, device=dev, dtype=dt)[None] + 0.5) * ds[:, None]      # [B, 48]
@@ -156,7 +175,7 @@ def corridor_geometry(tau0: torch.Tensor) -> CorridorGeom:
     ], 1)                                                                          # [B, 6, 48, 17]
     kk = path.eval(S[:, 1:]).kappa
     return CorridorGeom(points=pts, geo=geo, s=s, S=S, S_look=S_look, v_end=v_end, near_stop=S8 < NEAR_STOP_S,
-                        ext_clipped=ext_clipped, kappa_knots=kk, path=path)
+                        ext_clipped=ext_clipped, kappa_knots=kk, path=path, version=int(version))
 
 
 def sample_corridor(feat: torch.Tensor, points: torch.Tensor) -> torch.Tensor:

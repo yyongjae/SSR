@@ -148,6 +148,8 @@ PHASE0B_BLEND = "ck2T10"          # Phase 0b's deployment-blend critic (criterio
 REP_ID = "R2"                     # gt tube meta.json representation_id
 GT_TUBE_FORMAT = 2                # 2: + rule16 / rule80 (the readout-rule perfect-field tube)
 GPU_MEM_MAX = 1024                # [MiB] stage infer refuses a GPU using this much or more (as run_teachers.sh)
+_CUDA_GUARD_PASSED = None
+PRIV_ZERO_SUFFIX = "@privzero"    # --priv-zero: infer outputs of a privileged teacher with its GT-object input zeroed         # CUDA_VISIBLE_DEVICES value whose idle check this process already passed
 # (c) decision rule: docs/refiner_v4/V4_3_SPEC.md 'Phase 1c' primary P1 as replaced by the 'Phase 1c amendment'
 # (registered 2026-10-17 KST before any R2 teacher existed).  The old switch-rule rows stay in the outputs, descriptive.
 P1_KEYS = ("nc", "ttc")           # the keys the DET teacher owns (val has no DAC flag)
@@ -304,11 +306,14 @@ def cuda_guard(a) -> None:
     allowed GPU (ckutil.gpu_guard) and that GPU idle by nvidia-smi (memory.used < GPU_MEM_MAX MiB; a failed query
     refuses; V4_NVIDIA_SMI overrides the binary) -- checked before anything touches CUDA."""
     import subprocess
+    global _CUDA_GUARD_PASSED
     if os.environ.get("V4_USER_APPROVED") != "1" and not getattr(a, "approved", False):
         raise SystemExit("stage infer on CUDA needs the user's approval (V4_USER_APPROVED=1 or --approved); GPUs 0-3 "
                          "only, idle ones")
     U.gpu_guard(a.device)
     g = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if _CUDA_GUARD_PASSED == g:        # second teacher of the same call (--det + --map): the memory on the GPU is
+        return                         # this process's own context (2026-10-19 chain: refused its own 1.4 GB)
     smi = os.environ.get("V4_NVIDIA_SMI", "nvidia-smi")
     try:
         r = subprocess.run([smi, "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", g],
@@ -321,6 +326,7 @@ def cuda_guard(a) -> None:
     if used >= GPU_MEM_MAX:
         raise SystemExit(f"stage infer: GPU {g} uses {used:.0f} MiB (needs < {GPU_MEM_MAX}): busy, refusing")
     log(f"[infer] GPU {g}: {used:.0f} MiB used (< {GPU_MEM_MAX}), approved")
+    _CUDA_GUARD_PASSED = g
 
 
 def infer_resume_check(td: Path, meta: Dict) -> Dict:
@@ -372,9 +378,13 @@ def stage_infer(a, role: str, name: str) -> Dict:
     rows = base_rows(a)
     vd = SPLITS[a.split]["variants"]
     var_all = np.load(vd / "traj80.npy", mmap_mode="r")
-    td = split_root(a) / tname(name)
+    pz = bool(getattr(a, "priv_zero", False))
+    if pz and not privd:
+        raise SystemExit(f"--priv-zero: --{role} {run} is not a PRIVILEGED range teacher (config.json v4.rg_priv off)")
+    oname = tname(name) + (PRIV_ZERO_SUFFIX if pz else "")      # knock-out outputs live beside, never over, the real ones
+    td = split_root(a) / oname
     ck_file = run / f"ckpt_{a.which}.pt"
-    meta = dict(role=role, teacher=tname(name), run=str(run), which=a.which, arm=cfg["arm"],
+    meta = dict(role=role, teacher=oname, run=str(run), which=a.which, arm=cfg["arm"], priv_zero=pz,
                 ckpt=str(ck_file.absolute()), ckpt_sha16=U.sha256_file(ck_file) if ck_file.is_file() else None,
                 v4=net.v4.to_dict(),
                 rg_read=net.v4.rg_read, rg_stopped_aware=bool(net.v4.rg_stopped_aware),
@@ -392,8 +402,8 @@ def stage_infer(a, role: str, name: str) -> Dict:
     rr = rows[~np.asarray(A["done"][rows], bool)]
     # written before any row, so that outputs of an interrupted call still say which checkpoint wrote them
     U.write_json(td / "infer_meta.json", dict(meta, status="running", sessions=old.get("sessions") or []))
-    log(f"[infer] {role} {tname(name)} ({ck_file.name}, rg_read {net.v4.rg_read}) -> {td}: todo {len(rr)} of "
-        f"{len(rows)}")
+    log(f"[infer] {role} {oname} ({ck_file.name}, rg_read {net.v4.rg_read}{', PRIV ZEROED' if pz else ''}) -> {td}: "
+        f"todo {len(rr)} of {len(rows)}")
     n = n_bad = n_priv_missing = 0
     if len(rr):
         ds = CKDataset(a.split, bev=want, k=K16, labels=None, gt=False, rows=rr)   # priv: priv_ref (own GT store)
@@ -412,6 +422,9 @@ def stage_infer(a, role: str, name: str) -> Dict:
                 if privd:
                     priv = priv_ref(SPLITS[a.split]["gt_obj"], [str(x) for x in tdf.token.to_numpy()[prow]], dev)
                     n_priv_missing += int((~priv["ref_gt_ok"].cpu().numpy()).sum())
+                    if pz:                                      # knock-out: the GT objects are loaded (so the
+                        priv["ref_obj_n"].zero_()               # missing count is real) but none is selected ->
+                        priv["ref_gt_ok"].zero_()               # priv_channels gives zeros (test_v4_priv)
                 with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_amp):
                     o = range_forward(net, b["bev"].to(dev, non_blocking=True), cand, b["status"].to(dev).float(), var,
                                       priv=priv)
@@ -1715,6 +1728,9 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--det", default=None, help="DET range teacher run (dir or name)")
     ap.add_argument("--map", default=None, help="MAP range teacher run (navtest only)")
     ap.add_argument("--which", default="last")
+    ap.add_argument("--priv-zero", action="store_true",
+                    help="stage infer, PRIVILEGED (rg_priv) teacher only: zero its GT-object input (knock-out) and write "
+                         f"the outputs under <teacher>{PRIV_ZERO_SUFFIX}; evaluate them with --det <teacher>{PRIV_ZERO_SUFFIX}")
     ap.add_argument("--subset", choices=("all", "heldout", "f1"), default=None,
                     help="token subset (default: navtrain_val heldout, navtest all)")
     ap.add_argument("--limit", type=int, default=0, help="first N tokens of the subset into <out-root>/smoke<N>")

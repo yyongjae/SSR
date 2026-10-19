@@ -215,5 +215,18 @@ teacher as is, model.load_ck refuses it without allow_privileged).
   student input).  'far' PASS -> the front band alone is worth it and a 0-64 m student BEV is the natural follow-up.
   Both FAIL -> a CV-level input is not enough even all-around; the remaining lever is forecasting beyond CV from
   history (the v3 result says that is small) or the corrector line; report either way.
+* **RESULT (2026-10-19 09:07 KST val, 09:13 KST navtest; report 92)**: both arms FAIL.  val filter - blend: out
+  +0.16 [+0.02, +0.30] (break 0.24 %, 15.5 % of the GT gain), far +0.14 [-0.01, +0.30] (0.23 %, 13.8 %); (a) and (c)
+  not met.  P1 was -0.12.  navtest (report only, NC/TTC, ck2T10 blend): out -0.02, far +0.02.  Knock-out (same
+  checkpoints, GT-object input zeroed, `--priv-zero`): out -0.05 [-0.12, +0.03], far -0.08 -> the shift is the
+  channel's.  Where (val, 331 failing blend picks, catch rate P1 -> out): beyond 32 m 0.09 -> 0.72 (static 0.07 ->
+  0.89), behind 0.19 -> 0.40, in-window 0.33 -> 0.37, moving objects <= 0.51 everywhere; gap to GT -0.85 = missed
+  catches -0.58 + false alarms -0.18 + alternative quality -0.09.  Reading: the out-of-window t0 state was necessary,
+  not sufficient; the learned forecast sits between the CV (-0.19) and CA (+0.29) rule ceilings.  The range-teacher
+  line is closed unless the user asks otherwise (candidates: a CPU score-stack check of the privileged teacher's lp +
+  ck2T10, the corrector-A / Platt lines of report 91).  Chain note: the navtest infer stage exited 1 after the DET rows
+  were complete (the GPU guard re-ran for the MAP teacher inside the same process and saw its own memory); outputs
+  valid; guard made once-per-process.
+
 * The runs are launched by the user's standing approval of 2026-10-19 ("teacher 학습 알아서 해놔"); GPUs 0,1 (out)
   and 2,3 (far); eval chain on completion.

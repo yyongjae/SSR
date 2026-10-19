@@ -3,7 +3,7 @@
 # each, warm-started from the v4_3 range teachers (v4T10_rng2 / v4M10_rng2, R2 representation):
 #   DET  v5T_rel  arm T, relation channel (BEVFusion rows + causal CA) + unknown evidence + corrector A, L_refine all terms
 #   MAP  v5M_unk  arm M, unknown evidence + corrector A (L_refine road / progress / comfort) + corner margin aux
-#   V5_USER_APPROVED=1 [V5_EPOCHS=4] [V5_DET_GPUS=0,1] [V5_MAP_GPUS=2,3] bash tools/ck/v5/run_teachers_v5.sh [both|det|map]
+#   V5_USER_APPROVED=1 [V5_EPOCHS=3] [V5_TPB=32] [V5_LR=4e-4] [V5_WARMUP=200] [V5_DET_GPUS=0,1] [V5_MAP_GPUS=2,3] bash tools/ck/v5/run_teachers_v5.sh [both|det|map]
 #   V5_DRY_RUN=1 ... (print the commands only)
 # Refuses unless approved and every chosen GPU uses < 1 GB.  Outputs CK/v5/train/<run>/ (train_ck2 layout), <run>.log,
 # <run>.{pid,pgid}, launch_<run>.json (git head, dirty-diff sha, command, KST).  Stop: kill -TERM -- -$(cat <run>.pgid)
@@ -15,11 +15,14 @@ DRY=${V5_DRY_RUN:-0}
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 CK=/home/external-user/ssd/yongjae_refiner/ck
 OUT=${V5_OUT:-$CK/v5/train}
-EP=${V5_EPOCHS:-4}
+EP=${V5_EPOCHS:-3}
+TPB=${V5_TPB:-32}       # 16 / rank: the step is CPU-launch-bound (relation + LQR rollouts), a larger batch amortises it
+LR=${V5_LR:-4e-4}
+WU=${V5_WARMUP:-200}
 DG=${V5_DET_GPUS:-0,1}
 MG=${V5_MAP_GPUS:-2,3}
 for g in $DG $MG; do case "$g" in 0,1|2,3) ;; *) echo "refusing: GPUs '$g' (0,1 or 2,3)"; exit 2 ;; esac; done
-COMMON="--epochs $EP --tokens-per-batch 16 --lr 3e-4 --warmup-steps 300 --sur-groups near_mid --eval-every 2 \
+COMMON="--epochs $EP --tokens-per-batch $TPB --lr $LR --warmup-steps $WU --sur-groups near_mid --eval-every 2 \
 --best-metric none --train-eval-rows 2048 --v4-readout range --v4-exec-model lqr --v4-ev-tbin-s 0.25 --v4-ep-evidence 1 \
 --v4-rg-read any4 --v4-rg-stopped-aware 1 --v4-pref-head 1 --corridor-version 2 --time-idx-root $CK/v4/time_idx \
 --v5-unknown 1 --v5-corrector 1 --v5-freeze-trunk 1 --out-root $OUT --resume"

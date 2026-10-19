@@ -14,7 +14,8 @@ Executed states: the candidate's LQR states [B, Q, 6] (every z_stride-th of the 
   heading (TTC, delta 0.3 / 0.6 / 0.9 s; objects at t + delta).
 Overlap: p = sum_m w_m sigmoid(-sep_m / eps) (SAT separation temporal.raster.sat_sep, eps = exp(log_eps) learned, init
   V5Cfg.rel_eps), times the soft not-behind factor pi_s + (1 - pi_s) sigmoid((fwd + 1.3) / 0.3) (the at-fault proxy of
-  the range field B: stopped / static objects count from any side), times the official stopped-ego skips (NC |v| >
+  the range field B: stopped / static objects count from any side; measured from the CURRENT ego box at state n also
+  for the TTC projections, as the official TTC), times the official stopped-ego skips (NC |v| >
   0.05 m/s, TTC |v| >= 5e-3).  NC reads delta 0, TTC the max over the four deltas.
 Reliability a_i = sigmoid(MLP(score, class one-hot, range / 32, bearing cos / sin, speed / 10, has, |a| / 6, L / 5,
   W / 3)) (learned; target in tools/ck/train_ck2.py: matched agent with an agreeing velocity -- never a gate).
@@ -95,7 +96,13 @@ class RelationReader(nn.Module):
         self.log_eps = nn.Parameter(torch.tensor(math.log(float(cfg.rel_eps))))
         self.ca_logit = nn.Parameter(torch.zeros(2))                       # vehicle, VRU
         h = int(cfg.rel_hidden)
-        self.rel_mlp = nn.Sequential(nn.Linear(N_FEAT, h), nn.GELU(), nn.Linear(h, 1))
+        self.source = str(cfg.relation)                                    # 'teacher' (pack rows) | 'student' (det head)
+        if self.source == "student":
+            from .student_objects import N_FEAT_S
+            n_feat = N_FEAT_S
+        else:
+            n_feat = N_FEAT
+        self.rel_mlp = nn.Sequential(nn.Linear(n_feat, h), nn.GELU(), nn.Linear(h, 1))
         with torch.no_grad():
             self.rel_mlp[-1].bias.fill_(math.log(0.9 / 0.1))               # teacher boxes: ~90 % match GT [measured]
 
@@ -103,11 +110,20 @@ class RelationReader(nn.Module):
         return torch.sigmoid(self.rel_mlp(O["feats"]).float()[..., 0]) * O["valid"].float()
 
     def forward(self, objs: Dict[str, Tensor], states: Tensor, t: Tensor, tok: Tensor) -> Dict[str, Tensor]:
-        """objs (OBJ_INPUT_KEYS of T tokens), states [B, Q, 6] (rows of token tok [B]), t [Q] (s) -> module docstring
-        outputs + a_tok / valid_tok [T, n_obj] (token level, for the reliability loss), objs_tok (object_rows)."""
+        """objs: the teacher's OBJ_INPUT_KEYS of T tokens ('teacher') or the student's object rows (student_objects.
+        student_object_rows, already per token: 'student'); states [B, Q, 6] (rows of token tok [B]), t [Q] (s) -> module
+        docstring outputs + a_tok / valid_tok [T, n_obj] (token level, for the reliability loss), objs_tok (rows)."""
         dev = states.device
         with torch.autocast(device_type=dev.type, enabled=False):
-            O = object_rows(objs["obj_in"].to(dev), objs["obj_mask"].to(dev), objs["frame_valid"].to(dev), self.n_obj)
+            if "c0" in objs:                                     # already rows (student det head)
+                if self.source != "student":
+                    raise ValueError("RelationReader('teacher') got student object rows")
+                O = {k: v.to(dev) for k, v in objs.items()}
+            else:
+                if self.source != "teacher":
+                    raise ValueError("RelationReader('student') needs student_object_rows, got pack rows")
+                O = object_rows(objs["obj_in"].to(dev), objs["obj_mask"].to(dev), objs["frame_valid"].to(dev),
+                                self.n_obj)
             a_tok = self.reliability(O)
             tok = tok.to(dev).long()
             g = lambda x: x.index_select(0, tok)                                         # noqa: E731
@@ -142,6 +158,11 @@ class RelationReader(nn.Module):
                     dist = s_ * te + 0.5 * a_ * te ** 2
                     pos_ca = pos_hold + u0[:, None, None, :, :] * dist[..., None]
                     s_ca, _ = sat_sep(ce_x, he_x, pos_ca, ho, Lo, Wo)
+                # not-behind from the CURRENT ego box centre at state n (official TTC: is_agent_ahead of the state's
+                # rear axle; the projected box is only used for the overlap) -- review 98 R3; delta 0 = unchanged
+                ce_now, eh_now = ce[:, :, None, None, :], eh[:, :, None, None, :]
+                fwd = ((pos_hold - ce_now) * eh_now).sum(-1).expand(-1, -1, len(DELTAS), -1)
+                fwd_cv = ((pos_cv - ce_now) * eh_now).sum(-1)
                 moving_fwd = torch.where(pi_s[:, None, None, :] > 0.5, fwd, fwd_cv)
                 nb = pi_s[:, None, None, :] + (1 - pi_s[:, None, None, :]) * torch.sigmoid(
                     (moving_fwd - BEHIND_M) / 0.3)

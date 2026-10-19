@@ -31,7 +31,7 @@
 #       --which last      (-> .../ck/ck2/kd_calib/<run>__last.json; recorded with its sha16 in launch/teachers.json)
 # -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (min(16 x ngpu, 48) workers, --world-size ngpu, --max-epoch
 #   MAX_EPOCHS-2, --exit-when-done --train-pid-file) -> watchdog (restart a dead / hung labeler while training lives).
-# ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
+# ARM=bevkd (default on refiner-v5, as refiner-v4) | main (main_arm.set) | v5 / v5kd (refiner v5 student arms B / D); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
 #   after the arm file.  Never pkill / pgrep -f: processes are found through the pid files only.
 # Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu, at most 48: 32 / 48), LABELER_POLL (30),
 # ARM=bevkd (refiner-v4 default: ck_e2e2.yaml = the bevkd setting; also adds bevkd_arm.set) | main (main_arm.set: BEV KD
@@ -68,7 +68,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 RUN=${RUN:?RUN=<run name> is required}
-ARM=${ARM:-main}
+ARM=${ARM:-bevkd}
 E2E_ROOT=${E2E_ROOT:-/home/external-user/ssd/yongjae_refiner/ck/ck2/e2e}
 R="$E2E_ROOT/$RUN"
 L="$R/launch"; LB="$R/labeler"; IO="$R/ck_e2e2"
@@ -111,7 +111,7 @@ grp_kill() {  # grp_kill <pgid_file> <pid_file> <needle> <name>: TERM the group,
 need_gpus() { [ -n "$GPUS" ] || die "--gpus <2 or 4 GPUs of 0-3> is required (e.g. --gpus 0,1 or 0,1,2,3)"; }
 
 case "$R" in *=*) die "run dir $R contains '='";; esac
-case "$ARM" in main|bevkd|v4|v4_3) ;; *) die "ARM must be main | bevkd | v4 | v4_3 (got $ARM)";; esac
+case "$ARM" in main|bevkd|v4|v4_3|v5|v5kd) ;; *) die "ARM must be main | bevkd | v4 | v4_3 | v5 | v5kd (got $ARM)";; esac
 
 start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   if [ "${E2E_NO_LABELER:-0}" = 1 ]; then log "labeler disabled (E2E_NO_LABELER=1)"; return 0; fi
@@ -224,6 +224,9 @@ do_start() {
   [ "$ARM" = main ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/main_arm.set")
   [ "$ARM" = v4 ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/v4_arm.set")
   [ "$ARM" = v4_3 ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/v4_3_arm.set")
+  # refiner v5 student (Stage 2): arm B = v5_arm.set, arm D = + v5kd_arm.set (use E2E_EXTRA=tools/ck/e2e2/fusion_v13_v5.extra)
+  [ "$ARM" = v5 ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/v5_arm.set")
+  [ "$ARM" = v5kd ] && OA+=(--ck-set-file "$REPO/tools/ck/e2e2/v5_arm.set" --ck-set-file "$REPO/tools/ck/e2e2/v5kd_arm.set")
   [ -n "${E2E_CK_SET:-}" ] && OA+=(--ck-set-file "$E2E_CK_SET")
   [ -n "${E2E_EXTRA:-}" ] && OA+=(--extra-file "$E2E_EXTRA")
   [ -n "$CKPT" ] && OA+=(--resume-ckpt "$CKPT")

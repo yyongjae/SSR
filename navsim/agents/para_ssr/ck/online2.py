@@ -198,7 +198,7 @@ def _d_v4_opt() -> Dict[str, Any]:
     return {"exec_model": "plan", "ev_tbins": 10, "ev_tbin_s": 0.25, "ep_evidence": False, "vmax": "off",
             "edits": "off", "edit_k": 8, "edit_dt": 0.2, "edit_dlat": 0.3, "kd_score_scope": "all",
             "kd_constraint": _d_kd_constraint(), "rg_read": "nearest", "rg_stopped_aware": False,
-            "rg_gt_aux": _d_rg_gt_aux()}
+            "rg_gt_aux": _d_rg_gt_aux(), "v5": _d_v5()}
 
 
 V4_NET_KEYS = ("readout", "pref_head", "time_free", "lat_haz", "horizon", "corrector", "corr_k")
@@ -218,6 +218,23 @@ def _d_kd_constraint() -> Dict[str, Any]:
     # reach), both on the student's unique parents of the KD set and masked by the teacher's per-token ok.  enabled
     # false = no term (old KD exactly).
     return {"enabled": False, "lambda_occ": 0.5, "lambda_margin": 0.5, "map_range_m": 32.0, "occ_channels": "B"}
+
+
+def _d_v5() -> Dict[str, Any]:
+    # refiner v5 student (SSR/report/97_refiner_v5_design.md; ck/v5), ck_e2e2.v4.v5 (OPTIONAL v4 key: absent = off = the
+    # v4_3 student exactly): relation 'student' = the object relation channel on the student's own det head
+    # (ck/v5/student_objects.py; needs agent.config.expose_det_outputs for inference), unknown_ev = unknown-evidence
+    # residual input, corrector = corrector A_S (tau1 = decode(tau0, mu_lon, w_lat_head + mu_lat)) trained by
+    # lambda_ref * L_refine(X1) on the first ref_cols PARENT columns of the KD set (GT-ok tokens; ref_w term weights
+    # 'road=1,obj=1,...', ck/v5/refine_loss.REF_W), lambda_rel_a reliability BCE (student rows vs GT t0 objects),
+    # lambda_rel_h per-state hazard BCE (first rel_h_cols KD columns), z_kd = Z-KD of the per-state reads to the v5
+    # teachers' (DET: b_nc, b_ttc (+ H_nc, H_ttc with both relation channels); MAP: d_min; masked SmoothL1 on states
+    # that are readable for both and KD-ok, ramped like the other KD terms), infer_refine = inference also emits tau1 of
+    # the deployed pick (ck2_v5_traj).
+    return {"enabled": False, "relation": "off", "n_obj": 32, "score_thr": 0.3, "unknown_ev": False,
+            "corrector": False, "z_stride": 2, "lambda_ref": 1.0, "ref_w": "", "ref_cols": 16, "lambda_rel_a": 0.2,
+            "lambda_rel_h": 0.5, "rel_h_cols": 16, "z_kd": False, "lambda_zkd_det": 0.5, "lambda_zkd_map": 0.5,
+            "infer_refine": True}
 
 
 def _d_rg_gt_aux() -> Dict[str, Any]:
@@ -246,6 +263,7 @@ LEAD_CLASSES = (0, 2)              # refiner.gt_future.CLASS_NAMES: vehicle, bic
 LEAD_LAT_M, LEAD_DH_RAD, LEAD_GAP_MAX, LEAD_EGO_FRONT = 1.8, math.radians(60.0), 80.0, 4.049
 TTC0_NONE = 99.0                   # [s] ttc0 without a closing lead (lead_split.py convention)
 CK_MARGIN_CLIP = 5.0               # [m] margin targets clipped like losses.evidence_aux / train_ck2's range aux
+V5_TOKEN_KEYS = ("rel_a", "rel_valid", "rel_objs_tok")   # refiner v5 relation haz keys per TOKEN (not per candidate)
 RANGE_U_KEYS = ("occ_logit_u", "ovl_logit_u", "margin_u", "bp_logit_u")   # score_set range haz keys per PARENT row
                                                                            # (not per candidate; bp: rg_stopped_aware)
 
@@ -458,6 +476,21 @@ class CKE2E2Config:
                 raise ValueError(f"ck_e2e2.v4.rg_gt_aux: unknown key(s) {bad}")
             self.v4["rg_gt_aux"] = {"enabled": _b(gq["enabled"]), "lambda": float(gq["lambda"]),
                                     "max_parents": int(gq["max_parents"])}
+        if "v5" in q:                                  # refiner v5 student block (_d_v5)
+            vq = dict(_d_v5(), **dict(q["v5"] or {}))
+            bad = sorted(set(vq) - set(_d_v5()))
+            if bad:
+                raise ValueError(f"ck_e2e2.v4.v5: unknown key(s) {bad}")
+            if str(vq["relation"]) not in ("off", "student"):
+                raise ValueError(f"ck_e2e2.v4.v5.relation {vq['relation']!r} not in ('off', 'student')")
+            self.v4["v5"] = {"enabled": _b(vq["enabled"]), "relation": str(vq["relation"]), "n_obj": int(vq["n_obj"]),
+                             "score_thr": float(vq["score_thr"]), "unknown_ev": _b(vq["unknown_ev"]),
+                             "corrector": _b(vq["corrector"]), "z_stride": int(vq["z_stride"]),
+                             "lambda_ref": float(vq["lambda_ref"]), "ref_w": "" if vq["ref_w"] in (None, False) else
+                             str(vq["ref_w"]), "ref_cols": int(vq["ref_cols"]), "lambda_rel_a": float(vq["lambda_rel_a"]),
+                             "lambda_rel_h": float(vq["lambda_rel_h"]), "rel_h_cols": int(vq["rel_h_cols"]),
+                             "z_kd": _b(vq["z_kd"]), "lambda_zkd_det": float(vq["lambda_zkd_det"]),
+                             "lambda_zkd_map": float(vq["lambda_zkd_map"]), "infer_refine": _b(vq["infer_refine"])}
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
@@ -494,6 +527,20 @@ class CKE2E2Config:
     def rg_gt_aux(self) -> Dict[str, Any]:
         """refiner v4_3 (c) student GT range aux block (v4.rg_gt_aux; off when absent)."""
         return self.v4_opt("rg_gt_aux")
+
+    @property
+    def v5(self) -> Dict[str, Any]:
+        """refiner v5 student block (v4.v5; off when absent)."""
+        return self.v4_opt("v5")
+
+    def v5_net(self):
+        """V5Cfg of the student network (off unless v4.v5.enabled)."""
+        from .v5.config import V5Cfg
+        q = self.v5
+        if not q["enabled"]:
+            return V5Cfg()
+        return V5Cfg(relation="student" if q["relation"] != "off" else "off", n_obj=q["n_obj"], rel_ca=False,
+                     unknown_ev=q["unknown_ev"], corrector=q["corrector"], z_stride=q["z_stride"])
 
     def v4_net(self):
         """V4Cfg of the student network (ck/v4/config.py; the v4 block's network keys + the optional v4_3 ones given)."""
@@ -716,6 +763,8 @@ def build_student_ck2(cfg: CKE2E2Config, apply_prior: bool = True):
         kw["corridor_version"] = int(cfg.v4["corridor_version"])
     if cfg.v4_net().on:
         kw["v4"] = cfg.v4_net()
+    if cfg.v5_net().on:                        # refiner v5 student modules (off: the call unchanged)
+        kw["v5"] = cfg.v5_net()
     net = CKNet("S", int(cfg.seed), score_hidden=256, lead_aux=False, **kw)
     net.trunk.adapter.bev_grad_scale = float(cfg.bev_grad_scale)
     frozen = freeze_lon_gate(net)
@@ -747,11 +796,11 @@ def split_haz(haz: Dict[str, torch.Tensor], lo: int, hi: Optional[int] = None) -
     """The score_set 'haz' dict of the candidate columns [lo, hi) of a set: per-candidate tensors sliced on dim 1, the
     range readout's per-PARENT-row fields (RANGE_U_KEYS, [T, U, ...]) kept whole -- their rows are what parent_index
     [T, K] (sliced like a candidate tensor) points at."""
-    return {k: (v if k in RANGE_U_KEYS else v[:, lo:hi]) for k, v in haz.items()}
+    return {k: (v if (k in RANGE_U_KEYS or k in V5_TOKEN_KEYS) else v[:, lo:hi]) for k, v in haz.items()}
 
 
 def _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra_parent,
-                        return_pctx: bool = False) -> Dict:
+                        return_pctx: bool = False, rel_objs: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
     """student_forward2 for a refiner v4 student (hazard readout and / or P_ref head): ONE score_set over cat(cand,
     extra) with cat(parents) (None = itself) -> the student_forward2 keys + haz / extra_haz (split_haz: [B, K(2), ...]
     candidate tensors, the range readout's per-parent fields whole) + pref_logp [B] (None without the P_ref head).
@@ -765,8 +814,11 @@ def _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra
         if extra is not None:
             allp = torch.cat([allp, _parents_or_self(extra, extra_parent)], 1)
     pref = student.scene_pref(mem, ego)
-    corr = getattr(student, "corrector", None) is not None
+    corr = (getattr(student, "corrector", None) is not None
+            or getattr(student, "corrector_v5", None) is not None)       # v4 corrector A / v5 corrector A_S
     kw = {"return_pctx": True} if return_pctx else {}                 # off: the old call exactly
+    if rel_objs is not None:                                          # refiner v5 student relation channel
+        kw["rel_objs"] = rel_objs
     o = student.score_set(feat, mem, ego, allc, allp, pref=pref, return_ctx=corr, **kw)
     sc, w = o["score_logit"], o["w_lat"].float()
     out = {"score_logit": sc[:, :K], "extra_score_logit": None if extra is None else sc[:, K:],
@@ -877,7 +929,8 @@ def field_groups(spec) -> Tuple[str, ...]:
 
 
 def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optional[Dict[str, torch.Tensor]] = None,
-                    parents: Optional[torch.Tensor] = None, return_fields=False):
+                    parents: Optional[torch.Tensor] = None, return_fields=False,
+                    rel_objs: Optional[Dict[str, torch.Tensor]] = None, extras: Optional[Dict] = None):
     """The KD teacher ops under the caller's autocast / no_grad: trunk.scene once, trunk.candidates on `cand`, score
     -> (score logits [B,K,5] f32, w_lat [B,K,6]).  A temporal teacher (net.temporal, refiner-v3) additionally runs
     TemporalBranch.scene(objs) once and binds its hook to this candidate set -- the order and ops of
@@ -910,7 +963,11 @@ def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optio
     feat, mem = net.trunk.scene(bev, B)
     if getattr(net, "v4_readout", None) is not None:    # refiner v4 teacher: hazard readout on the parents' corridors
         kw = {"return_pctx": True} if return_fields else {}
+        if rel_objs is not None:                        # refiner v5 relation DET teacher: its object pack rows
+            kw["rel_objs"] = rel_objs
         o = net.score_set(feat, mem, ego, cand, parents, pref=net.scene_pref(mem, ego), **kw)
+        if extras is not None and "zq" in (o.get("haz") or {}):   # refiner v5: per-state reads (Z-KD targets)
+            extras["zq"] = o["haz"]["zq"].float()
         if not return_fields:
             return o["score_logit"], o["w_lat"]
         h = o["haz"]
@@ -1055,6 +1112,10 @@ class TeacherPair2:
                                                                                     ("map", self.map))}
         # refiner-v3: the DET teacher's temporal branch (None = CK2 teacher, the old path)
         self.det_temporal = getattr(self.det, "temporal", None) is not None
+        # refiner v5: the DET teacher's object relation channel (pack rows as input, like a temporal teacher)
+        self.det_rel = getattr(self.det, "relation", None) is not None
+        if getattr(self.map, "relation", None) is not None:
+            raise ValueError(f"teacher map {self.runs['map']}: a MAP teacher with the v5 relation channel")
         self.temporal_info = temporal_teacher_info(self.det)
         # KD calibration (Platt on the logits, per teacher and key); None = off (old path, nothing applied)
         self.calib: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None
@@ -1095,7 +1156,8 @@ class TeacherPair2:
     @torch.no_grad()
     def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None, objs_det=None,
             obj_ok_det=None, parents: Optional[torch.Tensor] = None,
-            family: Optional[torch.Tensor] = None, fields=False) -> Dict[str, torch.Tensor]:
+            family: Optional[torch.Tensor] = None, fields=False, rel_objs_det=None, rel_ok_det=None,
+            zq: bool = False) -> Dict[str, torch.Tensor]:
         """bev_* [B, 256, 50, 100] (f16 cache), ok_* [B], cand [B, K, 8, 3] (finite), status [B, 8], cand_ok [B, K]
         -> kd_score_prob f32 [B,K,5] (combine_teacher: nc/ttc DET, dac MAP, ep/comfort mean), kd_e_lat f32 [B,K,6]
         = 0.5 (e_DET + e_MAP) (decode z_lon = 0, slope 0), kd_ok bool [B,K] = DET ok & MAP ok (per token) & finite
@@ -1128,15 +1190,27 @@ class TeacherPair2:
             ok_det = ok_det.reshape(-1).bool().to(dev) & obj_ok_det.reshape(-1).bool().to(dev)
         elif objs_det is not None or obj_ok_det is not None:
             raise ValueError("TeacherPair2.run: object rows given but the DET teacher has no temporal branch")
+        if self.det_rel:                      # refiner v5 relation DET teacher: its pack rows + their ok
+            if rel_objs_det is None or rel_ok_det is None:
+                raise ValueError("TeacherPair2.run: the DET teacher has the v5 relation channel: rel_objs_det and "
+                                 "rel_ok_det (kd_objs_of(targets)) are required")
+            rel_objs_det = {k: v.to(dev) for k, v in rel_objs_det.items()}
+            ok_det = ok_det.reshape(-1).bool().to(dev) & rel_ok_det.reshape(-1).bool().to(dev)
+        elif rel_objs_det is not None:
+            raise ValueError("TeacherPair2.run: relation rows given but the DET teacher has no v5 relation channel")
         ego = ego_inputs(status.detach().float().to(dev))
         v0 = ego[0]
         ac = torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=self.amp and dev.type == "cuda")
-        logits, ws, flds = [], [], []
-        for net, bev, objs in ((self.det, bev_det, objs_det), (self.map, bev_map, None)):
+        logits, ws, flds, exs = [], [], [], []
+        for net, bev, objs, rel in ((self.det, bev_det, objs_det, rel_objs_det), (self.map, bev_map, None, None)):
+            ex: Dict[str, torch.Tensor] = {}
+            exs.append(ex)
             with ac:
                 r = teacher_forward(net, bev.to(dev).float(), cand, ego, objs,
                                     None if parents is None else parents.detach().float().to(dev),
-                                    **({"return_fields": fields} if fields else {}))
+                                    **({"return_fields": fields} if fields else {}),
+                                    **({"rel_objs": rel} if rel is not None else {}),
+                                    **({"extras": ex} if zq else {}))
             logits.append(r[0].float())
             ws.append(r[1].float())
             if fields:
@@ -1172,6 +1246,12 @@ class TeacherPair2:
         e_mean = 0.5 * (e_det + e_map)
         out = {"kd_score_prob": comb["kd_score_prob"].float(), "kd_e_lat": e_mean, "kd_ok": kd_ok,
                "e_det": e_det, "e_map": e_map, "p_det": torch.sigmoid(logits[0]), "p_map": torch.sigmoid(logits[1])}
+        if zq:                                # refiner v5 Z-KD: the teachers' per-state reads
+            for name, ex in zip(("det", "map"), exs):
+                if "zq" not in ex:
+                    raise ValueError(f"TeacherPair2.run(zq=True): teacher {name} {self.runs[name]} has no v5 per-state "
+                                     f"reads (not a refiner v5 teacher)")
+                out[f"zq_{name}"] = ex["zq"]
         if fields:                            # refiner v4_3 constraint KD
             for (name, okt), f in zip((("det", ok_det), ("map", ok_map)), flds):
                 fin = (torch.isfinite(f["blk_u"]).flatten(1).all(1) & torch.isfinite(f["margin_u"]).flatten(1).all(1))
@@ -1183,7 +1263,8 @@ class TeacherPair2:
 # ----------------------------------------------------------------------------------------------- student forward
 def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status: torch.Tensor,
                      extra: Optional[torch.Tensor] = None, cand_parent: Optional[torch.Tensor] = None,
-                     extra_parent: Optional[torch.Tensor] = None, return_pctx: bool = False) -> Dict:
+                     extra_parent: Optional[torch.Tensor] = None, return_pctx: bool = False,
+                     rel_objs: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
     """One trunk.scene + ONE trunk.candidates over cat(cand, extra) (candidates are processed independently) ->
     score_logit [B,K,5] f32, extra_score_logit [B,K2,5] | None, w_lat [B,K,6], w_lat_extra [B,K2,6] | None,
     score_all / w_lat_all (every candidate), ego.  No decode here (callers use lateral_decode, z_lon = 0).
@@ -1198,13 +1279,36 @@ def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status
     feat, mem = student.trunk.scene(bev_grid, B)
     if getattr(student, "v4_readout", None) is not None or getattr(student, "pref_head", None) is not None:
         return _student_forward_v4(student, feat, mem, ego, cand, extra, cand_parent, extra_parent,
-                                   return_pctx=return_pctx and getattr(student, "v4_readout", None) is not None)
+                                   return_pctx=return_pctx and getattr(student, "v4_readout", None) is not None,
+                                   rel_objs=rel_objs)
     o = student.trunk.candidates(feat, mem, allc, v0, a0, eds, cmd)
     sc = student.score(o, B, KA)
     w = o["w_lat"].float()
     return {"score_logit": sc[:, :K], "extra_score_logit": None if extra is None else sc[:, K:],
             "w_lat": w[:, :K], "w_lat_extra": None if extra is None else w[:, K:], "score_all": sc, "w_lat_all": w,
             "ego": ego}
+
+
+def student_rel_rows(predictions: Dict, v5: Dict[str, Any]) -> Optional[Dict[str, torch.Tensor]]:
+    """refiner v5 relation 'student': the student's det head (final layer of predictions all_bbox_preds /
+    all_cls_scores / det_hidden; detached) -> per-token object rows (ck/v5/student_objects.student_object_rows); None
+    when the block / channel is off.  KeyError when the det outputs are missing (inference needs
+    agent.config.expose_det_outputs=true)."""
+    if not v5["enabled"] or v5["relation"] == "off":
+        return None
+    from .v5.student_objects import student_object_rows
+    miss = [k for k in ("all_bbox_preds", "all_cls_scores", "det_hidden") if k not in predictions]
+    if miss:
+        raise KeyError(f"ck_e2e2.v4.v5.relation student: predictions lack {miss} (det head off, or inference without "
+                       f"agent.config.expose_det_outputs=true)")
+    return student_object_rows(predictions["all_bbox_preds"][-1].detach(), predictions["all_cls_scores"][-1].detach(),
+                               predictions["det_hidden"].detach(), int(v5["n_obj"]), float(v5["score_thr"]))
+
+
+def refine_cols_parents(vtype: torch.Tensor, n: int) -> torch.Tensor:
+    """the first n PARENT columns (vtype 0) of a KD set in slot order (stable), then the others -> [B, n]."""
+    order = torch.argsort((vtype != 0).to(torch.int8), dim=1, stable=True)
+    return order[:, :max(1, min(int(n), vtype.shape[1]))].contiguous()
 
 
 # ----------------------------------------------------------------------------------------------- helpers
@@ -1916,6 +2020,85 @@ class CKE2E2:
             inner = inner + q["lambda_station"] * l_st
         return inner
 
+    def _v5_terms(self, inner: torch.Tensor, out: Dict, S: Dict, logs: Dict[str, float], targets, student, T: Dict,
+                  rel_rows: Optional[Dict[str, torch.Tensor]], ego, r: float) -> torch.Tensor:
+        """refiner v5 student terms (ck_e2e2.v4.v5; off -> unchanged): reliability BCE of the student rows against the
+        GT t0 objects, per-state hazard BCE against the GT executed blocks, L_refine(X1) of the corrector A_S on the KD
+        set's parent columns, Z-KD of the per-state reads to the v5 teachers (ramped by r).  GT (ref_*) = targets only.
+        Logs v5/*."""
+        import torch.nn.functional as F
+        from ..refiner import gt_future as GF
+        from .v4 import lqr as LQR
+        from .v5 import refine_loss as RL
+        from .v5.student_objects import student_reliability_targets
+        q = self.cfg.v5
+        hk = out.get("haz")
+        if not q["enabled"] or hk is None or "zq" not in hk:
+            return inner
+        dev = hk["zq"].device
+        tg = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in (targets or {}).items() if k.startswith("ref_")}
+        B, K = S["cand"].shape[:2]
+        gt_ok = (tg["ref_gt_ok"].reshape(-1).bool() if "ref_gt_ok" in tg else torch.zeros(B, dtype=torch.bool,
+                                                                                            device=dev))
+        gt_ok = gt_ok & S["kd_tok_ok"].bool().to(dev)
+        idx = torch.nonzero(gt_ok, as_tuple=True)[0]
+        n = int(idx.numel())
+        gt = RL.gt_of(tg, idx) if n else None
+        zs = int(q["z_stride"])
+        tz = torch.arange(LQR.NT, dtype=torch.float64, device=dev)[::zs] * LQR.DT
+        logs["v5/n_gt"] = float(n)
+        if "unknown_frac" in hk:
+            logs["v5/unknown_frac"] = float(hk["unknown_frac"].detach().float().mean())
+        if rel_rows is not None and n:
+            if q["lambda_rel_a"] > 0 and "rel_a" in hk:
+                O = {k: v[idx] for k, v in rel_rows.items()}
+                y, m = student_reliability_targets(O, *RL.gt_t0_objects(gt))
+                av = hk["rel_a"][idx].float().clamp(1e-4, 1 - 1e-4)
+                mf = m.float()
+                l_a = (F.binary_cross_entropy(av, y, reduction="none") * mf).sum() / mf.sum().clamp(min=1.0)
+                inner = inner + q["lambda_rel_a"] * l_a
+                logs.update({"v5/rel_a_bce": _f(l_a), "v5/rel_a_pos": float((y * mf).sum() / mf.sum().clamp(min=1.0)),
+                             "v5/rel_a_mean": float((av.detach() * mf).sum() / mf.sum().clamp(min=1.0)),
+                             "v5/rel_n_obj": float(mf.sum() / max(n, 1))})
+            if q["lambda_rel_h"] > 0 and hk["zq"].shape[-1] >= 6:
+                Kh = max(1, min(int(q["rel_h_cols"]), K))
+                H = hk["zq"][idx][:, :Kh, :, -2:].float().clamp(1e-4, 1 - 1e-4)
+                yb, known = RL.gt_state_block(hk["exec_states"][idx][:, :Kh, ::zs], tz, gt)
+                mk = known.float()[..., None].expand_as(H)
+                l_h = (F.binary_cross_entropy(H, yb, reduction="none") * mk).sum() / mk.sum().clamp(min=1.0)
+                inner = inner + q["lambda_rel_h"] * l_h
+                logs.update({"v5/rel_h_bce": _f(l_h), "v5/rel_h_pos": float((yb * mk).sum() / mk.sum().clamp(min=1.0))})
+        if getattr(student, "corrector_v5", None) is not None and "ctx_all" in out:
+            cols = refine_cols_parents(S["vtype_kd"].to(dev), q["ref_cols"])
+            o_like = {"ctx": out["ctx_all"][:, :K], "score_logit": out["score_logit"], "haz": hk, "w_lat": out["w_lat"]}
+            rf = student.refine_drafts(o_like, S["cand"].float(), cols, ego)
+            inner = inner + 0.0 * (rf["mu"].sum() + rf["log_sig"].sum())
+            logs["v5/ref_mu_abs"] = float(rf["mu"].detach().abs().mean())
+            if n and q["lambda_ref"] > 0:
+                eds = ego[2].float()
+                w = RL.parse_weights(q["ref_w"])
+                l_ref, s_ref = RL.refine_loss(rf["tau1"][idx], rf["tau_base"][idx], eds[idx, 0], eds[idx, 2], gt, w)
+                l_u = (rf["mu"][idx].float() ** 2).mean()
+                inner = inner + q["lambda_ref"] * (l_ref + float(w.get("u", 0.0)) * l_u)
+                logs.update({f"v5/{k}": float(v) for k, v in s_ref.items()})
+                logs["v5/ref_loss"] = _f(l_ref)
+        if q["z_kd"] and "zq_det" in T and "zq_map" in T:
+            zs_ = hk["zq"].float()
+            zd, zm = T["zq_det"].float().to(dev), T["zq_map"].float().to(dev)
+            kd_ok = T["kd_ok"].bool().to(dev) & S["kd_tok_ok"].bool().to(dev)[:, None]
+            unk_s = zs_[..., 3] > 0.5
+            ch = [0, 1] + ([4, 5] if zs_.shape[-1] >= 6 and zd.shape[-1] >= 6 else [])
+            md = (kd_ok[..., None] & ~unk_s & ~(zd[..., 3] > 0.5)).float()
+            l_zd = (F.smooth_l1_loss(zs_[..., ch], zd[..., ch].detach(), reduction="none").mean(-1) * md).sum() \
+                / md.sum().clamp(min=1.0)
+            mm = (kd_ok[..., None] & ~unk_s & ~(zm[..., 3] > 0.5)).float()
+            l_zm = (F.smooth_l1_loss(zs_[..., 2], zm[..., 2].detach(), reduction="none") * mm).sum() \
+                / mm.sum().clamp(min=1.0)
+            inner = inner + r * (q["lambda_zkd_det"] * l_zd + q["lambda_zkd_map"] * l_zm)
+            logs.update({"v5/zkd_det": _f(l_zd), "v5/zkd_map": _f(l_zm), "v5/zkd_det_frac": float(md.mean()),
+                         "v5/zkd_map_frac": float(mm.mean())})
+        return inner
+
     def _rg_gt_aux(self, haz: Dict[str, torch.Tensor], S: Dict, targets, student
                    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         """ck_e2e2.v4.rg_gt_aux: range_targets.gt_field_aux of the student's KD-set fields (haz = out['haz'], its
@@ -1979,9 +2162,21 @@ class CKE2E2:
         ce = None
         computed = bool(getattr(getattr(student, "v4", None), "computed_edits", False))
         corr = getattr(student, "corrector", None) is not None
+        v5s = bool(getattr(getattr(student, "v5", None), "on", False))           # refiner v5 student
+        corr5 = getattr(student, "corrector_v5", None) is not None
+        rel_rows = student_rel_rows(predictions, self.cfg.v5) if v5s else None
         valid = V["valid96"] & fin
+        po = None
         with torch.autocast(device_type=dev.type, enabled=False):
-            if corr or computed:
+            if v5s and not (corr or computed):
+                # refiner v5: score the 96 with the relation rows of the student's own det head (+ context for A_S)
+                ego = ego_inputs(status)
+                feat, mem = student.trunk.scene(bev_sgrid(bev.float()), cand.shape[0])
+                pref = student.scene_pref(mem, ego)
+                kw5 = {"rel_objs": rel_rows} if rel_rows is not None else {}
+                po = student.score_set(feat, mem, ego, cand, par, pref=pref, return_ctx=corr5, **kw5)
+                out = {"score_logit": po["score_logit"], "w_lat": po["w_lat"]}
+            elif corr or computed:
                 # refiner v4 corrector A: score the 96 (+ corrector context), edit the critic's top-k, re-score;
                 # v4_3 computed edits (M5): the rule edits of the critic's top-edit_k parents on the predicted fields
                 # of the same parent pass (+ the corrector's residual when both are on)
@@ -2002,6 +2197,19 @@ class CKE2E2:
                "ck2_v2_sim": top["sim"], "ck2_cand96": V["traj96"], "ck2_valid96": valid,
                "ck2_score_logit": out["score_logit"].float(), "ck2_w_lat": out["w_lat"].float(),
                "ck2_e_lat": lat["e_lat"][..., 2:].float(), "ck2_lat_traj": lat["traj"].float()}
+        if po is not None and corr5 and self.cfg.v5["infer_refine"]:
+            # refiner v5 corrector A_S on the deployed pick (select2.select96, the deployment blend; infer_select's beta
+            # / set when given, else beta 0.5 over 'all'): tau1 = decode(pick, mu_lon, w_lat_head + mu_lat) is the
+            # v5 output (ck2_v5_traj; ck2_traj stays the 96-pool selection for the existing eval path)
+            from . import select2 as S2
+            bsel = self.cfg.infer_select or {"beta": 0.5, "set": "all"}
+            pick = S2.select96(res["ck2_v2_final"], res["ck2_v2_im"], torch.sigmoid(res["ck2_score_logit"]),
+                               res["ck2_valid96"], float(bsel["beta"]), types=S2.VARIANT_SETS[bsel["set"]])
+            pick = torch.as_tensor(np.asarray(pick.cpu() if torch.is_tensor(pick) else pick), dtype=torch.long,
+                                   device=dev)
+            with torch.autocast(device_type=dev.type, enabled=False):
+                rf = student.refine_drafts(po, cand.float(), pick[:, None], ego_inputs(status))
+            res.update(ck2_v5_traj=rf["tau1"][:, 0].float(), ck2_v5_src=pick, ck2_v5_mu=rf["mu"][:, 0].float())
         if ce is not None:          # the K edits (no lateral head on top: the corrector's / the rule's own controls)
             et = ce["edit_traj"].float()
             fin_e = torch.isfinite(et).flatten(2).all(-1)
@@ -2108,6 +2316,13 @@ class CKE2E2:
             tkw = {"objs_det": objs_det, "obj_ok_det": obj_ok_det}
         if c.kd_constraint["enabled"]:                  # refiner v4_3 constraint KD: the teachers' range fields
             tkw["fields"] = kd_constraint_request(c.kd_constraint["occ_channels"])
+        v5c = c.v5
+        if tp.det_rel:                                  # refiner v5 relation DET teacher: its object pack rows
+            objs_r, ok_r = kd_objs_of(targets, dev)
+            tkw.update(rel_objs_det=objs_r, rel_ok_det=ok_r)
+        if v5c["enabled"] and v5c["z_kd"]:              # refiner v5 Z-KD: the teachers' per-state reads
+            tkw["zq"] = True
+        rel_rows = student_rel_rows(predictions, v5c)    # refiner v5 student relation rows (None when off)
         T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
                    cand_ok=S["cand_ok"], parents=S.get("cand_parent"), family=S.get("vtype_kd"), **tkw)
         t_teacher = time.time() - tt
@@ -2117,6 +2332,8 @@ class CKE2E2:
         rec_edits = rec is not None and self.recorder is not None and defer_rec
         fkw = {"return_pctx": True} if (rec_edits and computed) else {}       # off: the old call exactly
         with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=bool(c.amp and dev.type == "cuda")):
+            if rel_rows is not None:
+                fkw["rel_objs"] = rel_rows
             out = student_forward2(student, bev_sgrid(bev), S["cand"], status, extra=S["extra"],
                                    cand_parent=S.get("cand_parent"), extra_parent=S.get("extra_parent"), **fkw)
         s_kd = out["score_logit"].float()
@@ -2195,12 +2412,17 @@ class CKE2E2:
             w = float(self.ema.weight(self.mb))
         inner = inner + (r * w) * l_lat
         inner = self._v4_terms(inner, out, S, logs, targets, student, s_lab)
+        inner = self._v5_terms(inner, out, S, logs, targets, student, T, rel_rows, ego, r)
         loss = c.loss_weight * inner
         loss = loss + 0.0 * (out["score_all"].sum() + out["w_lat_all"].sum())
         if out.get("pref_logp") is not None:
             loss = loss + 0.0 * out["pref_logp"].sum()
         if getattr(student, "corrector", None) is not None:      # in the DDP graph every step (AWR terms: _v4_terms)
             loss = loss + 0.0 * sum(p.sum() for p in student.corrector.parameters())
+        for mod_name in ("corrector_v5", "relation"):              # refiner v5 modules: in the DDP graph every step
+            mod = getattr(student, mod_name, None)
+            if mod is not None:
+                loss = loss + 0.0 * sum(p.sum() for p in mod.parameters())
         loss_val = _f(loss)
         bad_loss = not math.isfinite(loss_val)
         if bad_loss:
@@ -2342,7 +2564,7 @@ def ck2_parameters(agent) -> List[torch.nn.Parameter]:
     return [p for p in agent.ck_student.parameters() if p.requires_grad]
 
 
-STEP_LOG_PREFIXES = ("ck2/", "bevkd/", "gnorm/", "loss")
+STEP_LOG_PREFIXES = ("ck2/", "bevkd/", "gnorm/", "loss", "v4/", "v5/")   # v4 / v5: refiner terms
 
 
 def make_ck2_callback(agent):

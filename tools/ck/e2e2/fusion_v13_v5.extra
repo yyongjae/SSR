@@ -1,0 +1,30 @@
+# fusion_v13 + refiner v5 student (ARM=v5 | v5kd): the v13 arm (fusion_v13_arm.extra) + CK2 Refiner v2 E2E main arm + BEV Selector v13 (CK2-Aligned Wide-Corridor Multi-Scale & Soft-Capped Dual-Consumer KD, docs/bev_selector_v13.md).
+# Hydra overrides merged by key into the launcher recipe (E2E_EXTRA). Teachers of the v13 term come from the CK2
+# targets kd_bev_0 (BEVFusion) / kd_bev_1 (ReSMap, transpose only), which the dataloader workers load for the CK2
+# teachers anyway.
+wandb.entity=e2ekd
+wandb.project=v1_distill
+++agent.config.use_distill=true
+++agent.config.distill_selector_v8=false
+++agent.config.distill_selector_v9=false
+++agent.config.distill_selector_v10=false
+++agent.config.distill_selector_v11=false
+++agent.config.distill_selector_v12=false
+++agent.config.distill_selector_v13=true
+++agent.config.distill_teacher_source=targets
+++agent.config.distill_feature_root=/workspace/teacher_cache
+++agent.config.distill_lambda_gt=0.45
+++agent.config.distill_lambda_cov=0.20
+++agent.config.distill_lambda_risk=0.35
+++agent.config.distill_tau_gt=4.5
+++agent.config.distill_tau_risk=8.0
+++agent.config.distill_probe_warmup_steps=5300
+++agent.config.distill_probe_ramp_steps=2650
+++agent.config.distill_probe_loss_weight=0.5
+++agent.config.distill_probe_lr_mult=3.0
+++agent.config.distill_proj_lr_mult=2.0
+++agent.config.distill_probe_use_ema=true
+++agent.config.distill_probe_ema_decay=0.99
+wandb.group=refiner-v5
+++agent.config.det_vel_code_weights=[0.41,1.05]
+++agent.config.expose_det_outputs=true

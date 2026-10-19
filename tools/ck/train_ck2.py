@@ -1041,9 +1041,13 @@ def add_v5_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
     tz = torch.arange(LQR.NT, dtype=torch.float64, device=batch["cand"].device)[::zs] * LQR.DT
     if v5.rel:
         la, lh = float(getattr(a, "lambda_rel_a", 0.0)), float(getattr(a, "lambda_rel_h", 0.0))
-        if la > 0 and "fc_xyh" in batch:
-            y, m = RL.reliability_targets(haz["rel_objs_tok"], batch["fc_xyh"], batch["fc_state"])
-            av = haz["rel_a"].float().clamp(1e-4, 1 - 1e-4)
+        if la > 0 and n:
+            # a_i target: a GT object at t0 within 2 m whose t0 velocity agrees (review 98 R4: t0 vs t0, the student's
+            # rule ck/v5/student_objects.student_reliability_targets)
+            from navsim.agents.para_ssr.ck.v5.student_objects import student_reliability_targets
+            O = {k: v[idx] for k, v in haz["rel_objs_tok"].items()}
+            y, m = student_reliability_targets(O, *RL.gt_t0_objects(gt))
+            av = haz["rel_a"][idx].float().clamp(1e-4, 1 - 1e-4)
             mf = m.float()
             l_a = (F.binary_cross_entropy(av, y, reduction="none") * mf).sum() / mf.sum().clamp(min=1.0)
             loss = loss + la * l_a
@@ -1063,7 +1067,7 @@ def add_v5_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
         if lr > 0 and n:
             eds = out["ego"][2].float()
             w = getattr(a, "ref_weights", None) or RL.parse_weights("")
-            l_ref, s_ref = RL.refine_loss(rf["tau1"][idx], rf["tau0"][idx], eds[idx, 0], eds[idx, 2], gt, w)
+            l_ref, s_ref = RL.refine_loss(rf["tau1"][idx], rf["tau_base"][idx], eds[idx, 0], eds[idx, 2], gt, w)
             l_u = (rf["mu"][idx].float() ** 2).mean()
             loss = loss + lr * (l_ref + float(w.get("u", 0.0)) * l_u)
             st.update(s_ref)

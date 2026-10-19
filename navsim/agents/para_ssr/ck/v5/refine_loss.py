@@ -8,8 +8,8 @@ L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable), pe
         corners outside the SDF grid skipped)
   obj   mean over states of max over GT objects of softplus((m_obj - sep) / s) s     (sep = SAT separation of the official
         footprint at state n and the GT box at t_n; counted when the object is observed (metric-cache rule), the ego
-        moves (|v| > 0.05 m/s) and the object is not behind (centre >= -1.3 m along the ego heading) unless static /
-        stopped: the at-fault proxy of the range field B)
+        moves (|v| > 0.05 m/s) and the object is not behind (centre >= -1.3 m along the heading from the CURRENT ego
+        box at state n, also for the TTC projections) unless static / stopped: the at-fault proxy of the range field B)
   ttc   the same with the footprint projected |v| delta (0.3 / 0.6 / 0.9 s) along the heading against the GT boxes at
         t_n + delta, margin 0, max over delta
   prog  relu(min(1, S0 / P) - min(1, S1 / P)), S = executed 4 s path length (lqr.executed_progress), P = max(pdm_progress,
@@ -17,7 +17,9 @@ L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable), pe
   cmf   official comfort thresholds (pdm_comfort_metrics) on X1's finite differences: relu(a - 2.40) + relu(-4.05 - a) +
         relu(|v yaw_rate| - 4.89) + relu(|jerk_lon| - 4.13) + relu(|yaw_rate| - 0.95) + relu(|yaw_acc| - 1.93), means
   loss = sum_k w_k term_k (weights REF_W; caller adds w_u mean(mu^2))
-Stats (no grad) compare X1 with X0 = LQR(tau0): collision / off-road / TTC-overlap rates and the mean progress change.
+Stats (no grad) compare X1 with X0 = LQR(tau0) -- the callers pass tau0 = the corrector's baseline (mu = 0: today's
+laterally corrected draft, CKNet.refine_drafts 'tau_base'), so *0 vs *1 is the corrector's own change; L_prog uses the
+same baseline (progress lost relative to it).
 """
 from __future__ import annotations
 
@@ -98,8 +100,11 @@ def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequenc
     ce = states[..., :2] + EGO_OFF * eh                                                 # [n, R, Q, 2]
     shift = spd[..., None] * dl.to(states.dtype)                                        # [n, R, Q, D]
     ce_d = ce[..., None, :] + shift[..., None] * eh[..., None, :]                       # [n, R, Q, D, 2]
-    sep, fwd = sat_sep(ce_d[..., None, :], hd[..., None, None], boxes[..., :2], boxes[..., 2], boxes[..., 3],
-                       boxes[..., 4])                                                    # [n, R, Q, D, A]
+    sep, _ = sat_sep(ce_d[..., None, :], hd[..., None, None], boxes[..., :2], boxes[..., 2], boxes[..., 3],
+                     boxes[..., 4])                                                      # [n, R, Q, D, A]
+    # not-behind from the CURRENT ego box at state n (official TTC judges ahead / behind from the state's rear axle;
+    # the projected box is only used for the overlap) -- review 98 R3
+    fwd = ((boxes[..., :2] - ce[:, :, :, None, None, :]) * eh[:, :, :, None, None, :]).sum(-1)
     mv = torch.where(dl[None, None, None] == 0, (spd > STOP_NC)[..., None], (spd >= STOP_TTC)[..., None])
     count = obs & mv[..., None] & ((fwd.detach() >= BEHIND_M) | exempt[:, None, None, None, :])
     return sep, count
@@ -185,26 +190,11 @@ def gt_state_block(states: Tensor, t: Tensor, gt: Dict[str, Tensor]) -> Tuple[Te
 
 
 @torch.no_grad()
-def reliability_targets(O: Dict[str, Tensor], fc_xyh: Tensor, fc_state: Tensor, v_tol: float = 1.0
-                        ) -> Tuple[Tensor, Tensor]:
-    """a_i targets from the object pack's matched GT futures: O = relation.object_rows (n slots), fc_xyh [T, K, 10, 3],
-    fc_state [T, K, 10] -> y, m [T, n]: y = matched agent (state OBS at 0.5 s and 1.0 s, or a matched singleton) whose
-    detected velocity agrees with the GT velocity ((p(1.0 s) - p(0.5 s)) / 0.5; 0 for a singleton) within v_tol m/s;
-    m = valid agent slots (static classes have no target in the pack: masked)."""
-    n = O["valid"].shape[1]
-    k = min(n, fc_state.shape[1])
-    s0, s1 = fc_state[:, :k, 0].long(), fc_state[:, :k, 1].long()
-    obs = (s0 == FC_OBS) & (s1 == FC_OBS)
-    single = s0 == FC_SINGLE
-    vg = (fc_xyh[:, :k, 1, :2].float() - fc_xyh[:, :k, 0, :2].float()) / 0.5
-    vg = torch.where(single[..., None], torch.zeros_like(vg), vg)
-    err = torch.linalg.vector_norm(O["v0"][:, :k] - vg, dim=-1)
-    y = ((obs | single) & (err < v_tol)).float()
-    m = O["valid"][:, :k] & (O["group"][:, :k] < 2)
-    if k < n:
-        pad = lambda x: torch.cat([x, torch.zeros(x.shape[0], n - k, dtype=x.dtype, device=x.device)], 1)  # noqa
-        y, m = pad(y), pad(m)
-    return y, m
+def gt_t0_objects(gt: Dict[str, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+    """GT objects at t0 (metric-cache rule): centres [n, A, 2], annotated velocity [n, A, 2] (keyframe 0; 0 for
+    non-agents), observed [n, A] bool -> reliability targets compare t0 with t0 (review 98 R4)."""
+    boxes, obs = GF.query_torch(gt["kf"], gt["first"], gt["meta"], [0.0], valid=gt["valid"], n_kf=gt["n_kf"])
+    return boxes[:, :, 0, :2].float(), gt["kf"][:, :, 0, GF.KF_VX:GF.KF_VY + 1].float(), obs[:, :, 0].bool()
 
 
 def corner_margin_aux(Dc: Tensor, ok: Tensor, states: Tensor, sdf: Tensor, w_edge: float = 4.0) -> Tuple[Tensor, float]:

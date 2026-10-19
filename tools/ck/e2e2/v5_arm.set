@@ -1,0 +1,41 @@
+# refiner v5 student, Stage-2 arm B (GT-only control; SSR/report/97_refiner_v5_design.md §4) on fusion v13 (ARM=v5; use
+# with E2E_EXTRA=tools/ck/e2e2/fusion_v13_v5.extra = the v13 BEV-selector distillation + the det-head velocity fix +
+# the det outputs at inference).  ARM=v5kd adds v5kd_arm.set (arm D: + Z-KD of the per-state reads to the v5 teachers).
+#   * v4_3 range student (R2: any4 + stopped-aware), P_ref head, corridor v2; computed edits OFF (v5 uses the corrector
+#     A_S), v4 corrector OFF; constraint KD OFF (Z-KD replaces it in arm D); the student's own GT field aux ON;
+#   * v5 block: relation 'student' (its own det head: boxes / velocities / det_hidden, detached), unknown evidence,
+#     corrector A_S (tau1 = decode(tau0, mu_lon, w_lat_head + mu_lat)) trained by L_refine(X1) on the KD set's parents;
+#   * BEV KD OFF (the v13 selector distillation is the BEV-level KD of this branch); score KD nc <- DET, dac <- MAP on
+#     the parent columns (as v4_3); lateral KD unchanged.
+# Teachers: the v5 teachers (tools/ck/v5/run_teachers_v5.sh); their KD calibration files are PLACEHOLDERS until fitted
+# (tools/ck/e2e2/fit_kd_calib.py after the teachers finish) or kd_calib.enabled=false via E2E_CK_SET.
+# Not trained without the user's approval (GPUs 0-3).
+bev_kd.enabled=false
+bev_kd.teachers=[det]
+v4.readout=range
+v4.exec_model=lqr
+v4.ev_tbins=20
+v4.ev_tbin_s=0.25
+v4.ep_evidence=true
+v4.pref_head=true
+v4.corridor_version=2
+v4.rg_read=any4
+v4.rg_stopped_aware=true
+v4.edits=off
+v4.corrector=false
+v4.kd_parent_only=true
+kd_score_keys=[nc,dac]
+v4.kd_score_scope=all
+v4.kd_constraint.enabled=false
+v4.rg_gt_aux.enabled=true
+v4.rg_gt_aux.lambda=0.5
+v4.rg_gt_aux.max_parents=8
+v4.v5.enabled=true
+v4.v5.relation=student
+v4.v5.unknown_ev=true
+v4.v5.corrector=true
+v4.v5.z_kd=false
+teacher_det_run=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5T_rel
+teacher_map_run=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5M_unk
+kd_calib.det=/PLACEHOLDER/v5/kd_calib_det.json
+kd_calib.map=/PLACEHOLDER/v5/kd_calib_map.json

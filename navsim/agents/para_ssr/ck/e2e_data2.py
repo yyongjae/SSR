@@ -507,6 +507,23 @@ def teacher_temporal(run):
     return TemporalCfg.from_dict(json.loads(cj.read_text()).get("temporal"))
 
 
+def teacher_v5_rel_cfg(run):
+    """refiner v5: a DET teacher with the object relation channel (config.json v5.relation 'teacher') reads the refiner-v3
+    object pack rows like a temporal teacher -> the TemporalCfg that opens that pack (on, source bevfusion, forecaster
+    'ca', the run's --t-pack-root); None for any other run."""
+    from .temporal.config import TemporalCfg
+    if not run:
+        return None
+    cj = Path(str(run)) / "config.json"
+    if not cj.is_file():
+        return None
+    cfg = json.loads(cj.read_text())
+    if str((cfg.get("v5") or {}).get("relation", "off")) != "teacher":
+        return None
+    kw = {"pack_root": str(cfg["t_pack_root"])} if cfg.get("t_pack_root") else {}
+    return TemporalCfg(on=True, source="bevfusion", forecaster="ca", n_modes=1, fc_train="frozen", **kw)
+
+
 def _obj_pack_cls():
     """tools/ck/data/obj_pack.ObjPack of THIS worktree (the reader train_ck2 / infer_val_v3 use; imported only for a
     temporal teacher).  The repo root is added to sys.path if needed; a tools package of another worktree is refused."""
@@ -658,6 +675,8 @@ class CK2E2ETargetBuilder(_ATB):
         tdet = teacher_temporal(det)
         if tdet.on:
             self.kd_objs = KDObjRows(tdet, self.wcfg["packed"])
+        elif teacher_v5_rel_cfg(det) is not None:       # refiner v5 relation DET teacher: the same pack rows
+            self.kd_objs = KDObjRows(teacher_v5_rel_cfg(det), self.wcfg["packed"])
 
     def __getstate__(self):
         d = self.__dict__.copy()

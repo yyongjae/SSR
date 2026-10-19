@@ -7,7 +7,8 @@ relation    'off' | 'teacher'   object channel (ck/v5/relation.py): per-object r
             from the causal past frames), learned reliability a_i, per-state attributed hazard H_j (NC, TTC).  Adds 4
             residual inputs (lp_rel_nc, lp_rel_ttc, max_i a_i r_i, sum_i a_i) and a direct log-pass term per key
             (zero-initialised weights).  'teacher' = BEVFusion detections + past frames (refiner-v3 object pack,
-            OBJ_INPUT_KEYS); the student's det-head channel is Stage 2 (not built here).
+            OBJ_INPUT_KEYS); 'student' = the e2e student's own det head (ck/v5/student_objects.py: boxes, velocities,
+            det_hidden; detached; no CA mode).
 unknown_ev  an executed state whose NC point or any corner is off the parent grid has NO local evidence ("unknown", never
             "safe"): the fraction of such states joins the residual input and the per-state reads Z.
 corrector   corrector A (ck/v5/corrector.py): 12 decoder controls (z_lon 6 + w_lat 6, decoder mode B) for given draft
@@ -25,7 +26,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Optional
 
-RELATIONS = ("off", "teacher")
+RELATIONS = ("off", "teacher", "student")
 CONFIG_VERSION = "v5_1"
 N_Z_DENSE = 4            # per-state reads of the range fields: b_nc, b_ttc, d_min, unknown (ck/v5/zread.py)
 N_Z_REL = 2              # + relation hazard H_nc, H_ttc

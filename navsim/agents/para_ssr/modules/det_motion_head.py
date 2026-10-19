@@ -199,8 +199,12 @@ class ParaDetMotionHead(nn.Module):
         loss_traj_cls_weight: float = 0.2,
         assigner_cls_weight: float = 2.0,
         assigner_reg_weight: float = 0.25,
+        vel_code_weights: Optional[Sequence[float]] = None,
     ):
         super().__init__()
+        # refiner v5 V1 (report 97 §2-2): loss-time (vx, vy) code weights replacing code_weights[8:10] (None = unchanged).
+        # A plain attribute, not the code_weights buffer: a checkpoint load (buffers) cannot silently undo it.
+        self.vel_code_weights = None if vel_code_weights is None else tuple(float(v) for v in vel_code_weights)
         self.num_query = num_query
         self.num_classes = num_classes
         self.embed_dims = embed_dims
@@ -498,7 +502,11 @@ class ParaDetMotionHead(nn.Module):
             # Encoding them again would log size/position channels a second
             # time and move z away from code index 4.
             pred_code_all = bbox_preds.reshape(-1, self.code_size)
-            bbox_weights_t = bbox_weights_t * self.code_weights.to(bbox_weights_t.dtype)
+            cw = self.code_weights.to(bbox_weights_t.dtype)
+            if self.vel_code_weights is not None:            # refiner v5 V1: sigma-normalised velocity weights
+                cw = torch.cat([cw[:8], torch.as_tensor(self.vel_code_weights, dtype=cw.dtype, device=cw.device),
+                                cw[10:]])
+            bbox_weights_t = bbox_weights_t * cw
             bbox_avg_factor = distributed_avg_factor(num_pos_total, pred_code_all)
             loss_bbox = weighted_l1_loss(
                 torch.nan_to_num(pred_code_all),

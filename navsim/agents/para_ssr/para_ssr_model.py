@@ -230,6 +230,8 @@ class ParaSSRModel(nn.Module):
                 loss_bbox_weight=cfg.loss_bbox_weight,
                 loss_traj_weight=cfg.loss_traj_weight,
                 loss_traj_cls_weight=cfg.loss_traj_cls_weight,
+                **({"vel_code_weights": tuple(cfg.det_vel_code_weights)}
+                   if getattr(cfg, "det_vel_code_weights", None) else {}),
             )
             if cfg.use_det_motion_head
             else None
@@ -433,5 +435,8 @@ class ParaSSRModel(nn.Module):
                 predictions.update(det_out)
             if map_out is not None:
                 predictions.update(map_out)
+        elif det_out is not None and getattr(cfg, "expose_det_outputs", False):
+            # refiner v5 student (ck/v5 relation 'student'): the CK2 inference reads its own det head (final layer)
+            predictions.update({k: det_out[k] for k in ("all_bbox_preds", "all_cls_scores", "det_hidden") if k in det_out})
 
         return predictions

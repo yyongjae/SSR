@@ -1,0 +1,3 @@
+# refiner v5 student, Stage-2 arm D (ARM=v5kd = v5_arm.set + this line): + Z-KD of the per-state reads to the v5 teachers
+# (DET b_nc / b_ttc / H_nc / H_ttc, MAP d_min; masked SmoothL1 on states readable for both, ramped like the other KD).
+v4.v5.z_kd=true

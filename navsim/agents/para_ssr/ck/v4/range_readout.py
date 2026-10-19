@@ -585,7 +585,7 @@ class RangeReadout(nn.Module):
             v5o = None
             if self.v5_on:                                  # refiner v5: per-state reads Z (ck/v5/zread.py)
                 from ..v5.zread import state_reads, zq_of
-                sr = state_reads(blk, D, rows, geo, M, rd)
+                sr = state_reads(blk, D, rows, geo, M, rd, states=st)
                 v5o = {"zq": zq_of(sr, self.v5_stride), "unknown_frac": sr["unknown"].float().mean(-1),
                        "corner_D": Dc, "corner_ok": gd["ok"]}
             S_exec = LQR.executed_progress(st)[0]

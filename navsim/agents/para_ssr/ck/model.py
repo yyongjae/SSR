@@ -710,7 +710,8 @@ class CKNet(nn.Module):
         """refiner v5 corrector A (ck/v5/corrector.py) on the draft columns cols [T, R] of a score_set output o (with
         return_ctx): mu from the critic context (detached), the per-state reads zq (NOT detached) and the top related
         objects; tau1 = decode(tau0, mu_lon, w_lat_head (detached) + mu_lat), decoder mode B, differentiable in mu.
-        -> {cols, tau0 [T, R, 8, 3], tau1, mu / log_sig [T, R, 12]}."""
+        -> {cols, tau0 [T, R, 8, 3] (the drafts), tau_base (mu = 0: the laterally corrected drafts, no grad), tau1,
+        mu / log_sig [T, R, 12]}."""
         from .v5.corrector import decode_grad
         T, R = cols.shape
         cols = cols.to(cand.device).long()
@@ -722,9 +723,11 @@ class CKNet(nn.Module):
         a = self.corrector_v5(g4(o["ctx"]), g4(o["score_logit"].detach().float()), ego[0], g4(haz["zq"]), tz,
                               g4(haz["rel_top"]) if "rel_top" in haz else None)
         src = g4(cand.float())
-        tau1 = decode_grad(src, a["mu"][..., :N_FREE], g4(o["w_lat"]).detach().float() + a["mu"][..., N_FREE:],
-                           ego[0])
-        return {"cols": cols, "tau0": src, "tau1": tau1, "mu": a["mu"], "log_sig": a["log_sig"]}
+        wl = g4(o["w_lat"]).detach().float()
+        tau1 = decode_grad(src, a["mu"][..., :N_FREE], wl + a["mu"][..., N_FREE:], ego[0])
+        with torch.no_grad():               # mu = 0: today's laterally corrected draft (the corrector's own baseline)
+            tau_base = decode_grad(src, torch.zeros_like(wl), wl, ego[0])
+        return {"cols": cols, "tau0": src, "tau_base": tau_base, "tau1": tau1, "mu": a["mu"], "log_sig": a["log_sig"]}
 
 
 CKHead = CKNet          # task-text name

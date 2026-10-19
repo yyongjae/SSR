@@ -8,7 +8,8 @@ NC / TTC / DAC evidence, before the soft max over the states):
                  >= 2 m, else B / Bp); FLOOR where not read;
   d_min  [B, Q]  min over the 4 official corners of the bilinear margin D (m), clipped to +-D_CAP; D_CAP where no corner
                  is readable;
-  unknown [B, Q] the NC point or any corner is off the parent grid: no local evidence ("unknown", never "safe").
+  unknown [B, Q] the NC point or any corner is off the parent grid, or outside the BEV extent (in_s_grid: 0 <= x <= 32 m, |y| <= 32 m):
+                 no local evidence ("unknown", never "safe").
 zq = [clip(b_nc / 5, +-4), clip(b_ttc / 5, +-4), d_min / D_CAP, unknown] at every stride-th state -> [B, Q', 4];
 differentiable in the fields (the corrector's loss and a later Z-KD reach the field heads through it).
 """
@@ -35,9 +36,22 @@ def _read_points(G: Tensor, rows: Tensor, gc: Dict[str, Tensor], ch: Tensor, rea
     return read_nearest(G, rows, *nearest_cells(gc), ch)
 
 
-def state_reads(blk: Tensor, D: Tensor, rows: Tensor, geo: Dict[str, Tensor], M: int, read: str) -> Dict[str, Tensor]:
-    """blk [R, 48, 17, G M] logits, D [R, 48, 17] (m), rows [B], geo = range_readout.read_geometry(...) -> b_nc, b_ttc,
-    d_min, unknown [B, Q] (module docstring)."""
+def bev_support(states: Tensor) -> Tensor:
+    """states [B, Q, >=3] (N frame, rear axle) -> [B, Q] bool: the rear axle and the 4 official corners lie inside the
+    S-grid / BEV extent (refiner.corridor.in_s_grid: 0 <= x <= 32 m, |y| <= 32 m)."""
+    from ...refiner.corridor import in_s_grid
+    from ...refiner.sdf import ego_corners
+    st = states[..., :3].float()
+    pts = torch.cat([st[..., None, :2], ego_corners(st)], -2)                          # [B, Q, 5, 2]
+    return in_s_grid(pts).all(-1)
+
+
+def state_reads(blk: Tensor, D: Tensor, rows: Tensor, geo: Dict[str, Tensor], M: int, read: str, *,
+                states: Tensor) -> Dict[str, Tensor]:
+    """blk [R, 48, 17, G M] logits, D [R, 48, 17] (m), rows [B], geo = range_readout.read_geometry(...), states
+    [B, Q, 6] (the same executed states) -> b_nc, b_ttc, d_min, unknown [B, Q] (module docstring).  unknown = the NC
+    point or a corner off the parent grid OR outside the BEV window (bev_support; review 98 R2: the parent grid can
+    run past the BEV, where the fields are extrapolation, not evidence)."""
     gn, gt, gd = geo["nc"], geo["ttc"], geo["dac"]
     B, Q = gn["s"].shape
     ch_nc = geo["m_nc"][None].expand(B, Q)
@@ -51,6 +65,7 @@ def state_reads(blk: Tensor, D: Tensor, rows: Tensor, geo: Dict[str, Tensor], M:
     dmin = torch.where(okc, Dc, torch.full_like(Dc, float("inf"))).amin(-1)
     dmin = torch.where(torch.isfinite(dmin), dmin, torch.full_like(dmin, D_CAP)).clamp(-D_CAP, D_CAP)
     unknown = (~gn["ok"]) | (~okc.all(-1))
+    unknown = unknown | ~bev_support(states)
     return {"b_nc": b_nc, "b_ttc": b_tt, "d_min": dmin, "unknown": unknown}
 
 

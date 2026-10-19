@@ -281,7 +281,8 @@ def test_four_gpus_keep_the_schedule_in_samples(tmp_path):
                  "bev_kd.start_mb": "5300"}.items():
         assert _get(ov, c + k) == v, k
     assert ck["lat_kd"]["start_mb"] == 500 and ck["grad_share_every"] == 50 and ck["bev_kd"]["start_mb"] == 5300
-    assert _get(ov, "wandb.tags") == "[ck2e2e,main,gpu4]"
+    # refiner-v5 branch (fusion v13 + refiner-v4): ck_e2e2.yaml is refiner-v4's (the bevkd setting) -> tag bevkd
+    assert _get(ov, "wandb.tags") == "[ck2e2e,bevkd,gpu4]"
     ov2, _, _ = _ov(tmp_path, ["grad_share_every=7"], gpus=("0", "1", "2", "3"))
     assert _get(ov2, c + "grad_share_every") == "7"
     c2, c4 = L2.counters2(2), L2.counters2(4)

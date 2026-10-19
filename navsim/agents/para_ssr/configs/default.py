@@ -191,6 +191,12 @@ class ParaSSRConfig:
     det_code_weights: Tuple[float, ...] = (
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2,
     )
+    # refiner v5 V1 (report 97 §2-2): loss-time (vx, vy) code weights, e.g. (1 / 2.44, 1 / 0.95) = sigma-normalised by
+    # the GT lon / lat velocity spread (the lateral channel collapsed under 0.2 x 0.25); None = det_code_weights[8:10]
+    det_vel_code_weights: Optional[Tuple[float, float]] = None
+    # refiner v5 student: eval-mode predictions also carry the det head's final boxes / class logits / hidden states
+    # (the CK2 inference's relation channel reads them; training predictions always carry them)
+    expose_det_outputs: bool = False
     fut_mode: int = 6
     det_use_pe: bool = True
     loss_cls_weight: float = 2.0

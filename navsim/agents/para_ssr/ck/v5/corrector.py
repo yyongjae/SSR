@@ -59,10 +59,16 @@ class CorrectorV5(nn.Module):
 
 def decode_grad(src: torch.Tensor, z: torch.Tensor, w: torch.Tensor, v0: torch.Tensor) -> torch.Tensor:
     """src [T, R, 8, 3] drafts (inputs), z / w [T, R, 6] raw controls, v0 [T] -> tau1 [T, R, 8, 3] (decoder mode B,
-    float32, differentiable in z / w)."""
+    float32, differentiable in z / w).  The lateral spline keeps mode A's normalisation length S_L = S8 (lat_len):
+    the lateral head w_lat_head was trained through mode A (ck/correct.py), and mode B's default S_L = S8 + L_ext
+    turns the same control into another curve (review 98 R1: up to ~1 m at mu = 0) -- with lat_len = S8, mu = 0
+    reproduces today's laterally corrected draft exactly (tests/test_v5_review_fixes.py)."""
+    from ...refiner.decoder import DraftPath
     T, R = src.shape[:2]
     with torch.autocast(device_type=src.device.type, enabled=False):
         v = torch.nan_to_num(v0.float().reshape(T), nan=0.0).repeat_interleave(R)
-        dec = decode(src.reshape(T * R, 8, 3).float(), z.reshape(T * R, N_FREE).float(),
-                     w.reshape(T * R, N_FREE).float(), v0=v, mode="B")
+        sf = src.reshape(T * R, 8, 3).float()
+        S8 = DraftPath(sf).knots()[:, -1]
+        dec = decode(sf, z.reshape(T * R, N_FREE).float(), w.reshape(T * R, N_FREE).float(), v0=v, mode="B",
+                     lat_len=S8)
     return dec["traj"].reshape(T, R, 8, 3)

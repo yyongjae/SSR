@@ -13,8 +13,25 @@
 #     fusion_v13_v5.extra's det_stop_branch);
 #   * BEV KD OFF (the v13 selector distillation is the BEV-level KD of this branch); score KD nc <- DET, dac <- MAP on
 #     the parent columns (as v4_3); lateral KD unchanged.
+#   * 'rel' group (design §3.2 / §3.7 / §3.9; main-session decisions D1-D5, 2026-10-20): the relation reads the det
+#     head's own futures as modes m1..6 with a learned CV prior (rel_modes cv+fut; m7 CA stays off: PT-11 / PT-B3);
+#     the corrector's top-3 objects carry station / side / key + Delta r of the a-0.5 / l-0.5 / l+0.5 probes
+#     (top_feats v2); L_rel (lambda_rel 0.5, the chosen value = the L_H weight of the same lambda_rel group) and
+#     L_rel,cv (lambda_rel_cv 0.25 = 0.5 x lambda_rel, design §3.9; 0 = the report-only variant: the beyond-CV gap is
+#     logged either way) on the KD set's first 8 parents + siblings; the det-box gradient on GT-matched rows only
+#     (rel_det_grad_matched, design V2 'matched boxes').  The student reliability's v_tol stays 1.0 m/s (= the teachers'
+#     a_i^T, declared deviation from the design's 0.5).
+#   * 'zkd' group (design §2.1 L82 / §3.7 item 3 / §3.8; main-session decisions D1 / D2 / D6-D8, 2026-10-20): the Z
+#     adapters P_det / P_map (z_adapt; both arms, so D - B measures the KD only): the corrector reads the per-state
+#     reads in the teachers' normalised units (frozen per-channel mu_T / sigma_T of the teacher readers: z_stats_det /
+#     z_stats_map, BOTH needed -- d_min is normalised in arm B too) and arm D's Z-KD runs in those units
+#     (lambda_zkd_det / _map unchanged at 0.5); L_edit-Bernoulli (lambda_edit 0.25, the chosen value; the design gives
+#     none): tau1 re-read by the same relation reader, per-object BCE against the matched GT track (one-to-one 2 m
+#     Hungarian at t0, ghosts y = 0, duplicates masked).
 # Teachers: the v5 teachers (tools/ck/v5/run_teachers_v5.sh); their KD calibration files are PLACEHOLDERS until fitted
-# (tools/ck/e2e2/fit_kd_calib.py after the teachers finish) or kd_calib.enabled=false via E2E_CK_SET.
+# (tools/ck/e2e2/fit_kd_calib.py after the teachers finish) or kd_calib.enabled=false via E2E_CK_SET; the Z-adapter
+# statistics are PLACEHOLDERS until fitted by tools/ck/v5/fit_z_stats.py (CPU, --tokens 4096, after the teachers
+# finish; refused at launch while v4.v5.z_adapt is on, launch_util2.placeholder_check / z_stats_check).
 # Not trained without the user's approval (GPUs 0-3).
 bev_kd.enabled=false
 bev_kd.teachers=[det]
@@ -45,6 +62,16 @@ v4.v5.rel_det_grad=true
 v4.v5.record_tau1=true
 v4.v5.lambda_awr=0.1
 v4.v5.rel_pstop=true
+v4.v5.rel_modes=cv+fut
+v4.v5.top_feats=v2
+v4.v5.lambda_rel=0.5
+v4.v5.lambda_rel_cv=0.25
+v4.v5.rel_max_parents=8
+v4.v5.rel_det_grad_matched=true
+v4.v5.z_adapt=true
+v4.v5.z_stats_det=/PLACEHOLDER/v5/z_stats_det.json
+v4.v5.z_stats_map=/PLACEHOLDER/v5/z_stats_map.json
+v4.v5.lambda_edit=0.25
 teacher_det_run=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5T_rel4
 teacher_map_run=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5M_unk3
 kd_calib.det=/PLACEHOLDER/v5/kd_calib_det.json

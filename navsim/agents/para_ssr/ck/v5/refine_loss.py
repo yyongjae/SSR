@@ -41,6 +41,11 @@ L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable): a 
   corrector slack; nothing within reach is dropped), gt_state_block runs in object chunks.
   A weight 0 in w ('obj', 'ttc', 'road', 'prog', 'cmf') turns that factor off (p = 1; the MAP teacher has no object
   input: obj = ttc = 0); 'u' is the caller's mu^2 weight.
+Per-object relation targets of the student (match_t0, rel_object_targets, rel_object_mask, rel_object_bce,
+parent_sibling_cols; design §3.9 L_rel / L_rel,cv, §3.2 V2 'matched boxes only'; reused by the tau1 re-read's
+L_edit-Bernoulli of §3.7): the detection rows are matched one-to-one to the GT tracks at t0 (2 m Hungarian), the target
+y_ijk is the official-footprint overlap of candidate j's executed states with the matched track (L_rel; its t0 state at
+constant velocity for L_rel,cv), ghost rows (no GT within 2 m) y = 0, unmatched rows near a GT masked.
 Stats (no grad) compare X1 with X0 = LQR(tau0) -- the callers pass tau0 = the corrector's baseline (mu = 0: today's
 laterally corrected draft, CKNet.refine_drafts 'tau_base'), so *0 vs *1 is the corrector's own change; L_prog uses the
 same baseline (progress lost relative to it).
@@ -143,6 +148,24 @@ def relevant_objects(gt: Dict[str, Tensor], states: Tensor, slack: float = REACH
                  "n_reach_max": float(k)}
 
 
+def _gt_boxes_cv(gt: Dict[str, Tensor], t: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """_gt_boxes with every track's t0 state propagated at constant velocity (x0 + vx0 t, y0 + vy0 t, heading and size
+    fixed; observed at every t when present at t0 -- range_targets.priv_channels' rule): L_rel,cv targets."""
+    k0 = gt["kf"][:, :, 0].double()                                                     # [n, A, 6]
+    tt = torch.as_tensor(t, dtype=torch.float64, device=k0.device).reshape(1, 1, -1)
+    n, A = k0.shape[:2]
+    T = tt.shape[-1]
+    boxes = torch.stack([k0[..., GF.KF_X, None] + k0[..., GF.KF_VX, None] * tt,
+                         k0[..., GF.KF_Y, None] + k0[..., GF.KF_VY, None] * tt,
+                         k0[..., GF.KF_H, None].expand(n, A, T),
+                         gt["first"][..., GF.FI_L, None].double().expand(n, A, T),
+                         gt["first"][..., GF.FI_W, None].double().expand(n, A, T)], -1)
+    obs = (gt["valid"].bool() & (k0[..., GF.KF_PRESENT] > 0))[..., None].expand(n, A, T)
+    agent = gt["meta"][..., GF.MT_AGENT].bool()
+    v_first = torch.linalg.vector_norm(gt["first"][..., GF.FI_VX:GF.FI_VY + 1], dim=-1)
+    return boxes.float(), obs, (~agent) | (v_first < 0.5)
+
+
 def lon_lat_gaps(ce: Tensor, he: Tensor, co: Tensor, ho: Tensor, Lo: Tensor, Wo: Tensor) -> Tuple[Tensor, Tensor]:
     """signed longitudinal gap (object centre ahead along the ego heading minus the ego half-length and the object's
     extent on that axis) and the lateral SAT gap (|lateral offset| minus both half-extents on the ego lateral axis);
@@ -159,17 +182,19 @@ def lon_lat_gaps(ce: Tensor, he: Tensor, co: Tensor, ho: Tensor, Lo: Tensor, Wo:
     return d_ue - EGO_L / 2 - ext_ue, d_ve.abs() - EGO_W / 2 - ext_ve
 
 
-def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequence[float], extras: bool = False):
+def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequence[float], extras: bool = False,
+               motion: str = "gt"):
     """states [n, R, Q, >=4] (N frame, rear axle; Q states at times t [Q] s), deltas (s) -> sep [n, R, Q, D, A] (SAT
     separation of the official footprint projected |v| delta along the heading vs the GT boxes at t + delta;
     differentiable in states), count [n, R, Q, D, A] bool (observed, not-behind or exempt, ego moving: NC |v| > 0.05
-    for delta 0, TTC |v| >= 5e-3 otherwise)."""
+    for delta 0, TTC |v| >= 5e-3 otherwise).  motion 'cv': the tracks' t0 state at constant velocity (_gt_boxes_cv;
+    L_rel,cv); the default 'gt' is the annotated GT motion."""
     n, R, Q = states.shape[:3]
     dev = states.device
     dl = torch.as_tensor(list(deltas), dtype=torch.float64, device=dev)
     D = int(dl.numel())
     tt = (t.to(dev).double()[:, None] + dl[None]).reshape(-1)                          # [Q * D]
-    boxes, obs, exempt = _gt_boxes(gt, tt)                                              # [n, A, Q*D, 5]
+    boxes, obs, exempt = _gt_boxes(gt, tt) if motion == "gt" else _gt_boxes_cv(gt, tt)  # [n, A, Q*D, 5]
     A = boxes.shape[1]
     boxes = boxes.reshape(n, A, Q, D, 5).permute(0, 2, 3, 1, 4)[:, None]               # [n, 1, Q, D, A, 5]
     obs = obs.reshape(n, A, Q, D).permute(0, 2, 3, 1)[:, None]                         # [n, 1, Q, D, A]
@@ -365,3 +390,130 @@ def corner_margin_aux(Dc: Tensor, ok: Tensor, states: Tensor, sdf: Tensor, w_edg
     wt = torch.where(val.abs() <= 1.0, torch.full_like(val, float(w_edge)), torch.ones_like(val)) * m
     h = F.huber_loss(Dc.float(), val.float(), delta=1.0, reduction="none")
     return (h * wt).sum() / wt.sum().clamp(min=1.0), float(m.sum())
+
+
+# ----------------------------------------------------------------------------------------------- per-object relation
+# targets of the STUDENT (design §3.9 L_rel / L_rel,cv; §3.2 V2 'matched boxes only'; §3.7 L_edit-Bernoulli re-uses
+# match_t0 / rel_object_targets / rel_object_mask / rel_object_bce on the tau1 re-read, CKNet.relation_reread)
+MATCH_GATE_M = 2.0            # [m] t0 match gate (= the reliability target's gate, temporal.objects.match_targets)
+G_GHOST, G_DUP = -1, -2       # match_t0 codes: no GT within the gate (ghost: y = 0) / unmatched near a GT (masked)
+
+
+@torch.no_grad()
+def match_t0(c0: Tensor, valid: Tensor, agent: Tensor, gt: Dict[str, Tensor], gate_m: float = MATCH_GATE_M) -> Tensor:
+    """one-to-one Hungarian match of detection rows to GT tracks at t0: c0 [n, N, 2] (N frame), valid [n, N], agent
+    [n, N] bool (row class group < 2), gt = gt_of(...) -> g [n, N] int64: the matched track index of gt (A axis), or
+    G_GHOST (-1: no GT object observed at t0 within gate_m, of any class -- a true ghost box, y = 0) / G_DUP (-2:
+    unmatched, but a GT object observed at t0 lies within gate_m -- one the match gave to another row (a duplicate box:
+    two near-identical rows must not get y = 1 and y = 0), one of the other agent-ness that no pair could take (a
+    misclassified box on a real object), or a future-first singleton's held t0 pose -- its targets are MASKED).  The
+    ghost gate uses the GT set of the reliability target (student_reliability_targets on gt_t0_objects: valid, observed
+    at t0, class-blind), so a row that target may call real (y = 1) never gets y = 0 here.  Eligible for a PAIR
+    (temporal.objects.match_targets rule): valid, observed at t0, not a future-first singleton (meta first keyframe 0);
+    a pair counts only with the same agent-ness (vehicle / VRU rows <-> agent tracks, static rows <-> static tracks) and
+    distance <= gate_m.  Cost = the centre distance (scipy linear_sum_assignment per token on CPU)."""
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+    n, N = valid.shape
+    dev = c0.device
+    g = torch.full((n, N), G_GHOST, dtype=torch.long, device=dev)
+    if n == 0 or N == 0:
+        return g
+    gc, _, obs0 = gt_t0_objects(gt)                                                     # [n, A, 2], [n, A]
+    elig = obs0 & gt["valid"].bool() & (gt["meta"][..., GF.MT_FIRST] == 0)
+    gag = gt["meta"][..., GF.MT_AGENT].bool()
+    d = torch.cdist(c0.detach().float(), gc.float())                                    # [n, N, A]
+    near = valid.bool()[:, :, None] & elig[:, None, :] & (d <= float(gate_m))
+    feas = near & (agent.bool()[:, :, None] == gag[:, None, :])
+    feas_np = feas.cpu().numpy()
+    cost = torch.where(feas, d, torch.full_like(d, 1e6)).double().cpu().numpy()
+    out = np.full((n, N), G_GHOST, dtype=np.int64)
+    for i in range(n):
+        rows = np.flatnonzero(feas_np[i].any(1))
+        cols = np.flatnonzero(feas_np[i].any(0))
+        if rows.size == 0:
+            continue
+        ri, ci = linear_sum_assignment(cost[i][np.ix_(rows, cols)])
+        ok = feas_np[i][rows[ri], cols[ci]]
+        out[i, rows[ri[ok]]] = cols[ci[ok]]
+    g = torch.from_numpy(out).to(dev)
+    # ghost gate = the reliability target's GT set (observed at t0, class-blind; elig is a subset): only rows with no
+    # such GT within gate_m are ghosts (y = 0), every other unmatched row is masked
+    seen = valid.bool()[:, :, None] & (obs0 & gt["valid"].bool())[:, None, :] & (d <= float(gate_m))
+    dup = (g < 0) & seen.any(-1)
+    return torch.where(dup, torch.full_like(g, G_DUP), g)
+
+
+def matched_tracks(gt: Dict[str, Tensor], g: Tensor) -> Dict[str, Tensor]:
+    """gt restricted to the matched track of every row (A = N rows; valid = g >= 0; n_kf / sdf / p_pdm unchanged)."""
+    n, N = g.shape
+    gi = g.clamp(min=0)
+    take = lambda x: torch.gather(x, 1, gi.reshape(n, N, *([1] * (x.dim() - 2))).expand(n, N, *x.shape[2:]))  # noqa
+    return dict(gt, kf=take(gt["kf"]), first=take(gt["first"]), meta=take(gt["meta"]), valid=g >= 0)
+
+
+@torch.no_grad()
+def rel_object_targets(states: Tensor, t: Tensor, gt: Dict[str, Tensor], g: Tensor, motion: str = "gt"
+                       ) -> Tuple[Tensor, Tensor]:
+    """per-object relation targets y_ijk of the rows matched by g [n, N] (match_t0): states [n, K, Q, >=4] (the
+    candidates' executed states at t [Q] s, the relation reader's own strided states) -> y [n, K, N, 2] float (NC: the
+    ego footprint overlaps the matched track at delta 0 at some state; TTC: at some delta of (0, 0.3, 0.6, 0.9) s at
+    some state -- = the reader's r = max over the states; counted as L_refine / gt_state_block count: observed, not
+    behind the current ego unless static / stopped, ego moving), known [n, 2] bool (the annotation covers every read:
+    NC t[-1] <= t_av, TTC t[-1] + 0.9 <= t_av; per-pair censoring, declared: gt_state_block censors per state).
+    Ghost / duplicate rows (g < 0) give y = 0 (no track).  motion 'cv' (L_rel,cv): the matched track's t0 state
+    propagated at constant velocity (heading / size fixed, observed at every t: range_targets.priv_channels' rule);
+    known all True."""
+    if motion not in ("gt", "cv"):
+        raise ValueError(f"rel_object_targets: motion {motion!r} not in ('gt', 'cv')")
+    n, K = states.shape[:2]
+    gm = matched_tracks(gt, g)
+    sep, cnt = object_sep(states.float(), t, gm, (0.0,) + TTC_D, motion=motion)        # [n, K, Q, D, N]
+    hit = (sep < 0) & cnt
+    y = torch.stack([hit[..., 0, :].any(2), hit.any(3).any(2)], -1).float()
+    if motion == "cv":
+        return y, torch.ones(n, 2, dtype=torch.bool, device=states.device)
+    t_av = ((gt["n_kf"].double() - 1) * GF.KF_DT).clamp(max=GF.T_MAX).to(states.device)          # [n]
+    tl = float(t.reshape(-1)[-1])
+    known = torch.stack([tl <= t_av + 1e-6, tl + max(TTC_D) <= t_av + 1e-6], -1)
+    return y, known
+
+
+def rel_object_mask(valid: Tensor, g: Tensor, known: Tensor, y: Tensor, cols: Optional[Tensor] = None) -> Tensor:
+    """mask [n, K, N, 2] of the per-object BCE: valid rows, not a duplicate (G_DUP), and the target certain -- the
+    horizon known, or a seen hit (y = 1), or a ghost (its y = 0 holds at any horizon); cols [n, K] bool (the columns
+    read, parent_sibling_cols) when given."""
+    m = (valid.bool() & (g != G_DUP))[:, None, :, None] & (known.bool()[:, None, None, :] | (y > 0.5)
+                                                           | (g == G_GHOST)[:, None, :, None])
+    if cols is not None:
+        m = m & cols.bool()[:, :, None, None]
+    return m
+
+
+def rel_object_bce(r_nc: Tensor, r_ttc: Tensor, y: Tensor, mask: Tensor) -> Tensor:
+    """masked mean BCE(r, y) of the per-object relation r [n, K, N] (NC, TTC) against y [n, K, N, 2] (float32,
+    autocast off; 0 with an empty mask, in the graph of r)."""
+    with torch.autocast(device_type=y.device.type, enabled=False):
+        r = torch.stack([r_nc, r_ttc], -1).float().clamp(1e-4, 1 - 1e-4)
+        mf = mask.float()
+        return (F.binary_cross_entropy(r, y.float(), reduction="none") * mf).sum() / mf.sum().clamp(min=1.0)
+
+
+def parent_sibling_cols(parent_index: Tensor, is_self: Tensor, max_parents: int) -> Tensor:
+    """KD-set columns of L_rel: the first max_parents distinct parent rows per token in slot order (the own-parent
+    columns, range_targets.gt_field_aux's 'first' / 'keep' rule) and every column whose parent is one of them (the
+    parents + their siblings) -> [n, K] bool."""
+    pidx = parent_index.long()
+    n, K = pidx.shape
+    dev = pidx.device
+    U = int(pidx.max()) + 1 if pidx.numel() else 1
+    sel = is_self.bool()
+    ar = torch.arange(K, device=dev)[None].expand(n, K)
+    kk = torch.where(sel, ar, torch.full_like(ar, K))
+    rep = torch.full((n, U), K, dtype=torch.long, device=dev).scatter_reduce(1, pidx, kk, reduce="amin",
+                                                                             include_self=True)
+    first = sel & (torch.gather(rep, 1, pidx) == ar)
+    keep = first & (torch.cumsum(first.long(), 1) <= int(max_parents))
+    rows = torch.zeros(n, U + 1, dtype=torch.bool, device=dev)
+    rows.scatter_(1, torch.where(keep, pidx, torch.full_like(pidx, U)), True)
+    return torch.gather(rows[:, :U], 1, pidx)

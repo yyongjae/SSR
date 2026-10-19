@@ -7,7 +7,9 @@ Inputs per draft (T tokens x R drafts):
   v0     [T]          ego speed (/ 15)
   zq     [T, R, Q, C] per-state reads Z (ck/v5/zread.py + relation H; NOT detached: the correction loss trains the
                       reader, add.md (3)), + the state time t / 4 -> per-state MLP -> mean and max over the states
-  top    [T, R, 21]   the top-3 related objects (relation channel; absent without it)
+  top    [T, R, 3 F]  the top-3 related objects (relation channel; absent without it): F = 7 (V5Cfg.top_feats 'v1',
+                      the teachers' A_T) or 13 ('v2': + station / side / key + Delta r of the a-0.5 / l-0.5 / l+0.5
+                      probes, CKNet._v5_top_v2)
 Output mu [T, R, 12] = (z_lon 6, w_lat residual 6), zero-initialised (identity edit at the start); log_sig [T, R, 12]
 (init log 0.3; the Stage-2 AWR policy: recorded tau1 controls u = mu + sigma eps, online2.CKE2E2.v5_edits_rec /
 _awr_v5; unused by L_refine).

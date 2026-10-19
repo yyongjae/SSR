@@ -213,8 +213,9 @@ class ParaSSRConfig:
     loss_acc_code_weight: float = 0.5
     loss_stop2s_weight: float = 0.2
     det_acc_huber_delta: float = 1.0
-    # refiner v5 student: eval-mode predictions also carry the det head's final boxes / class logits / hidden states
-    # (the CK2 inference's relation channel reads them; training predictions always carry them)
+    # refiner v5 student: eval-mode predictions also carry the det head's final boxes / class logits / hidden states and
+    # its futures traj_preds / traj_cls_preds (para_ssr_model.EXPOSED_DET_KEYS; the CK2 inference's relation channel
+    # reads them; training predictions always carry them)
     expose_det_outputs: bool = False
     fut_mode: int = 6
     det_use_pe: bool = True

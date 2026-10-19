@@ -51,6 +51,7 @@ ARMS = ("T", "M", "S", "none")
 N_KEYS = len(CK_KEYS)
 V4_SEED_OFFSET = 40414      # refiner v4 heads: own seeded RNG, built after every CK2 / v3 module
 V5_SEED_OFFSET = 50515      # refiner v5 modules (ck/v5): own seeded RNG, built after every v4 module
+PROBE_SPEEDS, PROBE_LATS = (-0.5,), (-0.5, 0.5)   # refiner v5 top_feats 'v2' Delta r probes (design §3.7)
 GEO_T_ARR, GEO_V_ARR = 64 + 4, 64 + 5    # corridor_tensor channels of t_arr / v_arr (64 features + GEO_CHANNELS)
 
 
@@ -234,8 +235,9 @@ class CKNet(nn.Module):
         self.v5 = (v5 if v5 is not None else V5Cfg()).validate(self.v4)
         self.relation = None
         self.corrector_v5 = None
+        self.z_adapter = None
         if self.v5.on:
-            from .v5.config import N_TOP, N_TOP_FEAT
+            from .v5.config import N_TOP
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(seed + V5_SEED_OFFSET)
                 self.v4_readout.enable_v5(self.v5.n_extra, self.v5.rel, self.v5.unknown_ev, self.v5.z_stride)
@@ -244,9 +246,16 @@ class CKNet(nn.Module):
                     self.relation = RelationReader(self.v5)
                 if self.v5.corrector:
                     from .v5.corrector import CorrectorV5
+                    # top-3 object features: N_TOP_FEAT ('v1', the teachers' A_T) or 13 ('v2': + station / side / key
+                    # + Delta r of the probes, V5Cfg.top_feats)
                     self.corrector_v5 = CorrectorV5(self.trunk.d_model, self.v5.n_z,
-                                                    N_TOP * N_TOP_FEAT if self.v5.rel else 0,
+                                                    N_TOP * self.v5.n_top_feat if self.v5.rel else 0,
                                                     hidden=self.v5.corr_hidden, z_hidden=self.v5.z_hidden)
+                if self.v5.z_adapt:
+                    # student Z adapters P_det / P_map (ck/v5/zadapt.py): built LAST in the v5 fork, so every other v5
+                    # module's init is bit for bit the no-adapter net's; only the half z_channels keeps
+                    from .v5.zadapt import ZAdapter
+                    self.z_adapter = ZAdapter(self.v5.n_z, self.v5.z_adapt_hidden, self.v5.z_channels)
 
     # ------------------------------------------------------------------------------------------ helpers
     def param_counts(self) -> Dict[str, int]:
@@ -260,7 +269,8 @@ class CKNet(nn.Module):
             c["total"] = c["total"] + tc["temporal_shared"] + tc["forecaster"]
         for name, mod in (("v4_readout", self.v4_readout), ("pref_head", self.pref_head),
                           ("corrector", self.corrector), ("relation", getattr(self, "relation", None)),
-                          ("corrector_v5", getattr(self, "corrector_v5", None))):
+                          ("corrector_v5", getattr(self, "corrector_v5", None)),
+                          ("z_adapter", getattr(self, "z_adapter", None))):
             if mod is not None:                                         # keys only when on
                 c[name] = sum(p.numel() for p in mod.parameters())
                 c["total"] = c["total"] + c[name]
@@ -533,6 +543,8 @@ class CKNet(nn.Module):
                 haz.update(rel_lp=sh(rel["lp"]), rel_top=sh(rel["top"]), rel_r_nc=sh(rel["r_nc"]),
                            rel_r_ttc=sh(rel["r_ttc"]), rel_a=rel["a_tok"], rel_valid=rel["valid_tok"],
                            rel_objs_tok=rel["objs_tok"])
+                if "top_idx" in rel:                     # V5Cfg.top_feats 'v2': object slot of each top entry (-1 none)
+                    haz["rel_top_idx"] = sh(rel["top_idx"])
         return r, haz, (Fs, fr_u)
 
     def correct_topk(self, feat: torch.Tensor, mem: torch.Tensor, ego, pool: torch.Tensor, parents: torch.Tensor,
@@ -730,15 +742,94 @@ class CKNet(nn.Module):
         from .v4 import lqr as _LQR
         tz = (torch.arange(_LQR.NT, dtype=torch.float32, device=cand.device) * _LQR.DT)[::zs]
         zq = g4(haz["zq"])
+        if getattr(self, "z_adapter", None) is not None:   # V5Cfg.z_adapt: P_det / P_map on teacher-normalised Z
+            zq = self.z_adapter(zq)
         zc = getattr(self.v5, "z_channels", "all")
         if zc != "all":                     # per-teacher channel mask (V5Cfg.z_channels): zeroed, no gradient
             keep = torch.zeros(zq.shape[-1], dtype=zq.dtype, device=zq.device)
             idx = [0, 1, 3] + list(range(4, zq.shape[-1])) if zc == "det" else [2, 3]
             keep[idx] = 1.0
             zq = zq * keep
-        a = self.corrector_v5(g4(o["ctx"]), g4(o["score_logit"].detach().float()), ego[0], zq, tz,
-                              g4(haz["rel_top"]) if "rel_top" in haz else None)
+        top = g4(haz["rel_top"]) if "rel_top" in haz else None
+        if top is not None and self.v5.top_feats == "v2":   # + Delta r of the probes (design §3.7 A_S input)
+            top = self._v5_top_v2(haz, g4, g4(cand.float()), ego, top)
+        a = self.corrector_v5(g4(o["ctx"]), g4(o["score_logit"].detach().float()), ego[0], zq, tz, top)
         return a, g4(cand.float()), g4(o["w_lat"]).detach().float(), cols
+
+    def _v5_probes(self, src: torch.Tensor, ego) -> Tuple[torch.Tensor, torch.Tensor]:
+        """top_feats 'v2' Delta r probes (design §3.7): the CK2 variant rule's a-0.5, l-0.5, l+0.5 of each draft src
+        [T, R, 8, 3] (ck/variants.make_variants 'separate' with the run's s_on_frac / compute dtype = V5Cfg.probe_*, ego
+        speed v0 = hypot(vx, vy) in float64 as cands2.v0_from_status: a parent draft's probes are its pool siblings
+        bit for bit (columns c + 2 / c + 4 / c + 5); for a variant draft (a deployed pick may be one) they are variants
+        of the variant -- a necessary extension of the design's parent probes, declared).  All three are mode-A
+        variants, so variants.ext (mode B only) does not enter.  -> probes [T, R, 3, 8, 3] f32, ok [T, R, 3] (False: a
+        lateral probe of a draft with S_8 < 3 m -- a duplicate of the draft -- or a non-finite draft)."""
+        from .variants import make_variants
+        x = src.detach().float()
+        fin = torch.isfinite(x).flatten(2).all(-1)
+        x = torch.where(fin[..., None, None], x, torch.zeros_like(x))
+        eds = ego[2].detach()
+        v0 = torch.hypot(eds[:, 0].double(), eds[:, 1].double())
+        dt = torch.float64 if self.v5.probe_dtype == "float64" else torch.float32
+        out = make_variants(x, v0, PROBE_SPEEDS, PROBE_LATS, "separate", float(self.v5.probe_s_on_frac),
+                            compute_dtype=dt, ext="straight")
+        return out["traj"][:, :, 1:], out["valid"][:, :, 1:] & fin[..., None]
+
+    def _v5_top_v2(self, haz: Dict, g4, src: torch.Tensor, ego, top: torch.Tensor) -> torch.Tensor:
+        """top_feats 'v2' corrector input [T, R, 3 * 13]: per top object the relation's 10 features (haz rel_top of the
+        drafts src [T, R, 8, 3], g4 = the drafts' column gather) + Delta r_i(p) = a_i r_i(draft) - a_i r_i(probe p) for
+        the probes a-0.5 / l-0.5 / l+0.5 (_v5_probes; r = max(r_nc, r_ttc), a r clipped as the relation's top score),
+        re-read by relation_reread with the SAME token rows (haz rel_objs_tok); 0 for an empty top slot (top_idx -1) or
+        an invalid probe.  No graph through Delta r (an explanation input, like the detached critic context; the a r
+        entries of the 10 keep theirs).  A deterministic function of (draft, ego, rows): the recorded policy, its AWR
+        replay and the inference see identical inputs."""
+        from .v5.config import N_TOP
+        from .v5.relation import N_TOP_REL_V2, P_MAX
+        T, R = src.shape[:2]
+        with torch.no_grad(), torch.autocast(device_type=src.device.type, enabled=False):
+            probes, pok = self._v5_probes(src, ego)
+            rr = self.relation_reread(haz["rel_objs_tok"], probes, ego)
+            a = haz["rel_a"].detach().float()                                                  # [T, N]
+            ar = lambda w, r_nc, r_tt: torch.maximum((w * r_nc.float()).clamp(max=P_MAX),       # noqa: E731
+                                                     (w * r_tt.float()).clamp(max=P_MAX))
+            ar_p = ar(a[:, None, None], rr["r_nc"], rr["r_ttc"])                                # [T, R, 3p, N]
+            ar_0 = ar(a[:, None], g4(haz["rel_r_nc"]), g4(haz["rel_r_ttc"]))                    # [T, R, N]
+            ti = g4(haz["rel_top_idx"]).long()                                                  # [T, R, 3o]
+            tic = ti.clamp(min=0)
+            a0t = torch.gather(ar_0, 2, tic)                                                    # [T, R, 3o]
+            apt = torch.gather(ar_p, 3, tic[:, :, None, :].expand(T, R, ar_p.shape[2], tic.shape[-1]))  # [T,R,3p,3o]
+            dr = (a0t[:, :, None, :] - apt).transpose(2, 3)                                     # [T, R, 3o, 3p]
+            dr = torch.where((ti >= 0)[..., None] & pok[:, :, None, :], dr, torch.zeros_like(dr))
+        return torch.cat([top.float().reshape(T, R, N_TOP, N_TOP_REL_V2), dr], -1).reshape(T, R, -1)
+
+    def relation_reread(self, O: Dict[str, torch.Tensor], traj: torch.Tensor, ego, grad: bool = False) -> Dict:
+        """refiner v5 relation RE-READ primitive (design §3.7: the Delta r probes of top_feats 'v2'; X1 = LQR(tau1) for
+        L_edit-Bernoulli): the relation channel of the token rows O (haz['rel_objs_tok'] of a score_set of the same T
+        tokens) on arbitrary drafts traj [T, R, 8, 3] or [T, R, P, 8, 3], executed by the critic's own model
+        (range_readout.candidate_states, V4Cfg.exec_model, ego (vx, ax) = eds[:, 0], eds[:, 2] as score_set) and read
+        at the same strided states (V5Cfg.z_stride) -> {r_nc, r_ttc [T, R(, P), N], H [T, R(, P), Q', 2], a_tok [T, N],
+        states [T R (P), Q', 6], tq [Q'] (s)}; equals score_set's haz rel_r_* / zq H of the same drafts.  grad False
+        (default): no graph; True: the reader's graph (eps, cv_prior, reliability) and that of the rows / traj as given
+        (the caller detaches what it must not train)."""
+        if self.relation is None:
+            raise ValueError("relation_reread: this net has no v5 relation channel")
+        from .v4.range_readout import candidate_states
+        lead = tuple(traj.shape[:-2])
+        T = int(lead[0])
+        per = int(np.prod(lead[1:])) if len(lead) > 1 else 1
+        flat = traj.reshape(T * per, *traj.shape[-2:]).float()
+        eds = ego[2].float()
+        dev = flat.device
+        zs = int(self.v5.z_stride)
+        with torch.set_grad_enabled(bool(grad) and torch.is_grad_enabled()), \
+                torch.autocast(device_type=dev.type, enabled=False):
+            states, tq = candidate_states(flat, eds[:, 0].repeat_interleave(per), eds[:, 2].repeat_interleave(per),
+                                          self.v4.exec_model)
+            tok = torch.arange(T, device=dev).repeat_interleave(per)
+            rel = self.relation.read(O, states[:, ::zs], tq[::zs], tok)
+        sh = lambda a: a.reshape(*lead, *a.shape[1:])                                           # noqa: E731
+        return {"r_nc": sh(rel["r_nc"]), "r_ttc": sh(rel["r_ttc"]), "H": sh(rel["H"]), "a_tok": rel["a_tok"],
+                "states": states[:, ::zs], "tq": tq[::zs]}
 
     def v5_logp(self, feat: torch.Tensor, mem: torch.Tensor, ego, src: torch.Tensor, src_par: Optional[torch.Tensor],
                 u: torch.Tensor, pref: Optional[torch.Tensor] = None,

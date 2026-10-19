@@ -45,7 +45,7 @@ v5 (refiner v5 corrector A_S, ck_e2e2.v4.v5 corrector + infer_refine; CKE2E2.inf
   writes infer/{v5_traj [N, 1, 8, 3], v5_src [N] int16, v5_mu [N, 12]}.npy (opened on the first prediction that has
   them; the 96-pool ok / done unchanged) and, for relation 'student', the det inputs of the check rows into
   check_bev.npz (det_code / det_cls / det_hidden: the final det layer; + det_stop, its V1c stop logits, for a
-  v4.v5.rel_pstop student), label scores v5_traj -> labels/<split>/v5_<RUN>
+  v4.v5.rel_pstop student; + det_traj / det_traj_cls, its futures, for a v4.v5.rel_modes cv+fut student), label scores v5_traj -> labels/<split>/v5_<RUN>
   (K = 1), infer_check replays CKE2E2.infer's v5 branch (score_set with the student's relation rows, refine_drafts of
   the DUMPED src: v5_traj / v5_mu within tol; the replayed select96 pick's agreement with src is recorded, not
   required), and eval reports tau1 vs the pool pick it was computed from (eval_ck2 'v5', paired bootstrap).  A student
@@ -134,6 +134,7 @@ V5_SPECS = {"v5_traj": ((1, 8, 3), np.float32, np.nan), "v5_src": ((), np.int16,
 PRED_TO_V5 = {"ck2_v5_traj": "v5_traj", "ck2_v5_src": "v5_src", "ck2_v5_mu": "v5_mu"}
 V5_DET_KEYS = ("det_code", "det_cls", "det_hidden")     # check_bev.npz: the final det layer of the check rows
 V5_DET_STOP_KEY = "det_stop"                             # + its V1c stop logits when the student reads p_stop (rel_pstop)
+V5_FUT_KEYS = ("det_traj", "det_traj_cls")              # + its futures when the relation reads them (rel_modes cv+fut)
 
 
 def log(msg: str) -> None:
@@ -294,7 +295,10 @@ def extract_ck_v43(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, A
         raise SystemExit(f"{ckpt}: no '{E1.STUDENT_PREFIX}*' keys (not a ck_e2e checkpoint)")
     ck_cfg = dict(ck_cfg or {})
     seed = int(ck_cfg.get("seed", 0) or 0)
-    c = CKE2E2Config.from_any({"v4": dict(ck_cfg.get("v4") or {})})
+    # + the run's variants block: a v4.v5.top_feats 'v2' student's Delta r probes follow its s_on_frac / compute dtype
+    # (V5Cfg.probe_*; the other networks do not read it)
+    c = CKE2E2Config.from_any({"v4": dict(ck_cfg.get("v4") or {}),
+                               **({"variants": dict(ck_cfg["variants"])} if ck_cfg.get("variants") else {})})
     v4, cv, v5 = c.v4_net(), int(c.v4["corridor_version"]), c.v5_net()
     # refiner v5 student (ck_e2e2.v4.v5 block, = online2.build_student_ck2): its relation / corrector modules (off: the
     # v4_3 call unchanged)
@@ -328,8 +332,12 @@ def extract_ck2(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, Any]
     from navsim.agents.para_ssr.ck.online2 import V4_NET_OPT_KEYS
     if not ck_cfg or not str(ck_cfg.get("enabled", "")).lower() in ("true", "1"):
         log(f"warning: training config has no enabled ck_e2e2 ({ck_cfg and ck_cfg.get('enabled')})")
+    # + the run's variants block: extract_ck_v43 builds a v4.v5.top_feats 'v2' student's Delta r probes with its
+    # s_on_frac / compute dtype (V5Cfg.probe_*, = training and the eval agent's build_student_ck2); E1.extract_ck
+    # ignores it
     sub = {"seed": int((ck_cfg or {}).get("seed", 0) or 0),
-           **({"v4": dict(ck_cfg["v4"])} if (ck_cfg or {}).get("v4") else {})}
+           **({"v4": dict(ck_cfg["v4"])} if (ck_cfg or {}).get("v4") else {}),
+           **({"variants": dict(ck_cfg["variants"])} if (ck_cfg or {}).get("variants") else {})}
     if any(k in (sub.get("v4") or {}) for k in V4_NET_OPT_KEYS):
         cfg = extract_ck_v43(ckpt, out_dir, run_name, sub)       # refiner v4_3 network keys (eval_e2e reads v4_2's)
     else:
@@ -545,6 +553,9 @@ def run_dump_shard(P: Paths, ckpt: Path, tdf, shard: int, nshard: int, batch_siz
                 if v5q["rel_pstop"]:                # + the V1c stop logits the rows' p_stop feature reads
                     chk_det.setdefault(V5_DET_STOP_KEY, []).append(
                         pr["all_stop_logits"][-1][:take].detach().float().cpu().numpy())
+                if v5q.get("rel_modes", "cv") == "cv+fut":   # + the futures the relation's modes m1..6 read
+                    for k, x in zip(V5_FUT_KEYS, (pr["traj_preds"], pr["traj_cls_preds"])):
+                        chk_det.setdefault(k, []).append(x[:take].detach().float().cpu().numpy())
             if len(chk_rows) >= min(N_CHECK_BEV, len(pos)):
                 tmp = chk_path.with_name(f".check_bev.tmp{os.getpid()}.npz")
                 with open(tmp, "wb") as f:
@@ -744,7 +755,8 @@ def _infer_check_v5(P: Paths, net, cfg: Dict[str, Any], z, rows: np.ndarray, bev
         if not (v5q["enabled"] and v5q["relation"] != "off"):
             raise SystemExit(f"infer_check: {P.ck_run}/config.json ck_e2e2.v4.v5 ({v5q}) does not describe the net's "
                              f"relation channel ({net.v5.relation!r}); rerun --stage extract")
-        need = V5_DET_KEYS + ((V5_DET_STOP_KEY,) if v5q["rel_pstop"] else ())
+        fut = v5q.get("rel_modes", "cv") == "cv+fut"
+        need = V5_DET_KEYS + ((V5_DET_STOP_KEY,) if v5q["rel_pstop"] else ()) + (V5_FUT_KEYS if fut else ())
         miss = [k for k in need if k not in z.files]
         if miss:
             raise SystemExit(f"infer_check: {P.infer / 'check_bev.npz'} has no {miss} (the det inputs of the check rows "
@@ -753,6 +765,8 @@ def _infer_check_v5(P: Paths, net, cfg: Dict[str, Any], z, rows: np.ndarray, bev
         det_in = {"all_bbox_preds": [f("det_code")], "all_cls_scores": [f("det_cls")], "det_hidden": f("det_hidden")}
         if v5q["rel_pstop"]:
             det_in["all_stop_logits"] = [f(V5_DET_STOP_KEY)]
+        if fut:
+            det_in["traj_preds"], det_in["traj_cls_preds"] = f("det_traj"), f("det_traj_cls")
         kw["rel_objs"] = student_rel_rows(det_in, v5q)
     corr5 = getattr(net, "corrector_v5", None) is not None
     o = net.score_set(feat, mem, ego, cand, par, pref=pref, return_ctx=corr5, **kw)

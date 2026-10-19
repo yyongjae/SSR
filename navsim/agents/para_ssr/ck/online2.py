@@ -234,16 +234,57 @@ def _d_v5() -> Dict[str, Any]:
     # Stage 2 (report 97 §2-7 / §4; report 99 N3 / N4): rel_det_grad = design V2 (the student rows keep the det head's
     # position / velocity graph: the relation losses reach the box regression); record_tau1 = the on-policy record
     # carries tau1 of the deployment rule's pick over the step's KD columns (exploration sample u = mu + sigma eps of the
-    # corrector's Gaussian; edit block slot 0, labelled by labeler2 with the 96) -> the next generations' critic BCE has
-    # the tau1 column (L_label tau1 / L_edit-Bernoulli) and lambda_awr * AWR of A_S on credit A = PDMS(tau1) -
-    # PDMS(tau0) (official labels, one-generation delay, CKE2E2._awr_v5).
+    # corrector's Gaussian; edit block slot 0, labelled by labeler2 with the 96) -> the next generations' critic score
+    # BCE has the labelled tau1 column (L_label tau1: the critic's own score BCE on that column -- NOT the design's
+    # per-object L_edit-Bernoulli BCE(r_i(tau1), y_i(tau1)) of §3.7 item 3, a separate relation term on the tau1
+    # re-read) and lambda_awr * AWR of A_S on credit A = PDMS(tau1) - PDMS(tau0) (official labels, one-generation
+    # delay, CKE2E2._awr_v5).
     # rel_pstop = design §3.3's p_stop_i in the reliability MLP a_i: sigmoid of the det head's V1c stop logit of each row
     # (V5Cfg.rel_pstop; needs agent.config.det_stop_branch, refused otherwise; the ACC head's p_stop2s is an aux target
     # only, report 97 §1).
+    # 'rel' group (design §3.2 / §3.7 / §3.9; all off by default = the student above exactly):
+    #   rel_modes 'cv+fut' = the det head's own futures (traj_preds / traj_cls_preds, detached) as relation modes m1..6
+    #     with a learned CV prior (V5Cfg.rel_modes; inference needs agent.config.expose_det_outputs, which exposes them);
+    #     'cv+fut+ca' (m7) is conditional on PT-11 / PT-B3 and refused;
+    #   top_feats 'v2' = the corrector's top-3 object features + station / side / key + Delta r of the probes a-0.5 /
+    #     l-0.5 / l+0.5 of the draft (V5Cfg.top_feats; probes with this run's variants s_on_frac / compute_dtype);
+    #   lambda_rel = L_rel, per-object BCE(r_ij^k, y_ijk) of the student rows matched one-to-one to the GT tracks at t0
+    #     (2 m Hungarian, refine_loss.match_t0; ghost rows y = 0, unmatched rows near a GT masked) on the KD set's first
+    #     rel_max_parents unique parents + their siblings; lambda_rel_cv = the same against the GT t0 state at constant
+    #     velocity (L_rel,cv; its gap to L_rel = v5/rel_beyond_cv; needs lambda_rel > 0); design §3.9 puts both in
+    #     lambda_rel (L_rel + 0.5 L_rel,cv + L_a + L_H) -- the separate weights here are the chosen values;
+    #   rel_det_grad_matched (needs rel_det_grad) = design V2 'matched boxes only': the box code's position / velocity
+    #     keep their graph only on rows matched to a GT track at t0 (the same match); ghost / duplicate rows are
+    #     detached for every relation consumer (L_H, L_refine via Z, Z-KD, L_rel, AWR).  Training only.
+    # 'zkd' group (design §2.1 L82 / §3.7 item 3 / §3.8; main-session decisions D1 / D2 / D6-D8, 2026-10-20; all off by
+    # default = the student above exactly):
+    #   z_adapt = the student Z adapters P_det / P_map (V5Cfg.z_adapt, ck/v5/zadapt.py): the corrector A_S reads the
+    #     per-state reads in the teachers' normalised units Z~ = (Z - mu_T) / sigma_T (frozen per-channel statistics of
+    #     the teacher readers on navtrain: z_stats_det = the DET teacher's record (b_nc, b_ttc, H_nc, H_ttc), z_stats_map
+    #     = the MAP teacher's (d_min) of tools/ck/v5/fit_z_stats.py; BOTH required whenever z_adapt is on -- d_min is
+    #     normalised in arm B too; each record must belong to teacher_det_run / teacher_map_run at teacher_which, ckpt
+    #     sha16 checked when the student is built; a checkpoint carries the buffers) + per-channel affine + one MLP
+    #     (identity at init).  With z_kd the Z-KD runs in the same units: SmoothL1(P(Z_S), sg(Z~_T)) (lambda_zkd_det /
+    #     _map unchanged, D7; per-channel magnitudes v5/zkd_<ch>, and the old raw-unit values v5/zkd_raw_det / _map for
+    #     the scale);
+    #   lambda_edit = L_edit-Bernoulli (design §3.7 item 3): tau1 of the corrector's edited KD parents is re-read by the
+    #     SAME relation reader (CKNet.relation_reread on X1 = LQR(tau1), detached tau1: it trains the reader -- eps, the
+    #     CV prior, the reliability, the matched rows' boxes under rel_det_grad -- never the corrector, whose credit is
+    #     L_refine / AWR) and per-object BCE(r_i(tau1), y_i(tau1)) against the matched GT track (the step's one-to-one
+    #     2 m Hungarian at t0, refine_loss.match_t0; true ghosts (no GT observed at t0 within 2 m, any class) y = 0,
+    #     an unmatched row within 2 m of one (another row won it, its class differs, ...) is MASKED, D8; y read at the
+    #     reader's own strided states, t <= 4 s + delta <= 0.9 s).  Student only.
+    # NOT implemented (design items outside the student's training, or conditional; main-session decision D9): the
+    # student m7 CA mode (PT-11 / PT-B3), teacher L_rel flags, the teacher adapter flag (a''; A_T was trained without
+    # adapters and a teacher's own mu_T / sigma_T exist only after it is trained), the Delta r aux target (b'), the tau1
+    # explanation re-read at inference (b''), A_GT (c) and A_S Stage-1b (c') (gate inputs / GPU runs).
     return {"enabled": False, "relation": "off", "n_obj": 96, "score_thr": 0.3, "unknown_ev": False,
             "corrector": False, "z_stride": 2, "lambda_ref": 1.0, "ref_w": "", "ref_cols": 16, "lambda_rel_a": 0.2,
             "lambda_rel_h": 0.5, "rel_h_cols": 16, "z_kd": False, "lambda_zkd_det": 0.5, "lambda_zkd_map": 0.5,
-            "infer_refine": True, "rel_det_grad": False, "record_tau1": False, "lambda_awr": 0.1, "rel_pstop": False}
+            "infer_refine": True, "rel_det_grad": False, "record_tau1": False, "lambda_awr": 0.1, "rel_pstop": False,
+            "rel_modes": "cv", "top_feats": "v1", "lambda_rel": 0.0, "lambda_rel_cv": 0.0, "rel_max_parents": 8,
+            "rel_det_grad_matched": False, "z_adapt": False, "z_stats_det": "", "z_stats_map": "",
+            "lambda_edit": 0.0}
 
 
 def _d_rg_gt_aux() -> Dict[str, Any]:
@@ -501,8 +542,51 @@ class CKE2E2Config:
                              "z_kd": _b(vq["z_kd"]), "lambda_zkd_det": float(vq["lambda_zkd_det"]),
                              "lambda_zkd_map": float(vq["lambda_zkd_map"]), "infer_refine": _b(vq["infer_refine"]),
                              "rel_det_grad": _b(vq["rel_det_grad"]), "record_tau1": _b(vq["record_tau1"]),
-                             "lambda_awr": float(vq["lambda_awr"]), "rel_pstop": _b(vq["rel_pstop"])}
+                             "lambda_awr": float(vq["lambda_awr"]), "rel_pstop": _b(vq["rel_pstop"]),
+                             "rel_modes": str(vq["rel_modes"]), "top_feats": str(vq["top_feats"]),
+                             "lambda_rel": float(vq["lambda_rel"]), "lambda_rel_cv": float(vq["lambda_rel_cv"]),
+                             "rel_max_parents": int(vq["rel_max_parents"]),
+                             "rel_det_grad_matched": _b(vq["rel_det_grad_matched"]), "z_adapt": _b(vq["z_adapt"]),
+                             "z_stats_det": "" if vq["z_stats_det"] in (None, False) else str(vq["z_stats_det"]),
+                             "z_stats_map": "" if vq["z_stats_map"] in (None, False) else str(vq["z_stats_map"]),
+                             "lambda_edit": float(vq["lambda_edit"])}
             v5q = self.v4["v5"]
+            if v5q["z_adapt"]:
+                if not (v5q["enabled"] and v5q["corrector"]):
+                    raise ValueError("ck_e2e2.v4.v5.z_adapt adapts the corrector's input: needs v5.enabled and "
+                                     "v5.corrector")
+                for t in ("det", "map"):                   # BOTH: d_min is normalised in arm B too (D6)
+                    pz = v5q[f"z_stats_{t}"]
+                    if not pz or not os.path.isabs(pz) or "=" in pz:
+                        raise ValueError(f"ck_e2e2.v4.v5.z_adapt needs z_stats_{t} = an absolute path without '=' (the "
+                                         f"{t.upper()} teacher's tools/ck/v5/fit_z_stats.py record), got {pz!r}")
+            if v5q["lambda_edit"] < 0:
+                raise ValueError("ck_e2e2.v4.v5.lambda_edit must be >= 0")
+            if v5q["lambda_edit"] > 0 and not (v5q["enabled"] and v5q["relation"] == "student" and v5q["corrector"]):
+                raise ValueError("ck_e2e2.v4.v5.lambda_edit (L_edit-Bernoulli: the relation re-read of the corrector's "
+                                 "tau1) needs v5.enabled, v5.relation student and v5.corrector")
+            if v5q["rel_modes"] == "cv+fut+ca":
+                raise ValueError("ck_e2e2.v4.v5.rel_modes 'cv+fut+ca' (the student's m7 constant-acceleration mode) is "
+                                 "conditional on PT-11 / PT-B3 (design §3.2 / §3.3): not implemented")
+            if v5q["rel_modes"] not in ("cv", "cv+fut"):
+                raise ValueError(f"ck_e2e2.v4.v5.rel_modes {v5q['rel_modes']!r} not in ('cv', 'cv+fut')")
+            if v5q["rel_modes"] != "cv" and v5q["relation"] != "student":
+                raise ValueError("ck_e2e2.v4.v5.rel_modes 'cv+fut' needs v5.relation student")
+            if v5q["top_feats"] not in ("v1", "v2"):
+                raise ValueError(f"ck_e2e2.v4.v5.top_feats {v5q['top_feats']!r} not in ('v1', 'v2')")
+            if v5q["top_feats"] != "v1" and not (v5q["relation"] == "student" and v5q["corrector"]):
+                raise ValueError("ck_e2e2.v4.v5.top_feats 'v2' needs v5.relation student and v5.corrector")
+            if v5q["lambda_rel"] < 0 or v5q["lambda_rel_cv"] < 0:
+                raise ValueError("ck_e2e2.v4.v5.lambda_rel / lambda_rel_cv must be >= 0")
+            if v5q["lambda_rel"] > 0 and v5q["relation"] != "student":
+                raise ValueError("ck_e2e2.v4.v5.lambda_rel needs v5.relation student")
+            if v5q["lambda_rel_cv"] > 0 and not v5q["lambda_rel"] > 0:
+                raise ValueError("ck_e2e2.v4.v5.lambda_rel_cv > 0 needs lambda_rel > 0 (its gap to L_rel is the "
+                                 "reported beyond-CV share)")
+            if v5q["rel_max_parents"] < 1:
+                raise ValueError("ck_e2e2.v4.v5.rel_max_parents must be >= 1")
+            if v5q["rel_det_grad_matched"] and not v5q["rel_det_grad"]:
+                raise ValueError("ck_e2e2.v4.v5.rel_det_grad_matched needs v5.rel_det_grad")
             if v5q["rel_pstop"] and v5q["relation"] != "student":
                 raise ValueError("ck_e2e2.v4.v5.rel_pstop needs v5.relation student")
             if v5q["record_tau1"] and not (v5q["enabled"] and v5q["corrector"]):
@@ -559,9 +643,17 @@ class CKE2E2Config:
         q = self.v5
         if not q["enabled"]:
             return V5Cfg()
+        kw = {}
+        if q.get("rel_modes", "cv") != "cv":            # 'rel' group keys only when on (V5Cfg defaults otherwise)
+            kw["rel_modes"] = str(q["rel_modes"])
+        if q.get("top_feats", "v1") != "v1":            # + the Delta r probes' variant rule of this run
+            kw.update(top_feats=str(q["top_feats"]), probe_s_on_frac=float(self.variants["s_on_frac"]),
+                      probe_dtype=str(self.variants["compute_dtype"]))
+        if q.get("z_adapt", False):                     # 'zkd' group: the Z adapters (statistics: build_student_ck2)
+            kw["z_adapt"] = True
         return V5Cfg(relation="student" if q["relation"] != "off" else "off", n_obj=q["n_obj"], rel_ca=False,
                      unknown_ev=q["unknown_ev"], corrector=q["corrector"], z_stride=q["z_stride"],
-                     rel_pstop=bool(q["rel_pstop"]))
+                     rel_pstop=bool(q["rel_pstop"]), **kw)
 
     def v4_net(self):
         """V4Cfg of the student network (ck/v4/config.py; the v4 block's network keys + the optional v4_3 ones given)."""
@@ -800,8 +892,36 @@ def build_student_ck2(cfg: CKE2E2Config, apply_prior: bool = True):
         if prior is not None:
             net.set_score_prior(prior)
             rep["score_prior"] = [float(v) for v in prior]
+    if apply_prior and getattr(net, "z_adapter", None) is not None:
+        rep["z_stats"] = set_student_z_stats(net, cfg)   # a checkpoint load (apply_prior False) carries the buffers
     net.init_report = rep
     return net
+
+
+def set_student_z_stats(net, cfg: CKE2E2Config) -> Dict[str, Any]:
+    """refiner v5 'zkd' group (ck_e2e2.v4.v5.z_adapt): the frozen teacher statistics of the student's Z adapters from
+    the fit_z_stats records z_stats_det / z_stats_map, each checked against its teacher (run dir, teacher_which, the
+    checkpoint's sha16, arm, the student's z_stride; unfinished records refused: zadapt.check_z_stats) -> record
+    {det / map: {path, sha16, n_tokens, dry_run}, channels: {name: (mu, sd)}} (init_report 'z_stats')."""
+    from .model import _sha16
+    from .v5 import zadapt as ZA
+    q = cfg.v5
+    recs, out = {}, {}
+    for t, arm, run in (("det", "T", cfg.teacher_det_run), ("map", "M", cfg.teacher_map_run)):
+        try:
+            rec, info = ZA.load_z_stats(q[f"z_stats_{t}"])
+            ck = ZA.teacher_ckpt(run, cfg.teacher_which)
+            if not ck.is_file():
+                raise FileNotFoundError(f"teacher {t} checkpoint {ck} missing (the z-stats record is tied to it)")
+            ZA.check_z_stats(rec, arm, run=run, which=cfg.teacher_which, ckpt_sha16=_sha16(ck),
+                             z_stride=int(q["z_stride"]), where=f"ck_e2e2.v4.v5.z_stats_{t}")
+        except (ValueError, FileNotFoundError) as e:
+            raise ValueError(f"ck_e2e2.v4.v5.z_adapt: {e}") from None
+        recs[t] = rec
+        out[t] = dict(info, n_tokens=(rec.get("data") or {}).get("n_tokens"), dry_run=bool(rec.get("dry_run", True)),
+                      ckpt_sha16=rec.get("ckpt_sha16"))
+    out["channels"] = {k: list(v) for k, v in net.z_adapter.set_stats(recs["det"], recs["map"]).items()}
+    return out
 
 
 # ----------------------------------------------------------------------------------------------- decode / variants
@@ -1334,11 +1454,45 @@ def student_rel_rows(predictions: Dict, v5: Dict[str, Any]) -> Optional[Dict[str
             raise KeyError("ck_e2e2.v4.v5.rel_pstop needs agent.config.det_stop_branch=true (predictions lack "
                            "all_stop_logits)")
         kw["stop_logit"] = predictions["all_stop_logits"][-1].detach()
+    if v5.get("rel_modes", "cv") == "cv+fut":      # design §3.2 modes m1..6: the det head's own futures (detached)
+        miss = [k for k in ("traj_preds", "traj_cls_preds") if k not in predictions]
+        if miss:
+            raise KeyError(f"ck_e2e2.v4.v5.rel_modes cv+fut: predictions lack {miss} (inference needs "
+                           f"agent.config.expose_det_outputs=true)")
+        kw.update(traj=predictions["traj_preds"].detach(), traj_cls=predictions["traj_cls_preds"].detach())
     code = predictions["all_bbox_preds"][-1]
     if not v5.get("rel_det_grad", False):         # design V2 off: the det head is trained by its own GT losses only
         code = code.detach()
     return student_object_rows(code, predictions["all_cls_scores"][-1].detach(), predictions["det_hidden"].detach(),
                                int(v5["n_obj"]), float(v5["score_thr"]), **kw)
+
+
+def v5_needs_match(v5: Dict[str, Any]) -> bool:
+    """the student rows' t0 GT match is needed this step (matched-only det gradient, L_rel / L_rel,cv,
+    L_edit-Bernoulli)."""
+    return bool(v5.get("enabled") and v5.get("relation", "off") != "off" and (
+        (v5.get("rel_det_grad") and v5.get("rel_det_grad_matched")) or v5.get("lambda_rel", 0.0) > 0
+        or v5.get("lambda_rel_cv", 0.0) > 0 or v5.get("lambda_edit", 0.0) > 0))
+
+
+@torch.no_grad()
+def student_rel_match(rel_rows: Dict[str, torch.Tensor], targets, dev) -> torch.Tensor:
+    """refine_loss.match_t0 of the student rows (one-to-one 2 m Hungarian against the batch's GT tracks at t0, ref_*
+    = targets only) on the tokens with GT (ref_gt_ok) -> [B, N] int64: the matched track (gt_of order), G_GHOST (-1;
+    also every row of a token without GT) or G_DUP (-2)."""
+    from .v5 import refine_loss as RL
+    B, N = rel_rows["valid"].shape
+    g = torch.full((B, N), RL.G_GHOST, dtype=torch.long, device=dev)
+    tg = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in (targets or {}).items() if k.startswith("ref_")}
+    if "ref_gt_ok" not in tg:
+        return g
+    idx = torch.nonzero(tg["ref_gt_ok"].reshape(-1).bool(), as_tuple=True)[0]
+    if not idx.numel():
+        return g
+    gt = RL.gt_of(tg, idx)
+    g[idx] = RL.match_t0(rel_rows["c0"][idx].detach().to(dev), rel_rows["valid"][idx].to(dev),
+                         rel_rows["group"][idx].to(dev) < 2, gt)
+    return g
 
 
 def refine_cols_parents(vtype: torch.Tensor, n: int) -> torch.Tensor:
@@ -2134,11 +2288,13 @@ class CKE2E2:
         return inner
 
     def _v5_terms(self, inner: torch.Tensor, out: Dict, S: Dict, logs: Dict[str, float], targets, student, T: Dict,
-                  rel_rows: Optional[Dict[str, torch.Tensor]], ego, r: float) -> torch.Tensor:
+                  rel_rows: Optional[Dict[str, torch.Tensor]], ego, r: float,
+                  rel_match: Optional[torch.Tensor] = None) -> torch.Tensor:
         """refiner v5 student terms (ck_e2e2.v4.v5; off -> unchanged): reliability BCE of the student rows against the
-        GT t0 objects, per-state hazard BCE against the GT executed blocks, L_refine(X1) of the corrector A_S on the KD
-        set's parent columns, Z-KD of the per-state reads to the v5 teachers (ramped by r).  GT (ref_*) = targets only.
-        Logs v5/*."""
+        GT t0 objects, per-state hazard BCE against the GT executed blocks, per-object L_rel / L_rel,cv against the
+        matched GT tracks (rel_match = student_rel_match of the step, recomputed when None), L_refine(X1) of the
+        corrector A_S on the KD set's parent columns, Z-KD of the per-state reads to the v5 teachers (ramped by r).
+        GT (ref_*) = targets only.  Logs v5/*."""
         import torch.nn.functional as F
         from ..refiner import gt_future as GF
         from .v4 import lqr as LQR
@@ -2181,6 +2337,8 @@ class CKE2E2:
                 l_h = (F.binary_cross_entropy(H, yb, reduction="none") * mk).sum() / mk.sum().clamp(min=1.0)
                 inner = inner + q["lambda_rel_h"] * l_h
                 logs.update({"v5/rel_h_bce": _f(l_h), "v5/rel_h_pos": float((yb * mk).sum() / mk.sum().clamp(min=1.0))})
+            if (q.get("lambda_rel", 0.0) > 0 or q.get("lambda_rel_cv", 0.0) > 0) and "rel_r_nc" in hk:
+                inner = self._v5_rel_terms(inner, hk, rel_rows, rel_match, idx, gt, tz, zs, logs)
         if getattr(student, "corrector_v5", None) is not None and "ctx_all" in out:
             cols = refine_cols_parents(S["vtype_kd"].to(dev), q["ref_cols"])
             o_like = {"ctx": out["ctx_all"][:, :K], "score_logit": out["score_logit"], "haz": hk, "w_lat": out["w_lat"]}
@@ -2197,6 +2355,9 @@ class CKE2E2:
                 logs["v5/ref_loss"] = _f(l_ref)
             if q["record_tau1"] and q["lambda_awr"] > 0 and S.get("E") is not None:
                 inner = inner + q["lambda_awr"] * self._awr_v5(student, out, S, logs, rel_rows)
+            if n and q.get("lambda_edit", 0.0) > 0 and rel_rows is not None and getattr(student, "relation",
+                                                                                         None) is not None:
+                inner = self._v5_edit_terms(inner, student, rf, rel_rows, rel_match, idx, gt, ego, S, cols, tz, logs)
         if q["z_kd"] and "zq_det" in T and "zq_map" in T:
             zs_ = hk["zq"].float()
             zd, zm = T["zq_det"].float().to(dev), T["zq_map"].float().to(dev)
@@ -2204,14 +2365,126 @@ class CKE2E2:
             unk_s = zs_[..., 3] > 0.5
             ch = [0, 1] + ([4, 5] if zs_.shape[-1] >= 6 and zd.shape[-1] >= 6 else [])
             md = (kd_ok[..., None] & ~unk_s & ~(zd[..., 3] > 0.5)).float()
-            l_zd = (F.smooth_l1_loss(zs_[..., ch], zd[..., ch].detach(), reduction="none").mean(-1) * md).sum() \
-                / md.sum().clamp(min=1.0)
             mm = (kd_ok[..., None] & ~unk_s & ~(zm[..., 3] > 0.5)).float()
-            l_zm = (F.smooth_l1_loss(zs_[..., 2], zm[..., 2].detach(), reduction="none") * mm).sum() \
-                / mm.sum().clamp(min=1.0)
+            za = getattr(student, "z_adapter", None)
+            if za is not None:          # 'zkd' group: teacher-normalised units (design §3.8 L212); raw values logged
+                with torch.no_grad():
+                    raw_d = (F.smooth_l1_loss(zs_[..., ch], zd[..., ch], reduction="none").mean(-1) * md).sum() \
+                        / md.sum().clamp(min=1.0)
+                    raw_m = (F.smooth_l1_loss(zs_[..., 2], zm[..., 2], reduction="none") * mm).sum() \
+                        / mm.sum().clamp(min=1.0)
+                zs_, zd, zm = za(zs_), za.normalise(zd), za.normalise(zm)
+            h_d = F.smooth_l1_loss(zs_[..., ch], zd[..., ch].detach(), reduction="none")
+            l_zd = (h_d.mean(-1) * md).sum() / md.sum().clamp(min=1.0)
+            h_m = F.smooth_l1_loss(zs_[..., 2], zm[..., 2].detach(), reduction="none")
+            l_zm = (h_m * mm).sum() / mm.sum().clamp(min=1.0)
             inner = inner + r * (q["lambda_zkd_det"] * l_zd + q["lambda_zkd_map"] * l_zm)
             logs.update({"v5/zkd_det": _f(l_zd), "v5/zkd_map": _f(l_zm), "v5/zkd_det_frac": float(md.mean()),
                          "v5/zkd_map_frac": float(mm.mean())})
+            if za is not None:          # per-channel magnitudes (the scale of each channel's KD, D7)
+                from .v5.zadapt import Z_CHANNELS
+                with torch.no_grad():
+                    nd = md.sum().clamp(min=1.0)
+                    for j, c in enumerate(ch):
+                        logs[f"v5/zkd_{Z_CHANNELS[c]}"] = float((h_d[..., j] * md).sum() / nd)
+                    logs["v5/zkd_d_min"] = _f(l_zm)
+                logs.update({"v5/zkd_raw_det": _f(raw_d), "v5/zkd_raw_map": _f(raw_m)})
+        if getattr(student, "z_adapter", None) is not None:
+            za = student.z_adapter
+            with torch.no_grad():
+                gd = [p for p in (za.p_det, za.p_map) if p is not None]
+                logs["v5/zadapt_gamma_dev"] = float(max(float((p.gamma - 1).abs().max()) for p in gd))
+                logs["v5/zadapt_beta_abs"] = float(max(float(p.beta.abs().max()) for p in gd))
+                logs["v5/zadapt_mlp_abs"] = float(max(float(p.mlp[-1].weight.abs().max()) for p in gd))
+        return inner
+
+    def _v5_edit_terms(self, inner: torch.Tensor, student, rf: Dict, rel_rows: Dict[str, torch.Tensor],
+                       rel_match: Optional[torch.Tensor], idx: torch.Tensor, gt: Dict, ego, S: Dict,
+                       cols: torch.Tensor, tz: torch.Tensor, logs: Dict[str, float]) -> torch.Tensor:
+        """refiner v5 L_edit-Bernoulli (design §3.7 item 3; _d_v5 'zkd' group): tau1 of the corrector's edited KD
+        columns cols (refine_drafts rf) of the GT-ok tokens idx, DETACHED, re-read by the same relation reader on the
+        same token rows (CKNet.relation_reread with its graph: X1 = LQR(tau1), the reader's strided states) -> per-object
+        BCE(r_i^k(tau1), y_i^k(tau1)) (k = NC, TTC) against the matched GT track (rel_match = the step's one-to-one 2 m
+        Hungarian at t0; refine_loss.rel_object_targets / rel_object_mask: true ghosts y = 0, duplicate rows masked, the
+        horizon censored as L_rel); columns with a non-finite tau1 or a KD-invalid draft are masked."""
+        from .v5 import refine_loss as RL
+        q = self.cfg.v5
+        dev = rf["tau1"].device
+        O = {k: v[idx] for k, v in rel_rows.items()}
+        g = (rel_match.to(dev)[idx] if rel_match is not None
+             else RL.match_t0(O["c0"].detach(), O["valid"], O["group"] < 2, gt))
+        tau1 = rf["tau1"][idx].detach().float()                                         # [n, R, 8, 3]
+        n, R = tau1.shape[:2]
+        fin = torch.isfinite(tau1).flatten(2).all(-1)                                   # [n, R]
+        tau1 = torch.where(fin[..., None, None], tau1, torch.zeros_like(tau1))
+        colm = fin
+        if S.get("cand_ok") is not None:
+            colm = colm & torch.gather(S["cand_ok"].to(dev).bool(), 1, cols.to(dev).long())[idx]
+        rr = student.relation_reread(O, tau1, tuple(e[idx] for e in ego), grad=True)
+        st = rr["states"].reshape(n, R, *rr["states"].shape[1:])
+        y, known = RL.rel_object_targets(st, tz, gt, g)
+        mk = RL.rel_object_mask(O["valid"], g, known, y, colm)
+        l_edit = RL.rel_object_bce(rr["r_nc"], rr["r_ttc"], y, mk)
+        inner = inner + q["lambda_edit"] * l_edit
+        with torch.no_grad():
+            mf = mk.float()
+            nm = mf.sum().clamp(min=1.0)
+            vr = O["valid"].bool()
+            nv = max(float(vr.sum()), 1.0)
+            rr_ = torch.stack([rr["r_nc"], rr["r_ttc"]], -1).float()
+            logs.update({"v5/edit_bce": _f(l_edit), "v5/edit_pos": float((y * mf).sum() / nm),
+                         "v5/edit_n_pairs": float(mf.sum()), "v5/edit_cols": float(colm.sum()) / max(n, 1),
+                         "v5/edit_r_mean": float((rr_ * mf).sum() / nm),
+                         "v5/edit_match_frac": float(((g >= 0) & vr).sum()) / nv,
+                         "v5/edit_dup_masked": float(((g == RL.G_DUP) & vr).sum()) / max(n, 1)})
+        return inner
+
+    def _v5_rel_terms(self, inner: torch.Tensor, hk: Dict, rel_rows: Dict[str, torch.Tensor],
+                      rel_match: Optional[torch.Tensor], idx: torch.Tensor, gt: Dict, tz: torch.Tensor, zs: int,
+                      logs: Dict[str, float]) -> torch.Tensor:
+        """refiner v5 L_rel / L_rel,cv (design §3.9; _d_v5): per-object BCE(r_ij^k, y_ijk) of the GT-ok tokens idx on
+        the KD set's first rel_max_parents unique parents + their siblings (refine_loss.parent_sibling_cols), y from the
+        matched GT track (L_rel) / its t0 state at constant velocity (L_rel,cv, the SAME mask) at the reader's strided
+        executed states; ghost rows y = 0, duplicate rows masked (refine_loss.rel_object_mask)."""
+        from .v5 import refine_loss as RL
+        q = self.cfg.v5
+        dev = hk["rel_r_nc"].device
+        O = {k: v[idx] for k, v in rel_rows.items()}
+        g = (rel_match.to(dev)[idx] if rel_match is not None
+             else RL.match_t0(O["c0"].detach(), O["valid"], O["group"] < 2, gt))
+        cols = RL.parent_sibling_cols(hk["parent_index"][idx], hk["is_self"][idx], int(q["rel_max_parents"]))
+        n, K = cols.shape
+        Kc = max(1, int(cols.sum(1).max()))
+        order = torch.argsort((~cols).to(torch.int8), dim=1, stable=True)[:, :Kc]      # the read columns first
+        gk = lambda a: torch.gather(a, 1, order.reshape(n, Kc, *([1] * (a.dim() - 2))).expand(n, Kc, *a.shape[2:]))  # noqa
+        cc = gk(cols)
+        stz = gk(hk["exec_states"][idx][:, :, ::zs])
+        r_nc, r_tt = gk(hk["rel_r_nc"][idx]), gk(hk["rel_r_ttc"][idx])
+        y, known = RL.rel_object_targets(stz, tz, gt, g)
+        y_cv, _ = RL.rel_object_targets(stz, tz, gt, g, motion="cv")
+        mk = RL.rel_object_mask(O["valid"], g, known, y, cc)
+        l_rel = RL.rel_object_bce(r_nc, r_tt, y, mk)
+        l_cv = RL.rel_object_bce(r_nc, r_tt, y_cv, mk)
+        if q["lambda_rel"] > 0:
+            inner = inner + q["lambda_rel"] * l_rel
+        if q["lambda_rel_cv"] > 0:
+            inner = inner + q["lambda_rel_cv"] * l_cv
+        with torch.no_grad():
+            mf = mk.float()
+            nm = mf.sum().clamp(min=1.0)
+            vr = O["valid"].bool()
+            nv = max(float(vr.sum()), 1.0)
+            ghost = (g == RL.G_GHOST)[:, None, :, None] & mk
+            rr = torch.stack([r_nc, r_tt], -1).float()
+            logs.update({"v5/rel_bce": _f(l_rel), "v5/rel_cv_bce": _f(l_cv),
+                         "v5/rel_beyond_cv": _f(l_cv) - _f(l_rel),
+                         "v5/rel_cv_disagree": float(((y != y_cv).float() * mf).sum() / nm),
+                         "v5/rel_pos": float((y * mf).sum() / nm), "v5/rel_n_pairs": float(mf.sum()),
+                         "v5/rel_match_frac": float(((g >= 0) & vr).sum()) / nv,
+                         "v5/rel_ghost_frac": float(((g == RL.G_GHOST) & vr).sum()) / nv,
+                         "v5/rel_dup_frac": float(((g == RL.G_DUP) & vr).sum()) / nv,
+                         "v5/rel_cols": float(cc.sum()) / max(n, 1),
+                         "v5/rel_r_ghost": float((rr * ghost.float()).sum() / ghost.float().sum().clamp(min=1.0))})
         return inner
 
     def _rg_gt_aux(self, haz: Dict[str, torch.Tensor], S: Dict, targets, student
@@ -2439,6 +2712,15 @@ class CKE2E2:
         if v5c["enabled"] and v5c["z_kd"]:              # refiner v5 Z-KD: the teachers' per-state reads
             tkw["zq"] = True
         rel_rows = student_rel_rows(predictions, v5c)    # refiner v5 student relation rows (None when off)
+        rel_match = None
+        if rel_rows is not None and v5_needs_match(v5c):  # the rows' t0 GT match (D3 graph, L_rel targets)
+            from .v5.student_objects import rows_keep_graph
+            rel_match = student_rel_match(rel_rows, targets, dev)
+            if v5c["rel_det_grad"] and v5c["rel_det_grad_matched"]:   # design V2: matched boxes only
+                keep = (rel_match >= 0) & rel_rows["valid"].to(dev)
+                rel_rows = rows_keep_graph(rel_rows, keep)
+                logs["v5/rel_grad_rows"] = float(keep.sum()) / max(B, 1)
+                logs["v5/rel_grad_frac"] = float(keep.sum()) / max(float(rel_rows["valid"].sum()), 1.0)
         T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
                    cand_ok=S["cand_ok"], parents=S.get("cand_parent"), family=S.get("vtype_kd"), **tkw)
         t_teacher = time.time() - tt
@@ -2531,14 +2813,14 @@ class CKE2E2:
             w = float(self.ema.weight(self.mb))
         inner = inner + (r * w) * l_lat
         inner = self._v4_terms(inner, out, S, logs, targets, student, s_lab)
-        inner = self._v5_terms(inner, out, S, logs, targets, student, T, rel_rows, ego, r)
+        inner = self._v5_terms(inner, out, S, logs, targets, student, T, rel_rows, ego, r, rel_match=rel_match)
         loss = c.loss_weight * inner
         loss = loss + 0.0 * (out["score_all"].sum() + out["w_lat_all"].sum())
         if out.get("pref_logp") is not None:
             loss = loss + 0.0 * out["pref_logp"].sum()
         if getattr(student, "corrector", None) is not None:      # in the DDP graph every step (AWR terms: _v4_terms)
             loss = loss + 0.0 * sum(p.sum() for p in student.corrector.parameters())
-        for mod_name in ("corrector_v5", "relation"):              # refiner v5 modules: in the DDP graph every step
+        for mod_name in ("corrector_v5", "relation", "z_adapter"):  # refiner v5 modules: in the DDP graph every step
             mod = getattr(student, mod_name, None)
             if mod is not None:
                 loss = loss + 0.0 * sum(p.sum() for p in mod.parameters())

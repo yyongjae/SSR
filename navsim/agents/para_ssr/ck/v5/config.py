@@ -25,6 +25,20 @@ rel_pstop   relation 'student' only: the reliability MLP a_i also reads p_stop_i
             det-head V1c stop_branch (design §3.3 a_i = sigma(MLP_a([det_hidden, score, class, range, p_stop])); the
             ACC head's p_stop2s is an aux target only, report 97 §1 (c)/(d)): one more feats column (N_FEAT_S + 1).
             Needs agent.config.det_stop_branch (online2 refuses it otherwise).
+rel_modes   relation 'student' only (design §3.2 modes): 'cv' = hold + constant velocity (+ CA from the past rows with
+            rel_ca, teacher); 'cv+fut' = + the det head's own futures m1..6 (traj_preds, pi = softmax(traj_cls) mixed with
+            a learned CV prior pi0 = sigmoid(cv_prior), init 0.5; ck/v5/relation.py); 'cv+fut+ca' (student m7 constant
+            acceleration) is NOT implemented -- conditional on PT-11 / PT-B3 (design §3.2 / §3.3), refused.
+top_feats   corrector top-3 object features (relation + corrector): 'v1' = [a r_nc, a r_ttc, x, y, vx, vy, t*] (7, the
+            teachers' A_T); 'v2' (design §3.7 A_S input) = + station s*, side, key (relation.py) + Delta r of the probes
+            a-0.5 / l-0.5 / l+0.5 of the draft (CKNet._v5_act; 13 per object).  The probes are the CK2 variant rule
+            (ck/variants.make_variants) with probe_s_on_frac / probe_dtype = the run's variants config (online2.v5_net).
+z_adapt     the student's Z adapters P_det / P_map (ck/v5/zadapt.py; design §2.1 L82, §3.8 L191): the corrector reads
+            the per-state reads in the TEACHERS' normalised units (frozen per-channel mu_T / sigma_T of the teacher
+            readers, buffers set from tools/ck/v5/fit_z_stats.py records) through a per-channel affine + one
+            z_adapt_hidden-wide MLP per half (zero-initialised: identity on the normalised reads at init); Z-KD runs in
+            the same units (online2._v5_terms).  Needs the corrector.  Off (default) = no module, no buffer.  The
+            teachers' A_T is trained without it (a teacher adapter flag is NOT implemented, main-session decision D9).
 Sizes: n_obj (t0 rows read, score order), rel_hidden (reliability MLP), corr_hidden / z_hidden (corrector).
 """
 from __future__ import annotations
@@ -39,7 +53,13 @@ N_Z_DENSE = 4            # per-state reads of the range fields: b_nc, b_ttc, d_m
 N_Z_REL = 2              # + relation hazard H_nc, H_ttc
 N_REL_EV = 4             # relation residual inputs
 N_TOP = 3                # top related objects fed to the corrector
-N_TOP_FEAT = 7           # a r_nc, a r_ttc, x / 32, y / 32, vx / 10, vy / 10, t* / 4
+N_TOP_FEAT = 7           # a r_nc, a r_ttc, x / 32, y / 32, vx / 10, vy / 10, t* / 4  (top_feats 'v1')
+N_TOP_FEAT_V2 = 13       # 'v2': + station / 32, side, key (relation) + Delta r of the 3 probes (corrector input)
+REL_MODES = ("cv", "cv+fut")
+TOP_FEATS = ("v1", "v2")
+# keys added after the running teachers were written: left out of to_dict() at their default, so a teacher's
+# config.json 'v5' stays as before (from_dict of an old dict gives the default anyway)
+_OMIT_AT_DEFAULT = ("rel_modes", "top_feats", "probe_s_on_frac", "probe_dtype", "z_adapt", "z_adapt_hidden")
 
 
 @dataclass(frozen=True)
@@ -56,6 +76,12 @@ class V5Cfg:
     z_stride: int = 2
     z_channels: str = "all"        # corrector input channels: 'all' | 'det' (no D) | 'map' (D + unknown only)
     rel_pstop: bool = False        # relation 'student': p_stop_i of the det head's stop_branch in the a_i features
+    rel_modes: str = "cv"          # relation 'student': 'cv' | 'cv+fut' (the det head's futures as modes m1..6)
+    top_feats: str = "v1"          # corrector top-3 features: 'v1' (7) | 'v2' (13: + station, side, key, Delta r)
+    probe_s_on_frac: float = 0.2   # top_feats 'v2' Delta r probes: the run's variants s_on_frac / compute dtype
+    probe_dtype: str = "float64"
+    z_adapt: bool = False          # student Z adapters P_det / P_map on teacher-normalised reads (ck/v5/zadapt.py)
+    z_adapt_hidden: int = 32
     version: str = CONFIG_VERSION
 
     @property
@@ -75,6 +101,11 @@ class V5Cfg:
     def n_z(self) -> int:
         return N_Z_DENSE + (N_Z_REL if self.rel else 0)
 
+    @property
+    def n_top_feat(self) -> int:
+        """corrector input features per top object (top_feats)."""
+        return N_TOP_FEAT_V2 if self.top_feats == "v2" else N_TOP_FEAT
+
     def validate(self, v4=None) -> "V5Cfg":
         if self.relation not in RELATIONS:
             raise ValueError(f"v5.relation {self.relation!r} not in {RELATIONS}")
@@ -85,6 +116,26 @@ class V5Cfg:
         if self.rel_pstop and self.relation != "student":
             raise ValueError(f"v5.rel_pstop reads the student det head's stop_branch: relation 'student' only, got "
                              f"{self.relation!r}")
+        if self.rel_modes == "cv+fut+ca":
+            raise ValueError("v5.rel_modes 'cv+fut+ca' (the student's m7 constant-acceleration mode) is conditional on "
+                             "PT-11 / PT-B3 (design §3.2 / §3.3): not implemented")
+        if self.rel_modes not in REL_MODES:
+            raise ValueError(f"v5.rel_modes {self.rel_modes!r} not in {REL_MODES}")
+        if self.rel_modes != "cv" and self.relation != "student":
+            raise ValueError(f"v5.rel_modes {self.rel_modes!r} reads the student det head's futures: relation "
+                             f"'student' only, got {self.relation!r}")
+        if self.top_feats not in TOP_FEATS:
+            raise ValueError(f"v5.top_feats {self.top_feats!r} not in {TOP_FEATS}")
+        if self.top_feats != "v1" and not (self.rel and self.corrector):
+            raise ValueError("v5.top_feats 'v2' is a corrector input of the relation channel: needs relation and "
+                             "corrector")
+        if not (0.0 < float(self.probe_s_on_frac) < 1.0) or self.probe_dtype not in ("float64", "float32"):
+            raise ValueError(f"v5.probe_s_on_frac {self.probe_s_on_frac} / probe_dtype {self.probe_dtype!r}")
+        if self.z_adapt and not self.corrector:
+            raise ValueError("v5.z_adapt adapts the corrector's input Z: needs v5.corrector (an unused adapter breaks "
+                             "DDP)")
+        if int(self.z_adapt_hidden) < 4:
+            raise ValueError(f"v5.z_adapt_hidden {self.z_adapt_hidden} must be >= 4")
         if self.z_channels not in ("all", "det", "map"):
             raise ValueError(f"v5.z_channels {self.z_channels!r} not in ('all', 'det', 'map')")
         if int(self.z_stride) not in (1, 2, 4, 5):
@@ -105,7 +156,11 @@ class V5Cfg:
         return self
 
     def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
+        d = dataclasses.asdict(self)
+        for k in _OMIT_AT_DEFAULT:
+            if d[k] == getattr(V5Cfg, k):
+                del d[k]
+        return d
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "V5Cfg":

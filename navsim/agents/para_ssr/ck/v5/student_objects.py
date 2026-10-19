@@ -22,6 +22,15 @@ Gradient (design V2, report 97 §2-2 "det outputs into the relation module witho
   derives from them: sp0, u0, pi_s) keep the box code's graph when `code` requires grad, so the relation losses (L_H,
   the corrector's L_refine / AWR through Z, Z-KD) reach the det head's position / velocity regression.  A detached
   `code` (online2.student_rel_rows with rel_det_grad off, inference) gives the old rows exactly.
+  Matched boxes only (design V2 'the matched boxes'; online2 v4.v5.rel_det_grad_matched): rows_keep_graph keeps that
+  graph on the rows matched one-to-one to a GT track at t0 (refine_loss.match_t0, 2 m) and detaches the others (ghost /
+  duplicate boxes) for every relation consumer; training only (inference rows carry no graph).
+Futures (V5Cfg.rel_modes 'cv+fut', design §3.2 modes m1..6): with traj [T, Q, M, 8, 2] / traj_cls [T, Q, M] (the det
+  head's traj_preds / traj_cls_preds: PER-STEP offsets in the det frame (x_right, y_forward) of the t0 ego frame, 0.5 s
+  steps to 4 s, the first relative to the t0 box centre -- para_ssr_targets._track_future, det_motion_head
+  ._last_valid_fde) the rows gain fut [T, n, M, 8, 2] = the cumulative displacement from c0 in the N frame
+  (cumsum of (d_y, -d_x)) and pi_fut [T, n, M] = softmax(traj_cls); both detached (the futures are trained by the det
+  head's L_traj / L_traj_cls only); padding / invalid slots: fut 0, pi_fut uniform.
 """
 from __future__ import annotations
 
@@ -38,13 +47,22 @@ N_FEAT_S = 256 + N_CLS + 7      # hidden, class probabilities, score, range, cos
 
 
 def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int, score_thr: float = 0.3,
-                        stop_logit: Optional[Tensor] = None) -> Dict[str, Tensor]:
+                        stop_logit: Optional[Tensor] = None, traj: Optional[Tensor] = None,
+                        traj_cls: Optional[Tensor] = None) -> Dict[str, Tensor]:
     """code [T, Q, 10], cls_logit [T, Q, 7], hidden [T, Q, 256] (final det layer; stop_logit [T, Q] = its V1c stop
-    logit, only for V5Cfg.rel_pstop) -> the relation.object_rows dict (c0, v0, h0, L, W, sp0, u0, acc, has, group,
-    pi_s, valid, feats) of n slots per token, + q_idx [T, n] (query of each slot, -1 = padding).  c0 / v0 / sp0 / u0 /
-    pi_s carry code's graph (module docstring 'Gradient'); the rest (feats incl. p_stop) is detached."""
+    logit, only for V5Cfg.rel_pstop; traj [T, Q, M, 8, 2] / traj_cls [T, Q, M] = its futures, only for rel_modes
+    'cv+fut') -> the relation.object_rows dict (c0, v0, h0, L, W, sp0, u0, acc, has, group, pi_s, valid, feats) of n
+    slots per token, + q_idx [T, n] (query of each slot, -1 = padding) (+ fut / pi_fut with traj, module docstring).
+    c0 / v0 / sp0 / u0 / pi_s carry code's graph (module docstring 'Gradient'); the rest (feats incl. p_stop, the
+    futures) is detached."""
     if stop_logit is not None and tuple(stop_logit.shape) != tuple(code.shape[:2]):
         raise ValueError(f"student_object_rows: stop_logit {tuple(stop_logit.shape)} != code {tuple(code.shape[:2])}")
+    if (traj is None) != (traj_cls is None):
+        raise ValueError("student_object_rows: traj and traj_cls go together")
+    if traj is not None and (traj.dim() != 5 or tuple(traj.shape[:2]) != tuple(code.shape[:2]) or traj.shape[3] != 8
+                             or traj.shape[4] != 2 or tuple(traj_cls.shape) != tuple(traj.shape[:3])):
+        raise ValueError(f"student_object_rows: traj {tuple(traj.shape)} / traj_cls {tuple(traj_cls.shape)} vs code "
+                         f"{tuple(code.shape)} (expected [T, Q, M, 8, 2] / [T, Q, M])")
     code_g = code.float()                                   # position / velocity entries: graph kept (V2)
     code = code_g.detach()
     with torch.no_grad():
@@ -89,6 +107,15 @@ def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int,
     out = dict(c0=c0, v0=v0, h0=g(h), L=Lk, W=Wk, sp0=sp0, u0=u0, acc=torch.zeros_like(sp0),
                has=torch.zeros_like(valid), group=group, pi_s=pi_s, valid=valid, feats=feats,
                q_idx=torch.where(valid, qi, torch.full_like(qi, -1)))
+    M = 0
+    if traj is not None:                                    # rel_modes 'cv+fut': the det head's futures (detached)
+        with torch.no_grad():
+            d = torch.nan_to_num(traj.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            fut = torch.cumsum(torch.stack([d[..., 1], -d[..., 0]], -1), 3)            # [T, Q, M, 8, 2] N frame
+            M = int(traj.shape[2])
+            pf = torch.softmax(traj_cls.detach().float(), -1)
+            pf = torch.where(torch.isfinite(pf).all(-1, keepdim=True), pf, torch.full_like(pf, 1.0 / M))
+            out["fut"], out["pi_fut"] = g(fut), g(pf)
     if k < n:
         for key, v in out.items():
             pad = torch.zeros(T, n - k, *v.shape[2:], dtype=v.dtype, device=dev)
@@ -96,6 +123,8 @@ def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int,
                 pad = pad + 1.0
             if key == "q_idx":
                 pad = pad - 1
+            if key == "pi_fut":
+                pad = pad + 1.0 / M
             out[key] = torch.cat([v, pad], 1)
     vm = out["valid"]
     for key in ("c0", "v0", "h0", "sp0", "u0", "pi_s", "feats"):
@@ -103,6 +132,24 @@ def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int,
                                torch.zeros_like(out[key]))
     out["L"] = torch.where(vm, out["L"], torch.ones_like(out["L"]))
     out["W"] = torch.where(vm, out["W"], torch.ones_like(out["W"]))
+    if traj is not None:
+        out["fut"] = torch.where(vm[..., None, None, None], out["fut"], torch.zeros_like(out["fut"]))
+        out["pi_fut"] = torch.where(vm[..., None], out["pi_fut"], torch.full_like(out["pi_fut"], 1.0 / M))
+    return out
+
+
+GRAPH_KEYS = ("c0", "v0", "sp0", "u0", "pi_s")          # the row entries that carry the box code's graph
+
+
+def rows_keep_graph(O: Dict[str, Tensor], keep: Tensor) -> Dict[str, Tensor]:
+    """design V2 'matched boxes only' (online2 v4.v5.rel_det_grad_matched): the rows O with the box code's graph kept on
+    the slots keep [T, n] (matched one-to-one to a GT track at t0) and detached on every other slot (ghost / duplicate
+    boxes: no relation loss moves their regression); values unchanged."""
+    out = dict(O)
+    kp = keep.to(O["valid"].device).bool()
+    for key in GRAPH_KEYS:
+        v = O[key]
+        out[key] = torch.where(kp.reshape(*kp.shape, *([1] * (v.dim() - 2))), v, v.detach())
     return out
 
 
@@ -111,7 +158,10 @@ def student_reliability_targets(O: Dict[str, Tensor], gt_boxes0: Tensor, gt_vel0
                                 gate_m: float = 2.0, v_tol: float = 1.0):
     """a_i targets of the student rows against the GT objects at t0 (GT = target only): O (student_object_rows of n
     tokens), gt_boxes0 [n, A, 2] centres, gt_vel0 [n, A, 2], gt_obs0 [n, A] -> y, m [n, N]: y = a GT object within
-    gate_m of the row centre whose velocity agrees within v_tol m/s (nearest one); m = valid rows."""
+    gate_m of the row centre whose velocity agrees within v_tol m/s (nearest one); m = valid rows.
+    v_tol = 1.0 m/s is a DECLARED DEVIATION from design §3.3's 0.5 m/s (main-session decision D5, 2026-10-20): the
+    teachers' a_i^T (tools/ck/train_ck2.py) is trained with 1.0, and its H feeds the student's Z-KD (arm D), so the
+    student reliability keeps the same tolerance."""
     d = torch.cdist(O["c0"].float(), gt_boxes0.float())                                   # [n, N, A]
     d = torch.where(gt_obs0[:, None, :], d, torch.full_like(d, float("inf")))
     dmin, j = d.min(-1)

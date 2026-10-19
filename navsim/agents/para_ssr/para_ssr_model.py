@@ -50,9 +50,10 @@ def _det_v5_kwargs(cfg) -> Dict[str, object]:
 
 
 # det head outputs that eval-mode predictions carry with expose_det_outputs (the CK2 inference's relation channel and
-# the eval dumps read them; the v5 options' keys only exist when the option is on)
+# the eval dumps read them; the v5 options' keys only exist when the option is on; traj_preds / traj_cls_preds = the
+# futures that a ck_e2e2.v4.v5.rel_modes 'cv+fut' student's relation reads at inference)
 EXPOSED_DET_KEYS = ("all_bbox_preds", "all_cls_scores", "det_hidden", "all_stop_logits", "all_vel_raw", "acc_preds",
-                    "stop2s_logits")
+                    "stop2s_logits", "traj_preds", "traj_cls_preds")
 
 
 def heading_from_path(poses: torch.Tensor, min_step: float = 0.5) -> torch.Tensor:

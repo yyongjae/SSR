@@ -46,7 +46,10 @@ teachers.json det.temporal + kd_objects recorded and ck2/kd_obj_ok_frac logged w
 refiner v4_3 (tools/ck/e2e2/v4_3_arm.set, ARM=v4_3; arm_of 'v4_3' for a range readout): apply_sets2 declares the
 optional v4 keys a set line names (absent from ck_e2e2.yaml: older arms unchanged); placeholder_check refuses any
 ck_e2e2 value still holding the arm file's /PLACEHOLDER/ (teacher runs / KD calibration files of the range teachers,
-set by the user's E2E_CK_SET file); kd_constraint_check (v4.kd_constraint.enabled) refuses non-range teachers, teachers on
+set by the user's E2E_CK_SET file; refiner v5: the Z adapters' teacher-statistics records v4.v5.z_stats_det / _map,
+refused only while v4.v5.z_adapt is on, as kd_calib.* only while kd_calib is enabled; z_stats_check then ties each
+record to its teacher -- run, which, ckpt sha16, z_stride; strict mode refuses dry-run records -- and records them as
+teachers.json 'z_stats'); kd_constraint_check (v4.kd_constraint.enabled) refuses non-range teachers, teachers on
 another grid (corridor version, time bins) than the student, teachers whose rg_stopped_aware differs from the student's
 (Phase 0b R2 B semantics: an R2 student needs R2 teachers and vice versa) and an occ_channels group missing on the
 student or the DET teacher -- the runtime rule and message (online2.constraint_teacher_problems / CONSTRAINT_REFUSAL) on
@@ -420,12 +423,54 @@ def placeholder_check(ck: Dict[str, Any]) -> None:
     calibration files of its R2 teachers v4T10_rng2 / v4M10_rng2 are set by the user's E2E_CK_SET file once those
     teachers exist; the teacher runs themselves are named and refused by teacher_check until they have finished)."""
     kc_on = str((ck.get("kd_calib") or {}).get("enabled", True)).lower() in ("true", "1")
+    # refiner v5 'zkd' group (v5_arm.set): the Z adapters' teacher statistics, refused exactly like kd_calib -- only
+    # while v4.v5.z_adapt is on (unused statistics paths when it is off)
+    v5 = (ck.get("v4") or {}).get("v5") or {}
+    za_on = str(v5.get("z_adapt", False)).lower() in ("true", "1")
     bad = [k for k, v in LU.flatten(ck) if isinstance(v, str) and PLACEHOLDER in v
-           and (kc_on or not k.startswith("kd_calib."))]               # unused calibration paths when it is off
+           and (kc_on or not k.startswith("kd_calib."))                # unused calibration paths when it is off
+           and (za_on or not k.startswith("v4.v5.z_stats_"))]
     if bad:
         raise LaunchError(f"ck_e2e2 {bad} still hold the arm file's placeholder ({PLACEHOLDER}...): set them (e.g. "
                           f"E2E_CK_SET=<file> with teacher_det_run=<range DET run> / teacher_map_run=<range MAP run> / "
-                          f"kd_calib.det|map=<their calibration files> or kd_calib.enabled=false) before a launch")
+                          f"kd_calib.det|map=<their calibration files> or kd_calib.enabled=false / "
+                          f"v4.v5.z_stats_det|map=<the teachers' tools/ck/v5/fit_z_stats.py records> or "
+                          f"v4.v5.z_adapt=false) before a launch")
+
+
+def z_stats_check(c, teachers: Dict[str, Any], mode: str = "strict") -> Dict[str, Any]:
+    """refiner v5 'zkd' group (ck_e2e2.v4.v5.z_adapt; {} when off): both teacher-statistics records (v4.v5.z_stats_det
+    / _map, tools/ck/v5/fit_z_stats.py) must exist and belong to the teachers of teacher_check (navsim
+    ck/v5/zadapt.check_z_stats: arm, run, which, the ckpt sha16 of the teacher record, the student's z_stride; an
+    unfinished record refused; strict mode also refuses a DRY-RUN record: fewer than zadapt.DRY_RUN_BELOW tokens or
+    --limit) -> record {det / map: {path, sha16, n_tokens, channels}} (teachers.json 'z_stats').  A missing file is
+    refused with the fit command."""
+    v5 = c.v5
+    if not (v5.get("enabled") and v5.get("z_adapt")):
+        return {}
+    from navsim.agents.para_ssr.ck.v5 import zadapt as ZA
+    out: Dict[str, Any] = {}
+    for name, arm, run in (("det", "T", c.teacher_det_run), ("map", "M", c.teacher_map_run)):
+        p = str(v5.get(f"z_stats_{name}") or "")
+        LU.no_equals(p, f"ck_e2e2.v4.v5.z_stats_{name}")
+        if not Path(p).is_file():
+            raise LaunchError(
+                f"ck_e2e2.v4.v5.z_stats_{name}: teacher-statistics file {p!r} missing (Z adapters of teacher {run} "
+                f"'{c.teacher_which}' not fitted yet): after the teacher has finished run (CPU)  CUDA_VISIBLE_DEVICES= "
+                f"OMP_NUM_THREADS=8 PYTHONPATH={REPO} {PY} {REPO}/tools/ck/v5/fit_z_stats.py --run {run} --which "
+                f"{c.teacher_which} --tokens 4096 --out {p}   (or set v4.v5.z_adapt=false)")
+        try:
+            rec, info = ZA.load_z_stats(p)
+            ZA.check_z_stats(rec, arm, run=run, which=c.teacher_which,
+                             ckpt_sha16=(teachers.get(name) or {}).get("ckpt_sha16"), z_stride=int(v5["z_stride"]),
+                             allow_dry_run=mode != "strict", where=f"ck_e2e2.v4.v5.z_stats_{name}")
+        except (ValueError, FileNotFoundError) as e:
+            raise LaunchError(str(e)) from None
+        out[name] = dict(info, n_tokens=(rec.get("data") or {}).get("n_tokens"), dry_run=bool(rec.get("dry_run")),
+                         ckpt_sha16=rec.get("ckpt_sha16"),
+                         channels={k: {"mean": v.get("mean"), "std": v.get("std"), "n": v.get("n")}
+                                   for k, v in (rec.get("channels") or {}).items()})
+    return out
 
 
 def kd_constraint_check(c) -> Dict[str, Any]:
@@ -593,6 +638,9 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
     bk = bevkd_norms(c)
     if bk:
         teachers["bev_kd"] = bk
+    zs = z_stats_check(c, teachers, teacher_mode)      # refiner v5 Z adapters only (off: no key)
+    if zs:
+        teachers["z_stats"] = zs
     kq = kd_constraint_check(c)                        # refiner v4_3 constraint KD only (off: no key)
     if kq:
         teachers["kd_constraint"] = kq

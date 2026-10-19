@@ -671,7 +671,10 @@ def test_arm_files_switch_the_det_fixes_on():
     sets = [(REPO / f"tools/ck/e2e2/{f}").read_text().splitlines() for f in ("v5_arm.set", "v5kd_arm.set")]
     assert "v4.v5.rel_pstop=true" in sets[0]
     lines = [x for s in sets for x in s]
-    assert not any(x.split("=")[0].strip().endswith(("rel_ca", "rel_modes")) for x in lines if not x.startswith("#"))
+    assert not any(x.split("=")[0].strip().endswith("rel_ca") for x in lines if not x.startswith("#"))
+    # the 'rel' group reads the det head's futures (rel_modes cv+fut); mode 7 (cv+fut+ca) stays off
+    assert not any(x.split("=")[0].strip().endswith("rel_modes") and "ca" in x.split("=", 1)[1] for x in lines
+                   if not x.startswith("#"))
     for arm in (sets[0], sets[0] + sets[1]):
         ck = LU2.apply_sets2(LU2.load_ck2_yaml(), arm)
         v5 = CKE2E2Config.from_any(ck).v5

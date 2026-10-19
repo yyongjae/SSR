@@ -22,12 +22,15 @@ L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable): a 
   computed in LOG space (report 100 F1: log(S + 1e-3) scaled every gradient by S / (S + 1e-3), ~1e-13 on a deep
   overlap): log S = log p_nc + log p_dac + log(5 p_ttc + 2 p_c + 5 ep) - log 12 with log p = logsigmoid (linear tail:
   a constant 1 / s per metre however deep), and log p_nc additionally carries the IN-PATH SHAPING term
-  sum over objects a of c_a logsigmoid(g_a / s): c_a = sigmoid(-min_n sep_na / s) (soft "collides with a"),
-  g_a = min over the states where a overlaps the ego footprint laterally of the SIGNED longitudinal gap (a's centre
-  ahead along the ego heading minus both half-extents; no abs, no not-behind cut) -- the worst-state SAT term alone is
-  flat in the longitudinal control on a head-on overlap (its least-overlapping axis is lateral), and a penetration sum
-  over the states rewards driving THROUGH faster; g_a only grows when the ego progresses less, so braking is always
-  the local direction until a is cleared, after which c_a -> 0 (non-colliding rollouts: ~0, worst-state ranking).
+  sum over objects a of 1[a collides] 1[a ahead] min(0, g_a) / s: 'collides' = the counted worst SAT separation with a
+  is < 0 (hard: a soft sigmoid weight leaked onto safe objects, report 101 N1), 'ahead' = a is fully ahead of the ego
+  (signed longitudinal gap >= 0) at its first observed state (a car behind / alongside is never braked for: braking
+  cannot clear it), g_a = min over the states where a overlaps the ego footprint laterally of the SIGNED longitudinal
+  gap (a's centre ahead along the ego heading minus both half-extents; no abs, no not-behind cut) -- the worst-state
+  SAT term alone is flat in the longitudinal control on a head-on overlap (its least-overlapping axis is lateral), and
+  a penetration sum over the states rewards driving THROUGH faster; g_a only grows when the ego progresses less, so
+  braking is the local direction until a is cleared, where g_a -> 0 (the term is continuous there); non-colliding
+  rollouts get exactly 0 from it (worst-state ranking).
   loss = mean over drafts of (log S(X0) - log S(X1)) / max(1, -log S(X0)) (relative to the baseline tau0 the caller
   passes = the corrector's mu = 0 draft; the per-draft normaliser keeps a deep-overlap draft from dominating the batch
   and does not change the sign), s = 0.1 m.
@@ -185,8 +188,12 @@ def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequenc
         return sep, count
     b0 = boxes[:, :, :, 0]                                                              # delta 0: [n, 1, Q, A, 5]
     lon, lat = lon_lat_gaps(ce[..., None, :], hd[..., None], b0[..., :2], b0[..., 2], b0[..., 3], b0[..., 4])
-    inpath = (lat.detach() < 0) & obs[:, :, :, 0] & mv[..., 0][..., None]               # [n, R, Q, A]
-    return sep, count, lon, inpath
+    obs0 = obs[:, :, :, 0].expand(n, R, Q, A)
+    inpath = (lat.detach() < 0) & obs0 & mv[..., 0][..., None]                           # [n, R, Q, A]
+    first = obs0.to(torch.int8).argmax(2)                                               # first observed state [n, R, A]
+    lon_first = torch.gather(lon.detach(), 2, first[:, :, None, :]).squeeze(2)
+    ahead = obs0.any(2) & (lon_first >= 0)                                              # [n, R, A]
+    return sep, count, lon, inpath, ahead
 
 
 _CMF_OPS: Dict[str, Tensor] = {}
@@ -236,16 +243,16 @@ def _terms(X: Tensor, gt: Dict[str, Tensor], t: Tensor, w: Dict[str, float]) -> 
     out["offroad"] = (dmin < 0).float()
     out["lp_dac"] = lsg(dmin) if w.get("road", 0.0) else zero
     if w.get("obj", 0.0) or w.get("ttc", 0.0):
-        sep, cnt, lon, inpath = object_sep(X, t, gt, (0.0,) + TTC_D, extras=True)
+        sep, cnt, lon, inpath, ahead = object_sep(X, t, gt, (0.0,) + TTC_D, extras=True)
         big = torch.full_like(sep, 10.0)
         s_nc = torch.where(cnt[..., 0, :], sep[..., 0, :], big[..., 0, :]).flatten(2).amin(-1)
         s_tt = torch.where(cnt[..., 1:, :], sep[..., 1:, :], big[..., 1:, :]).flatten(2).amin(-1)
         out["coll"] = (s_nc < 0).float()
         out["ttc_hit"] = (s_tt < 0).float()
         ms_a = torch.where(cnt[..., 0, :], sep[..., 0, :], big[..., 0, :]).amin(2)       # [n, R, A] per object
-        c_a = torch.sigmoid(-ms_a / SCALE)
+        hit = ((ms_a.detach() < 0) & ahead).float()
         g_a = torch.where(inpath, lon, torch.full_like(lon, 10.0)).amin(2)              # [n, R, A]
-        shp = (c_a * F.logsigmoid(g_a / SCALE)).sum(-1)
+        shp = (hit * g_a.clamp(max=0.0) / SCALE).sum(-1)
         out["shape_nc"] = shp
         out["lp_nc"] = lsg(s_nc) + shp if w.get("obj", 0.0) else zero
         out["lp_ttc"] = lsg(s_tt) if w.get("ttc", 0.0) else zero

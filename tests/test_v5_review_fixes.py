@@ -288,3 +288,23 @@ def test_f2_gt_of_keeps_every_track_and_reach_filter_is_exact():
     hit = (sep < 0) & cnt & win[:, None, None, None, :]
     ref = torch.stack([hit[..., 0, :].any(-1), hit.any(-1).any(-1)], -1).float()
     assert torch.equal(y, ref) and float(ref.sum()) > 0
+
+
+# ---- report 101 (2026-10-20) ----------------------------------------------------------------------------------------
+def test_n1_safe_car_behind_never_rewards_braking():
+    """N1: a stopped car 0.5 m behind the ego's rear bumper (the ego drives away at 5 m/s, nothing fails): the in-path
+    shaping is exactly 0 and braking raises the loss (the soft-weighted signed gap rewarded braking, report 101)."""
+    from navsim.agents.para_ssr.ck.v5 import refine_loss as RL
+    from navsim.agents.para_ssr.ck.v5.corrector import decode_grad
+    from navsim.agents.para_ssr.ck.temporal.config import EGO_REAR
+    gt = _stopped_car_gt(x=EGO_REAR - 0.5 - 2.25)            # car front bumper 0.5 m behind the ego's rear bumper
+    w = RL.parse_weights("")
+    base, v0, a0 = _straight(5.0)[None], torch.tensor([5.0]), torch.tensor([0.0])
+    t = torch.arange(LQR.NT, dtype=torch.float64) * LQR.DT
+    T = RL._terms(LQR.simulate(base, torch.tensor([[[5.0, 0.0]]]), dtype=torch.float32), gt, t, w)
+    assert float(T["shape_nc"].abs().max()) == 0.0 and float(T["coll"].max()) == 0.0
+    for z in (-0.1, -0.5, -1.0):
+        m = torch.zeros(1, 1, 12)
+        m[..., :6] = z
+        l, _ = RL.refine_loss(decode_grad(base, m[..., :6], m[..., 6:], v0), base, v0, a0, gt, w)
+        assert float(l) > 0

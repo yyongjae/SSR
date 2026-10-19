@@ -30,3 +30,14 @@ wandb.group=refiner-v5
 # (1 / 0.95, 1 / 2.44) -- lateral sigma 0.95, longitudinal 2.44 m/s (report 99 N2: [0.41, 1.05] was the NAVSIM order)
 ++agent.config.det_vel_code_weights=[1.05,0.41]
 ++agent.config.expose_det_outputs=true
+# refiner v5 det-head fixes of Stage-2 arm B / D (design §3.2, report 97 §2-2; modules/det_motion_head.py): V1b velocity
+# rows only on moving matched GT, V1c stop_branch (deployed velocity = (1 - sigmoid(stop)) x raw; all_bbox_preds carries
+# the gated one), ACC aux head (a_lon / p_stop2s from det_hidden, GT keyframe-speed targets) -- an aux target only: the
+# critic's CA mode 7, V3 (velocity in the Hungarian cost) and V4 (heading-frame velocity) stay off
+++agent.config.det_vel_moving_only=true
+++agent.config.det_stop_branch=true
+++agent.config.det_acc_head=true
+# 3-frame student input (user 2026-10-20: t-1.0, t-0.5, t0 = NAVSIM history frames 1, 2, 3; default (2, 3)): one more
+# no-grad history BEV pass + one more image load per sample (configs/default.py frame_indices); the history recursion
+# is frame 1 -> 2 -> 3 (para_ssr_model.obtain_history_bev), bev_shift / ego_motion per consecutive pair (features)
+++agent.config.frame_indices=[1,2,3]

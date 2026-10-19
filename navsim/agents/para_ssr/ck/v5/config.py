@@ -21,6 +21,10 @@ z_channels  which per-state reads the corrector sees: 'all'; 'det' (b_nc, b_ttc,
             are zeroed (no gradient into fields nothing else trains; review 2026-10-20 f11 / f24).
 z_stride    per-state reads Z at every z_stride-th LQR state (2: t = 0, 0.2, .., 4.0 s, 21 states); the relation runs on
             the same states.
+rel_pstop   relation 'student' only: the reliability MLP a_i also reads p_stop_i = sigmoid(stop logit) of the student's
+            det-head V1c stop_branch (design §3.3 a_i = sigma(MLP_a([det_hidden, score, class, range, p_stop])); the
+            ACC head's p_stop2s is an aux target only, report 97 §1 (c)/(d)): one more feats column (N_FEAT_S + 1).
+            Needs agent.config.det_stop_branch (online2 refuses it otherwise).
 Sizes: n_obj (t0 rows read, score order), rel_hidden (reliability MLP), corr_hidden / z_hidden (corrector).
 """
 from __future__ import annotations
@@ -51,6 +55,7 @@ class V5Cfg:
     z_hidden: int = 32
     z_stride: int = 2
     z_channels: str = "all"        # corrector input channels: 'all' | 'det' (no D) | 'map' (D + unknown only)
+    rel_pstop: bool = False        # relation 'student': p_stop_i of the det head's stop_branch in the a_i features
     version: str = CONFIG_VERSION
 
     @property
@@ -77,6 +82,9 @@ class V5Cfg:
             raise ValueError(f"v5.n_obj {self.n_obj} not in [1, 96]")
         if not (0.01 <= float(self.rel_eps) <= 5.0):
             raise ValueError(f"v5.rel_eps {self.rel_eps} not in [0.01, 5] m")
+        if self.rel_pstop and self.relation != "student":
+            raise ValueError(f"v5.rel_pstop reads the student det head's stop_branch: relation 'student' only, got "
+                             f"{self.relation!r}")
         if self.z_channels not in ("all", "det", "map"):
             raise ValueError(f"v5.z_channels {self.z_channels!r} not in ('all', 'det', 'map')")
         if int(self.z_stride) not in (1, 2, 4, 5):

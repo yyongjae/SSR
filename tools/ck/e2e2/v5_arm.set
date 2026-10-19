@@ -1,6 +1,7 @@
 # refiner v5 student, Stage-2 arm B (GT-only control; SSR/report/97_refiner_v5_design.md §4) on fusion v13 (ARM=v5; use
-# with E2E_EXTRA=tools/ck/e2e2/fusion_v13_v5.extra = the v13 BEV-selector distillation + the det-head velocity fix +
-# the det outputs at inference).  ARM=v5kd adds v5kd_arm.set (arm D: + Z-KD of the per-state reads to the v5 teachers).
+# with E2E_EXTRA=tools/ck/e2e2/fusion_v13_v5.extra = the v13 BEV-selector distillation + the det-head fixes V1 / V1b /
+# V1c / ACC aux head + the det outputs at inference).  ARM=v5kd adds v5kd_arm.set (arm D: + Z-KD of the per-state
+# reads to the v5 teachers).
 #   * v4_3 range student (R2: any4 + stopped-aware), P_ref head, corridor v2; computed edits OFF (v5 uses the corrector
 #     A_S), v4 corrector OFF; constraint KD OFF (Z-KD replaces it in arm D); the student's own GT field aux ON;
 #   * v5 block: relation 'student' (its own det head; box position / velocity keep their graph = design V2,
@@ -8,6 +9,8 @@
 #     mu_lon, w_lat_head + mu_lat)) trained by L_refine(X1) on the KD set's parents AND (record_tau1) by AWR on the
 #     official PDMS(tau1) - PDMS(tau0) of the recorded deployment-rule pick (k = 1; its labelled tau1 is also a critic
 #     BCE column of the next generations);
+#     the reliability a_i also reads p_stop_i = sigmoid of the det head's V1c stop logit (rel_pstop; needs
+#     fusion_v13_v5.extra's det_stop_branch);
 #   * BEV KD OFF (the v13 selector distillation is the BEV-level KD of this branch); score KD nc <- DET, dac <- MAP on
 #     the parent columns (as v4_3); lateral KD unchanged.
 # Teachers: the v5 teachers (tools/ck/v5/run_teachers_v5.sh); their KD calibration files are PLACEHOLDERS until fitted
@@ -41,6 +44,7 @@ v4.v5.z_kd=false
 v4.v5.rel_det_grad=true
 v4.v5.record_tau1=true
 v4.v5.lambda_awr=0.1
+v4.v5.rel_pstop=true
 teacher_det_run=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5T_rel4
 teacher_map_run=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5M_unk3
 kd_calib.det=/PLACEHOLDER/v5/kd_calib_det.json

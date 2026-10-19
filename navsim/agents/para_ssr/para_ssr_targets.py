@@ -63,6 +63,7 @@ from navsim.common.dataclasses import Annotations, Scene
 from navsim.planning.training.abstract_feature_target_builder import AbstractTargetBuilder
 
 from .cache_key import cache_key
+from .modules.det_motion_head import ACC_N_KF, N_AGENT_CLASSES
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,9 @@ DET_CLASS_NAMES: Tuple[str, ...] = (
     "generic_object",
 )
 DET_NAME_TO_INDEX = {name: i for i, name in enumerate(DET_CLASS_NAMES)}
+# nuPlan AGENT_TYPES (refiner.gt_future.AGENT_CLASSES): the only classes whose annotated velocity is a velocity; every
+# other object is static (v = 0, as in the metric cache).  'ego' never occurs in the logs.
+AGENT_NAMES = DET_CLASS_NAMES[:N_AGENT_CLASSES] + ("ego",)
 
 # NAVSIM-convention map classes, shared with the ReSMap teacher.  nuPlan has no
 # divider/boundary labels -- the old three were an interpretation of an
@@ -254,6 +258,8 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
                 # frame token; the field is only present when it is on, so the
                 # distillation-off cache name is unchanged.
                 *((("scene_token", True),) if getattr(cfg, "needs_scene_token", False) else ()),
+                # refiner v5 ACC head targets (gt_kf_speed / gt_kf_present): only when on, so the off name is unchanged
+                *((("det_kf_speed", ACC_N_KF),) if getattr(cfg, "det_acc_head", False) else ()),
             ),
         )
 
@@ -326,6 +332,10 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         gt_valid = np.zeros(max_agents, dtype=bool)
         gt_fut = np.zeros((max_agents, fut_ts, 2), dtype=np.float32)
         gt_fut_mask = np.zeros((max_agents, fut_ts), dtype=np.float32)
+        acc_on = bool(getattr(cfg, "det_acc_head", False))       # refiner v5 ACC head targets
+        if acc_on:
+            gt_kf_speed = np.zeros((max_agents, ACC_N_KF), dtype=np.float32)
+            gt_kf_present = np.zeros((max_agents, ACC_N_KF), dtype=bool)
 
         # future ego poses (global) for re-expressing future agent centres
         ego_poses = [
@@ -365,14 +375,20 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             )
             gt_fut[slot] = traj
             gt_fut_mask[slot] = mask
+            if acc_on:
+                gt_kf_speed[slot], gt_kf_present[slot] = self._track_speeds(scene, tracks[i], cur_idx, ACC_N_KF)
 
-        return {
+        out = {
             "gt_boxes": torch.tensor(gt_boxes),
             "gt_labels": torch.tensor(gt_labels),
             "gt_valid": torch.tensor(gt_valid),
             "gt_fut_trajs": torch.tensor(gt_fut),
             "gt_fut_masks": torch.tensor(gt_fut_mask),
         }
+        if acc_on:
+            out["gt_kf_speed"] = torch.tensor(gt_kf_speed)
+            out["gt_kf_present"] = torch.tensor(gt_kf_present)
+        return out
 
     def compute_detection_evaluation_targets(
         self, scene: Scene
@@ -421,6 +437,37 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             "gt_boxes": torch.from_numpy(box_array),
             "gt_labels": torch.tensor(eval_labels, dtype=torch.long),
         }
+
+    @staticmethod
+    def _track_speeds(
+        scene: Scene, track_token: str, cur_idx: int, n_kf: int
+    ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.bool_]]:
+        """GT keyframe speeds of one track for the refiner v5 ACC head -> (speed [n_kf] m/s, present [n_kf]).
+
+        Keyframe k is frame ``cur_idx + k`` (index based, 0.5 k s: the refiner.gt_future keyframe store's layout).
+        present[k] = the track is annotated in that frame (a gap does not end the track; later frames are still
+        read); speed = |annotated velocity| for nuPlan agent classes and 0 for every other class (the metric-cache /
+        gt_future rule; the frame's own class); frames past the scene end are absent.  An unknown class name is
+        refused (gt_future.build_from_frames refuses it too)."""
+        speed = np.zeros(n_kf, dtype=np.float32)
+        present = np.zeros(n_kf, dtype=bool)
+        for k in range(n_kf):
+            f_idx = cur_idx + k
+            if f_idx >= len(scene.frames):
+                break
+            fann = scene.frames[f_idx].annotations
+            ftokens = list(fann.track_tokens)
+            if track_token not in ftokens:
+                continue
+            j = ftokens.index(track_token)
+            name = str(list(fann.names)[j])
+            if name not in DET_NAME_TO_INDEX and name not in AGENT_NAMES:
+                raise ValueError(f"unknown object class {name!r} of track {track_token!r} in frame {f_idx}")
+            present[k] = True
+            if name in AGENT_NAMES:
+                v = np.asarray(fann.velocity_3d, dtype=np.float64).reshape(-1, 3)[j]
+                speed[k] = np.float32(np.hypot(v[0], v[1]))
+        return speed, present
 
     def _track_future(
         self,

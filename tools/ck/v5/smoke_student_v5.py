@@ -11,6 +11,14 @@ then one eval-mode forward (ck2_* inference incl. ck2_v5_traj).  Teachers = the 
 
 Checks: finite ck2/* and v5/* logs, no non-finite loss, v5 terms present (rel_a_bce, rel_h_bce, ref_loss, zkd_det /
 zkd_map with --zkd 1), every v5 parameter moved, the inference returns ck2_v5_traj [B, 8, 3] finite and ck2_v5_src.
+Det-head fixes of arm B / D (fusion_v13_v5.extra: V1b det_vel_moving_only, V1c det_stop_branch, the ACC aux head
+det_acc_head; v5_arm.set: rel_pstop): the fixture gets the ACC targets gt_kf_speed / gt_kf_present from the real scenes
+(ParaSSRTargetBuilder; its recomputed gt_boxes must equal the fixture's), every det loss call of the fit carries finite
+loss_stop* / loss_acc / loss_stop2s, every stop_branches / acc_head parameter moved.  The fixture's det head is
+untrained (no query reaches score 0.3), so a probe hooks 4 confident in-window detections into one train-mode forward:
+the student rows are valid, their p_stop feature = sigmoid(stop logit), the relation hazard's gradient reaches
+stop_branches[-1] (rel_det_grad, design V2 + V1c); and one eval-mode forward with the same detections returns a finite
+ck2_v5_traj.
 --roundtrip 1 (Stage 2 credit, report 99 N3 / N4; v5_arm.set's rel_det_grad / record_tau1 / lambda_awr): epochs 0-1 ->
 labeler2 (official, gen 1) -> resume epoch 2 'onpolicy' (records the 96 + tau1 of the deployment-rule pick) -> labeler2
 (gen 2, the tau1 edit slot labelled) -> resume epoch 3 'onpolicy' (label set + the tau1 column from gen 2, AWR of A_S):
@@ -44,7 +52,9 @@ V13 = dict(use_distill=True, distill_selector_v8=False, distill_selector_v9=Fals
            distill_probe_warmup_steps=2, distill_probe_ramp_steps=2, distill_probe_loss_weight=0.5,
            distill_probe_lr_mult=3.0, distill_proj_lr_mult=2.0, distill_probe_use_ema=True,
            distill_probe_ema_decay=0.99)
-V5_AGENT = dict(det_vel_code_weights=[1.05, 0.41], expose_det_outputs=True)
+V5_AGENT = dict(det_vel_code_weights=[1.05, 0.41], expose_det_outputs=True,          # = fusion_v13_v5.extra
+                det_vel_moving_only=True, det_stop_branch=True, det_acc_head=True)
+DET_V5_LOSS = ("loss_stop", "loss_acc", "loss_stop2s")      # the det-head fixes' loss keys (+ loss_stop_d<l>)
 
 
 def v5_ck2(io_dir: Path, zkd: bool, stage2: bool = False) -> dict:
@@ -57,7 +67,7 @@ def v5_ck2(io_dir: Path, zkd: bool, stage2: bool = False) -> dict:
                "corrector": False, "kd_parent_only": True, "kd_score_scope": "all",
                "kd_constraint": {"enabled": False}, "rg_gt_aux": {"enabled": True, "lambda": 0.5, "max_parents": 8},
                "v5": {"enabled": True, "relation": "student", "unknown_ev": True, "corrector": True,
-                      "z_kd": bool(zkd)}}
+                      "z_kd": bool(zkd), "rel_pstop": True}}
     if stage2:
         d["v4"]["v5"].update(rel_det_grad=True, record_tau1=True, lambda_awr=0.1)
     return d
@@ -80,8 +90,54 @@ def edit_labels(io: Path, epoch: int) -> dict:
             "slot0_pdms": [float(x) for x in lab[:, 0, 6]] if len(done) else []}
 
 
+def load_scenes(split: str, tokens) -> dict:
+    """token -> navsim Scene (annotations only, no sensors) of `split` (tools/ck/data/common.split paths)."""
+    from dataclasses import replace
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+    from navsim.common.dataclasses import SensorConfig
+    from navsim.common.dataloader import SceneLoader
+    from tools.ck.data import common as CM
+    sp = CM.split(split)
+    tdf = CM.split_tokens(split).set_index("token")
+    tokens = [str(t) for t in tokens]
+    need = sorted(set(tdf.loc[tokens, "log"]))
+    sf = instantiate(OmegaConf.load(CM.resolve_path(sp["scene_filter"])))
+    sf = replace(sf, tokens=tokens, max_scenes=None, log_names=sorted(set(sf.log_names or need) & set(need)))
+    loader = SceneLoader(data_path=Path(sp["navsim_logs"]), sensor_blobs_path=Path(sp["sensor_blobs"]),
+                         scene_filter=sf, sensor_config=SensorConfig.build_no_sensors())
+    miss = sorted(set(tokens) - set(loader.tokens))
+    if miss:
+        raise RuntimeError(f"scene loader misses {len(miss)} of {len(tokens)} tokens, e.g. {miss[:3]}")
+    return {t: loader.get_scene_from_token(t) for t in tokens}
+
+
+def acc_targets(scenes: dict, tokens, ref: dict) -> dict:
+    """the ACC head targets of the det slots (ParaSSRTargetBuilder with det_acc_head) for `tokens`, stacked; refuses
+    when the recomputed slot boxes / labels / validity differ from the fixture's (`ref`: gt_boxes / gt_labels /
+    gt_valid of the same tokens), so the targets are aligned with the fixture's det GT slot by slot."""
+    from dataclasses import replace
+    from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+    from navsim.agents.para_ssr.configs.default import ParaSSRConfig
+    from navsim.agents.para_ssr.para_ssr_targets import ParaSSRTargetBuilder
+    b = ParaSSRTargetBuilder(replace(ParaSSRConfig(), det_acc_head=True),
+                             TrajectorySampling(time_horizon=4, interval_length=0.5))
+    out = {"gt_kf_speed": [], "gt_kf_present": []}
+    for i, tok in enumerate(tokens):
+        sc = scenes[str(tok)]
+        tg = b._compute_agent_targets(sc, sc.scene_metadata.num_history_frames - 1)
+        for k in ("gt_boxes", "gt_labels", "gt_valid"):
+            if not torch.allclose(tg[k].float(), ref[k][i].float(), atol=1e-5, rtol=0):
+                raise RuntimeError(f"{tok}: recomputed {k} differs from the fixture's (slot alignment broken)")
+        for k in out:
+            out[k].append(tg[k])
+    return {k: torch.stack(v) for k, v in out.items()}
+
+
 class FixtureV5(CD.FixtureDS):
-    """the cpu_dryrun fixture + the v5 DET teacher's pack rows (e2e_data2.KDObjRows of its ck_row)."""
+    """the cpu_dryrun fixture + the v5 DET teacher's pack rows (e2e_data2.KDObjRows of its ck_row) + the ACC head's
+    keyframe-speed targets of the real scenes (acc_targets; computed once per process)."""
+    _acc = None
 
     def __init__(self):
         super().__init__()
@@ -93,11 +149,98 @@ class FixtureV5(CD.FixtureDS):
         self.kd = [kd.item(int(r)) for r in self.t["ck_row"]]
         toks = ED.RowMap(packed).tokens                 # the v13 distillation needs targets['scene_token']
         self.tok = [str(toks[int(r)]) for r in self.t["ck_row"]]
+        if FixtureV5._acc is None:
+            FixtureV5._acc = acc_targets(load_scenes("navtrain_train", self.tok), self.tok, self.t)
+        self.acc = FixtureV5._acc
 
     def __getitem__(self, i):
         f, t = super().__getitem__(i)
-        t = dict(t, **self.kd[i], scene_token=self.tok[i])
+        t = dict(t, **self.kd[i], scene_token=self.tok[i], **{k: v[i] for k, v in self.acc.items()})
         return f, t
+
+
+def watch_det_loss(agent, store: list) -> None:
+    """record every det-head loss call's det-fix terms (finite or not) into `store` (the fit's det losses are not in
+    steps.jsonl)."""
+    head = agent.para_ssr_model.det_motion_head
+    orig = head.loss
+
+    def loss(*a, **kw):
+        out = orig(*a, **kw)
+        store.append({k: float(v.detach()) for k, v in out.items() if k.startswith(DET_V5_LOSS)})
+        return out
+    head.loss = loss
+
+
+DET_V5_PREFIX = ("stop_branches.", "acc_head.")
+
+
+def det_v5_params(agent) -> dict:
+    return {n: p.detach().clone() for n, p in agent.para_ssr_model.det_motion_head.named_parameters()
+            if n.startswith(DET_V5_PREFIX)}
+
+
+def probe_valid_objects(agent) -> dict:
+    """the fixture's det head is untrained (no query reaches score_thr 0.3): hook 4 confident in-window vehicles into
+    its final layer (positions / classes replaced, velocities = the head's own deployed ones, graph kept) and check the
+    student rows, their p_stop feature, the relation gradient into stop_branches[-1], and the eval-mode v5 output."""
+    import math as _m
+    from navsim.agents.para_ssr.ck.online2 import student_rel_rows
+    from navsim.agents.para_ssr.ck.v4 import lqr as LQR
+    head = agent.para_ssr_model.det_motion_head
+    pos = torch.tensor([[-1.5, 8.0], [2.0, 14.0], [-4.0, 20.0], [5.0, 26.0]])
+
+    def hook(mod, inp, out):
+        out = dict(out)
+        cls = out["all_cls_scores"].clone()
+        cls[-1, :, :4] = -6.0
+        cls[-1, :, :4, 0] = 4.0
+        code = out["all_bbox_preds"].clone()
+        code[-1, :, :4, 0:2] = pos.to(code)
+        code[-1, :, :4, 2:8] = torch.tensor([_m.log(1.9), _m.log(4.5), 0.0, _m.log(1.6), 0.0, 1.0]).to(code)
+        out.update(all_cls_scores=cls, all_bbox_preds=code)
+        return out
+    h = head.register_forward_hook(hook)
+    res = {}
+    try:
+        ds = FixtureV5()
+        f, _ = ds[0]
+        feats = {k: v[None] for k, v in f.items()}
+        agent.train()
+        torch.manual_seed(0)
+        pred = agent.para_ssr_model(feats)
+        v5 = dict(agent._ck_e2e2.cfg.v5, rel_det_grad=True)         # the V2 path (v5_arm.set; Stage 2 here)
+        O = student_rel_rows(pred, v5)
+        sel = O["q_idx"][0]
+        ok = sel >= 0
+        p_stop = torch.sigmoid(pred["all_stop_logits"][-1][0].detach())[sel.clamp(min=0)]
+        res["n_valid_rows"] = int(ok.sum())
+        res["p_stop_feature_err"] = float((O["feats"][0, ok, -1] - p_stop[ok]).abs().max()) if bool(ok.any()) else None
+        v = 6.0
+        tt = torch.arange(1, 9, dtype=torch.float32) * 0.5
+        st = LQR.simulate(torch.stack([v * tt, torch.zeros_like(tt), torch.zeros_like(tt)], -1)[None],
+                          torch.tensor([[v, 0.0]]), dtype=torch.float32)
+        zs = int(v5["z_stride"])
+        t = torch.arange(LQR.NT, dtype=torch.float64)[::zs] * LQR.DT
+        head.zero_grad(set_to_none=True)
+        rel = agent.ck_student.relation(O, st[:, ::zs], t, torch.zeros(1, dtype=torch.long))
+        rel["H"].sum().backward()
+        g = head.stop_branches[-1].weight.grad
+        res["H_max"] = float(rel["H"].detach().max())
+        res["stop_branch_grad_abs"] = 0.0 if g is None else float(g.abs().sum())
+        head.zero_grad(set_to_none=True)
+        agent.eval()
+        with torch.no_grad():
+            pe = agent.forward(feats)
+        tv = pe.get("ck2_v5_traj")
+        res["eval_v5_traj_finite"] = tv is not None and bool(torch.isfinite(tv).all())
+        res["eval_has_stop_logits"] = "all_stop_logits" in pe
+    finally:
+        h.remove()
+    res["pass"] = (res["n_valid_rows"] >= 1 and res["p_stop_feature_err"] is not None
+                   and res["p_stop_feature_err"] < 1e-6 and res["stop_branch_grad_abs"] > 0
+                   and res["eval_v5_traj_finite"] and res["eval_has_stop_logits"])
+    return res
 
 
 def main(argv=None) -> int:
@@ -128,6 +271,9 @@ def main(argv=None) -> int:
     student = agent.ck_student
     v5_mods = {n: p.detach().clone() for n, p in student.named_parameters()
                if n.startswith(("relation.", "corrector_v5.")) or n in ("v4_readout.rel_w", "v4_readout.resid.0.weight")}
+    det_mods = det_v5_params(agent)
+    det_calls: list = []
+    watch_det_loss(agent, det_calls)
     t0 = time.time()
     rt = {}
     if a.roundtrip:
@@ -136,6 +282,7 @@ def main(argv=None) -> int:
         for ep, name in ((3, "B"), (4, "C")):
             ck = CD.last_ckpt(root)
             agent = CD.build_agent(ck2)
+            watch_det_loss(agent, det_calls)
             CD.fit(agent, root, ep, ckpt=ck)
             if name == "B":
                 rt["L2_rc"] = CD.labeler(io, 2)
@@ -156,6 +303,17 @@ def main(argv=None) -> int:
     res["v5_params_unmoved"] = sorted(n for n, d in moved.items() if d == 0.0)
     need = ["v5/rel_a_bce", "v5/rel_h_bce", "v5/ref_loss"] + (["v5/zkd_det", "v5/zkd_map"] if a.zkd else [])
     res["missing_terms"] = [k for k in need if k not in keys]
+    # det-head fixes (V1b / V1c / ACC): every fit loss call carries finite terms; their parameters moved
+    det_keys = sorted({k for c in det_calls for k in c})
+    res["det_v5"] = {"n_loss_calls": len(det_calls), "keys": det_keys,
+                     "missing": [k for k in DET_V5_LOSS if k not in det_keys],
+                     "calls_without_terms": sum(1 for c in det_calls if not all(k in c for k in DET_V5_LOSS)),
+                     "nonfinite": sorted({k for c in det_calls for k, v in c.items() if not math.isfinite(v)}),
+                     "mean": {k: sum(c[k] for c in det_calls if k in c) / max(1, sum(k in c for c in det_calls))
+                              for k in det_keys}}
+    det_now = det_v5_params(agent)
+    res["det_v5"]["params_unmoved"] = sorted(n for n, p in det_now.items() if float((p - det_mods[n]).abs().max()) == 0)
+    res["det_v5"]["n_params"] = len(det_now)
     # one eval-mode forward: the ck2_* inference with the v5 output
     ds = FixtureV5()
     f, t = ds[0]
@@ -167,8 +325,13 @@ def main(argv=None) -> int:
     res["infer_v5_traj"] = None if tv is None else {"shape": list(tv.shape), "finite": bool(torch.isfinite(tv).all()),
                                                      "src": int(pred["ck2_v5_src"][0]),
                                                      "mu_abs": float(pred["ck2_v5_mu"].abs().mean())}
+    res["probe_valid_objects"] = probe_valid_objects(agent)
+    dv = res["det_v5"]
+    det_ok = (dv["n_loss_calls"] > 0 and not dv["missing"] and dv["calls_without_terms"] == 0 and not dv["nonfinite"]
+              and not dv["params_unmoved"] and dv["n_params"] > 0)
     res["pass"] = (not bad and res["nonfinite_loss"] == 0 and not res["missing_terms"] and tv is not None
-                   and bool(torch.isfinite(tv).all()) and tuple(tv.shape) == (1, 8, 3))
+                   and bool(torch.isfinite(tv).all()) and tuple(tv.shape) == (1, 8, 3) and det_ok
+                   and res["probe_valid_objects"]["pass"])
     if a.roundtrip:
         ep = lambda e: [s for s in steps if int(s.get("epoch", -1)) == e]                     # noqa: E731
         e2, e3 = ep(2), ep(3)

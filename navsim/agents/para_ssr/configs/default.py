@@ -195,6 +195,24 @@ class ParaSSRConfig:
     # LONGITUDINAL) velocity (para_ssr_targets.navsim_box_to_ssr), sigma-normalised by the GT spread: (1 / 0.95, 1 / 2.44)
     # = (1.05, 0.41) (the lateral channel collapsed under 0.2 x 0.25; report 99 N2); None = det_code_weights[8:10]
     det_vel_code_weights: Optional[Tuple[float, float]] = None
+    # refiner v5 V1b (design refiner_v5_design_final.md §3.2, report 97 §2-2): the velocity rows of the det box L1 only
+    # on matched GT that moves (speed >= det_stop_speed and an agent class); the positive count is unchanged.  Needs
+    # det_stop_branch (refused otherwise: static objects' velocity would be unsupervised and ungated).
+    det_vel_moving_only: bool = False
+    # refiner v5 V1c: a per-decoder-layer stop logit; the deployed velocity all_bbox_preds[..., 8:10] = (1 - sigmoid(stop))
+    # x the raw velocity (all_vel_raw, the L1 target); label stop = GT speed < det_stop_speed or a non-agent class;
+    # sigmoid focal x loss_stop_weight on the matched queries.  The threshold is shared by V1b and the ACC head.
+    det_stop_branch: bool = False
+    det_stop_speed: float = 0.5
+    loss_stop_weight: float = 1.0
+    # refiner v5 ACC aux head (design §3.2 / §3.9 L_det; Stage-2 arm B aux target only -- the critic's mode 7 stays
+    # off): a_lon (m/s^2) + p_stop2s from det_hidden, targets = the matched track's GT keyframe speeds (target builder
+    # gt_kf_speed / gt_kf_present; a new cache name): Huber(det_acc_huber_delta) x loss_acc_code_weight inside the box
+    # term's weight, focal x loss_stop2s_weight
+    det_acc_head: bool = False
+    loss_acc_code_weight: float = 0.5
+    loss_stop2s_weight: float = 0.2
+    det_acc_huber_delta: float = 1.0
     # refiner v5 student: eval-mode predictions also carry the det head's final boxes / class logits / hidden states
     # (the CK2 inference's relation channel reads them; training predictions always carry them)
     expose_det_outputs: bool = False

@@ -455,6 +455,13 @@ class ParaSSRAgent(AbstractAgent):
                 "det_code_size and det_code_weights length must both be 10, "
                 f"got {config.det_code_size} and {len(config.det_code_weights)}"
             )
+        # refiner v5 det-head options (modules/det_motion_head.py V1b / V1c / ACC head)
+        det_v5 = [k for k in ("det_vel_moving_only", "det_stop_branch", "det_acc_head") if getattr(config, k, False)]
+        if det_v5 and not config.use_det_motion_head:
+            raise ValueError(f"{det_v5} need the det head (use_det_motion_head=true)")
+        if getattr(config, "det_vel_moving_only", False) and not getattr(config, "det_stop_branch", False):
+            raise ValueError("det_vel_moving_only (V1b) needs det_stop_branch=true (V1c): static objects would get no "
+                             "velocity supervision and an ungated deployed velocity")
         if config.map_num_classes != len(MAP_CLASS_NAMES):
             raise ValueError(
                 "map_num_classes must match MAP_CLASS_NAMES "

@@ -11,8 +11,12 @@ Selection (declared input-selection hyper-parameters, report 97 §9-16; no evide
   class probability >= score_thr inside the student window (x_N in [0, 32], |y_N| <= 32, |bearing| <= 80 deg), top n_obj
   by score.  Static classes (cone, barrier, czone sign, generic object) are held (pi_s = 1); agents get the soft hold
   sigmoid((0.1 - |v|) / 0.05).  No past frames (two camera frames give no finite difference): has = False (no CA mode).
-feats [T, n, 256 + 7 + 7] = [det_hidden, class probabilities, score, range / 32, bearing cos / sin, speed / 10, L / 5,
-  W / 3] -> the reliability MLP.
+  Velocity = the box code's entries 8, 9 = the det head's DEPLOYED velocity: with the V1c stop_branch
+  (agent.config.det_stop_branch) that is already (1 - sigmoid(stop)) v_hat, so the soft hold and the relation read the
+  gated speed and, with a graph-carrying code (V2), the relation losses reach both v_hat and the stop branch.
+  acc = 0 and has = False always: the ACC head's a_lon is an aux target, the critic's CA mode 7 is off (design §3.3).
+feats [T, n, 256 + 7 + 7 (+ 1)] = [det_hidden, class probabilities, score, range / 32, bearing cos / sin, speed / 10,
+  L / 5, W / 3 (, p_stop = sigmoid(stop logit) with stop_logit given: V5Cfg.rel_pstop)] -> the reliability MLP.
 Gradient (design V2, report 97 §2-2 "det outputs into the relation module without detach"; report 99 N3): the slot
   selection, class, heading, size and feats are detached; the centre c0 = (x, y) and velocity v0 = (vx, vy) (and what
   derives from them: sp0, u0, pi_s) keep the box code's graph when `code` requires grad, so the relation losses (L_H,
@@ -22,7 +26,7 @@ Gradient (design V2, report 97 §2-2 "det outputs into the relation module witho
 from __future__ import annotations
 
 import math
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -33,12 +37,14 @@ WIN_X, WIN_Y, FOV_DEG = 32.0, 32.0, 80.0
 N_FEAT_S = 256 + N_CLS + 7      # hidden, class probabilities, score, range, cos, sin, speed, L, W
 
 
-def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int, score_thr: float = 0.3
-                        ) -> Dict[str, Tensor]:
-    """code [T, Q, 10], cls_logit [T, Q, 7], hidden [T, Q, 256] (final det layer) -> the relation.object_rows dict
-    (c0, v0, h0, L, W, sp0, u0, acc, has, group, pi_s, valid, feats) of n slots per token, + q_idx [T, n] (query of each
-    slot, -1 = padding).  c0 / v0 / sp0 / u0 / pi_s carry code's graph (module docstring 'Gradient'); the rest is
-    detached."""
+def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int, score_thr: float = 0.3,
+                        stop_logit: Optional[Tensor] = None) -> Dict[str, Tensor]:
+    """code [T, Q, 10], cls_logit [T, Q, 7], hidden [T, Q, 256] (final det layer; stop_logit [T, Q] = its V1c stop
+    logit, only for V5Cfg.rel_pstop) -> the relation.object_rows dict (c0, v0, h0, L, W, sp0, u0, acc, has, group,
+    pi_s, valid, feats) of n slots per token, + q_idx [T, n] (query of each slot, -1 = padding).  c0 / v0 / sp0 / u0 /
+    pi_s carry code's graph (module docstring 'Gradient'); the rest (feats incl. p_stop) is detached."""
+    if stop_logit is not None and tuple(stop_logit.shape) != tuple(code.shape[:2]):
+        raise ValueError(f"student_object_rows: stop_logit {tuple(stop_logit.shape)} != code {tuple(code.shape[:2])}")
     code_g = code.float()                                   # position / velocity entries: graph kept (V2)
     code = code_g.detach()
     with torch.no_grad():
@@ -74,9 +80,12 @@ def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int,
         c0d, sp0d = c0.detach(), sp0.detach()
         rng = torch.linalg.vector_norm(c0d, dim=-1)
         bear = torch.atan2(c0d[..., 1], c0d[..., 0])
-        feats = torch.cat([g(hidden.float()), g(prob), g(score)[..., None], (rng / 32.0)[..., None],
-                           torch.cos(bear)[..., None], torch.sin(bear)[..., None], (sp0d / 10.0)[..., None],
-                           (Lk / 5.0)[..., None], (Wk / 3.0)[..., None]], -1)
+        cols = [g(hidden.float()), g(prob), g(score)[..., None], (rng / 32.0)[..., None],
+                torch.cos(bear)[..., None], torch.sin(bear)[..., None], (sp0d / 10.0)[..., None],
+                (Lk / 5.0)[..., None], (Wk / 3.0)[..., None]]
+        if stop_logit is not None:                          # V5Cfg.rel_pstop: p_stop_i of the det head's stop_branch
+            cols.append(g(torch.sigmoid(stop_logit.detach().float()))[..., None])   # non-finite rows: not selected
+        feats = torch.cat(cols, -1)
     out = dict(c0=c0, v0=v0, h0=g(h), L=Lk, W=Wk, sp0=sp0, u0=u0, acc=torch.zeros_like(sp0),
                has=torch.zeros_like(valid), group=group, pi_s=pi_s, valid=valid, feats=feats,
                q_idx=torch.where(valid, qi, torch.full_like(qi, -1)))

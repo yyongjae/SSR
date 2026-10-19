@@ -257,6 +257,11 @@ class ParaSSRLoss(torch.nn.Module):
 
         # ---- detection + motion ---------------------------------------
         if model.det_motion_head is not None and "all_cls_scores" in predictions:
+            # refiner v5 ACC head: its keyframe-speed targets, passed only when the head is built (off: the old call)
+            acc_kw = (
+                {"gt_kf_speed": targets.get("gt_kf_speed"), "gt_kf_present": targets.get("gt_kf_present")}
+                if getattr(model.det_motion_head, "acc_head", None) is not None else {}
+            )
             det_losses = model.det_motion_head.loss(
                 predictions,
                 targets["gt_boxes"],
@@ -264,6 +269,7 @@ class ParaSSRLoss(torch.nn.Module):
                 targets["gt_valid"],
                 targets.get("gt_fut_trajs"),
                 targets.get("gt_fut_masks"),
+                **acc_kw,
             )
             det_sum = sum(
                 v for k, v in det_losses.items() if not k.startswith("loss_traj")

@@ -33,6 +33,28 @@ from .modules.planner_head import ParaSSRPlannerHead
 
 
 
+def _det_v5_kwargs(cfg) -> Dict[str, object]:
+    """refiner v5 det-head options (ParaDetMotionHead V1b / V1c / ACC head) of the config -> constructor kwargs; {}
+    when all are off (the head is then built by the old call exactly)."""
+    kw: Dict[str, object] = {}
+    if getattr(cfg, "det_vel_moving_only", False):
+        kw["vel_moving_only"] = True
+    if getattr(cfg, "det_stop_branch", False):
+        kw.update(stop_branch=True, loss_stop_weight=float(cfg.loss_stop_weight))
+    if getattr(cfg, "det_acc_head", False):
+        kw.update(acc_head=True, loss_acc_code_weight=float(cfg.loss_acc_code_weight),
+                  loss_stop2s_weight=float(cfg.loss_stop2s_weight), acc_huber_delta=float(cfg.det_acc_huber_delta))
+    if kw:
+        kw["stop_speed"] = float(cfg.det_stop_speed)
+    return kw
+
+
+# det head outputs that eval-mode predictions carry with expose_det_outputs (the CK2 inference's relation channel and
+# the eval dumps read them; the v5 options' keys only exist when the option is on)
+EXPOSED_DET_KEYS = ("all_bbox_preds", "all_cls_scores", "det_hidden", "all_stop_logits", "all_vel_raw", "acc_preds",
+                    "stop2s_logits")
+
+
 def heading_from_path(poses: torch.Tensor, min_step: float = 0.5) -> torch.Tensor:
     """Evaluation-only: replace each pose's heading by the path's direction of travel.
 
@@ -232,6 +254,8 @@ class ParaSSRModel(nn.Module):
                 loss_traj_cls_weight=cfg.loss_traj_cls_weight,
                 **({"vel_code_weights": tuple(cfg.det_vel_code_weights)}
                    if getattr(cfg, "det_vel_code_weights", None) else {}),
+                # refiner v5 V1b / V1c / ACC head (modules/det_motion_head.py): passed only when on (off = the old call)
+                **_det_v5_kwargs(cfg),
             )
             if cfg.use_det_motion_head
             else None
@@ -437,6 +461,6 @@ class ParaSSRModel(nn.Module):
                 predictions.update(map_out)
         elif det_out is not None and getattr(cfg, "expose_det_outputs", False):
             # refiner v5 student (ck/v5 relation 'student'): the CK2 inference reads its own det head (final layer)
-            predictions.update({k: det_out[k] for k in ("all_bbox_preds", "all_cls_scores", "det_hidden") if k in det_out})
+            predictions.update({k: det_out[k] for k in EXPOSED_DET_KEYS if k in det_out})
 
         return predictions

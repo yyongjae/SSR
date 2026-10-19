@@ -19,6 +19,8 @@ Overlap: p = sum_m w_m sigmoid(-sep_m / eps) (SAT separation temporal.raster.sat
   0.05 m/s, TTC |v| >= 5e-3).  NC reads delta 0, TTC the max over the four deltas.
 Reliability a_i = sigmoid(MLP(score, class one-hot, range / 32, bearing cos / sin, speed / 10, has, |a| / 6, L / 5,
   W / 3)) (learned; target in tools/ck/train_ck2.py: matched agent with an agreeing velocity -- never a gate).
+  Relation 'student': the student rows' feats (ck/v5/student_objects.py), + p_stop_i of the det head's V1c
+  stop_branch with V5Cfg.rel_pstop.
 Outputs per candidate b:
   r_i^k = max_n p^k_ni (per object), lp_k = sum_i log(1 - a_i r_i^k) (<= 0; k = NC, TTC);
   H^k_n = 1 - prod_i (1 - a_i p^k_ni) (per-state attributed hazard, the 'not bbox-anchored' quantity of Z);
@@ -106,7 +108,7 @@ class RelationReader(nn.Module):
         self.source = str(cfg.relation)                                    # 'teacher' (pack rows) | 'student' (det head)
         if self.source == "student":
             from .student_objects import N_FEAT_S
-            n_feat = N_FEAT_S
+            n_feat = N_FEAT_S + (1 if cfg.rel_pstop else 0)              # + p_stop_i (V5Cfg.rel_pstop)
         else:
             n_feat = N_FEAT
         self.rel_mlp = nn.Sequential(nn.Linear(n_feat, h), nn.GELU(), nn.Linear(h, 1))

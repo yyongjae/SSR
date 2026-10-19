@@ -237,10 +237,13 @@ def _d_v5() -> Dict[str, Any]:
     # corrector's Gaussian; edit block slot 0, labelled by labeler2 with the 96) -> the next generations' critic BCE has
     # the tau1 column (L_label tau1 / L_edit-Bernoulli) and lambda_awr * AWR of A_S on credit A = PDMS(tau1) -
     # PDMS(tau0) (official labels, one-generation delay, CKE2E2._awr_v5).
+    # rel_pstop = design §3.3's p_stop_i in the reliability MLP a_i: sigmoid of the det head's V1c stop logit of each row
+    # (V5Cfg.rel_pstop; needs agent.config.det_stop_branch, refused otherwise; the ACC head's p_stop2s is an aux target
+    # only, report 97 §1).
     return {"enabled": False, "relation": "off", "n_obj": 96, "score_thr": 0.3, "unknown_ev": False,
             "corrector": False, "z_stride": 2, "lambda_ref": 1.0, "ref_w": "", "ref_cols": 16, "lambda_rel_a": 0.2,
             "lambda_rel_h": 0.5, "rel_h_cols": 16, "z_kd": False, "lambda_zkd_det": 0.5, "lambda_zkd_map": 0.5,
-            "infer_refine": True, "rel_det_grad": False, "record_tau1": False, "lambda_awr": 0.1}
+            "infer_refine": True, "rel_det_grad": False, "record_tau1": False, "lambda_awr": 0.1, "rel_pstop": False}
 
 
 def _d_rg_gt_aux() -> Dict[str, Any]:
@@ -498,8 +501,10 @@ class CKE2E2Config:
                              "z_kd": _b(vq["z_kd"]), "lambda_zkd_det": float(vq["lambda_zkd_det"]),
                              "lambda_zkd_map": float(vq["lambda_zkd_map"]), "infer_refine": _b(vq["infer_refine"]),
                              "rel_det_grad": _b(vq["rel_det_grad"]), "record_tau1": _b(vq["record_tau1"]),
-                             "lambda_awr": float(vq["lambda_awr"])}
+                             "lambda_awr": float(vq["lambda_awr"]), "rel_pstop": _b(vq["rel_pstop"])}
             v5q = self.v4["v5"]
+            if v5q["rel_pstop"] and v5q["relation"] != "student":
+                raise ValueError("ck_e2e2.v4.v5.rel_pstop needs v5.relation student")
             if v5q["record_tau1"] and not (v5q["enabled"] and v5q["corrector"]):
                 raise ValueError("ck_e2e2.v4.v5.record_tau1 needs v5.enabled and v5.corrector")
             if v5q["rel_det_grad"] and v5q["relation"] != "student":
@@ -555,7 +560,8 @@ class CKE2E2Config:
         if not q["enabled"]:
             return V5Cfg()
         return V5Cfg(relation="student" if q["relation"] != "off" else "off", n_obj=q["n_obj"], rel_ca=False,
-                     unknown_ev=q["unknown_ev"], corrector=q["corrector"], z_stride=q["z_stride"])
+                     unknown_ev=q["unknown_ev"], corrector=q["corrector"], z_stride=q["z_stride"],
+                     rel_pstop=bool(q["rel_pstop"]))
 
     def v4_net(self):
         """V4Cfg of the student network (ck/v4/config.py; the v4 block's network keys + the optional v4_3 ones given)."""
@@ -585,6 +591,10 @@ class CKE2E2Config:
                 raise ValueError("ck_e2e2 reads the 50 x 100 S grid (0.64 m, front ROI)")
             if int(parent.embed_dims) != 256:
                 raise ValueError(f"ck_e2e2 needs embed_dims 256, got {parent.embed_dims}")
+            v5p = self.v5
+            if v5p["enabled"] and v5p["rel_pstop"] and not getattr(parent, "det_stop_branch", False):
+                raise ValueError("ck_e2e2.v4.v5.rel_pstop reads the det head's V1c stop logits: it needs "
+                                 "agent.config.det_stop_branch=true")
         if self.topk != K16:
             raise ValueError(f"ck_e2e2.topk must be {K16} (96-column generation layout), got {self.topk}")
         v = self.variants
@@ -1309,7 +1319,8 @@ def student_rel_rows(predictions: Dict, v5: Dict[str, Any]) -> Optional[Dict[str
     all_cls_scores / det_hidden; detached except the box code's position / velocity with rel_det_grad, design V2)
     -> per-token object rows (ck/v5/student_objects.student_object_rows); None
     when the block / channel is off.  KeyError when the det outputs are missing (inference needs
-    agent.config.expose_det_outputs=true)."""
+    agent.config.expose_det_outputs=true; rel_pstop needs the det head's V1c stop logits,
+    agent.config.det_stop_branch=true).  The box code's velocity is the head's deployed (stop-gated) one."""
     if not v5["enabled"] or v5["relation"] == "off":
         return None
     from .v5.student_objects import student_object_rows
@@ -1317,11 +1328,17 @@ def student_rel_rows(predictions: Dict, v5: Dict[str, Any]) -> Optional[Dict[str
     if miss:
         raise KeyError(f"ck_e2e2.v4.v5.relation student: predictions lack {miss} (det head off, or inference without "
                        f"agent.config.expose_det_outputs=true)")
+    kw = {}
+    if v5.get("rel_pstop", False):                # design §3.3 p_stop_i: the V1c stop probability (detached feature)
+        if "all_stop_logits" not in predictions:
+            raise KeyError("ck_e2e2.v4.v5.rel_pstop needs agent.config.det_stop_branch=true (predictions lack "
+                           "all_stop_logits)")
+        kw["stop_logit"] = predictions["all_stop_logits"][-1].detach()
     code = predictions["all_bbox_preds"][-1]
     if not v5.get("rel_det_grad", False):         # design V2 off: the det head is trained by its own GT losses only
         code = code.detach()
     return student_object_rows(code, predictions["all_cls_scores"][-1].detach(), predictions["det_hidden"].detach(),
-                               int(v5["n_obj"]), float(v5["score_thr"]))
+                               int(v5["n_obj"]), float(v5["score_thr"]), **kw)
 
 
 def refine_cols_parents(vtype: torch.Tensor, n: int) -> torch.Tensor:

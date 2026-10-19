@@ -101,6 +101,17 @@ refiner v4_3 range teachers (docs/refiner_v4/V4_3_SPEC.md M4 / M6; --v4-readout 
   aux = the stopped-aware blocked field, + a third field group Bp = the plain not-behind B, trained on LON >= -1.3 m,
   that the readout's TTC reads: R2 changes NC only); both are stored in config.json 'v4' (rg_read / rg_stopped_aware)
   and part of the --resume check.  run_teachers.sh READOUT=range R2=1 launches v4T10_rng2 / v4M10_rng2 with both.
+
+refiner v5 teachers (SSR/report/97_refiner_v5_design.md; ck/v5; every --v5-* default = off = the v4_3 trainer unchanged):
+  --v5-relation teacher (arm T): the object relation channel on the BEVFusion rows of the refiner-v3 object pack
+  (--t-pack-root; datasets get objects without augmentation, train with the matched GT futures as reliability targets);
+  --v5-unknown 1: unknown-evidence residual input; --v5-corrector 1: corrector A on the --ref-groups anchors (tau1 =
+  decode(tau0, mu_lon, w_lat_head + mu_lat)), trained by lambda_ref * L_refine(X1) (ck/v5/refine_loss.py; --ref-w term
+  weights) on the GT-ok tokens; --lambda-rel-a reliability BCE, --lambda-rel-h per-state hazard BCE (first
+  --rg-max-parents anchors), --lambda-corner corner-weighted margin Huber (MAP).  --v5-init <run>: warm start
+  (model.init_partial: matching tensors + the widened residual layer with zero new columns; --norm-from defaults to
+  the same run), --v5-freeze-trunk 1: the CK trunk (adapter, corridor, layers) gets no gradient (Stage-1 readers on a
+  frozen trunk).  config.json 'v5' (+ the v5 lambdas) is part of the --resume check.
 """
 from __future__ import annotations
 
@@ -287,6 +298,22 @@ def get_parser() -> argparse.ArgumentParser:
                     help="learned arm: pre-trained forecaster (tools/ck/v3/pretrain_forecaster.py <out>/forecaster.pt)")
     ap.add_argument("--t-fc-train", choices=TCF.FC_TRAIN, default=d.fc_train,
                     help="learned arm: frozen (default; needs --t-fc-init) | joint (forecast loss trains it)")
+    # refiner v5 (ck/v5; module docstring 'refiner v5 teachers'); every default = off
+    ap.add_argument("--v5-relation", choices=("off", "teacher"), default="off",
+                    help="teacher = object relation channel on the BEVFusion rows (arm T; needs --v4-readout range)")
+    ap.add_argument("--v5-n-obj", type=int, default=32, help="t0 object rows read by the relation channel")
+    ap.add_argument("--v5-rel-ca", type=int, choices=(0, 1), default=1, help="constant-acceleration mode (past frames)")
+    ap.add_argument("--v5-unknown", type=int, choices=(0, 1), default=0, help="unknown-evidence residual input")
+    ap.add_argument("--v5-corrector", type=int, choices=(0, 1), default=0, help="corrector A + L_refine(X1)")
+    ap.add_argument("--v5-z-stride", type=int, default=2, help="per-state reads at every k-th LQR state")
+    ap.add_argument("--v5-init", default="", help="warm start from a CK / v4_3 run dir (model.init_partial)")
+    ap.add_argument("--v5-freeze-trunk", type=int, choices=(0, 1), default=0, help="1 = no gradient into the CK trunk")
+    ap.add_argument("--lambda-ref", type=float, default=1.0, help="L_refine(X1) weight (with --v5-corrector 1)")
+    ap.add_argument("--ref-w", default="", help="L_refine term weights, e.g. 'road=1,obj=1,ttc=0.5,prog=1,cmf=0.1,u=1e-3'")
+    ap.add_argument("--ref-groups", choices=SUR_GROUPS, default="near_mid", help="anchors the corrector edits")
+    ap.add_argument("--lambda-rel-a", type=float, default=0.2, help="reliability a_i BCE (relation channel)")
+    ap.add_argument("--lambda-rel-h", type=float, default=0.5, help="per-state hazard H BCE (relation channel)")
+    ap.add_argument("--lambda-corner", type=float, default=0.0, help="corner-weighted executed margin Huber (MAP)")
     return ap
 
 
@@ -359,7 +386,47 @@ def resolve_args(a):
     if a.v4_cfg.rg_priv != "off" and not str(a.run).endswith("_PRIV"):
         raise SystemExit(f"PRIVILEGED range run (--v4-rg-priv {a.v4_cfg.rg_priv}): the run name must end with _PRIV "
                          f"(got {a.run!r})")
+    a.v5_cfg = resolve_v5(a)
     return a
+
+
+V5_ARG_KEYS = ("v5_relation", "v5_n_obj", "v5_rel_ca", "v5_unknown", "v5_corrector", "v5_z_stride", "v5_init",
+               "v5_freeze_trunk", "lambda_ref", "ref_w", "ref_groups", "lambda_rel_a", "lambda_rel_h", "lambda_corner",
+               "v5_cfg", "ref_weights")
+
+
+def resolve_v5(a):
+    """-> V5Cfg from the --v5-* flags (off unless one of relation / unknown / corrector is on)."""
+    from navsim.agents.para_ssr.ck.v5.config import V5Cfg
+    from navsim.agents.para_ssr.ck.v5.refine_loss import parse_weights
+    rel = str(getattr(a, "v5_relation", "off") or "off")
+    unk = bool(int(getattr(a, "v5_unknown", 0) or 0))
+    cor = bool(int(getattr(a, "v5_corrector", 0) or 0))
+    try:
+        a.ref_weights = parse_weights(getattr(a, "ref_w", ""))
+        v5 = V5Cfg(relation=rel, n_obj=int(getattr(a, "v5_n_obj", 32)), rel_ca=bool(int(getattr(a, "v5_rel_ca", 1))),
+                   unknown_ev=unk, corrector=cor, z_stride=int(getattr(a, "v5_z_stride", 2))).validate(v4_cfg_of(a))
+    except ValueError as e:
+        raise SystemExit(f"--v5-*: {e}") from None
+    if v5.rel and a.arm != "T":
+        raise SystemExit("--v5-relation teacher reads the BEVFusion detections: arm T only")
+    if temporal_cfg_of(a).on and v5.on:
+        raise SystemExit("--v5-* is not combined with the refiner-v3 temporal branch")
+    init = str(getattr(a, "v5_init", "") or "")
+    if init:
+        if a.init_from not in (None, "", "none"):
+            raise SystemExit("--v5-init and --init-from are exclusive")
+        if not (Path(init) / "config.json").is_file():
+            raise SystemExit(f"--v5-init {init}: no config.json")
+        if a.norm_from in (None, "", "compute"):
+            a.norm_from = init                               # the trunk's own input normalisation
+    return v5
+
+
+def v5_cfg_of(a):
+    from navsim.agents.para_ssr.ck.v5.config import V5Cfg
+    v = getattr(a, "v5_cfg", None)
+    return v if v is not None else V5Cfg()
 
 
 V4_3_FLAGS = ("v4_exec_model", "v4_ev_tbin_s", "v4_ep_evidence", "v4_vmax", "v4_rg_read",
@@ -537,6 +604,15 @@ def objects_spec(a, split: str, train: bool) -> Optional[Dict]:
     return {"cfg": t.to_dict(), "aug": False, "targets": bool(has)}
 
 
+def v5_objects_spec(a, split: str, train: bool) -> Dict:
+    """Dataset `objects` kwarg of the v5 relation channel: the refiner-v3 object pack rows (no augmentation), train with
+    the matched GT futures (reliability targets)."""
+    from navsim.agents.para_ssr.ck.temporal.config import TemporalCfg
+    t = TemporalCfg(on=True, source="bevfusion", forecaster="ca", n_modes=1, pack_root=str(a.t_pack_root),
+                    ca_scales=str(a.t_ca_scales), fc_train="frozen")
+    return {"cfg": t.to_dict(), "aug": False, "targets": bool(train)}
+
+
 def check_obj_bad(name: str, ds) -> None:
     """SPEC 5.3 fail loudly: more than 0.5 % of a dataset's tokens without objects (obj_ok False) -> SystemExit."""
     from tools.ck.data.ck2_dataset import OBJ_BAD_MAX
@@ -555,8 +631,12 @@ def build_datasets(a) -> Dict:
     ck2 = dict(var_name=a.var_name, seed=a.seed, sampler_seed=a.sampler_seed, ep_target=ep)
     on = temporal_cfg_of(a).on
 
+    v5rel = v5_cfg_of(a).rel
+
     def ob(split, train=False):                    # the objects kwarg only when the branch is on (OFF: no kwarg)
-        return {"objects": objects_spec(a, split, train)} if on else {}
+        if on:
+            return {"objects": objects_spec(a, split, train)}
+        return {"objects": v5_objects_spec(a, split, train)} if v5rel else {}
 
     v4kw = {}                                      # refiner v4 extras (off: the CK2 dataset call, unchanged)
     if getattr(a, "time_idx_root", ""):
@@ -585,7 +665,7 @@ def build_datasets(a) -> Dict:
                                                  rows=rows, ep_target=ep, **ob(a.split))))
             evals.append((name + RAW_SUFFIX, "raw", CK2Dataset(a.split, bev=a.arm, n_var=a.eval_n_var, gt=egt,
                                                                epoch=0, rows=rows, **ck2, **ob(a.split))))
-    if on:
+    if on or v5rel:
         check_obj_bad(a.split, train)
         for name, _, ds in evals:
             check_obj_bad(name, ds)
@@ -689,6 +769,8 @@ def setup_model(a, run: Path, train_ds, D: Dist, norm_override=None):
         kw["corridor_version"] = int(a.corridor_version)
     if v4_cfg_of(a).on:                                            # refiner v4 (off: the call unchanged)
         kw["v4"] = v4_cfg_of(a)
+    if v5_cfg_of(a).on:                                            # refiner v5 (off: the call unchanged)
+        kw["v5"] = v5_cfg_of(a)
     net = build_ck(a.arm, seed=a.seed, norm=(mean, std), init_from=init, lead_aux=False, **kw)
     rep = getattr(net, "init_report", None)
     rep = dict(rep) if isinstance(rep, dict) else {"report": str(rep)}
@@ -699,7 +781,16 @@ def setup_model(a, run: Path, train_ds, D: Dist, norm_override=None):
         if prior is not None:
             net.set_score_prior(prior)
             rep["score_prior"] = [float(x) for x in prior]
+    if str(getattr(a, "v5_init", "") or ""):                       # refiner v5 warm start (after the score prior)
+        from navsim.agents.para_ssr.ck.model import init_partial
+        r5 = init_partial(net, a.v5_init)
+        rep["v5_init"] = {k: (v if not isinstance(v, list) else {"n": len(v), "names": v[:40]}) for k, v in r5.items()}
     rep["frozen"] = freeze_unused(net)
+    if int(getattr(a, "v5_freeze_trunk", 0) or 0):
+        for n_, p_ in net.trunk.named_parameters():
+            if p_.requires_grad:
+                p_.requires_grad_(False)
+                rep["frozen"].append(f"trunk.{n_}")
     return net, rep
 
 
@@ -732,7 +823,22 @@ def anchors_on(dev) -> "torch.Tensor":
     return _ANCHORS_T[key]
 
 
-def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool, tcfg=None) -> Dict:
+def refine_columns(batch: Dict, groups: str) -> "torch.Tensor":
+    """anchor columns [T, R] the v5 corrector edits: the --ref-groups anchors (near: group 0, near_mid: <= 1, all) in
+    slot order (stable); R = the smallest per-token count (the sampler draws a fixed 8 near + 8 mid + 16 strat)."""
+    cand = batch["cand"]
+    T, K = cand.shape[:2]
+    gmax = SUR_GROUP_MAX[groups]
+    if gmax is None or "anc_group" not in batch:
+        return torch.arange(K, device=cand.device)[None].expand(T, K).contiguous()
+    keep = batch["anc_group"].to(cand.device).long() <= gmax
+    R = int(keep.sum(1).min())
+    order = torch.argsort((~keep).to(torch.int8), dim=1, stable=True)
+    return order[:, :max(R, 1)].contiguous()
+
+
+def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool, tcfg=None, refine: bool = False,
+            ref_groups: str = "near_mid") -> Dict:
     """CKNet forward on the model inputs only (bev, cand, status, var_traj; + OBJ_INPUT_KEYS (+ the oracle's
     PRIV_INPUT_KEYS) when the temporal branch is on); no decode (done with z_lon = 0).
     refiner v4 hazard readout: the raw anchors are their own parents, a variant's parent is its anchor
@@ -749,6 +855,12 @@ def forward(net, batch: Dict, use_amp: bool, dev, with_var: bool, tcfg=None) -> 
     if v4 is not None and v4.range and v4.rg_priv != "off":      # PRIVILEGED teacher: the batch's GT objects as input
         from navsim.agents.para_ssr.ck.v4.losses import EV_REF_KEYS
         kw["priv"] = {k: batch[k].to(dev) for k in EV_REF_KEYS if k in batch}
+    v5 = getattr(core, "v5", None)
+    if v5 is not None and v5.rel:                                # refiner v5 relation channel: the pack's t0 + past rows
+        from navsim.agents.para_ssr.ck.temporal.config import OBJ_INPUT_KEYS
+        kw["rel_objs"] = {k: batch[k].to(dev) for k in OBJ_INPUT_KEYS}
+    if refine and v5 is not None and v5.corrector:
+        kw["refine_cols"] = refine_columns(batch, ref_groups)
     with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_amp):
         return net(batch.get("bev"), batch["cand"].float(), batch["status"].float(), extra=extra, decode=False,
                    **kw)
@@ -827,6 +939,7 @@ def compute_loss(out: Dict, corr: Dict, batch: Dict, a) -> Tuple[torch.Tensor, D
         st.update({f"t_{k}": float(v) for k, v in (terms or {}).items()})
     loss = loss + 0.0 * out["w_lat"].float().sum()          # lateral head always in the graph (DDP)
     loss = add_v4_losses(loss, st, out, batch, a)
+    loss = add_v5_losses(loss, st, out, batch, a)
     st["e_abs"] = float(corr["e_lat"].detach()[..., 2:].abs().mean())
     st["w_lat_abs"] = float(out["w_lat"].detach().float().abs().mean())
     st["z_lon_absmax"] = float(out["z_lon"].detach().float().abs().max())
@@ -909,6 +1022,63 @@ def add_v4_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
     return loss
 
 
+def add_v5_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
+    """refiner v5 terms (V5Cfg off -> unchanged): reliability BCE (lambda_rel_a; the pack's matched GT futures),
+    per-state hazard BCE (lambda_rel_h; GT objects at the first --rg-max-parents anchors' executed states), L_refine(X1)
+    of the corrector (lambda_ref; GT-ok tokens), corner-weighted margin Huber (lambda_corner).  GT = targets only."""
+    import torch.nn.functional as F
+    from navsim.agents.para_ssr.ck.v4 import lqr as LQR
+    from navsim.agents.para_ssr.ck.v5 import refine_loss as RL
+    v5 = v5_cfg_of(a)
+    if not v5.on or "haz" not in out:
+        return loss
+    haz = out["haz"]
+    idx = TC.gt_index(batch)
+    n = int(idx.numel())
+    gt = RL.gt_of(batch, idx) if n else None
+    Kh = int(getattr(a, "rg_max_parents", 8))
+    zs = int(v5.z_stride)
+    tz = torch.arange(LQR.NT, dtype=torch.float64, device=batch["cand"].device)[::zs] * LQR.DT
+    if v5.rel:
+        la, lh = float(getattr(a, "lambda_rel_a", 0.0)), float(getattr(a, "lambda_rel_h", 0.0))
+        if la > 0 and "fc_xyh" in batch:
+            y, m = RL.reliability_targets(haz["rel_objs_tok"], batch["fc_xyh"], batch["fc_state"])
+            av = haz["rel_a"].float().clamp(1e-4, 1 - 1e-4)
+            mf = m.float()
+            l_a = (F.binary_cross_entropy(av, y, reduction="none") * mf).sum() / mf.sum().clamp(min=1.0)
+            loss = loss + la * l_a
+            st.update(rel_a_bce=float(l_a.detach()), rel_a_pos=float((y * mf).sum() / mf.sum().clamp(min=1.0)),
+                      rel_a_mean=float((av.detach() * mf).sum() / mf.sum().clamp(min=1.0)))
+        if lh > 0 and n:
+            H = haz["zq"][idx][:, :Kh, :, -2:].float().clamp(1e-4, 1 - 1e-4)          # [n, Kh, Q', 2]
+            y, known = RL.gt_state_block(haz["exec_states"][idx][:, :Kh, ::zs], tz, gt)
+            mk = known.float()[..., None].expand_as(H)
+            l_h = (F.binary_cross_entropy(H, y, reduction="none") * mk).sum() / mk.sum().clamp(min=1.0)
+            loss = loss + lh * l_h
+            st.update(rel_h_bce=float(l_h.detach()), rel_h_pos=float((y * mk).sum() / mk.sum().clamp(min=1.0)))
+    if v5.corrector and "refine" in out:
+        rf = out["refine"]
+        loss = loss + 0.0 * (rf["mu"].sum() + rf["log_sig"].sum())                    # DDP: always in the graph
+        lr = float(getattr(a, "lambda_ref", 0.0))
+        if lr > 0 and n:
+            eds = out["ego"][2].float()
+            w = getattr(a, "ref_weights", None) or RL.parse_weights("")
+            l_ref, s_ref = RL.refine_loss(rf["tau1"][idx], rf["tau0"][idx], eds[idx, 0], eds[idx, 2], gt, w)
+            l_u = (rf["mu"][idx].float() ** 2).mean()
+            loss = loss + lr * (l_ref + float(w.get("u", 0.0)) * l_u)
+            st.update(s_ref)
+            st.update(ref_loss=float(l_ref.detach()), ref_mu_abs=float(rf["mu"].detach().abs().mean()))
+    lc = float(getattr(a, "lambda_corner", 0.0) or 0.0)
+    if lc > 0 and n and "corner_D" in haz:
+        l_c, n_c = RL.corner_margin_aux(haz["corner_D"][idx][:, :Kh], haz["corner_ok"][idx][:, :Kh],
+                                        haz["exec_states"][idx][:, :Kh], gt["sdf"])
+        loss = loss + lc * l_c
+        st.update(corner_huber=float(l_c.detach()), corner_n=float(n_c))
+    if "unknown_frac" in haz:
+        st["unknown_frac"] = float(haz["unknown_frac"].detach().float().mean())
+    return loss
+
+
 def range_gt_aux(haz: Dict, cand: torch.Tensor, ref: Dict, a, need_occ: bool = True, need_margin: bool = True
                  ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """refiner v4_3 range teachers (--v4-readout range; spec V4_3 M4 / M6 'Teachers'): GT field aux on the parent rows of
@@ -942,6 +1112,8 @@ def dummy_backward(out: Dict) -> None:
     graph (zero-weighted outputs), so the reducer stays in step; the gradients are discarded."""
     terms = [out[k].float().nan_to_num(0.0, 0.0, 0.0).sum() * 0.0 for k in ("score_logit", "extra_score_logit",
                                                                             "w_lat", "pref_logp") if k in out]
+    if out.get("refine") is not None:                               # refiner v5 corrector
+        terms += [out["refine"][k].float().nan_to_num(0.0, 0.0, 0.0).sum() * 0.0 for k in ("mu", "log_sig")]
     if out.get("fc") is not None and out["fc"].mu.requires_grad:   # learned forecaster outputs (not frozen)
         from navsim.agents.para_ssr.ck.temporal.loss import forecast_touch
         terms.append(forecast_touch(out["fc"]).nan_to_num(0.0, 0.0, 0.0))
@@ -1220,6 +1392,10 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
     # refiner v4 flags: recorded only when v4 is on (off: the CK2 / v3 config.json keys exactly; the v4 block and
     # weights are added below)
     targs = {k: v for k, v in targs.items() if k not in V4_ARG_KEYS or v4_cfg_of(a).on}
+    targs = {k: v for k, v in targs.items() if k not in V5_ARG_KEYS or v5_cfg_of(a).on}
+    if v5_cfg_of(a).on:
+        targs["v5"] = v5_cfg_of(a).to_dict()
+        targs["ref_weights"] = dict(getattr(a, "ref_weights", {}) or {})
     cfg = dict(targs, arm=a.arm, seed=a.seed, trainer="train_ck2", git_head=U.git_head(), run_dir=str(run),
                device_resolved=str(dev), cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"), world_size=D.world,
                tokens_per_rank=b_local, global_batch=a.tokens_per_batch,
@@ -1257,6 +1433,9 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
         from navsim.agents.para_ssr.ck.v4.config import V4Cfg
         if V4Cfg.from_dict(old.get("v4")) != v4_cfg_of(a):           # old config without the key = off
             raise SystemExit(f"{run}: resume with v4={v4_cfg_of(a).to_dict()!r} but config.json has {old.get('v4')!r}")
+        from navsim.agents.para_ssr.ck.v5.config import V5Cfg
+        if V5Cfg.from_dict(old.get("v5")) != v5_cfg_of(a):           # old config without the key = off
+            raise SystemExit(f"{run}: resume with v5={v5_cfg_of(a).to_dict()!r} but config.json has {old.get('v5')!r}")
         if tcfg.on and old.get("provenance"):      # review fix D5: a resumed arm must keep its code and data
             from tools.ck.v3 import provenance as PV
             cmp = PV.compare({"config.json": old["provenance"], "now": cfg["provenance"]})
@@ -1381,7 +1560,8 @@ def _train(a, D: Dist, datasets, collate_fn, norm_override) -> Path:
         bi = bstart
         for batch in dl:
             batch = TC.to_dev(batch, dev)
-            out = forward(model, batch, use_amp, dev, with_var, tcfg)
+            out = forward(model, batch, use_amp, dev, with_var, tcfg, refine=v5_cfg_of(a).corrector,
+                          ref_groups=getattr(a, "ref_groups", "near_mid"))
             corr = lateral_decode(batch["cand"], out["w_lat"], out["ego"][0], slope)
             loss, st = compute_loss(out, corr, batch, a)
             opt.zero_grad(set_to_none=True)

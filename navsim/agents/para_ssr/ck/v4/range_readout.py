@@ -483,6 +483,24 @@ class RangeReadout(nn.Module):
         self.comfort_head = _mlp(d, int(cfg.comfort_hidden), 1)
         self.lat_head = _mlp(2 * d + HC_CH, int(cfg.lat_hidden), N_FREE, zero_last=True)
 
+    # refiner v5 (ck/v5; off unless CKNet calls enable_v5): extra residual inputs, relation log-pass terms, per-state
+    # reads Z and the executed-corner margins
+    v5_on = False
+
+    def enable_v5(self, n_extra: int, rel: bool, unknown_ev: bool, z_stride: int) -> None:
+        """refiner v5 (ck/v5/config.py): the residual MLP takes n_extra more inputs after [ev(7), g] (rebuilt here; the
+        caller seeds the RNG; a warm start from a v4_3 run copies the old columns and zeroes the new ones), rel adds the
+        direct log-pass weights rel_w [2] (NC, TTC; zero-initialised), forward() then also returns zq / unknown_frac /
+        corner_D / corner_ok."""
+        if self.resid is None:
+            raise ValueError("v5 needs the range readout's residual MLP (V4Cfg.ev_resid)")
+        d = self.resid[0].in_features - N_RES
+        if int(n_extra) > 0:
+            self.resid = _mlp(N_RES + d + int(n_extra), int(self.cfg.rg_hidden), 3, zero_last=True)
+        self.v5_on, self.v5_n_extra, self.v5_rel = True, int(n_extra), bool(rel)
+        self.v5_unknown, self.v5_stride = bool(unknown_ev), int(z_stride)
+        self.rel_w = nn.Parameter(torch.zeros(2)) if rel else None
+
     @torch.no_grad()
     def set_prior(self, prior: Sequence[float]) -> None:
         """B / U logits biased so that a uniform field read at every executed state gives the NC pass prior (logit
@@ -530,7 +548,8 @@ class RangeReadout(nn.Module):
 
     def forward(self, fields: Dict[str, Tensor], rows: Tensor, fr: Dict[str, Tensor], states: Tensor, t: Tensor,
                 xs: Tensor, xd: Tensor, Hc: Tensor, g: Tensor, S8: Tensor, d_st: Tensor, t_in: Tensor,
-                t_leave: Tensor, pref: Optional[Tensor] = None) -> Dict[str, Tensor]:
+                t_leave: Tensor, pref: Optional[Tensor] = None, v5: Optional[Dict[str, Tensor]] = None
+                ) -> Dict[str, Tensor]:
         """fields = scene(...) of the R parent rows, rows [B] (candidate -> parent row), fr = range_targets.parent_frame
         of the R rows, states [B, Q, 6] at t [Q] (candidate_states), xs [B, 48, d] / xd [B, d] (the candidate's
         parent's station / draft tokens), Hc [R, 128, 48, 17] (parent rows), g [B, d] (draft_mlp of the candidate),
@@ -563,6 +582,12 @@ class RangeReadout(nn.Module):
             slack_dac = torch.where(torch.isfinite(slack_dac), slack_dac, torch.full_like(slack_dac, SDF_CLIP))
             # ---- thresholded fields: slacks / critical points (no gradient)
             hard = hard_evidence(blk.detach() > 0, D.detach(), rows, geo, M, self.tbin, read=rd)
+            v5o = None
+            if self.v5_on:                                  # refiner v5: per-state reads Z (ck/v5/zread.py)
+                from ..v5.zread import state_reads, zq_of
+                sr = state_reads(blk, D, rows, geo, M, rd)
+                v5o = {"zq": zq_of(sr, self.v5_stride), "unknown_frac": sr["unknown"].float().mean(-1),
+                       "corner_D": Dc, "corner_ok": gd["ok"]}
             S_exec = LQR.executed_progress(st)[0]
             overspeed = torch.zeros(B, dtype=torch.float32, device=dev)
             if self.cfg.vmax == "feature":
@@ -575,10 +600,25 @@ class RangeReadout(nn.Module):
         ev = torch.stack([five(lp_nc), five(lp_ttc), five(lp_dac), five(hard["slack_nc"]), five(hard["slack_ttc"]),
                           five(slack_dac.clamp(-SDF_CLIP, SDF_CLIP)), five(overspeed).clamp(max=3.0)], -1)
         if self.resid is not None:
-            r = self.resid(torch.cat([ev.to(dt), g], -1)).float()
+            rin = [ev.to(dt), g]
+            if v5o is not None and self.v5_n_extra:
+                ext = []
+                if self.v5_rel:
+                    if v5 is None or v5.get("ev_extra") is None:
+                        raise ValueError("range readout with the v5 relation channel: forward(..., v5={'ev_extra', "
+                                         "'rel_lp'}) is required")
+                    ext.append(v5["ev_extra"].float())
+                if self.v5_unknown:
+                    ext.append(v5o["unknown_frac"][:, None])
+                rin.append(torch.cat(ext, -1).to(dt))
+            r = self.resid(torch.cat(rin, -1)).float()
             logit[:, I_NC] = logit[:, I_NC] + r[:, 0]
             logit[:, I_TTC] = logit[:, I_TTC] + r[:, 1]
             logit[:, I_DAC] = logit[:, I_DAC] + r[:, 2]
+        if v5o is not None and self.v5_rel:              # direct relation log-pass terms (zero-initialised weights)
+            lp_rel = v5["rel_lp"].float()
+            logit[:, I_NC] = logit[:, I_NC] + self.rel_w[0].float() * lp_rel[:, 0]
+            logit[:, I_TTC] = logit[:, I_TTC] + self.rel_w[1].float() * lp_rel[:, 1]
         # ---- stations read on the planned schedule (EP / lateral heads, v4_2 keys)
         H = float(self.cfg.horizon)
         m = read_mask(t_in, H)
@@ -615,6 +655,8 @@ class RangeReadout(nn.Module):
                "min_margin": slack_dac, "exec_ratio": ratio_x, "S_exec": S_exec, "overspeed": overspeed,
                "mask": m, "t_out": t_out}
         out.update({k: hard[k] for k in ("crit_station", "crit_lat", "crit_time", "crit_chan")})
+        if v5o is not None:
+            out.update(v5o)
         return out
 
     @torch.no_grad()

@@ -45,10 +45,12 @@ from .constants import CK_KEYS, NORM_FILE, SCORE_SEED_OFFSET
 from .correct import correct
 from .temporal.config import TemporalCfg
 from .v4.config import V4Cfg
+from .v5.config import V5Cfg
 
 ARMS = ("T", "M", "S", "none")
 N_KEYS = len(CK_KEYS)
 V4_SEED_OFFSET = 40414      # refiner v4 heads: own seeded RNG, built after every CK2 / v3 module
+V5_SEED_OFFSET = 50515      # refiner v5 modules (ck/v5): own seeded RNG, built after every v4 module
 GEO_T_ARR, GEO_V_ARR = 64 + 4, 64 + 5    # corridor_tensor channels of t_arr / v_arr (64 features + GEO_CHANNELS)
 
 
@@ -171,7 +173,8 @@ class CKNet(nn.Module):
 
     def __init__(self, arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                  score_hidden: int = 256, lead_aux: bool = False, temporal: Optional[TemporalCfg] = None,
-                 ca_b: Optional[torch.Tensor] = None, corridor_version: int = 1, v4: Optional[V4Cfg] = None):
+                 ca_b: Optional[torch.Tensor] = None, corridor_version: int = 1, v4: Optional[V4Cfg] = None,
+                 v5: Optional[V5Cfg] = None):
         super().__init__()
         self.arm = arm
         self.seed = int(seed)
@@ -227,6 +230,23 @@ class CKNet(nn.Module):
                 # so DDP / optimisers never expect a gradient for them
                 for mod in (self.score_head, self.trunk.lat_head, self.trunk.lon_head, self.trunk.gate_head):
                     mod.requires_grad_(False)
+        # refiner v5 (ck/v5): built AFTER every v4 module under its own seed (V5Cfg() = off: nothing is built)
+        self.v5 = (v5 if v5 is not None else V5Cfg()).validate(self.v4)
+        self.relation = None
+        self.corrector_v5 = None
+        if self.v5.on:
+            from .v5.config import N_TOP, N_TOP_FEAT
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed + V5_SEED_OFFSET)
+                self.v4_readout.enable_v5(self.v5.n_extra, self.v5.rel, self.v5.unknown_ev, self.v5.z_stride)
+                if self.v5.rel:
+                    from .v5.relation import RelationReader
+                    self.relation = RelationReader(self.v5)
+                if self.v5.corrector:
+                    from .v5.corrector import CorrectorV5
+                    self.corrector_v5 = CorrectorV5(self.trunk.d_model, self.v5.n_z,
+                                                    N_TOP * N_TOP_FEAT if self.v5.rel else 0,
+                                                    hidden=self.v5.corr_hidden, z_hidden=self.v5.z_hidden)
 
     # ------------------------------------------------------------------------------------------ helpers
     def param_counts(self) -> Dict[str, int]:
@@ -239,7 +259,8 @@ class CKNet(nn.Module):
             c.update(tc)
             c["total"] = c["total"] + tc["temporal_shared"] + tc["forecaster"]
         for name, mod in (("v4_readout", self.v4_readout), ("pref_head", self.pref_head),
-                          ("corrector", self.corrector)):
+                          ("corrector", self.corrector), ("relation", getattr(self, "relation", None)),
+                          ("corrector_v5", getattr(self, "corrector_v5", None))):
             if mod is not None:                                         # keys only when on
                 c[name] = sum(p.numel() for p in mod.parameters())
                 c["total"] = c["total"] + c[name]
@@ -297,7 +318,8 @@ class CKNet(nn.Module):
                   parents: Optional[torch.Tensor] = None, tfeat=None, pref: Optional[torch.Tensor] = None,
                   return_ctx: bool = False, parent_index: Optional[torch.Tensor] = None, pctx: Optional[Dict] = None,
                   return_pctx: bool = False, dedupe: Optional[bool] = None,
-                  priv: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
+                  priv: Optional[Dict[str, torch.Tensor]] = None,
+                  rel_objs: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
         """Score one candidate set with the token's scene (feat, mem from trunk.scene).  priv: the batch's ref_obj_*
         dict (losses.EV_REF_KEYS) of a PRIVILEGED range teacher (V4Cfg.rg_priv != 'off'; required then, refused
         otherwise; range_targets.priv_channels on the parent rows, reused from a range pctx):
@@ -415,7 +437,7 @@ class CKNet(nn.Module):
             haz = {k: sh(r[k]) for k in ("occ_logit", "margin", "lp_nc", "lp_ttc", "lp_dac", "min_margin")}
             haz["pts"] = sh(pgeom.points.detach().float())
         else:                                                           # range (V4_3 M4): fields once per parent row
-            r, haz, rg = self._range_read(P, rows, pidx, T, K, flat, ego, x, g, cgeom, sib, pr, priv)
+            r, haz, rg = self._range_read(P, rows, pidx, T, K, flat, ego, x, g, cgeom, sib, pr, priv, rel_objs)
             haz["pts"] = sh(pgeom.points.detach().float())
         haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), t_in=sh(sib["t_in"]), t_out=sh(r["t_out"]),
                    d_lat=sh(sib["d"]), is_self=sh(is_self))
@@ -439,7 +461,8 @@ class CKNet(nn.Module):
 
     def _range_read(self, P: Dict, rows: Optional[torch.Tensor], pidx: Optional[torch.Tensor], T: int, K: int,
                     flat: torch.Tensor, ego, x: torch.Tensor, g: torch.Tensor, cgeom, sib: Dict, pr,
-                    priv: Optional[Dict[str, torch.Tensor]] = None):
+                    priv: Optional[Dict[str, torch.Tensor]] = None,
+                    rel_objs: Optional[Dict[str, torch.Tensor]] = None):
         """score_set's readout 'range' (spec V4_3 M4; ck/v4/range_readout.py): scene fields on the R rows of the parent
         pass P (R = T * U unique parents, or T * K without dedupe; reused from P['rg_fields'] / P['rg_frame'] when P is
         a range pctx), the candidates' states (exec_model; ego (vx, ax) = eds[:, 0], eds[:, 2], i.e. status[..., 4] /
@@ -472,8 +495,21 @@ class CKNet(nn.Module):
         rep = lambda a: a.reshape(T, 1).repeat_interleave(K, 0)[:, 0]
         with torch.autocast(device_type=dev.type, enabled=False):
             states, tq = candidate_states(flat, rep(eds[:, 0]), rep(eds[:, 2]), self.v4.exec_model)
+        v5in, rel = None, None
+        if self.v5.on:                                   # refiner v5: relation channel on the strided executed states
+            v5in = {}
+            if self.relation is not None:
+                if rel_objs is None:
+                    raise ValueError("CKNet.score_set: this net has the v5 relation channel: rel_objs= (obj_in, "
+                                     "obj_mask, frame_valid of the batch) is required")
+                zs = int(self.v5.z_stride)
+                tok = torch.arange(B, device=dev) // K
+                rel = self.relation(rel_objs, states[:, ::zs], tq[::zs], tok)
+                v5in = {"ev_extra": rel["ev"], "rel_lp": rel["lp"]}
+        elif rel_objs is not None:
+            raise ValueError("CKNet.score_set: rel_objs given to a net without the v5 relation channel")
         r = self.v4_readout(Fs, prow, fr_u, states, tq, x[:, 1:], x[:, 0], P["Hc"], g, cgeom.S[:, -1], sib["d"],
-                            sib["t_in"], sib["t_leave"], pr)
+                            sib["t_in"], sib["t_leave"], pr, **({"v5": v5in} if v5in is not None else {}))
         M = self.v4_readout.M
         sh = lambda a: a.reshape(T, K, *a.shape[1:])
         R = Fs["blk"].shape[0]
@@ -489,6 +525,14 @@ class CKNet(nn.Module):
         haz.update({k: sh(r[k]) for k in ("lp_nc", "lp_ttc", "lp_dac", "slack_nc", "slack_ttc", "slack_dac",
                                            "min_margin", "crit_station", "crit_lat", "crit_time", "crit_chan",
                                            "exec_ratio", "S_exec", "overspeed")})
+        if self.v5.on:                                   # refiner v5 outputs (per candidate; rel_a / rel_valid per token)
+            zq = r["zq"] if rel is None else torch.cat([r["zq"], rel["H"].float()], -1)
+            haz.update(zq=sh(zq), unknown_frac=sh(r["unknown_frac"]), corner_D=sh(r["corner_D"]),
+                       corner_ok=sh(r["corner_ok"]))
+            if rel is not None:
+                haz.update(rel_lp=sh(rel["lp"]), rel_top=sh(rel["top"]), rel_r_nc=sh(rel["r_nc"]),
+                           rel_r_ttc=sh(rel["r_ttc"]), rel_a=rel["a_tok"], rel_valid=rel["valid_tok"],
+                           rel_objs_tok=rel["objs_tok"])
         return r, haz, (Fs, fr_u)
 
     def correct_topk(self, feat: torch.Tensor, mem: torch.Tensor, ego, pool: torch.Tensor, parents: torch.Tensor,
@@ -572,15 +616,18 @@ class CKNet(nn.Module):
                 extra: Optional[torch.Tensor] = None, decode: bool = True, slope: float = 0.0,
                 rescore_corr: bool = False, objs: Optional[Dict[str, torch.Tensor]] = None,
                 cand_parent: Optional[torch.Tensor] = None, extra_parent: Optional[torch.Tensor] = None,
-                priv: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
+                priv: Optional[Dict[str, torch.Tensor]] = None, rel_objs: Optional[Dict[str, torch.Tensor]] = None,
+                refine_cols: Optional[torch.Tensor] = None) -> Dict:
         """cand_parent / extra_parent [T, K(2), 8, 3]: refiner v4 hazard readout only (each candidate's parent draft;
         None = itself); ignored by the mean readout.  priv: the ref_obj_* dict of a PRIVILEGED range teacher
         (score_set)."""
         if self.v4_readout is not None:
             return self._forward_v4(bev, cand, status, extra, decode, slope, rescore_corr, objs, cand_parent,
-                                    extra_parent, priv)
+                                    extra_parent, priv, rel_objs, refine_cols)
         if priv is not None:
             raise ValueError("priv given to a CK net without a range readout")
+        if rel_objs is not None or refine_cols is not None:
+            raise ValueError("rel_objs / refine_cols given to a CK net without the v5 modules")
         T, K = cand.shape[:2]
         if status.shape[0] != T:
             raise ValueError(f"status {tuple(status.shape)} vs cand {tuple(cand.shape)}")
@@ -620,7 +667,7 @@ class CKNet(nn.Module):
         return out
 
     def _forward_v4(self, bev, cand, status, extra, decode, slope, rescore_corr, objs, cand_parent,
-                    extra_parent, priv=None) -> Dict:
+                    extra_parent, priv=None, rel_objs=None, refine_cols=None) -> Dict:
         """forward() with the v4 hazard readout (same output keys; + 'haz' (per set: a_nc / a_ttc / a_dac / haz_mask /
         t_arr / d_lat) and 'pref_logp' [T] when the P_ref head is on)."""
         T, K = cand.shape[:2]
@@ -633,23 +680,51 @@ class CKNet(nn.Module):
         cand = cand.float()
         feat, mem = self.trunk.scene(bev, T)
         pref = self.scene_pref(mem, ego)
-        o = self.score_set(feat, mem, ego, cand, cand_parent, pref=pref, priv=priv)
+        refine = refine_cols is not None
+        if refine and self.corrector_v5 is None:
+            raise ValueError("refine_cols given to a CK net without the v5 corrector")
+        o = self.score_set(feat, mem, ego, cand, cand_parent, pref=pref, priv=priv, rel_objs=rel_objs,
+                           return_ctx=refine)
         out = {"score_logit": o["score_logit"], "z_lon": o["z_lon"], "w_lat": o["w_lat"],
                "gate_logit": o["gate_logit"], "ego": ego, "haz": o["haz"]}
+        if refine:                                       # refiner v5 corrector A on the given draft columns
+            out["refine"] = self.refine_drafts(o, cand, refine_cols, ego)
         if pref is not None:
             out["pref_logp"] = pref
         if decode or rescore_corr:
             out["corr"] = correct(cand, out["z_lon"], out["w_lat"], v0, slope)
         if rescore_corr:
             ct = out["corr"]["traj"].detach()
-            out["corr_score_logit"] = self.score_set(feat, mem, ego, ct, cand, pref=pref, priv=priv)["score_logit"]
+            out["corr_score_logit"] = self.score_set(feat, mem, ego, ct, cand, pref=pref, priv=priv,
+                                                     rel_objs=rel_objs)["score_logit"]
         if extra is not None:
             if extra.shape[0] != T:
                 raise ValueError(f"extra {tuple(extra.shape)} vs cand {tuple(cand.shape)}")
-            oe = self.score_set(feat, mem, ego, extra.float(), extra_parent, pref=pref, priv=priv)
+            oe = self.score_set(feat, mem, ego, extra.float(), extra_parent, pref=pref, priv=priv, rel_objs=rel_objs)
             out["extra_score_logit"] = oe["score_logit"]
             out["extra_haz"] = oe["haz"]
         return out
+
+
+    def refine_drafts(self, o: Dict, cand: torch.Tensor, cols: torch.Tensor, ego) -> Dict:
+        """refiner v5 corrector A (ck/v5/corrector.py) on the draft columns cols [T, R] of a score_set output o (with
+        return_ctx): mu from the critic context (detached), the per-state reads zq (NOT detached) and the top related
+        objects; tau1 = decode(tau0, mu_lon, w_lat_head (detached) + mu_lat), decoder mode B, differentiable in mu.
+        -> {cols, tau0 [T, R, 8, 3], tau1, mu / log_sig [T, R, 12]}."""
+        from .v5.corrector import decode_grad
+        T, R = cols.shape
+        cols = cols.to(cand.device).long()
+        g4 = lambda a: torch.gather(a, 1, cols.reshape(T, R, *([1] * (a.dim() - 2))).expand(T, R, *a.shape[2:]))
+        haz = o["haz"]
+        zs = int(self.v5.z_stride)
+        from .v4 import lqr as _LQR
+        tz = (torch.arange(_LQR.NT, dtype=torch.float32, device=cand.device) * _LQR.DT)[::zs]
+        a = self.corrector_v5(g4(o["ctx"]), g4(o["score_logit"].detach().float()), ego[0], g4(haz["zq"]), tz,
+                              g4(haz["rel_top"]) if "rel_top" in haz else None)
+        src = g4(cand.float())
+        tau1 = decode_grad(src, a["mu"][..., :N_FREE], g4(o["w_lat"]).detach().float() + a["mu"][..., N_FREE:],
+                           ego[0])
+        return {"cols": cols, "tau0": src, "tau1": tau1, "mu": a["mu"], "log_sig": a["log_sig"]}
 
 
 CKHead = CKNet          # task-text name
@@ -685,7 +760,8 @@ def _torch_load(p: Path) -> Dict:
 
 def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarray]] = None,
              init_from: Optional[Union[str, Path]] = None, lead_aux: bool = False, score_hidden: int = 256,
-             temporal: Optional[TemporalCfg] = None, corridor_version: int = 1, v4: Optional[V4Cfg] = None) -> CKNet:
+             temporal: Optional[TemporalCfg] = None, corridor_version: int = 1, v4: Optional[V4Cfg] = None,
+             v5: Optional[V5Cfg] = None) -> CKNet:
     """CKNet, optionally initialised from
       * a v1 stage-T run dir (config.json + ckpt_best.pt (else ckpt_last.pt) with RefinerNet keys): loaded into
         net.trunk; the source arm must equal the target arm, except target 'S', for which every adapter.* key is
@@ -707,7 +783,7 @@ def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarra
         if norm is None and arm in NORM_FILE and src_arm == arm and (src / NORM_FILE[arm]).is_file():
             norm = load_arm_norm(src, arm)
     net = CKNet(arm, seed, norm, score_hidden=score_hidden, lead_aux=lead_aux, temporal=temporal,
-                corridor_version=corridor_version, v4=v4)
+                corridor_version=corridor_version, v4=v4, **({"v5": v5} if v5 is not None and v5.on else {}))
     if init_from is None:
         net.init_report = report
         return net
@@ -745,6 +821,41 @@ def build_ck(arm: str, seed: int = 0, norm: Optional[Tuple[np.ndarray, np.ndarra
     return net
 
 
+def init_partial(net: CKNet, run_dir: Union[str, Path], which: str = "last") -> Dict:
+    """refiner v5 warm start from a trained CK / v4_3 run (e.g. the range teacher v4T10_rng2): every parameter / buffer
+    of the source whose name and shape match is copied; the range readout's residual first layer (more inputs in v5:
+    [ev(7), g(d), extra]) gets the source columns and ZERO new columns, so the warm-started critic's outputs equal the
+    source's at step 0 (the v5 relation term starts at rel_w = 0).  The source arm must equal the target's.  ->
+    report {source, ckpt, ckpt_sha16, n_copied, adapted, new (target keys not in the source), skipped (shape)}."""
+    src = Path(run_dir)
+    cfg = json.loads((src / "config.json").read_text()) if (src / "config.json").is_file() else {}
+    if cfg.get("arm") not in (None, net.arm):
+        raise ValueError(f"init_partial: source {src} arm {cfg.get('arm')!r} != target {net.arm!r}")
+    p = _ckpt_path(src, which)
+    sd = _torch_load(p)["model"]
+    own = net.state_dict()
+    copied, adapted, skipped = 0, [], []
+    with torch.no_grad():
+        for k, v in sd.items():
+            if k not in own:
+                skipped.append(k)
+                continue
+            t = own[k]
+            if tuple(t.shape) == tuple(v.shape):
+                t.copy_(v.to(t.dtype))
+                copied += 1
+            elif k == "v4_readout.resid.0.weight" and t.dim() == 2 and t.shape[0] == v.shape[0] \
+                    and t.shape[1] > v.shape[1]:
+                t.zero_()
+                t[:, :v.shape[1]].copy_(v.to(t.dtype))
+                adapted.append(k)
+            else:
+                skipped.append(k)
+    new = sorted(set(own) - set(sd))
+    return {"source": str(src), "ckpt": str(p), "ckpt_sha16": _sha16(p), "n_copied": copied, "adapted": adapted,
+            "new": new, "skipped": skipped}
+
+
 def save_ck(path: Union[str, Path], net: CKNet, cfg: Dict, **extra) -> None:
     """torch.save({'model', 'cfg', **extra}) atomically (tmp file + os.replace)."""
     path = Path(path)
@@ -778,7 +889,7 @@ def load_ck(run_dir: Union[str, Path], which: str = "last", device="cpu",
                 score_hidden=int(cfg.get("score_hidden", 256)), lead_aux=bool(int(cfg.get("lead_aux", 0) or 0)),
                 temporal=tcfg, ca_b=(torch.ones(2, 10) if tcfg.on and tcfg.forecaster != "learned" else None),
                 corridor_version=1 if cfg.get("corridor_version") is None else int(cfg["corridor_version"]),
-                v4=V4Cfg.from_dict(cfg.get("v4")))
+                v4=V4Cfg.from_dict(cfg.get("v4")), v5=V5Cfg.from_dict(cfg.get("v5")))
     # (ca_b placeholder: the checkpoint's persistent buffer overwrites it in the strict load below)
     p = _ckpt_path(run_dir, which)
     net.load_state_dict(_torch_load(p)["model"], strict=True)

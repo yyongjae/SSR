@@ -408,6 +408,8 @@ def resolve_v5(a):
         keys = set(getattr(a, "score_keys", None) or [])
         det_k, map_k = bool(keys & {"nc", "ttc"}), "dac" in keys
         zc = "all" if (det_k and map_k) or not keys else ("det" if det_k else "map")
+        if rel == "off" and not unk and not cor:     # v5 off: the default config (a non-v5 run's resume check)
+            zc = "all"
         v5 = V5Cfg(relation=rel, n_obj=int(getattr(a, "v5_n_obj", 96)), rel_ca=bool(int(getattr(a, "v5_rel_ca", 1))),
                    unknown_ev=unk, corrector=cor, z_stride=int(getattr(a, "v5_z_stride", 2)),
                    z_channels=zc).validate(v4_cfg_of(a))

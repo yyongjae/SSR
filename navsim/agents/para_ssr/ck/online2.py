@@ -1939,56 +1939,51 @@ class CKE2E2:
                 "valid": valid}
 
     def v5_edits_rec(self, student, out: Dict, S: Dict, s_kd: torch.Tensor, top: Dict, V: Dict,
-                     logs: Dict[str, float]) -> Optional[Dict[str, torch.Tensor]]:
-        """refiner v5 A_S, recording (report 97 §4 'labeler tau1 column, k = 1 credit'; report 99 N4): the deployment
-        rule's pick (select2.select96: infer_select's beta / set, else beta 0.5 over 'all' -- the pick CKE2E2.infer
-        refines) over THIS step's KD columns (the 96-columns outside the KD set get no score), its tau1 under an
-        exploration sample u = mu + exp(log_sig) eps of the corrector's Gaussian: tau1 = decode(pick, u_lon, w_lat_head
-        + u_lat) -> the EDIT_K record block {traj [B,8,8,3], src [B,8] (96-column of the pick), u [B,8,12], valid
-        [B,8]} with tau1 in slot 0 (slots 1.. invalid), or None (no v5 corrector / no KD column map / no context)."""
+                     logs: Dict[str, float], rel_rows: Optional[Dict[str, torch.Tensor]] = None
+                     ) -> Optional[Dict[str, torch.Tensor]]:
+        """refiner v5 A_S, recording (report 97 §4 'labeler tau1 column, k = 1 credit'; reports 99 N4 / 100 F3): the
+        DEPLOYED pick exactly as CKE2E2.infer makes it -- the whole 96 pool (infer_pool of this step's online variants)
+        scored by the student under no grad (score_set with the relation rows and the corrector context, fp32),
+        select2.select96 with infer_select's beta / set (else beta 0.5 over 'all') -- and its tau1 under an exploration
+        sample u = mu + exp(log_sig) eps of the corrector's Gaussian: tau1 = decode(pick, u_lon, w_lat_head + u_lat)
+        -> the EDIT_K record block {traj [B,8,8,3], src [B,8] (96-column of the pick), u [B,8,12], valid [B,8]} with
+        tau1 in slot 0 (slots 1.. invalid), or None (no v5 corrector).  Costs one no-grad 96-candidate score_set per
+        recorded step."""
         from . import select2 as S2
         from .e2e_data2 import EDIT_K
         from .v5.corrector import N_U as N_U5, decode_grad
         from ..refiner.decoder import N_FREE as NF
-        if getattr(student, "corrector_v5", None) is None or "kd_col96" not in S or "ctx_all" not in out:
+        if getattr(student, "corrector_v5", None) is None or "scene" not in out:
             return None
-        B, Kc = S["cand"].shape[:2]
-        dev = s_kd.device
-        col96 = S["kd_col96"].long().to(dev)
-        okc = S["cand_ok"].bool().to(dev)
-        # probabilities of the KD columns at their 96-columns; ineligible / padded KD columns go to a trash column
-        # (a -1 column must not overwrite identity column 0)
-        prob96 = torch.full((B, S2.G_K + 1, 5), float("nan"), dtype=torch.float64, device=dev)
-        pk = torch.sigmoid(s_kd.detach().double())
-        tgt = torch.where(okc & (col96 >= 0) & (col96 < S2.G_K), col96, torch.full_like(col96, S2.G_K))
-        prob96.scatter_(1, tgt[..., None].expand(B, Kc, 5), pk)
-        prob96 = prob96[:, :S2.G_K]
-        bsel = self.cfg.infer_select or {"beta": 0.5, "set": "all"}
-        cpu = lambda x: x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)    # noqa: E731
-        pick96 = torch.as_tensor(S2.select96(cpu(top["final"]), cpu(top["im"]), cpu(prob96), cpu(V["valid96"]),
-                                             float(bsel["beta"]), types=S2.VARIANT_SETS[bsel["set"]]),
-                                 dtype=torch.long, device=dev)                                     # [B]
-        hit = (col96 == pick96[:, None]) & okc
-        has = hit.any(1)
-        j = torch.where(has, hit.float().argmax(1), torch.zeros_like(pick96))
         feat, mem, ego, pref = out["scene"]
-        o_like = {"ctx": out["ctx_all"][:, :Kc], "score_logit": out["score_logit"], "haz": out["haz"],
-                  "w_lat": out["w_lat"]}
+        dev = feat.device
+        cand, fin, par = infer_pool(V["traj96"].to(dev), top["cand"].to(dev))
+        valid96 = V["valid96"].to(dev) & fin
+        kw5 = {"rel_objs": rel_rows} if rel_rows is not None else {}
+        bsel = self.cfg.infer_select or {"beta": 0.5, "set": "all"}
         with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=False):
-            a, src, wl, _ = student._v5_act(o_like, S["cand"].float(), j[:, None], ego)
+            po = student.score_set(feat.float(), mem.float(), ego, cand.float(), par.float(),
+                                   pref=None if pref is None else pref.float(), return_ctx=True, **kw5)
+            pick = S2.select96(top["final"], top["im"], torch.sigmoid(po["score_logit"].float()), valid96,
+                               float(bsel["beta"]), types=S2.VARIANT_SETS[bsel["set"]])
+            pick = torch.as_tensor(np.asarray(pick.cpu() if torch.is_tensor(pick) else pick), dtype=torch.long,
+                                   device=dev)
+            a, src, wl, _ = student._v5_act(po, cand.float(), pick[:, None], ego)
             u = a["mu"].float() + torch.exp(a["log_sig"].float()) * torch.randn_like(a["mu"].float())
             tau1 = decode_grad(src, u[..., :NF], wl + u[..., NF:], ego[0])
-        valid = has & torch.isfinite(tau1).flatten(1).all(-1)
+        B = cand.shape[0]
+        ar = torch.arange(B, device=dev)
+        valid = valid96[ar, pick] & torch.isfinite(tau1).flatten(1).all(-1)
         traj = torch.zeros(B, EDIT_K, 8, 3, dtype=torch.float32, device=dev)
         traj[:, 0] = torch.where(valid[:, None, None], tau1[:, 0], torch.zeros_like(tau1[:, 0]))
         srcc = torch.full((B, EDIT_K), -1, dtype=torch.long, device=dev)
-        srcc[:, 0] = torch.where(valid, pick96, torch.full_like(pick96, -1))
+        srcc[:, 0] = torch.where(valid, pick, torch.full_like(pick, -1))
         uu = torch.zeros(B, EDIT_K, N_U5, dtype=torch.float32, device=dev)
         uu[:, 0] = u[:, 0]
         vv = torch.zeros(B, EDIT_K, dtype=torch.bool, device=dev)
         vv[:, 0] = valid
         logs["v5/rec_tau1_valid_frac"] = float(valid.float().mean())
-        logs["v5/rec_pick_in_kd_frac"] = float(has.float().mean())
+        logs["v5/rec_pick_identity_frac"] = float((pick % NV == 0).float().mean())
         logs["v5/rec_u_abs"] = float(u.abs().mean())
         return {"traj": traj, "src": srcc, "u": uu, "valid": vv}
 
@@ -2445,7 +2440,7 @@ class CKE2E2:
         if rec_edits:
             top, V = rec
             if rec_v5:
-                ed = self.v5_edits_rec(student, out, S, s_kd, top, V, logs)
+                ed = self.v5_edits_rec(student, out, S, s_kd, top, V, logs, rel_rows=rel_rows)
             else:
                 ed = (self.computed_edits_rec(student, out, S, s_kd) if computed
                       else self.corrector_edits(student, out, S, s_kd))

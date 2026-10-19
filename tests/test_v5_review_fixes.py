@@ -221,3 +221,70 @@ def test_n4_awr_logp_and_record_block():
     l.backward()
     # both recorded controls lie above mu: both pull mu up (negative grad), the better tau1 (A = +0.2) much harder
     assert float(mu.grad[0, 0, 0]) < float(mu.grad[1, 0, 0]) <= 0.0
+
+
+# ---- report 100 (2026-10-20) ----------------------------------------------------------------------------------------
+def _stopped_car_gt(x: float = 30.0):
+    from navsim.agents.para_ssr.refiner import gt_future as GF
+    gt = _bicycle_gt()
+    gt["kf"][0, 0, :, GF.KF_X] = x
+    gt["kf"][0, 0, :, GF.KF_Y] = 0.0
+    gt["kf"][0, 0, :, GF.KF_H] = 0.0
+    gt["kf"][0, 0, :, GF.KF_VY] = 0.0
+    gt["first"] = torch.tensor([[[4.5, 1.9, 0.0, 0.0, 0.0, 0.0]]])
+    gt["meta"][0, 0, 0] = 0
+    gt["sdf"] = torch.full((1, 320, 256), 5.0)
+    return gt
+
+
+def test_f1_braking_gradient_at_mu0_through_a_stopped_car():
+    """F1: driving through a stopped car at mu = 0, the L_refine gradient is not vanishing, points to braking (dL /
+    dz_lon > 0 summed), and a small gradient step lowers the loss (the old log(S + 1e-3) gave exactly 0)."""
+    from navsim.agents.para_ssr.ck.v5 import refine_loss as RL
+    from navsim.agents.para_ssr.ck.v5.corrector import decode_grad
+    gt = _stopped_car_gt()
+    w = RL.parse_weights("")
+    fast, v0, a0 = _straight(10.0)[None], torch.tensor([10.0]), torch.tensor([0.0])
+    mu = torch.zeros(1, 1, 12, requires_grad=True)
+    loss, _ = RL.refine_loss(decode_grad(fast, mu[..., :6], mu[..., 6:], v0), fast, v0, a0, gt, w)
+    g, = torch.autograd.grad(loss, mu)
+    assert float(g.norm()) > 1e-2 and float(g[0, 0, :6].sum()) > 0
+    mu2 = (-0.05 * g / g.norm()).detach()
+    l2, _ = RL.refine_loss(decode_grad(fast, mu2[..., :6], mu2[..., 6:], v0), fast, v0, a0, gt, w)
+    assert float(l2) < float(loss)
+    # monotone along the braking direction up to clearing the car (no 'drive through faster' optimum)
+    ls = []
+    for z in (0.0, -0.1, -0.3, -0.5, -1.0):
+        m = torch.zeros(1, 1, 12)
+        m[..., :6] = z
+        ls.append(float(RL.refine_loss(decode_grad(fast, m[..., :6], m[..., 6:], v0), fast, v0, a0, gt, w)[0]))
+    assert all(b < a for a, b in zip(ls, ls[1:]))
+
+
+def test_f2_gt_of_keeps_every_track_and_reach_filter_is_exact():
+    """F2: gt_of keeps all tracks (no 64 cap); the reach filter of gt_state_block changes no target."""
+    from navsim.agents.para_ssr.ck.v5 import refine_loss as RL
+    from navsim.agents.para_ssr.refiner import gt_future as GF
+    g = torch.Generator().manual_seed(3)
+    A = 90
+    kf = torch.zeros(1, A, GF.N_KF, 6)
+    kf[0, :, :, GF.KF_X] = (torch.rand(A, generator=g) * 50 - 5)[:, None]
+    kf[0, :, :, GF.KF_Y] = (torch.rand(A, generator=g) * 30 - 15)[:, None]
+    kf[0, :, :, GF.KF_PRESENT] = 1.0
+    batch = {"ref_obj_n": torch.tensor([A]), "ref_obj_kf": kf,
+             "ref_obj_first": torch.tensor([[4.5, 1.9, 0.0, 0.0, 0.0, 0.0]]).expand(1, A, 6).clone(),
+             "ref_obj_meta": torch.tensor([[2, 1, 0, GF.N_KF - 1, 0]]).expand(1, A, 5).clone(),
+             "ref_obj_n_kf": torch.tensor([GF.N_KF]), "ref_sdf": torch.zeros(1, 320, 256), "ref_p_pdm": torch.ones(1)}
+    batch["ref_obj_meta"][..., 0] = 0
+    gt = RL.gt_of(batch, torch.tensor([0]))
+    assert gt["valid"].shape == (1, A) and bool(gt["valid"].all())
+    st = torch.stack([LQR.simulate(_straight(v), torch.tensor([[v, 0.0]]), dtype=torch.float32)[0]
+                      for v in (3.0, 8.0, 12.0)])[None][:, :, ::2]                       # [1, 3, 21, 6]
+    t = (torch.arange(LQR.NT, dtype=torch.float64) * LQR.DT)[::2]
+    y, _ = RL.gt_state_block(st, t, gt)
+    sep, cnt = RL.object_sep(st.float(), t, gt, (0.0,) + RL.TTC_D)                      # unfiltered reference
+    c0, _, obs0 = RL.gt_t0_objects(gt)
+    win = obs0 & (c0[..., 0] >= 0) & (c0[..., 0] <= 32.0) & (c0[..., 1].abs() <= 32.0)
+    hit = (sep < 0) & cnt & win[:, None, None, None, :]
+    ref = torch.stack([hit[..., 0, :].any(-1), hit.any(-1).any(-1)], -1).float()
+    assert torch.equal(y, ref) and float(ref.sum()) > 0

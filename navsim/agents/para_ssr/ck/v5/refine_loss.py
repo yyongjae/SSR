@@ -19,8 +19,22 @@ L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable): a 
           smoothed a < 4.13, yaw rate w5 d1 < 0.95, yaw accel w5 p3 d2 < 1.93; the official lateral check reads
           ACCELERATION_Y = 0 and never fails)
     ep    = min(1, S_exec / P)     executed 4 s path length over the token's pdm_progress_eff (>= 5 m)
-  loss = mean over drafts of log(S_hat(X0) + 1e-3) - log(S_hat(X1) + 1e-3) (relative to the baseline tau0 the caller
-  passes = the corrector's mu = 0 draft; log keeps the gradient of a deep overlap alive), s = 0.1 m.
+  computed in LOG space (report 100 F1: log(S + 1e-3) scaled every gradient by S / (S + 1e-3), ~1e-13 on a deep
+  overlap): log S = log p_nc + log p_dac + log(5 p_ttc + 2 p_c + 5 ep) - log 12 with log p = logsigmoid (linear tail:
+  a constant 1 / s per metre however deep), and log p_nc additionally carries the IN-PATH SHAPING term
+  sum over objects a of c_a logsigmoid(g_a / s): c_a = sigmoid(-min_n sep_na / s) (soft "collides with a"),
+  g_a = min over the states where a overlaps the ego footprint laterally of the SIGNED longitudinal gap (a's centre
+  ahead along the ego heading minus both half-extents; no abs, no not-behind cut) -- the worst-state SAT term alone is
+  flat in the longitudinal control on a head-on overlap (its least-overlapping axis is lateral), and a penetration sum
+  over the states rewards driving THROUGH faster; g_a only grows when the ego progresses less, so braking is always
+  the local direction until a is cleared, after which c_a -> 0 (non-colliding rollouts: ~0, worst-state ranking).
+  loss = mean over drafts of (log S(X0) - log S(X1)) / max(1, -log S(X0)) (relative to the baseline tau0 the caller
+  passes = the corrector's mu = 0 draft; the per-draft normaliser keeps a deep-overlap draft from dominating the batch
+  and does not change the sign), s = 0.1 m.
+  GT objects (report 100 F2): gt_of keeps EVERY track of the token (the old cap of 64 nearest-to-the-GT-path tracks
+  turned correct detections into reliability negatives); object_sep's callers restrict the tracks to the ones whose
+  4.9 s footprint can reach the rollouts (relevant_objects: spatial, time-agnostic, + the TTC projection and a 4 m
+  corrector slack; nothing within reach is dropped), gt_state_block runs in object chunks.
   A weight 0 in w ('obj', 'ttc', 'road', 'prog', 'cmf') turns that factor off (p = 1; the MAP teacher has no object
   input: obj = ttc = 0); 'u' is the caller's mu^2 weight.
 Stats (no grad) compare X1 with X0 = LQR(tau0) -- the callers pass tau0 = the corrector's baseline (mu = 0: today's
@@ -47,7 +61,8 @@ SCALE = 0.1                                   # [m] soft pass sigmoid(margin / S
 BEHIND_M = -1.3
 STOP_NC, STOP_TTC = 0.05, 5e-3
 TTC_D = (0.3, 0.6, 0.9)
-A_MAX = 64                                    # GT tracks kept per token (stored nearest-to-the-GT-path first)
+REACH_SLACK_M = 4.0                           # relevant_objects: corrector deviation slack beyond the drafts' sweep
+CHUNK_A = 64                                  # gt_state_block object chunk (no grad; exact)
 CMF = {"lon_max": 2.40, "lon_min": -4.05, "lat": 4.89, "jerk_lon": 4.13, "yaw_rate": 0.95, "yaw_acc": 1.93}
 CMF_LAT_JERK_NOTE = "max_abs_mag_jerk 8.37 not used: lon jerk 4.13 is the binding one on a smooth LQR rollout"
 
@@ -68,10 +83,10 @@ def parse_weights(s: Optional[str]) -> Dict[str, float]:
 
 
 def gt_of(batch: Dict, idx: Tensor) -> Dict[str, Tensor]:
-    """GT of the token rows idx from a train batch (ref_*), objects trimmed to A_MAX."""
+    """GT of the token rows idx from a train batch (ref_*), EVERY track (A = the rows' largest count; report 100 F2)."""
     g = lambda k: batch[f"ref_{k}"][idx]                                               # noqa: E731
     n_obj = g("obj_n").long()
-    A = int(max(1, min(A_MAX, int(n_obj.max()) if idx.numel() else 1)))
+    A = int(max(1, min(int(batch["ref_obj_kf"].shape[1]), int(n_obj.max()) if idx.numel() else 1)))
     return {"kf": g("obj_kf")[:, :A].float(), "first": g("obj_first")[:, :A].float(),
             "meta": g("obj_meta")[:, :A].long(),
             "valid": torch.arange(A, device=idx.device)[None] < n_obj[:, None],
@@ -87,7 +102,60 @@ def _gt_boxes(gt: Dict[str, Tensor], t: Tensor) -> Tuple[Tensor, Tensor, Tensor]
     return boxes.float(), st.bool(), (~agent) | (v_first < 0.5)
 
 
-def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequence[float]) -> Tuple[Tensor, Tensor]:
+@torch.no_grad()
+def relevant_objects(gt: Dict[str, Tensor], states: Tensor, slack: float = REACH_SLACK_M) -> Tuple[Dict[str, Tensor], Dict]:
+    """GT restricted to the tracks that can reach the rollouts states [n, R, Q, >=4]: a track is kept when some point of
+    its 0..4.9 s centre path (0.25 s) lies within ego half-diagonal + its own half-diagonal + 0.9 s x the token's max
+    speed (TTC projection) + slack of some executed rear-axle / box-centre position of any draft (time-agnostic: a
+    slower tau1 sweeps a subset of the path, the slack covers the corrector's lateral / extra-progress change).  Kept
+    tracks first (stable order), A' = the rows' largest kept count -> (gt', stats).  Nothing within reach is dropped."""
+    from ..temporal.config import EGO_L, EGO_W
+    n, A = gt["valid"].shape
+    dev = states.device
+    tq = torch.arange(0.0, GF.T_MAX + 1e-6, 0.25, dtype=torch.float64, device=dev)
+    boxes, obs = GF.query_torch(gt["kf"], gt["first"], gt["meta"], tq, valid=gt["valid"], n_kf=gt["n_kf"])
+    oc = boxes[..., :2].float()                                                         # [n, A, T, 2]
+    ohd = 0.5 * torch.sqrt(boxes[..., 3].float() ** 2 + boxes[..., 4].float() ** 2)     # [n, A, T]
+    ovm = ((oc[:, :, 1:] - oc[:, :, :-1]).norm(dim=-1) / 0.25).amax(-1, keepdim=True)  # [n, A, 1] max track speed
+    st = states.float()[:, :, ::2]                                                      # every 2nd state (gap term below)
+    eh = torch.stack([torch.cos(st[..., 2]), torch.sin(st[..., 2])], -1)
+    pts = (st[..., :2] + EGO_OFF * eh).reshape(n, -1, 2)                                # box centres [n, R*Q', 2]
+    vmax = states[..., 3].float().abs().reshape(n, -1).amax(-1)                         # [n]
+    dt_gap = 2 * float(LQR.DT) * (1 if states.shape[2] > 21 else 2)                    # spacing of the kept states [s]
+    # ego half-diagonal + TTC projection (0.9 s) + half the kept-state spacing + slack; object half-diagonal + half the
+    # 0.25 s sampling of its path
+    reach = 0.5 * math.hypot(EGO_L, EGO_W) + (0.9 + 0.5 * dt_gap) * vmax + float(slack)   # [n]
+    d = torch.cdist(oc.reshape(n, -1, 2), pts).amin(-1).reshape(n, A, -1)               # [n, A, T]
+    near = ((d <= ohd + 0.125 * ovm + reach[:, None, None]) & obs.bool()).any(-1) & gt["valid"]   # [n, A]
+    order = torch.argsort((~near).to(torch.int8), dim=1, stable=True)
+    k = int(max(1, int(near.sum(1).max()) if n else 1))
+    idx = order[:, :k]
+    take = lambda x: torch.gather(x, 1, idx.reshape(n, k, *([1] * (x.dim() - 2))).expand(n, k, *x.shape[2:]))  # noqa
+    out = dict(gt)
+    for key in ("kf", "first", "meta"):
+        out[key] = take(gt[key])
+    out["valid"] = take(near)
+    return out, {"n_tracks": float(gt["valid"].sum(1).float().mean()), "n_reach": float(near.sum(1).float().mean()),
+                 "n_reach_max": float(k)}
+
+
+def lon_lat_gaps(ce: Tensor, he: Tensor, co: Tensor, ho: Tensor, Lo: Tensor, Wo: Tensor) -> Tuple[Tensor, Tensor]:
+    """signed longitudinal gap (object centre ahead along the ego heading minus the ego half-length and the object's
+    extent on that axis) and the lateral SAT gap (|lateral offset| minus both half-extents on the ego lateral axis);
+    arguments as temporal.raster.sat_sep (broadcast)."""
+    from ..temporal.config import EGO_L, EGO_W
+    cue, sue = torch.cos(he), torch.sin(he)
+    cuo, suo = torch.cos(ho), torch.sin(ho)
+    dx, dy = co[..., 0] - ce[..., 0], co[..., 1] - ce[..., 1]
+    lo, wo = Lo / 2, Wo / 2
+    d_ue = dx * cue + dy * sue
+    d_ve = -dx * sue + dy * cue
+    ext_ue = lo * (cuo * cue + suo * sue).abs() + wo * (-suo * cue + cuo * sue).abs()
+    ext_ve = lo * (-cuo * sue + suo * cue).abs() + wo * (suo * sue + cuo * cue).abs()
+    return d_ue - EGO_L / 2 - ext_ue, d_ve.abs() - EGO_W / 2 - ext_ve
+
+
+def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequence[float], extras: bool = False):
     """states [n, R, Q, >=4] (N frame, rear axle; Q states at times t [Q] s), deltas (s) -> sep [n, R, Q, D, A] (SAT
     separation of the official footprint projected |v| delta along the heading vs the GT boxes at t + delta;
     differentiable in states), count [n, R, Q, D, A] bool (observed, not-behind or exempt, ego moving: NC |v| > 0.05
@@ -113,7 +181,12 @@ def object_sep(states: Tensor, t: Tensor, gt: Dict[str, Tensor], deltas: Sequenc
     fwd = ((boxes[..., :2] - ce[:, :, :, None, None, :]) * eh[:, :, :, None, None, :]).sum(-1)
     mv = torch.where(dl[None, None, None] == 0, (spd > STOP_NC)[..., None], (spd >= STOP_TTC)[..., None])
     count = obs & mv[..., None] & ((fwd.detach() >= BEHIND_M) | exempt[:, None, None, None, :])
-    return sep, count
+    if not extras:
+        return sep, count
+    b0 = boxes[:, :, :, 0]                                                              # delta 0: [n, 1, Q, A, 5]
+    lon, lat = lon_lat_gaps(ce[..., None, :], hd[..., None], b0[..., :2], b0[..., 2], b0[..., 3], b0[..., 4])
+    inpath = (lat.detach() < 0) & obs[:, :, :, 0] & mv[..., 0][..., None]               # [n, R, Q, A]
+    return sep, count, lon, inpath
 
 
 _CMF_OPS: Dict[str, Tensor] = {}
@@ -150,28 +223,34 @@ def _comfort(X: Tensor) -> Tensor:
 
 
 def _terms(X: Tensor, gt: Dict[str, Tensor], t: Tensor, w: Dict[str, float]) -> Dict[str, Tensor]:
-    """soft PDMS factors of rollouts X [n, R, 41, 6] -> dict of [n, R] (module docstring) + hard stats."""
+    """soft PDMS factors of rollouts X [n, R, 41, 6] -> dict of [n, R] (module docstring): log factors lp_nc / lp_dac /
+    lp_ttc, logS, S_hat = exp(logS), p_* = exp(lp_*), + hard stats."""
     n, R, Q = X.shape[:3]
     out: Dict[str, Tensor] = {}
-    sg = lambda x: torch.sigmoid(x / SCALE)                                             # noqa: E731
-    one = X.new_ones(n, R)
+    lsg = lambda x: F.logsigmoid(x / SCALE)                                             # noqa: E731
+    zero, one = X.new_zeros(n, R), X.new_ones(n, R)
     cor = ego_corners(X[..., :3])                                                       # [n, R, Q, 4, 2]
     val, ok = sample_sdf(gt["sdf"], cor.reshape(n, -1, 2))
     val, ok = val.reshape(n, R, Q * 4), ok.reshape(n, R, Q * 4)
     dmin = torch.where(ok, val, torch.full_like(val, 10.0)).amin(-1)
     out["offroad"] = (dmin < 0).float()
-    out["p_dac"] = sg(dmin) if w.get("road", 0.0) else one
+    out["lp_dac"] = lsg(dmin) if w.get("road", 0.0) else zero
     if w.get("obj", 0.0) or w.get("ttc", 0.0):
-        sep, cnt = object_sep(X, t, gt, (0.0,) + TTC_D)
+        sep, cnt, lon, inpath = object_sep(X, t, gt, (0.0,) + TTC_D, extras=True)
         big = torch.full_like(sep, 10.0)
         s_nc = torch.where(cnt[..., 0, :], sep[..., 0, :], big[..., 0, :]).flatten(2).amin(-1)
         s_tt = torch.where(cnt[..., 1:, :], sep[..., 1:, :], big[..., 1:, :]).flatten(2).amin(-1)
         out["coll"] = (s_nc < 0).float()
         out["ttc_hit"] = (s_tt < 0).float()
-        out["p_nc"] = sg(s_nc) if w.get("obj", 0.0) else one
-        out["p_ttc"] = sg(s_tt) if w.get("ttc", 0.0) else one
+        ms_a = torch.where(cnt[..., 0, :], sep[..., 0, :], big[..., 0, :]).amin(2)       # [n, R, A] per object
+        c_a = torch.sigmoid(-ms_a / SCALE)
+        g_a = torch.where(inpath, lon, torch.full_like(lon, 10.0)).amin(2)              # [n, R, A]
+        shp = (c_a * F.logsigmoid(g_a / SCALE)).sum(-1)
+        out["shape_nc"] = shp
+        out["lp_nc"] = lsg(s_nc) + shp if w.get("obj", 0.0) else zero
+        out["lp_ttc"] = lsg(s_tt) if w.get("ttc", 0.0) else zero
     else:
-        out["p_nc"], out["p_ttc"] = one, one
+        out["lp_nc"], out["lp_ttc"] = zero, zero
     S = LQR.executed_progress(X)[0]                                                     # [n, R]
     out["S"] = S
     P = gt["p_pdm"].float().clamp(min=5.0)[:, None]
@@ -179,7 +258,11 @@ def _terms(X: Tensor, gt: Dict[str, Tensor], t: Tensor, w: Dict[str, float]) -> 
     cv = _comfort(X)
     out["cmf_fail"] = (cv > 0).float()
     out["p_c"] = torch.sigmoid(-cv / 0.5) if w.get("cmf", 0.0) else one
-    out["S_hat"] = out["p_nc"] * out["p_dac"] * (5 * out["p_ttc"] + 2 * out["p_c"] + 5 * out["ep"]) / 12.0
+    for k in ("nc", "dac", "ttc"):
+        out[f"p_{k}"] = torch.exp(out[f"lp_{k}"])
+    out["logS"] = (out["lp_nc"] + out["lp_dac"]
+                   + torch.log(5 * out["p_ttc"] + 2 * out["p_c"] + 5 * out["ep"] + 1e-6) - math.log(12.0))
+    out["S_hat"] = torch.exp(out["logS"])
     return out
 
 
@@ -193,10 +276,12 @@ def refine_loss(tau1: Tensor, tau0: Tensor, v0: Tensor, a0: Tensor, gt: Dict[str
         t = torch.arange(LQR.NT, dtype=torch.float64, device=dev) * LQR.DT
         with torch.no_grad():
             X0 = LQR.simulate(tau0.float(), ego, dtype=torch.float32)
+            sweep = torch.cat([X0, LQR.simulate(tau1.detach().float(), ego, dtype=torch.float32)], 1)
+            gt, rs = relevant_objects(gt, sweep) if (w.get("obj", 0.0) or w.get("ttc", 0.0)) else (gt, {})
             T0 = _terms(X0, gt, t, w)
         X1 = LQR.simulate(tau1.float(), ego, dtype=torch.float32)
         T1 = _terms(X1, gt, t, w)
-        L = torch.log(T0["S_hat"] + 1e-3) - torch.log(T1["S_hat"] + 1e-3)
+        L = (T0["logS"] - T1["logS"]) / (-T0["logS"]).clamp(min=1.0)
         loss = torch.nan_to_num(L, nan=0.0, posinf=10.0, neginf=-10.0).mean()
         st = {f"ref_{k}{i}": float(T[k].detach().mean()) for i, T in (("0", T0), ("1", T1))
               for k in ("S_hat", "p_nc", "p_dac", "p_ttc", "ep", "p_c", "offroad", "cmf_fail")}
@@ -210,6 +295,8 @@ def refine_loss(tau1: Tensor, tau0: Tensor, v0: Tensor, a0: Tensor, gt: Dict[str
             st[f"ref_ttc_hit{i}"] = float(H["ttc_hit"].mean())
         st["ref_dS"] = float((T1["S"] - T0["S"]).detach().mean())
         st["ref_n"] = float(n * R)
+        st["ref_logS0"], st["ref_logS1"] = float(T0["logS"].mean()), float(T1["logS"].detach().mean())
+        st.update({f"ref_gt_{k}": v for k, v in rs.items()})
     return loss, st
 
 
@@ -222,13 +309,23 @@ def gt_state_block(states: Tensor, t: Tensor, gt: Dict[str, Tensor], fov_deg: Op
     t0 with the centre inside the detector window (x in [0, 32], |y| <= 32; + |bearing| <= fov_deg for the student's
     camera head) -- the relation reads t0 detections only, an object absent at t0 or outside the window is an
     irreducible positive that would inflate eps / a_i (review 2026-10-20 f6)."""
-    sep, cnt = object_sep(states.float(), t, gt, (0.0,) + TTC_D)
+    gt, _ = relevant_objects(gt, states.float(), slack=1.0)       # tracks out of reach never overlap these states
     c0, _, obs0 = gt_t0_objects(gt)
     win = obs0 & (c0[..., 0] >= 0) & (c0[..., 0] <= 32.0) & (c0[..., 1].abs() <= 32.0)
     if fov_deg is not None:
         win = win & (torch.rad2deg(torch.atan2(c0[..., 1], c0[..., 0])).abs() <= float(fov_deg) + 1e-4)
-    hit = (sep < 0) & cnt & win[:, None, None, None, :]                                   # [n, K, Q, D, A]
-    y = torch.stack([hit[..., 0, :].any(-1), hit.any(-1).any(-1)], -1).float()
+    n, K, Q = states.shape[:3]
+    y_nc = torch.zeros(n, K, Q, dtype=torch.bool, device=states.device)
+    y_tt = torch.zeros_like(y_nc)
+    A = gt["valid"].shape[1]
+    for a0 in range(0, A, CHUNK_A):                                  # object chunks: OR over the tracks is exact
+        sl = slice(a0, min(A, a0 + CHUNK_A))
+        g = dict(gt, kf=gt["kf"][:, sl], first=gt["first"][:, sl], meta=gt["meta"][:, sl], valid=gt["valid"][:, sl])
+        sep, cnt = object_sep(states.float(), t, g, (0.0,) + TTC_D)
+        hit = (sep < 0) & cnt & win[:, sl][:, None, None, None, :]                        # [n, K, Q, D, a]
+        y_nc |= hit[..., 0, :].any(-1)
+        y_tt |= hit.any(-1).any(-1)
+    y = torch.stack([y_nc, y_tt], -1).float()
     t_av = ((gt["n_kf"].double() - 1) * GF.KF_DT).clamp(max=GF.T_MAX)                  # [n]
     known = (t.to(states.device).double()[None] + max(TTC_D) <= t_av[:, None] + 1e-6)  # [n, Q]
     return y, known[:, None, :].expand(states.shape[0], states.shape[1], -1)

@@ -19,15 +19,15 @@ from pathlib import Path
 from typing import Dict, Optional
 
 CK_REPO = str(Path(__file__).resolve().parents[2])   # repo root of this worktree
-ALLOWED_GPUS = (
-    ("0", "1", "2", "3", "4", "5", "6", "7")
-    if os.environ.get("CK_ALLOW_GPU45") == "1" or os.environ.get("CK_ALLOW_GPU4567") == "1"
-    else ("0", "1", "2", "3")
-)
+ALLOWED_GPUS = ("0", "1", "2", "3")
+EXTRA_DDP_PAIR = ("4", "5")          # gpu_guard_ddp with CK_ALLOW_GPU45=1 only (refiner-v4 rule, user 2026-10-12)
 
 
 def _allowed_gpus():
-    if os.environ.get("CK_ALLOW_GPU45") == "1" or os.environ.get("CK_ALLOW_GPU4567") == "1":
+    """refiner-v5 merge of fusion v13 (aux_distill) and refiner-v4: GPUs 0-3; the v13 opt-in CK_ALLOW_GPU4567=1 widens
+    it to every GPU (explicit flag only); CK_ALLOW_GPU45=1 keeps the refiner-v4 meaning (the DDP pair 4,5 exactly,
+    gpu_guard_ddp), never 6 / 7."""
+    if os.environ.get("CK_ALLOW_GPU4567") == "1":
         return ("0", "1", "2", "3", "4", "5", "6", "7")
     return ALLOWED_GPUS
 
@@ -69,7 +69,9 @@ def gpu_guard_ddp(device: str, world_size: int, max_gpus: int = 2) -> None:
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     ids = [x.strip() for x in vis.split(",") if x.strip()]
     allowed = _allowed_gpus()
-    if not (1 <= len(ids) <= max_gpus) or len(set(ids)) != len(ids) or any(i not in allowed for i in ids):
+    if os.environ.get("CK_ALLOW_GPU45") == "1" and tuple(ids) == EXTRA_DDP_PAIR:
+        pass
+    elif not (1 <= len(ids) <= max_gpus) or len(set(ids)) != len(ids) or any(i not in allowed for i in ids):
         raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK2 jobs run on 1..{max_gpus} distinct GPUs of {allowed}")
     if len(ids) != int(world_size):
         raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r} has {len(ids)} GPU(s) but WORLD_SIZE={world_size}: "

@@ -1,0 +1,10 @@
+# refiner v5 student main run (2026-10-20 KST): the retrained v5 teachers (report-overnight: v5T_rel5 = DET with the
+# cut-in-aware L_refine, v5M_unk5 = MAP with the GT object / TTC factors on), their KD calibration
+# (tools/ck/e2e2/fit_kd_calib.py --n-tokens 16384) and Z statistics (tools/ck/v5/fit_z_stats.py --tokens 4096 --device
+# cuda --amp 1).  Use as E2E_CK_SET with ARM=v5kd (or v5) and E2E_EXTRA=tools/ck/e2e2/fusion_v13_v5.extra.
+teacher_det_run=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5T_rel5
+teacher_map_run=/home/external-user/ssd/yongjae_refiner/ck/v5/train/v5M_unk5
+kd_calib.det=/home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/v5T_rel5__last.json
+kd_calib.map=/home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/v5M_unk5__last.json
+v4.v5.z_stats_det=/home/external-user/ssd/yongjae_refiner/ck/v5/z_stats/v5T_rel5__last.json
+v4.v5.z_stats_map=/home/external-user/ssd/yongjae_refiner/ck/v5/z_stats/v5M_unk5__last.json

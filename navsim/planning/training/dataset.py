@@ -230,7 +230,7 @@ class Dataset(torch.utils.data.Dataset):
 
             features, targets = self._load_scene_with_token(token)
         else:
-            scene = self._scene_loader.get_scene_from_token(self._scene_loader.tokens[idx])
+            scene = self._scene_loader.get_scene_from_token(token)
             agent_input = scene.get_agent_input(self.use_fut_frames)
             for builder in self._feature_builders:
                 features.update(builder.compute_features(agent_input))

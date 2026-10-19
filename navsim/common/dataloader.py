@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any, Dict, List
 from tqdm import tqdm
 
+from collections.abc import Mapping
+from typing import Iterator
+
 from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SensorConfig
 from navsim.planning.metric_caching.metric_cache import MetricCache
 import numpy as np
@@ -70,6 +73,94 @@ def filter_scenes(data_path: Path, scene_filter: SceneFilter) -> Dict[str, List[
     return filtered_scenes
 
 
+
+class SceneFrameStore(Mapping):
+    """token -> list of frame dicts, held as ONE pickle byte buffer.
+
+    Why not a plain dict: DataLoader workers are forked from the main process
+    and share its memory copy-on-write.  A dict of ~85k scenes is millions of
+    Python objects; merely reading one (even `token in tokens`) writes its
+    refcount, so the kernel copies that page into the worker.  Over an epoch
+    every worker grows its own copy of the metadata it touched (~1 GB/epoch
+    measured), on top of 4 ranks x 8 workers (x2 while the val loader's
+    workers overlap) -- enough to exhaust a 188 GB host.  One numpy array has
+    a single refcount in a single page, so the buffer stays shared for the
+    life of the worker; a scene is unpickled only when requested and freed
+    right after.
+
+    Frames are stored once each: with frame_interval=1 a frame belongs to up
+    to num_frames overlapping scenes, so pickling per scene would duplicate
+    the data ~14x (measured 16 GB for a 52k-scene subset).  A scene is a
+    contiguous run of frames of one log, so it is just (start, count) into
+    the frame table.
+    """
+
+    def __init__(self, scene_frames_dicts: Dict[str, List[Dict[str, Any]]]):
+        self._tokens: List[str] = list(scene_frames_dicts.keys())
+        self._index: Dict[str, int] = {t: i for i, t in enumerate(self._tokens)}
+        self._log_names: List[str] = [
+            frames[0]["log_name"] for frames in scene_frames_dicts.values()
+        ]
+        frame_slot: Dict[int, int] = {}          # id(frame dict) -> frame index
+        chunks: List[bytes] = []
+        offsets: List[int] = [0]
+        scene_start = np.zeros(len(self._tokens), dtype=np.int64)
+        scene_count = np.zeros(len(self._tokens), dtype=np.int32)
+        keepalive: List[Dict[str, Any]] = []   # ids are only unique while objects live
+        for i, frames in enumerate(scene_frames_dicts.values()):
+            slots = []
+            for frame in frames:
+                slot = frame_slot.get(id(frame))
+                if slot is None:
+                    slot = len(chunks)
+                    chunk = pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL)
+                    chunks.append(chunk)
+                    offsets.append(offsets[-1] + len(chunk))
+                    frame_slot[id(frame)] = slot
+                    keepalive.append(frame)
+                slots.append(slot)
+            assert slots == list(range(slots[0], slots[0] + len(slots))), (
+                "scene frames are expected to be consecutive frames of one log"
+            )
+            scene_start[i], scene_count[i] = slots[0], len(slots)
+        self._scene_start = scene_start
+        self._scene_count = scene_count
+        self._offsets = np.asarray(offsets, dtype=np.int64)
+        self._buffer = np.frombuffer(b"".join(chunks), dtype=np.uint8)
+        self.num_frames = len(chunks)
+        del chunks, keepalive, frame_slot
+
+    @property
+    def tokens(self) -> List[str]:
+        return self._tokens
+
+    @property
+    def nbytes(self) -> int:
+        return int(self._buffer.nbytes)
+
+    def log_name_of(self, token: str) -> str:
+        return self._log_names[self._index[token]]
+
+    def _frame(self, slot: int) -> Dict[str, Any]:
+        start, end = int(self._offsets[slot]), int(self._offsets[slot + 1])
+        # memoryview slice: zero-copy view into the shared buffer
+        return pickle.loads(self._buffer.data[start:end])
+
+    def __getitem__(self, token: str) -> List[Dict[str, Any]]:
+        i = self._index[token]
+        start, count = int(self._scene_start[i]), int(self._scene_count[i])
+        return [self._frame(s) for s in range(start, start + count)]
+
+    def __contains__(self, token: object) -> bool:
+        return token in self._index
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._tokens)
+
+    def __len__(self) -> int:
+        return len(self._tokens)
+
+
 class SceneLoader:
 
     def __init__(
@@ -82,28 +173,36 @@ class SceneLoader:
     ):
         if train_debug:
             print('begin loading scene_frames_dicts')
-            self.scene_frames_dicts = np.load('/home/yingyan.li/repo/WoTE/dataset/scene_frames_dicts_debug.npy', allow_pickle=True).item()
+            scene_frames_dicts = np.load('/home/yingyan.li/repo/WoTE/dataset/scene_frames_dicts_debug.npy', allow_pickle=True).item()
             print('finish loading scene_frames_dicts')
         else:
             print('Begin filtering scenes')
-            self.scene_frames_dicts = filter_scenes(data_path, scene_filter)
+            scene_frames_dicts = filter_scenes(data_path, scene_filter)
             print('Finish filtering Scenes ')
+        # Pack into one shared byte buffer (see SceneFrameStore) and drop the
+        # object graph so neither the main process nor forked workers hold it.
+        self.scene_frames_dicts: SceneFrameStore = SceneFrameStore(scene_frames_dicts)
+        del scene_frames_dicts
+        print(f"Packed {len(self.scene_frames_dicts)} scenes / "
+              f"{self.scene_frames_dicts.num_frames} frames into "
+              f"{self.scene_frames_dicts.nbytes / 2**20:.0f} MB shared buffer")
         self._sensor_blobs_path = sensor_blobs_path
         self._scene_filter = scene_filter
         self._sensor_config = sensor_config
 
     @property
     def tokens(self) -> List[str]:
-        return list(self.scene_frames_dicts.keys())
+        # Cached list: do not rebuild (and touch every key) on each access.
+        return self.scene_frames_dicts.tokens
 
     def __len__(self):
-        return len(self.tokens)
+        return len(self.scene_frames_dicts)
 
     def __getitem__(self, idx) -> str:
         return self.tokens[idx]
 
     def get_scene_from_token(self, token: str) -> Scene:
-        assert token in self.tokens
+        assert token in self.scene_frames_dicts
         return Scene.from_scene_dict_list(
             self.scene_frames_dicts[token],
             self._sensor_blobs_path,
@@ -113,7 +212,7 @@ class SceneLoader:
         )
 
     def get_agent_input_from_token(self, token: str, use_fut_frames=False) -> AgentInput:
-        assert token in self.tokens
+        assert token in self.scene_frames_dicts
         return AgentInput.from_scene_dict_list(
             self.scene_frames_dicts[token],
             self._sensor_blobs_path,
@@ -125,12 +224,9 @@ class SceneLoader:
     def get_tokens_list_per_log(self) -> Dict[str, List[str]]:
         # generate a dict that contains a list of tokens for each log-name
         tokens_per_logs: Dict[str, List[str]] = {}
-        for token, scene_dict_list in self.scene_frames_dicts.items():
-            log_name = scene_dict_list[0]["log_name"]
-            if tokens_per_logs.get(log_name):
-                tokens_per_logs[log_name].append(token)
-            else:
-                tokens_per_logs.update({log_name: [token]})
+        for token in self.tokens:
+            # log_name is kept out of the pickle buffer so this needs no unpickling
+            tokens_per_logs.setdefault(self.scene_frames_dicts.log_name_of(token), []).append(token)
         return tokens_per_logs
 
 class MetricCacheLoader:

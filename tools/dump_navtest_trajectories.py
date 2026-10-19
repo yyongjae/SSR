@@ -70,7 +70,8 @@ def _worker_init(_):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--arm", choices=sorted(ARMS), required=True)
+    parser.add_argument("--arm", choices=sorted(ARMS), default=None)
+    parser.add_argument("--experiment", default=None, help="work_dirs/<experiment> directory (overrides --arm)")
     parser.add_argument("--checkpoint", type=Path, default=None, help="default: newest version's last.ckpt")
     parser.add_argument(
         "--download", type=Path, default=os.environ.get("NAVSIM_DOWNLOAD") or None,
@@ -101,7 +102,7 @@ def main() -> int:
     from omegaconf import OmegaConf
     from navsim.common.dataloader import SceneLoader
 
-    experiment = ARMS[args.arm]
+    experiment = args.experiment or ARMS[args.arm]
     run_dir = REPO_ROOT / "work_dirs" / experiment
     checkpoint = args.checkpoint or sorted(
         run_dir.glob("lightning_logs/version_*/checkpoints/last.ckpt"),

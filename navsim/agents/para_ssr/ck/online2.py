@@ -231,10 +231,16 @@ def _d_v5() -> Dict[str, Any]:
     # teachers' (DET: b_nc, b_ttc (+ H_nc, H_ttc with both relation channels); MAP: d_min; masked SmoothL1 on states
     # that are readable for both and KD-ok, ramped like the other KD terms), infer_refine = inference also emits tau1 of
     # the deployed pick (ck2_v5_traj).
+    # Stage 2 (report 97 §2-7 / §4; report 99 N3 / N4): rel_det_grad = design V2 (the student rows keep the det head's
+    # position / velocity graph: the relation losses reach the box regression); record_tau1 = the on-policy record
+    # carries tau1 of the deployment rule's pick over the step's KD columns (exploration sample u = mu + sigma eps of the
+    # corrector's Gaussian; edit block slot 0, labelled by labeler2 with the 96) -> the next generations' critic BCE has
+    # the tau1 column (L_label tau1 / L_edit-Bernoulli) and lambda_awr * AWR of A_S on credit A = PDMS(tau1) -
+    # PDMS(tau0) (official labels, one-generation delay, CKE2E2._awr_v5).
     return {"enabled": False, "relation": "off", "n_obj": 96, "score_thr": 0.3, "unknown_ev": False,
             "corrector": False, "z_stride": 2, "lambda_ref": 1.0, "ref_w": "", "ref_cols": 16, "lambda_rel_a": 0.2,
             "lambda_rel_h": 0.5, "rel_h_cols": 16, "z_kd": False, "lambda_zkd_det": 0.5, "lambda_zkd_map": 0.5,
-            "infer_refine": True}
+            "infer_refine": True, "rel_det_grad": False, "record_tau1": False, "lambda_awr": 0.1}
 
 
 def _d_rg_gt_aux() -> Dict[str, Any]:
@@ -490,7 +496,16 @@ class CKE2E2Config:
                              str(vq["ref_w"]), "ref_cols": int(vq["ref_cols"]), "lambda_rel_a": float(vq["lambda_rel_a"]),
                              "lambda_rel_h": float(vq["lambda_rel_h"]), "rel_h_cols": int(vq["rel_h_cols"]),
                              "z_kd": _b(vq["z_kd"]), "lambda_zkd_det": float(vq["lambda_zkd_det"]),
-                             "lambda_zkd_map": float(vq["lambda_zkd_map"]), "infer_refine": _b(vq["infer_refine"])}
+                             "lambda_zkd_map": float(vq["lambda_zkd_map"]), "infer_refine": _b(vq["infer_refine"]),
+                             "rel_det_grad": _b(vq["rel_det_grad"]), "record_tau1": _b(vq["record_tau1"]),
+                             "lambda_awr": float(vq["lambda_awr"])}
+            v5q = self.v4["v5"]
+            if v5q["record_tau1"] and not (v5q["enabled"] and v5q["corrector"]):
+                raise ValueError("ck_e2e2.v4.v5.record_tau1 needs v5.enabled and v5.corrector")
+            if v5q["rel_det_grad"] and v5q["relation"] != "student":
+                raise ValueError("ck_e2e2.v4.v5.rel_det_grad needs v5.relation student")
+            if v5q["lambda_awr"] < 0:
+                raise ValueError("ck_e2e2.v4.v5.lambda_awr must be >= 0")
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
@@ -1291,7 +1306,8 @@ def student_forward2(student, bev_grid: torch.Tensor, cand: torch.Tensor, status
 
 def student_rel_rows(predictions: Dict, v5: Dict[str, Any]) -> Optional[Dict[str, torch.Tensor]]:
     """refiner v5 relation 'student': the student's det head (final layer of predictions all_bbox_preds /
-    all_cls_scores / det_hidden; detached) -> per-token object rows (ck/v5/student_objects.student_object_rows); None
+    all_cls_scores / det_hidden; detached except the box code's position / velocity with rel_det_grad, design V2)
+    -> per-token object rows (ck/v5/student_objects.student_object_rows); None
     when the block / channel is off.  KeyError when the det outputs are missing (inference needs
     agent.config.expose_det_outputs=true)."""
     if not v5["enabled"] or v5["relation"] == "off":
@@ -1301,8 +1317,11 @@ def student_rel_rows(predictions: Dict, v5: Dict[str, Any]) -> Optional[Dict[str
     if miss:
         raise KeyError(f"ck_e2e2.v4.v5.relation student: predictions lack {miss} (det head off, or inference without "
                        f"agent.config.expose_det_outputs=true)")
-    return student_object_rows(predictions["all_bbox_preds"][-1].detach(), predictions["all_cls_scores"][-1].detach(),
-                               predictions["det_hidden"].detach(), int(v5["n_obj"]), float(v5["score_thr"]))
+    code = predictions["all_bbox_preds"][-1]
+    if not v5.get("rel_det_grad", False):         # design V2 off: the det head is trained by its own GT losses only
+        code = code.detach()
+    return student_object_rows(code, predictions["all_cls_scores"][-1].detach(), predictions["det_hidden"].detach(),
+                               int(v5["n_obj"]), float(v5["score_thr"]))
 
 
 def refine_cols_parents(vtype: torch.Tensor, n: int) -> torch.Tensor:
@@ -1727,6 +1746,8 @@ class CKE2E2:
                 kw["with_pref"] = True
             if q["corrector"] or self.cfg.v4_opt("edits") == "computed":     # corrector A / v4_3 computed edits
                 kw["with_edits"] = True
+            if self.cfg.v5["enabled"] and self.cfg.v5["record_tau1"]:        # refiner v5 A_S: the tau1 column
+                kw["with_edits"] = True
             self._labels = LabelStore2(self.cfg.io_dir, n_rows=N_ROWS, packed=self.cfg.warmup["packed"],
                                        var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target, **kw)
         return self._labels
@@ -1917,6 +1938,86 @@ class CKE2E2:
         return {"traj": traj.detach(), "src": torch.gather(S["kd_col96"], 1, idx), "u": a["u"].detach(),
                 "valid": valid}
 
+    def v5_edits_rec(self, student, out: Dict, S: Dict, s_kd: torch.Tensor, top: Dict, V: Dict,
+                     logs: Dict[str, float]) -> Optional[Dict[str, torch.Tensor]]:
+        """refiner v5 A_S, recording (report 97 §4 'labeler tau1 column, k = 1 credit'; report 99 N4): the deployment
+        rule's pick (select2.select96: infer_select's beta / set, else beta 0.5 over 'all' -- the pick CKE2E2.infer
+        refines) over THIS step's KD columns (the 96-columns outside the KD set get no score), its tau1 under an
+        exploration sample u = mu + exp(log_sig) eps of the corrector's Gaussian: tau1 = decode(pick, u_lon, w_lat_head
+        + u_lat) -> the EDIT_K record block {traj [B,8,8,3], src [B,8] (96-column of the pick), u [B,8,12], valid
+        [B,8]} with tau1 in slot 0 (slots 1.. invalid), or None (no v5 corrector / no KD column map / no context)."""
+        from . import select2 as S2
+        from .e2e_data2 import EDIT_K
+        from .v5.corrector import N_U as N_U5, decode_grad
+        from ..refiner.decoder import N_FREE as NF
+        if getattr(student, "corrector_v5", None) is None or "kd_col96" not in S or "ctx_all" not in out:
+            return None
+        B, Kc = S["cand"].shape[:2]
+        dev = s_kd.device
+        col96 = S["kd_col96"].long().to(dev)
+        okc = S["cand_ok"].bool().to(dev)
+        # probabilities of the KD columns at their 96-columns; ineligible / padded KD columns go to a trash column
+        # (a -1 column must not overwrite identity column 0)
+        prob96 = torch.full((B, S2.G_K + 1, 5), float("nan"), dtype=torch.float64, device=dev)
+        pk = torch.sigmoid(s_kd.detach().double())
+        tgt = torch.where(okc & (col96 >= 0) & (col96 < S2.G_K), col96, torch.full_like(col96, S2.G_K))
+        prob96.scatter_(1, tgt[..., None].expand(B, Kc, 5), pk)
+        prob96 = prob96[:, :S2.G_K]
+        bsel = self.cfg.infer_select or {"beta": 0.5, "set": "all"}
+        cpu = lambda x: x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)    # noqa: E731
+        pick96 = torch.as_tensor(S2.select96(cpu(top["final"]), cpu(top["im"]), cpu(prob96), cpu(V["valid96"]),
+                                             float(bsel["beta"]), types=S2.VARIANT_SETS[bsel["set"]]),
+                                 dtype=torch.long, device=dev)                                     # [B]
+        hit = (col96 == pick96[:, None]) & okc
+        has = hit.any(1)
+        j = torch.where(has, hit.float().argmax(1), torch.zeros_like(pick96))
+        feat, mem, ego, pref = out["scene"]
+        o_like = {"ctx": out["ctx_all"][:, :Kc], "score_logit": out["score_logit"], "haz": out["haz"],
+                  "w_lat": out["w_lat"]}
+        with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=False):
+            a, src, wl, _ = student._v5_act(o_like, S["cand"].float(), j[:, None], ego)
+            u = a["mu"].float() + torch.exp(a["log_sig"].float()) * torch.randn_like(a["mu"].float())
+            tau1 = decode_grad(src, u[..., :NF], wl + u[..., NF:], ego[0])
+        valid = has & torch.isfinite(tau1).flatten(1).all(-1)
+        traj = torch.zeros(B, EDIT_K, 8, 3, dtype=torch.float32, device=dev)
+        traj[:, 0] = torch.where(valid[:, None, None], tau1[:, 0], torch.zeros_like(tau1[:, 0]))
+        srcc = torch.full((B, EDIT_K), -1, dtype=torch.long, device=dev)
+        srcc[:, 0] = torch.where(valid, pick96, torch.full_like(pick96, -1))
+        uu = torch.zeros(B, EDIT_K, N_U5, dtype=torch.float32, device=dev)
+        uu[:, 0] = u[:, 0]
+        vv = torch.zeros(B, EDIT_K, dtype=torch.bool, device=dev)
+        vv[:, 0] = valid
+        logs["v5/rec_tau1_valid_frac"] = float(valid.float().mean())
+        logs["v5/rec_pick_in_kd_frac"] = float(has.float().mean())
+        logs["v5/rec_u_abs"] = float(u.abs().mean())
+        return {"traj": traj, "src": srcc, "u": uu, "valid": vv}
+
+    def _awr_v5(self, student, out: Dict, S: Dict, logs: Dict[str, float],
+                rel_rows: Optional[Dict[str, torch.Tensor]]) -> torch.Tensor:
+        """refiner v5 Stage-2 AWR (report 97 §2-7 (1)): log pi(u) of the recorded tau1 controls (edit slot 0 of the
+        generation) under the current A_S for the recorded source draft (its parent), weighted by the dense k = 1
+        credit A = PDMS(tau1) - PDMS(tau0) (official labels; v4.corrector.awr_loss weights exp(A / 0.05), cap 20,
+        mean 1).  No ranking / re-selection term."""
+        from .v4.corrector import awr_loss
+        E = S["E"]
+        feat, mem, ego, pref = out["scene"]
+        feat, mem = feat.float(), mem.float()
+        ok = E["E_ok"][:, :1].bool() & (E["E_src"][:, :1] >= 0)
+        with torch.autocast(device_type=feat.device.type, enabled=False):
+            logp = student.v5_logp(feat, mem, ego, E["E_src_traj"][:, :1].float(), E["E_src_par"][:, :1].float(),
+                                   E["E_u"][:, :1].float(), pref=None if pref is None else pref.float(),
+                                   rel_objs=rel_rows)
+        A = (E["E_pdms"][:, :1] - E["E_src_pdms"][:, :1]).float()
+        l = awr_loss(logp, A, ok)
+        n = int(ok.sum())
+        logs["v5/awr"] = _f(l)
+        logs["v5/awr_n"] = float(n)
+        if n:
+            logs["v5/awr_A_mean"] = float(A[ok].mean())
+            logs["v5/tau1_better_frac"] = float((A[ok] > 1e-6).float().mean())
+            logs["v5/tau1_worse_frac"] = float((A[ok] < -1e-6).float().mean())
+        return l
+
     def computed_edits_rec(self, student, out: Dict, S: Dict, s_kd: torch.Tensor) -> Optional[Dict[str, torch.Tensor]]:
         """refiner v4_3 M5, recording (= corrector_edits' block for the labeler): CKNet.computed_edits of the KD set
         (the current top-16 + sampled variants; sources = its top EDIT_K PARENT columns, i.e. identities, by the
@@ -2082,6 +2183,8 @@ class CKE2E2:
                 inner = inner + q["lambda_ref"] * (l_ref + float(w.get("u", 0.0)) * l_u)
                 logs.update({f"v5/{k}": float(v) for k, v in s_ref.items()})
                 logs["v5/ref_loss"] = _f(l_ref)
+            if q["record_tau1"] and q["lambda_awr"] > 0 and S.get("E") is not None:
+                inner = inner + q["lambda_awr"] * self._awr_v5(student, out, S, logs, rel_rows)
         if q["z_kd"] and "zq_det" in T and "zq_map" in T:
             zs_ = hk["zq"].float()
             zd, zm = T["zq_det"].float().to(dev), T["zq_map"].float().to(dev)
@@ -2300,7 +2403,8 @@ class CKE2E2:
         # refiner v4 corrector / v4_3 computed edits: the on-policy record also carries the step's edits -> recorded
         # after the forward
         computed = bool(getattr(getattr(student, "v4", None), "computed_edits", False))
-        defer_rec = ((getattr(student, "corrector", None) is not None or computed) and phase == "onpolicy"
+        rec_v5 = bool(getattr(student, "corrector_v5", None) is not None and c.v5["enabled"] and c.v5["record_tau1"])
+        defer_rec = ((getattr(student, "corrector", None) is not None or computed or rec_v5) and phase == "onpolicy"
                      and "kd_col96" in S)
         if rec is not None and self.recorder is not None and not defer_rec:
             top, V = rec
@@ -2340,8 +2444,11 @@ class CKE2E2:
         s_lab = s_kd if S["extra"] is None else out["extra_score_logit"].float()
         if rec_edits:
             top, V = rec
-            ed = (self.computed_edits_rec(student, out, S, s_kd) if computed
-                  else self.corrector_edits(student, out, S, s_kd))
+            if rec_v5:
+                ed = self.v5_edits_rec(student, out, S, s_kd, top, V, logs)
+            else:
+                ed = (self.computed_edits_rec(student, out, S, s_kd) if computed
+                      else self.corrector_edits(student, out, S, s_kd))
             if ed is not None and "kind" in ed:
                 kd_, cl_ = ed.pop("kind"), ed.pop("clear")
                 logs["v4/edit_rec_valid_frac"] = float(ed["valid"].float().mean())

@@ -713,6 +713,15 @@ class CKNet(nn.Module):
         -> {cols, tau0 [T, R, 8, 3] (the drafts), tau_base (mu = 0: the laterally corrected drafts, no grad), tau1,
         mu / log_sig [T, R, 12]}."""
         from .v5.corrector import decode_grad
+        a, src, wl, cols = self._v5_act(o, cand, cols, ego)
+        tau1 = decode_grad(src, a["mu"][..., :N_FREE], wl + a["mu"][..., N_FREE:], ego[0])
+        with torch.no_grad():               # mu = 0: today's laterally corrected draft (the corrector's own baseline)
+            tau_base = decode_grad(src, torch.zeros_like(wl), wl, ego[0])
+        return {"cols": cols, "tau0": src, "tau_base": tau_base, "tau1": tau1, "mu": a["mu"], "log_sig": a["log_sig"]}
+
+    def _v5_act(self, o: Dict, cand: torch.Tensor, cols: torch.Tensor, ego):
+        """the v5 corrector's policy on the draft columns cols [T, R] of a score_set output o (return_ctx) -> (a =
+        {mu, log_sig} [T, R, 12], drafts [T, R, 8, 3], lateral head w_lat (detached) [T, R, 6], cols)."""
         T, R = cols.shape
         cols = cols.to(cand.device).long()
         g4 = lambda a: torch.gather(a, 1, cols.reshape(T, R, *([1] * (a.dim() - 2))).expand(T, R, *a.shape[2:]))
@@ -729,12 +738,23 @@ class CKNet(nn.Module):
             zq = zq * keep
         a = self.corrector_v5(g4(o["ctx"]), g4(o["score_logit"].detach().float()), ego[0], zq, tz,
                               g4(haz["rel_top"]) if "rel_top" in haz else None)
-        src = g4(cand.float())
-        wl = g4(o["w_lat"]).detach().float()
-        tau1 = decode_grad(src, a["mu"][..., :N_FREE], wl + a["mu"][..., N_FREE:], ego[0])
-        with torch.no_grad():               # mu = 0: today's laterally corrected draft (the corrector's own baseline)
-            tau_base = decode_grad(src, torch.zeros_like(wl), wl, ego[0])
-        return {"cols": cols, "tau0": src, "tau_base": tau_base, "tau1": tau1, "mu": a["mu"], "log_sig": a["log_sig"]}
+        return a, g4(cand.float()), g4(o["w_lat"]).detach().float(), cols
+
+    def v5_logp(self, feat: torch.Tensor, mem: torch.Tensor, ego, src: torch.Tensor, src_par: Optional[torch.Tensor],
+                u: torch.Tensor, pref: Optional[torch.Tensor] = None,
+                rel_objs: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+        """refiner v5 Stage-2 AWR (report 97 §2-7 (1), §4 L_AWR(tau1); report 99 N4): log pi(u | src) [T, k] under the
+        CURRENT corrector A_S for recorded sources src [T, k, 8, 3] (parents src_par) and recorded controls u
+        [T, k, 12].  The critic / readers only supply the (detached) context, zq and the related objects (as the v4
+        corrector_logp): the AWR gradient trains the corrector, L_refine / L_H / Z-KD train the readers."""
+        if self.corrector_v5 is None:
+            raise ValueError("v5_logp: this net has no v5 corrector")
+        with torch.no_grad():
+            o = self.score_set(feat, mem, ego, src.float(), src_par, pref=pref, return_ctx=True, rel_objs=rel_objs)
+        T, k = src.shape[:2]
+        cols = torch.arange(k, device=src.device)[None].expand(T, k)
+        a, _, _, _ = self._v5_act(o, src.float(), cols, ego)
+        return self.corrector_v5.log_prob(a["mu"], a["log_sig"], u)
 
 
 CKHead = CKNet          # task-text name

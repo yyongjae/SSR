@@ -9,7 +9,8 @@ Inputs per draft (T tokens x R drafts):
                       reader, add.md (3)), + the state time t / 4 -> per-state MLP -> mean and max over the states
   top    [T, R, 21]   the top-3 related objects (relation channel; absent without it)
 Output mu [T, R, 12] = (z_lon 6, w_lat residual 6), zero-initialised (identity edit at the start); log_sig [T, R, 12]
-(init log 0.3; for a later AWR stage, unused by L_refine).
+(init log 0.3; the Stage-2 AWR policy: recorded tau1 controls u = mu + sigma eps, online2.CKE2E2.v5_edits_rec /
+_awr_v5; unused by L_refine).
 decode_grad: refiner.decoder.decode mode 'B' (deceleration + limited acceleration + lateral) WITH gradient (the v4
 decode_edits is no_grad: it was AWR-only).
 """
@@ -42,6 +43,12 @@ class CorrectorV5(nn.Module):
         nn.init.zeros_(self.mu.bias)
         nn.init.zeros_(self.log_sig.weight)
         nn.init.constant_(self.log_sig.bias, math.log(sigma0))
+
+    @staticmethod
+    def log_prob(mu: torch.Tensor, log_sig: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """diagonal Gaussian log density [...] of u [..., 12] (the AWR policy; = v4 CorrectorA.log_prob)."""
+        z = (u.float() - mu.float()) / torch.exp(log_sig.float())
+        return (-0.5 * z * z - log_sig.float() - 0.5 * math.log(2 * math.pi)).sum(-1)
 
     def forward(self, ctx: torch.Tensor, logit: torch.Tensor, v0: torch.Tensor, zq: torch.Tensor, tq: torch.Tensor,
                 top: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:

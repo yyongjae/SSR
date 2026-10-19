@@ -12,8 +12,12 @@ Selection (declared input-selection hyper-parameters, report 97 §9-16; no evide
   by score.  Static classes (cone, barrier, czone sign, generic object) are held (pi_s = 1); agents get the soft hold
   sigmoid((0.1 - |v|) / 0.05).  No past frames (two camera frames give no finite difference): has = False (no CA mode).
 feats [T, n, 256 + 7 + 7] = [det_hidden, class probabilities, score, range / 32, bearing cos / sin, speed / 10, L / 5,
-  W / 3] -> the reliability MLP.  Everything is DETACHED here (the det head is trained by its own GT losses; the
-  consequence gradient V2 of the design is not wired in this version).
+  W / 3] -> the reliability MLP.
+Gradient (design V2, report 97 §2-2 "det outputs into the relation module without detach"; report 99 N3): the slot
+  selection, class, heading, size and feats are detached; the centre c0 = (x, y) and velocity v0 = (vx, vy) (and what
+  derives from them: sp0, u0, pi_s) keep the box code's graph when `code` requires grad, so the relation losses (L_H,
+  the corrector's L_refine / AWR through Z, Z-KD) reach the det head's position / velocity regression.  A detached
+  `code` (online2.student_rel_rows with rel_det_grad off, inference) gives the old rows exactly.
 """
 from __future__ import annotations
 
@@ -29,44 +33,50 @@ WIN_X, WIN_Y, FOV_DEG = 32.0, 32.0, 80.0
 N_FEAT_S = 256 + N_CLS + 7      # hidden, class probabilities, score, range, cos, sin, speed, L, W
 
 
-@torch.no_grad()
 def student_object_rows(code: Tensor, cls_logit: Tensor, hidden: Tensor, n: int, score_thr: float = 0.3
                         ) -> Dict[str, Tensor]:
     """code [T, Q, 10], cls_logit [T, Q, 7], hidden [T, Q, 256] (final det layer) -> the relation.object_rows dict
     (c0, v0, h0, L, W, sp0, u0, acc, has, group, pi_s, valid, feats) of n slots per token, + q_idx [T, n] (query of each
-    slot, -1 = padding)."""
-    code, prob = code.float(), torch.sigmoid(cls_logit.float())
-    T, Q, _ = code.shape
-    dev = code.device
-    score, cls = prob.max(-1)
-    xr, yf = code[..., 0], code[..., 1]
-    x, y = yf, -xr
-    yaw = torch.atan2(code[..., 6], code[..., 7])
-    h = torch.remainder((-yaw - math.pi) + math.pi, 2 * math.pi) - math.pi          # wrap(-yaw - pi)
-    L, W = torch.exp(code[..., 3]).clamp(0.2, 30.0), torch.exp(code[..., 2]).clamp(0.2, 10.0)
-    vx, vy = code[..., 9], -code[..., 8]
-    bearing = torch.rad2deg(torch.atan2(-y, x)).abs()
-    inwin = (x >= 0) & (x <= WIN_X) & (y.abs() <= WIN_Y) & (bearing <= FOV_DEG + 1e-4)
-    ok = (score >= float(score_thr)) & inwin & torch.isfinite(code).all(-1)
-    k = max(1, min(int(n), Q, int(ok.sum(1).max()) if T else 1))       # trimmed to the batch's largest valid count
-    n = k
-    s_sel = torch.where(ok, score, torch.full_like(score, -1.0))
-    top = torch.topk(s_sel, k, dim=1)
-    qi, valid = top.indices, top.values >= 0
+    slot, -1 = padding).  c0 / v0 / sp0 / u0 / pi_s carry code's graph (module docstring 'Gradient'); the rest is
+    detached."""
+    code_g = code.float()                                   # position / velocity entries: graph kept (V2)
+    code = code_g.detach()
+    with torch.no_grad():
+        prob = torch.sigmoid(cls_logit.float())
+        T, Q, _ = code.shape
+        dev = code.device
+        score, cls = prob.max(-1)
+        xr, yf = code[..., 0], code[..., 1]
+        x, y = yf, -xr
+        yaw = torch.atan2(code[..., 6], code[..., 7])
+        h = torch.remainder((-yaw - math.pi) + math.pi, 2 * math.pi) - math.pi      # wrap(-yaw - pi)
+        L, W = torch.exp(code[..., 3]).clamp(0.2, 30.0), torch.exp(code[..., 2]).clamp(0.2, 10.0)
+        bearing = torch.rad2deg(torch.atan2(-y, x)).abs()
+        inwin = (x >= 0) & (x <= WIN_X) & (y.abs() <= WIN_Y) & (bearing <= FOV_DEG + 1e-4)
+        ok = (score >= float(score_thr)) & inwin & torch.isfinite(code).all(-1)
+        k = max(1, min(int(n), Q, int(ok.sum(1).max()) if T else 1))   # trimmed to the batch's largest valid count
+        n = k
+        s_sel = torch.where(ok, score, torch.full_like(score, -1.0))
+        top = torch.topk(s_sel, k, dim=1)
+        qi, valid = top.indices, top.values >= 0
     g = lambda a: torch.gather(a, 1, qi.reshape(T, k, *([1] * (a.dim() - 2))).expand(T, k, *a.shape[2:]))  # noqa
-    c0 = torch.stack([g(x), g(y)], -1)
-    v0 = torch.stack([g(vx), g(vy)], -1)
+    cg = torch.nan_to_num(code_g, nan=0.0, posinf=0.0, neginf=0.0)      # non-finite rows are not selected
+    c0 = torch.stack([g(cg[..., 1]), -g(cg[..., 0])], -1)               # (x_N, y_N) = (y_rec, -x_rec)
+    v0 = torch.stack([g(cg[..., 9]), -g(cg[..., 8])], -1)               # (vx_N, vy_N) = (vy_rec, -vx_rec)
     sp0 = torch.linalg.vector_norm(v0, dim=-1)
     u0 = v0 / sp0.clamp(min=1e-6)[..., None]
-    clsk = g(cls)
-    group = torch.as_tensor(GROUP_OF_CLASS, dtype=torch.long, device=dev)[clsk]
+    with torch.no_grad():
+        clsk = g(cls)
+        group = torch.as_tensor(GROUP_OF_CLASS, dtype=torch.long, device=dev)[clsk]
     pi_s = torch.where(group == 2, torch.ones_like(sp0), torch.sigmoid((0.1 - sp0) / 0.05))
-    Lk, Wk = g(L), g(W)
-    rng = torch.linalg.vector_norm(c0, dim=-1)
-    bear = torch.atan2(c0[..., 1], c0[..., 0])
-    feats = torch.cat([g(hidden.float()), g(prob), g(score)[..., None], (rng / 32.0)[..., None],
-                       torch.cos(bear)[..., None], torch.sin(bear)[..., None], (sp0 / 10.0)[..., None],
-                       (Lk / 5.0)[..., None], (Wk / 3.0)[..., None]], -1)
+    with torch.no_grad():
+        Lk, Wk = g(L), g(W)
+        c0d, sp0d = c0.detach(), sp0.detach()
+        rng = torch.linalg.vector_norm(c0d, dim=-1)
+        bear = torch.atan2(c0d[..., 1], c0d[..., 0])
+        feats = torch.cat([g(hidden.float()), g(prob), g(score)[..., None], (rng / 32.0)[..., None],
+                           torch.cos(bear)[..., None], torch.sin(bear)[..., None], (sp0d / 10.0)[..., None],
+                           (Lk / 5.0)[..., None], (Wk / 3.0)[..., None]], -1)
     out = dict(c0=c0, v0=v0, h0=g(h), L=Lk, W=Wk, sp0=sp0, u0=u0, acc=torch.zeros_like(sp0),
                has=torch.zeros_like(valid), group=group, pi_s=pi_s, valid=valid, feats=feats,
                q_idx=torch.where(valid, qi, torch.full_like(qi, -1)))

@@ -118,8 +118,13 @@ def run_info(run: Path, which: str, allow_unfinished: bool = False) -> Dict[str,
     ck = run / (which if which.endswith(".pt") else f"ckpt_{which}.pt")
     if not ck.is_file():
         raise SystemExit(f"{run}: {ck.name} missing")
+    from navsim.agents.para_ssr.ck.e2e_data2 import teacher_v5_rel_cfg
+    rel = teacher_v5_rel_cfg(run)            # refiner v5 relation DET teacher: the object pack rows it reads (else None)
+    if rel is not None and tc.on:
+        raise SystemExit(f"{run}: temporal branch and v5 relation channel both on (not a trainable combination)")
     return {"cfg": cfg, "arm": cfg["arm"], "ep_target": run_ep_target(cfg), "ckpt": ck,
-            "ckpt_sha16": U.sha256_file(ck), "split": cfg.get("split", "navtrain_train"), "temporal": tc}
+            "ckpt_sha16": U.sha256_file(ck), "split": cfg.get("split", "navtrain_train"), "temporal": tc,
+            "v5_rel": rel}
 
 
 def fit_rows(cfg: Dict[str, Any], n_tokens: int, seed: int = 0, limit: int = 0, root=None):
@@ -147,10 +152,11 @@ def fit_rows(cfg: Dict[str, Any], n_tokens: int, seed: int = 0, limit: int = 0, 
 
 
 # ----------------------------------------------------------------------------------------------- inference
-def teacher_logits(net, bev, cand, status, amp: bool, objs=None):
+def teacher_logits(net, bev, cand, status, amp: bool, objs=None, rel_objs=None):
     """score logits f32 [B, K, 5] with the ops of online2.TeacherPair2.run (scene once, candidates, score; fp16
     autocast on CUDA when amp).  objs (refiner-v3 temporal DET teacher only: {obj_in, obj_mask, frame_valid} on the
-    candidates' device) -> online2.teacher_forward, the very function TeacherPair2.run calls; None -> the CK2 ops."""
+    candidates' device) -> online2.teacher_forward, the very function TeacherPair2.run calls; None -> the CK2 ops.
+    rel_objs (refiner v5 relation DET teacher only: the same three object pack keys) -> teacher_forward(rel_objs=)."""
     import torch
 
     from navsim.agents.para_ssr.refiner.e2e import ego_inputs
@@ -158,10 +164,11 @@ def teacher_logits(net, bev, cand, status, amp: bool, objs=None):
     B, K = cand.shape[:2]
     ego = ego_inputs(status.detach().float().to(dev))
     ac = torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=bool(amp) and dev.type == "cuda")
-    if objs is not None or getattr(net, "temporal", None) is not None or getattr(net, "v4_readout", None) is not None:
+    if (objs is not None or rel_objs is not None or getattr(net, "temporal", None) is not None
+            or getattr(net, "v4_readout", None) is not None):
         from navsim.agents.para_ssr.ck.online2 import teacher_forward
         with torch.no_grad(), ac:
-            s, _ = teacher_forward(net, bev.to(dev).float(), cand.float(), ego, objs)
+            s, _ = teacher_forward(net, bev.to(dev).float(), cand.float(), ego, objs, rel_objs=rel_objs)
         return s.float()
     with torch.no_grad(), ac:
         feat, mem = net.trunk.scene(bev.to(dev).float(), B)
@@ -189,10 +196,12 @@ def objects_record(tc, split: str) -> Optional[Dict[str, Any]]:
 
 
 def infer(run: Path, which: str, arm: str, split: str, rows: np.ndarray, ep_target: str, device: str, batch: int,
-          workers: int, amp: bool, root=None, tc=None) -> Dict[str, Any]:
+          workers: int, amp: bool, root=None, tc=None, rel=None) -> Dict[str, Any]:
     """-> logits f32 [n, 16, 5], y f32 [n, 16, 5] (CK targets, EP per ep_target), y_ok bool [n, 16], bev_ok bool [n],
     obj_ok bool [n] (temporal teacher: object pack obj_ok; True otherwise), sanity (first batch: teacher_logits vs
-    CKNet.forward max |diff|), timing.  tc: the run's TemporalCfg (on -> CLEAN object rows + temporal forward)."""
+    CKNet.forward max |diff|), timing.  tc: the run's TemporalCfg (on -> CLEAN object rows + temporal forward); rel:
+    the v5 relation teacher's pack TemporalCfg (e2e_data2.teacher_v5_rel_cfg; -> CLEAN object rows as rel_objs, report
+    99 N5: the relation channel refuses to score without them)."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -209,11 +218,17 @@ def infer(run: Path, which: str, arm: str, split: str, rows: np.ndarray, ep_targ
     on = getattr(net, "temporal", None) is not None
     if on != bool(tc is not None and tc.on):
         raise SystemExit(f"{run}: loaded net temporal={on} but config.json temporal.on={bool(tc is not None and tc.on)}")
+    v5 = getattr(net, "v5", None)
+    has_rel = bool(v5 is not None and getattr(v5, "rel", False))
+    if has_rel != (rel is not None):
+        raise SystemExit(f"{run}: loaded net v5 relation={has_rel} but config.json v5.relation teacher={rel is not None}")
     n = len(rows)
     out = {"logits": np.full((n, K16, 5), np.nan, np.float32), "y": np.full((n, K16, 5), np.nan, np.float32),
            "y_ok": np.zeros((n, K16), bool), "bev_ok": np.zeros(n, bool), "obj_ok": np.ones(n, bool)}
     pos = {int(r): i for i, r in enumerate(rows)}
     okw = {"objects": objects_spec(tc)} if on else {}               # CK2 teacher: no objects kwarg (old dataset)
+    if has_rel:
+        okw = {"objects": objects_spec(rel)}
     ds = CKDataset(split, bev=arm, k=K16, labels="cand", gt=False, rows=rows, root=root, ep_target=ep_target, **okw)
     dl = DataLoader(ds, batch_size=int(batch), shuffle=False, collate_fn=collate_ck, num_workers=int(workers),
                     pin_memory=dev.type == "cuda", prefetch_factor=4 if workers > 0 else None)
@@ -221,22 +236,23 @@ def infer(run: Path, which: str, arm: str, split: str, rows: np.ndarray, ep_targ
     for b in dl:
         idx = np.asarray([pos[int(r)] for r in b["rows"].numpy()], np.int64)
         cand = b["cand"].to(dev).float()
-        objs = None
-        if on:
+        objs = rel_objs = None
+        if on or has_rel:
             from navsim.agents.para_ssr.ck.temporal.config import OBJ_INPUT_KEYS
-            objs = {k: b[k].to(dev) for k in OBJ_INPUT_KEYS}            # model inputs only (no fc_* targets)
-        s = teacher_logits(net, b["bev"], cand, b["status"], amp, objs=objs)
+            pack = {k: b[k].to(dev) for k in OBJ_INPUT_KEYS}            # model inputs only (no fc_* targets)
+            objs, rel_objs = (pack, None) if on else (None, pack)
+        s = teacher_logits(net, b["bev"], cand, b["status"], amp, objs=objs, rel_objs=rel_objs)
         if sanity is None:
             with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16,
                                                  enabled=bool(amp) and dev.type == "cuda"):
                 ref = net(b["bev"].to(dev).float(), cand, b["status"].to(dev).float(), decode=False,
-                          **({"objs": objs} if on else {}))
+                          **({"objs": objs} if on else {}), **({"rel_objs": rel_objs} if has_rel else {}))
             sanity = {"fwd_score_maxdiff_vs_cknet": float((ref["score_logit"].float() - s).abs().max())}
         out["logits"][idx] = s.cpu().numpy()
         out["y"][idx] = b["y"].numpy().astype(np.float32)
         out["y_ok"][idx] = b["y_ok"].numpy().astype(bool)
         out["bev_ok"][idx] = b["bev_ok"].numpy().astype(bool).reshape(-1)
-        if on:
+        if on or has_rel:
             out["obj_ok"][idx] = b["obj_ok"].numpy().astype(bool).reshape(-1)
         done += len(idx)
         if done % (int(batch) * 50) < int(batch) or done == n:
@@ -255,6 +271,9 @@ def _cache_meta(info: Dict[str, Any], rows_sha16: str, amp: bool, which: str) ->
     if tc is not None and tc.on:          # temporal teacher only: CK2 cache keys (and their caches) stay unchanged
         m["temporal"] = tc.to_dict()
         m["objects"] = objects_record(tc, info["split"])
+    rel = info.get("v5_rel")
+    if rel is not None:                   # v5 relation teacher only
+        m["v5_rel_objects"] = objects_record(rel, info["split"])
     return m
 
 
@@ -277,7 +296,8 @@ def save_cache(path: Path, R: Dict[str, Any], meta: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.stem}.tmp{os.getpid()}.npz")
     m = dict(meta, sanity=R.get("sanity", {}), sec=R.get("sec"), device=R.get("device"), saved=kst())
-    extra = {"obj_ok": R["obj_ok"]} if "temporal" in meta else {}      # temporal teacher only (CK2 npz unchanged)
+    extra = ({"obj_ok": R["obj_ok"]} if ("temporal" in meta or "v5_rel_objects" in meta)
+             else {})                                                   # object-reading teachers only (CK2 npz unchanged)
     np.savez(tmp, logits=R["logits"], y=R["y"], y_ok=R["y_ok"], bev_ok=R["bev_ok"], meta=np.asarray(json.dumps(m)),
              **extra)
     os.replace(tmp, path)
@@ -383,7 +403,7 @@ def main(argv=None) -> Dict[str, Any]:
     R = None if a.force_infer else load_cache(cache, want)
     if R is None:
         R = infer(run, a.which, arm, info["split"], rows, ep, a.device, a.batch, a.workers, bool(a.amp), a.data_root,
-                  tc=tc)
+                  tc=tc, rel=info.get("v5_rel"))
         save_cache(cache, R, want)
         R["cached"] = False
         log(f"inference {R['sec']} s on {R['device']} -> {cache}; sanity {R['sanity']}")
@@ -391,7 +411,8 @@ def main(argv=None) -> Dict[str, Any]:
         log(f"inference cache reused: {cache}")
     fold_tok = KC.log_folds(logs, a.fold_seed)
     ok = R["y_ok"] & R["bev_ok"][:, None]
-    if tc.on:                    # temporal DET teacher: tokens without object rows have KD off in the student too
+    rel = info.get("v5_rel")
+    if tc.on or rel is not None:  # object-reading DET teacher: tokens without object rows have KD off in the student too
         ok = ok & R["obj_ok"][:, None]
     F = fit_all(R["logits"], R["y"], ok, fold_tok, arm, kd_keys)
     print_table(F["metrics"])
@@ -408,6 +429,11 @@ def main(argv=None) -> Dict[str, Any]:
                  "forward": "online2.TeacherPair2.run ops (trunk.scene, trunk.candidates, score)",
                  "cache": str(cache), "cached": bool(R.get("cached")), "sec": R.get("sec"),
                  "sanity": R.get("sanity", {})}
+    if rel is not None:          # refiner v5 relation DET teacher
+        data["n_tokens_obj_ok"] = int(R["obj_ok"].sum())
+        data["objects"] = objects_record(rel, info["split"])
+        inference["forward"] = ("online2.teacher_forward(rel_objs = the CLEAN object pack rows) = TeacherPair2.run "
+                                "(v5 relation channel)")
     if tc.on:                    # refiner-v3 temporal DET teacher (CK2 records unchanged)
         data["n_tokens_obj_ok"] = int(R["obj_ok"].sum())
         data["objects"] = objects_record(tc, info["split"])

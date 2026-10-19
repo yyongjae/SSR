@@ -142,10 +142,12 @@ class RelationReader(nn.Module):
             c0, v0, h0 = g(O["c0"]), g(O["v0"]), g(O["h0"])                              # [B, N, ..]
             L, W, sp0, u0, acc = g(O["L"]), g(O["W"]), g(O["sp0"]), g(O["u0"]), g(O["acc"])
             pi_s, valid, has, grp = g(O["pi_s"]), g(O["valid"]), g(O["has"]), g(O["group"])
-            with torch.no_grad():
-                hd, spd = st[..., 2], st[..., 3].abs()
+            # geometry: no graph for the teacher's pack rows (data); the student's rows keep their det-head graph on
+            # c0 / v0 (design V2, report 99 N3) -- with detached rows nothing in here requires grad either way
+            with torch.set_grad_enabled(torch.is_grad_enabled() and self.source == "student"):
+                hd, spd = st[..., 2].detach(), st[..., 3].detach().abs()
                 eh = torch.stack([torch.cos(hd), torch.sin(hd)], -1)                     # [B, Q, 2]
-                ce = st[..., :2] + EGO_OFF * eh
+                ce = st[..., :2].detach() + EGO_OFF * eh
                 ce_d = ce[:, :, None, :] + (spd[..., None] * dl)[..., None] * eh[:, :, None, :]   # [B, Q, D, 2]
                 ce_x = ce_d[:, :, :, None, :]                                            # [B, Q, D, 1, 2]
                 he_x = hd[:, :, None, None]

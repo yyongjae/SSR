@@ -26,5 +26,7 @@ wandb.project=v1_distill
 ++agent.config.distill_probe_use_ema=true
 ++agent.config.distill_probe_ema_decay=0.99
 wandb.group=refiner-v5
-++agent.config.det_vel_code_weights=[0.41,1.05]
+# det code order (vx_right, vy_forward) = (lateral, longitudinal) (para_ssr_targets.navsim_box_to_ssr): weights
+# (1 / 0.95, 1 / 2.44) -- lateral sigma 0.95, longitudinal 2.44 m/s (report 99 N2: [0.41, 1.05] was the NAVSIM order)
+++agent.config.det_vel_code_weights=[1.05,0.41]
 ++agent.config.expose_det_outputs=true

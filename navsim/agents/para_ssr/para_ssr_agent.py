@@ -748,6 +748,12 @@ class ParaSSRAgent(AbstractAgent):
             builders.append(CorridorPlanTargetBuilder(cfg))
         elif float(getattr(cfg, "corridor_weight", 0.0)) > 0:
             builders.append(CorridorTargetBuilder(cfg))
+        if float(getattr(cfg, "cand_scorer_weight", 0.0)) > 0 and getattr(cfg, "cand_official", False):
+            from .modules.exact_score import ExactFullTargetBuilder
+            builders.append(ExactFullTargetBuilder(cfg))
+        elif float(getattr(cfg, "cand_scorer_weight", 0.0)) > 0 and getattr(cfg, "exact_dir", None):
+            from .modules.exact_verdict import ExactTargetBuilder
+            builders.append(ExactTargetBuilder(cfg))
         if self._ck_e2e is not None:
             from .ck.e2e_data import CKE2ETargetBuilder
 
@@ -797,7 +803,10 @@ class ParaSSRAgent(AbstractAgent):
         if self.para_ssr_model.corridor_head is not None and "corridor_valid" in targets:
             # km 10/15: corridor loss added AFTER the grad balancer (v2's plan/det/map shares unchanged)
             c_loss, c_logs = corridor_loss(predictions, targets, float(self._config.corridor_occ_weight),
-                                           float(getattr(self._config, "corridor_route_weight", 0.0)))
+                                           float(getattr(self._config, "corridor_route_weight", 0.0)),
+                                           occ_pos_weight=float(getattr(self._config, "corridor_occ_pos_weight", 4.0)),
+                                           occ_time_weight=float(getattr(self._config, "corridor_occ_time_weight", 0.0)),
+                                           sdf_boundary_weight=float(getattr(self._config, "corridor_sdf_boundary_weight", 4.0)))
             logs["loss_v2"] = logs["loss"]
             loss = loss + float(self._config.corridor_weight) * c_loss
             logs.update(c_logs)
@@ -821,6 +830,44 @@ class ParaSSRAgent(AbstractAgent):
                         ttc=float(getattr(cfg, "corridor_plan_ttc_weight", 0.0)) > 0)
                     loss = loss + float(cfg.corridor_verdict_weight) * v_loss
                     logs.update(v_logs)
+            logs["loss"] = loss.detach()
+        if self.para_ssr_model.cand_scorer is not None and "ex1_valid" in targets and "cand_states" in predictions:
+            # km 10/19 (C v3): every head vs the OFFICIAL per-candidate PDMS / EPDMS terms of the same candidates,
+            # tracked from the token's exact initial state (exact_score.official_scores)
+            from .modules import exact_score as ES
+            from .modules.candidate_scorer import cand_scorer_loss
+            from .modules.torch_tracker import track
+            cand = (predictions["trajectory_anchors"].float()[None] + predictions["trajectory_offset"].float()).detach()
+            b, k = cand.shape[:2]
+            with torch.no_grad():
+                init = ES.ego_init(targets["ex_ego"].double())
+                st9 = track(cand.reshape(b * k, 8, 3).double(), init.repeat_interleave(k, 0), full=True,
+                            angular=True).reshape(b, k, 41, 9).float()
+                ES.track_human(targets, init)
+                ex = ES.official_scores(st9, targets, targets)
+            s_loss, s_logs = cand_scorer_loss(predictions, ex,
+                                              prog_weight=float(getattr(self._config, "cand_scorer_prog_weight", 1.0)))
+            logs.setdefault("loss_v2", logs["loss"])
+            loss = loss + float(self._config.cand_scorer_weight) * s_loss
+            logs.update(s_logs)
+            with torch.no_grad():
+                logs["cand/ex1_trunc"] = targets["ex1_trunc"].float().mean()
+                logs["cand/ex2_trunc"] = targets["ex2_trunc"].float().mean()
+                logs["cand/ex2_valid"] = targets["ex2_valid"].float().mean()
+                logs["cand/gt_best_pdms1"] = torch.nan_to_num(ex["pdms1"], nan=0.0).amax(1).mean()
+                logs["cand/gt_best_epdms2"] = torch.nan_to_num(ex["epdms2"], nan=0.0).amax(1).mean()
+            logs["loss"] = loss.detach()
+        elif self.para_ssr_model.cand_scorer is not None and "ex_valid" in targets and "cand_states" in predictions:
+            # km 10/19 (C): candidate scorer vs the exact GT verdicts of the same tracked candidates (after the balancer)
+            from .modules.candidate_scorer import cand_scorer_loss
+            from .modules.exact_verdict import exact_verdicts
+            ex = exact_verdicts(predictions["cand_states"], targets)
+            s_loss, s_logs = cand_scorer_loss(predictions, ex, targets["ex_valid"],
+                                              prog_weight=float(getattr(self._config, "cand_scorer_prog_weight", 1.0)))
+            logs.setdefault("loss_v2", logs["loss"])
+            loss = loss + float(self._config.cand_scorer_weight) * s_loss
+            logs.update(s_logs)
+            logs["cand/ex_trunc"] = targets["ex_trunc"].float().mean()
             logs["loss"] = loss.detach()
         if self._stage_e is not None and self.training:
             # Added AFTER the grad balancer: its plan/det/map shares are unchanged.

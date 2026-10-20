@@ -20,6 +20,7 @@ from navsim.planning.training.abstract_feature_target_builder import AbstractTar
 
 CLIP = 8.0
 T_SWEPT = 8
+SIGMA_MIN = 0.05
 SPLITS = ("navtrain_train", "navtrain_val")
 
 
@@ -94,9 +95,10 @@ class AgentCrossAttn(nn.Module):
 
 class CorridorHead(nn.Module):
     def __init__(self, cin: int, bev_h: int, bev_w: int, hid: int = 192, t: int = T_SWEPT, route: bool = False,
-                 agent_attn: bool = False, agent_k: int = 32, agent_detach: bool = True):
+                 agent_attn: bool = False, agent_k: int = 32, agent_detach: bool = True, sigma: bool = False):
         super().__init__()
         self.bev_h, self.bev_w = bev_h, bev_w
+        self.sigma = sigma
         # km 10/16 (v3.1): cross-attention to the det/motion head's agent tokens (None = the v3 head)
         self.agent = AgentCrossAttn(hid, cin, bev_h, bev_w, agent_k, detach=agent_detach) if agent_attn else None
         # km 10/16 (v3-64): route progress / distance channels at the BEV resolution (0.64 m)
@@ -105,7 +107,7 @@ class CorridorHead(nn.Module):
         self.low = nn.Sequential(_blk(hid, hid), _blk(hid, hid), _blk(hid, hid))
         self.up = nn.Sequential(nn.ConvTranspose2d(hid, hid // 2, 2, stride=2), nn.BatchNorm2d(hid // 2),
                                 nn.ReLU(inplace=True), _blk(hid // 2, hid // 2))
-        self.out = nn.Conv2d(hid // 2, 1 + t, 1)
+        self.out = nn.Conv2d(hid // 2, 1 + t + int(sigma), 1)
 
     def forward(self, bev_embed: torch.Tensor, det: Dict[str, torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         b, n, c = bev_embed.shape
@@ -115,7 +117,11 @@ class CorridorHead(nn.Module):
             assert det is not None and "motion_hidden" in det, "agent_attn needs det_out with return_hidden=True"
             z = self.agent(z, det)
         y = self.out(self.up(z))
-        out = {"corridor_sdf": CLIP * torch.tanh(y[:, 0] / CLIP), "corridor_occ": y[:, 1:]}
+        if self.sigma:  # km 10/18 (v3.2b): last channel = SDF scale (m), >= SIGMA_MIN
+            out = {"corridor_sdf": CLIP * torch.tanh(y[:, 0] / CLIP), "corridor_occ": y[:, 1:-1],
+                   "corridor_sdf_sigma": F.softplus(y[:, -1]) + SIGMA_MIN}
+        else:
+            out = {"corridor_sdf": CLIP * torch.tanh(y[:, 0] / CLIP), "corridor_occ": y[:, 1:]}
         if self.route is not None:
             r = self.route(z)
             out["corridor_route_s"], out["corridor_route_d"] = 10.0 * r[:, 0], F.softplus(r[:, 1])
@@ -123,21 +129,40 @@ class CorridorHead(nn.Module):
 
 
 def corridor_loss(pred: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], occ_weight: float = 1.0,
-                  route_weight: float = 0.0):
-    """-> (loss, logs).  Samples without a target (corridor_valid = 0) contribute 0 but keep the graph."""
+                  route_weight: float = 0.0, occ_pos_weight: float = 4.0, occ_time_weight: float = 0.0,
+                  sdf_boundary_weight: float = 4.0):
+    """-> (loss, logs).  Samples without a target (corridor_valid = 0) contribute 0 but keep the graph.
+    km 10/18 (v3.2b): occ plane k of P weighted by 1 + occ_time_weight * k / (P - 1) (normalised to mean 1);
+    with pred["corridor_sdf_sigma"]: + Gaussian NLL of the detached SDF error under sigma (boundary-weighted), so
+    sigma learns the error scale without changing the SDF regression."""
     sp, op = pred["corridor_sdf"].float(), pred["corridor_occ"].float()
     s, o = targets["corridor_sdf"].float(), targets["corridor_occ"].float()
     v = targets["corridor_valid"].float()
     nv = v.sum().clamp(min=1.0)
-    w = 1.0 + 4.0 * torch.exp(-s.abs())
+    w = 1.0 + sdf_boundary_weight * torch.exp(-s.abs())
     ls = ((w * F.smooth_l1_loss(sp, s, beta=0.5, reduction="none")).mean((1, 2)) * v).sum() / nv
-    lo = (F.binary_cross_entropy_with_logits(op, o, pos_weight=torch.tensor(4.0, device=op.device),
-                                             reduction="none").mean((1, 2, 3)) * v).sum() / nv
+    bce = F.binary_cross_entropy_with_logits(op, o, pos_weight=torch.tensor(occ_pos_weight, device=op.device),
+                                             reduction="none").mean((2, 3))                    # [B, P]
+    npl = op.shape[1]
+    if occ_time_weight > 0 and npl > 1:
+        tw = 1.0 + occ_time_weight * torch.arange(npl, device=op.device, dtype=bce.dtype) / (npl - 1)
+        bce = bce * (tw / tw.mean())
+    lo = (bce.mean(1) * v).sum() / nv
     loss = ls + occ_weight * lo + 0.0 * (sp.sum() + op.sum())
     with torch.no_grad():
         band = (s.abs() < 1) & (v[:, None, None] > 0)
         sign = ((sp > 0) == (s > 0))[band].float().mean() if band.any() else sp.new_tensor(0.0)
     logs = {"corr/sdf": ls.detach(), "corr/occ": lo.detach(), "corr/sign_band1m": sign}
+    if "corridor_sdf_sigma" in pred:
+        sg = pred["corridor_sdf_sigma"].float()
+        err = (sp.detach() - s) / sg
+        nll = ((w * (0.5 * err ** 2 + torch.log(sg))).mean((1, 2)) * v).sum() / nv
+        loss = loss + nll
+        with torch.no_grad():
+            # calibration check: fraction of boundary-band cells whose |error| <= sigma (Gaussian: 0.683)
+            cov = (err.abs() <= 1)[band].float().mean() if band.any() else sp.new_tensor(0.0)
+            sgb = sg[band].mean() if band.any() else sg.mean()
+        logs.update({"corr/sdf_nll": nll.detach(), "corr/sigma_band1m": sgb, "corr/sigma_cov1_band1m": cov})
     if route_weight > 0 and "corridor_route_s" in pred and "corridor_route_s" in targets:
         # progress along the route (what EP measures), supervised near the route (distance < 6 m), in 10 m units
         rs, rd = pred["corridor_route_s"].float(), pred["corridor_route_d"].float()
@@ -221,19 +246,20 @@ def _occ_dist(planes: np.ndarray, res: float = 0.32) -> np.ndarray:
 
 
 class CorridorPlanTargetBuilder(CorridorTargetBuilder):
-    """Adds corridor_occ_dist [40, 100, 200] (0.1 s planes, signed distance to agents) for the plan constraint."""
+    """Adds corridor_occ_dist [P, 100, 200] (0.1 s planes, signed distance to agents) for the plan constraint;
+    P = the planes stored in corridor_dir (40: corridor_dt01, 49 = 0.1 .. 4.9 s: corridor32_p49)."""
 
     def get_unique_name(self) -> str:
-        return "para_ssr_corridor_dt01_plan"
+        return "para_ssr_corridor_dt01_plan" if self._planes <= 40 else f"para_ssr_corridor_dt01_p{self._planes}_plan"
 
     def compute_targets(self, scene) -> Dict[str, torch.Tensor]:
         out = super().compute_targets(scene)
         token = scene.frames[scene.scene_metadata.num_history_frames - 1].token
         hit = self._index.get(token)
         if hit is None:
-            out["corridor_occ_dist"] = torch.full((40, 100, 200), CLIP)
+            out["corridor_occ_dist"] = torch.full((max(self._planes, 40), 100, 200), CLIP)
             return out
-        d = np.unpackbits(np.asarray(self._arr[hit[0]][1][hit[1]]), axis=-1).astype(bool)   # [40, 100, 200]
+        d = np.unpackbits(np.asarray(self._arr[hit[0]][1][hit[1]]), axis=-1).astype(bool)   # [40 | 49, 100, 200]
         out["corridor_occ_dist"] = torch.from_numpy(_occ_dist(d).astype(np.float32))
         return out
 
@@ -372,6 +398,23 @@ def _wrap_t(a: torch.Tensor) -> torch.Tensor:
     return torch.atan2(torch.sin(a), torch.cos(a))
 
 
+def phi(z: torch.Tensor) -> torch.Tensor:
+    """standard normal CDF"""
+    return 0.5 * (1 + torch.erf(z / np.sqrt(2.0)))
+
+
+def occ_plane_index(npl: int, dev) -> torch.Tensor:
+    """predicted plane of each 0.1 s step 1..40: P >= 40 -> the step itself (0.1 s planes), P = 8 -> 0.5 s windows"""
+    steps = torch.arange(40, device=dev)
+    return steps if npl >= 40 else steps // (40 // npl)
+
+
+def ttc_plane_index(npl: int, step: torch.Tensor) -> torch.Tensor:
+    """predicted plane of 0-based 0.1 s step index ``step`` (may exceed 39 = 4.0 s for the TTC projection): P >= 40
+    -> min(step, P - 1) (P = 49 reaches 4.9 s; P = 40 holds the 4.0 s plane), P = 8 -> its 0.5 s window (<= 4.0 s)"""
+    return step.clamp(max=npl - 1) if npl >= 40 else step.clamp(max=39) // (40 // npl)
+
+
 def corridor_verdict_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor],
                           status: torch.Tensor, n_anchor: int = 64, tau: float = 0.25, ttc: bool = True):
     """km 10/16 (v3.1): supervise the PREDICTED corridor at exactly what the selector reads — the verdict of tracked
@@ -400,6 +443,11 @@ def corridor_verdict_loss(predictions: Dict[str, torch.Tensor], targets: Dict[st
     gs, _ = _sample(targets["corridor_sdf"].float()[:, None], pc)
     inr = inr.reshape(b, nq, -1)
     big = torch.full_like(ps.reshape(b, nq, -1), CLIP)
+    sig = "corridor_sdf_sigma" in predictions
+    if sig:  # km 10/18 (v3.2b): z = sdf / sigma per corner, the verdict is Phi(min z) (= the selector's p_DAC)
+        sv, _ = _sample(predictions["corridor_sdf_sigma"].float()[:, None], pc)
+        ps = ps / sv
+        big = torch.full_like(big, CLIP / SIGMA_MIN)
     p_min = torch.where(inr, ps.reshape(b, nq, -1), big).amin(-1)
     g_min = torch.where(inr, gs.reshape(b, nq, -1), big).amin(-1)
     m_dac = inr.any(-1).float() * targets["corridor_valid"].float()[:, None]
@@ -413,14 +461,14 @@ def corridor_verdict_loss(predictions: Dict[str, torch.Tensor], targets: Dict[st
         pos, neg = m * yv, m * (1 - yv)
         return 0.5 * ((l * pos).sum() / pos.sum().clamp(min=1) + (l * neg).sum() / neg.sum().clamp(min=1))
 
-    l_dac = bal_bce(p_min / tau, y_dac, m_dac)
+    l_dac = bal_bce(phi(p_min), y_dac, m_dac, is_prob=True) if sig else bal_bce(p_min / tau, y_dac, m_dac)
     fx, fy = torch.meshgrid(torch.linspace(-REAR, FRONT, 5, device=dev), torch.linspace(-HALF_W, HALF_W, 3, device=dev),
                             indexing="ij")
     fx, fy = fx.reshape(-1), fy.reshape(-1)
     pf = torch.stack([x[..., None] + c * fx - s * fy, y[..., None] + s * fx + c * fy], -1)  # [B, Q, 40, 15, 2]
     po = torch.sigmoid(predictions["corridor_occ"].float())                                  # [B, P, H, W]
     npl = po.shape[1]
-    plane = torch.arange(40, device=dev) // (40 // npl)
+    plane = occ_plane_index(npl, dev)
     od = targets["corridor_occ_dist"].float()
     qf = pf.permute(0, 2, 1, 3, 4).reshape(b, 40, -1, 2)
     pv, pin = _sample(po[:, plane], qf)
@@ -442,7 +490,7 @@ def corridor_verdict_loss(predictions: Dict[str, torch.Tensor], targets: Dict[st
             sh = (spd * dd * 0.1)[..., None]
             tq = torch.stack([x[..., None] + c * (gx + sh) - s * gy, y[..., None] + s * (gx + sh) + c * gy], -1)
             tq = tq.permute(0, 2, 1, 3, 4).reshape(b, 40, -1, 2)
-            tv, ti = _sample(po[:, plane[(steps + dd).clamp(max=39)]], tq)
+            tv, ti = _sample(po[:, ttc_plane_index(npl, steps + dd)], tq)
             tv = torch.where(ti, tv, torch.zeros_like(tv)).reshape(b, 40, nq, 12).amax(-1).permute(0, 2, 1)
             pt = torch.maximum(pt, (tv * mov).amax(-1))
             gd, _ = _sample(od[:, (steps + dd).clamp(max=od.shape[1] - 1)], tq)
@@ -522,8 +570,8 @@ class Corridor64TargetBuilder(AbstractTargetBuilder):
         A = self._arr[hit[0]]
         r = hit[1]
         occ = raster_agents(np.asarray(A["agent_rows"][A["agent_off"][r]:A["agent_off"][r + 1]]))   # [49, 200, 200]
-        o40 = occ[:40]
-        if self._planes != 40:
+        o40 = occ if self._planes == occ.shape[0] else occ[:40]      # km 10/19: 49 planes = 0.1 .. 4.9 s
+        if self._planes not in (40, occ.shape[0]):
             o40 = o40.reshape(self._planes, -1, 200, 200).any(1)
         out = {"corridor_sdf": torch.from_numpy(np.asarray(A["static_sdf"][r], np.float32)),
                "corridor_occ": torch.from_numpy(o40.astype(np.float32)),

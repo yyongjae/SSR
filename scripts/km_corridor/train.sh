@@ -5,6 +5,16 @@
 #            v31  : + 40 x 0.1 s planes, plan constraint (static / occ / TTC), conditional EP, route channel,
 #                   progress reward inside the GT-safe corridor, official-comfort hinge, verdict supervision  == corr30_v31
 #            v31_64 : v31 on the 64 m BEV / GT (NOT smoke-tested yet, see README)
+#            v32b : v31 + 49 x 0.1 s planes (to 4.9 s, GT corridor32_p49: tools/corridor/build_corridor_p49.py), occ
+#                   pos_weight 8 + plane weight 1 -> 2 over time, SDF boundary weight 8 + sigma head (p_DAC = Phi(z)),
+#                   forward selection pred_multiply_sigma_ttc (km 10/18)
+#            c64  : (km 10/19, C) v31_64 + 49 x 0.1 s planes + the candidate scorer on the model's own tracked
+#                   candidates (exact GT verdicts, tools/corridor/build_exact.py) + fixed LQR port; no verdict loss on
+#                   random anchors.  km 10/19 (C v3): every scorer head trained on the OFFICIAL per-candidate PDMS (v1
+#                   cache) / EPDMS (v2 cache, EC excluded) terms (modules/exact_score.py); submits
+#                   corridor_select_rule=cand_official (expected PDMS first, expected EPDMS among the near-ties; no
+#                   anchor-label term)
+#            c64_traj : c64 with the scorer WITHOUT the predicted-corridor read-out (ablation)
 #   smoke: EPOCHS=1 LIMIT_TRAIN=40 LIMIT_VAL=5 VAL_EVERY=1 WANDB=false
 #   SELECT_RULE (km 10/17): trajectory the agent submits at inference, default pred_multiply_t0.25 (corridor); v2 = no corridor
 set -uo pipefail
@@ -13,8 +23,10 @@ VAR=$1; RUN=$2; GPUS=$3; shift 3
 NG=$(echo $GPUS | tr ',' '\n' | wc -l)
 OUT=$KM_ROOT/km_runs/corr30/$RUN; mkdir -p $OUT
 export CUDA_VISIBLE_DEVICES=$GPUS CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_SOCKET_IFNAME=lo OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+[ "$VAR" = v32b ] && PLANES=49 && SELECT_RULE=${SELECT_RULE:-pred_multiply_sigma_ttc}
+case $VAR in c64|c64_traj) PLANES=49; SELECT_RULE=${SELECT_RULE:-cand_official} ;; esac
 V31=(++agent.config.corridor_plan_weight=20.0 ++agent.config.corridor_plan_ttc_weight=1.0 ++agent.config.plan_ep_feasible_only=true
-     ++agent.config.corridor_occ_planes=40 ++agent.config.corridor_route_weight=1.0
+     ++agent.config.corridor_occ_planes=${PLANES:-40} ++agent.config.corridor_route_weight=1.0
      ++agent.config.corridor_plan_prog_weight=0.2 ++agent.config.corridor_plan_comfort_weight=1.0 ++agent.config.corridor_verdict_weight=1.0)
 case $VAR in
   v2)  EXTRA=(++agent.config.corridor_dir=$KM_ROOT/corridor_dt01) ;;
@@ -22,7 +34,17 @@ case $VAR in
   v31_64) EXTRA=("${V31[@]}" ++agent.config.corridor_format=c64 ++agent.config.corridor_dir=$KM_ROOT/corridor64
            "++agent.config.pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]" "++agent.config.map_pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]"
            ++agent.config.bev_h=100) ;;
-  *) echo "variant: v2 | v31 | v31_64"; exit 2 ;;
+  v32b) EXTRA=("${V31[@]}" ++agent.config.corridor_dir=$KM_ROOT/corridor32_p49 ++agent.config.corridor_route_dir=$KM_ROOT/route32
+         ++agent.config.corridor_occ_pos_weight=8.0 ++agent.config.corridor_occ_time_weight=1.0
+         ++agent.config.corridor_sdf_boundary_weight=8.0 ++agent.config.corridor_sdf_sigma=true) ;;
+  c64|c64_traj) V31C=(); for x in "${V31[@]}"; do [[ $x == *corridor_verdict_weight* ]] || V31C+=("$x"); done
+           EXTRA=("${V31C[@]}" ++agent.config.corridor_format=c64
+           ++agent.config.corridor_dir=$KM_ROOT/corridor64
+           "++agent.config.pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]" "++agent.config.map_pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]"
+           ++agent.config.bev_h=100 ++agent.config.cand_scorer_weight=1.0 ++agent.config.exact_dir=$KM_ROOT/exact
+           ++agent.config.cand_official=true ++agent.config.exact2_dir=$KM_ROOT/exact2
+           ++agent.config.cand_scorer_fields=$([ "$VAR" = c64 ] && echo true || echo false)) ;;
+  *) echo "variant: v2 | v31 | v31_64 | v32b | c64 | c64_traj"; exit 2 ;;
 esac
 exec $PY navsim/planning/script/run_training.py \
   agent=para_ssr_agent agent.lr=1e-4 agent.config.max_epochs=30 experiment_name=$RUN \

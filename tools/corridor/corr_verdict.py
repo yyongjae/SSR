@@ -79,7 +79,11 @@ def main(argv=None) -> int:
     from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_comfort_metrics import ego_is_comfortable
     from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import StateIndex
     P = T["cocc"].shape[1]
-    plane = torch.arange(40, device=dev) // (40 // P)                                       # plane of each step
+    plane = CH.occ_plane_index(P, dev)                                                      # plane of each step
+
+    def ttc_idx(pl, dd):  # km 10/18: 49 head planes reach 4.9 s; 40 / 8 planes (and the 40-plane mocc) hold 4.0 s
+        st_ = torch.arange(40, device=dev) + dd
+        return CH.ttc_plane_index(P, st_) if pl is plane else pl[st_.clamp(max=39)]
     gx, gy = torch.meshgrid(torch.linspace(0.0, CH.FRONT, 4, device=dev),
                             torch.linspace(-CH.HALF_W, CH.HALF_W, 3, device=dev), indexing="ij")
     gx, gy = gx.reshape(-1), gy.reshape(-1)                                                 # front half (TTC)
@@ -121,7 +125,7 @@ def main(argv=None) -> int:
                 for dd in (3, 6, 9):
                     sh = (spd * dd * 0.1)[..., None]
                     q = torch.stack([x[..., None] + c * (gx + sh) - s * gy, y[..., None] + s * (gx + sh) + c * gy], -1)
-                    f = planes[:, pl[(torch.arange(40, device=dev) + dd).clamp(max=39)]]
+                    f = planes[:, ttc_idx(pl, dd)]
                     v, inr = CH._sample(f, q.permute(0, 2, 1, 3, 4).reshape(b, 40, -1, 2))
                     v = torch.where(inr, v, torch.zeros_like(v)).reshape(b, 40, 256, 12).amax(-1).permute(0, 2, 1)
                     best = torch.maximum(best, (v * mov).amax(-1))

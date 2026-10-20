@@ -215,8 +215,17 @@ class ParaSSRModel(nn.Module):
                                            route=float(getattr(cfg, "corridor_route_weight", 0.0)) > 0,
                                            agent_attn=bool(getattr(cfg, "corridor_agent_attn", False)),
                                            agent_k=int(getattr(cfg, "corridor_agent_k", 32)),
-                                           agent_detach=bool(getattr(cfg, "corridor_agent_detach", True)))
+                                           agent_detach=bool(getattr(cfg, "corridor_agent_detach", True)),
+                                           sigma=bool(getattr(cfg, "corridor_sdf_sigma", False)))
                               if float(getattr(cfg, "corridor_weight", 0.0)) > 0 else None)
+        # km 10/19 (C): candidate scorer on the model's own tracked candidates, trained on their exact GT verdicts
+        # (modules/candidate_scorer.py, modules/exact_verdict.py)
+        self.cand_scorer = None
+        if float(getattr(cfg, "cand_scorer_weight", 0.0)) > 0:
+            from .modules.candidate_scorer import CandidateScorer
+            self.cand_scorer = CandidateScorer(cfg.embed_dims, cfg.bev_h, cfg.bev_w, float(cfg.pc_range[4] - cfg.pc_range[1]),
+                                               use_fields=bool(getattr(cfg, "cand_scorer_fields", True)) and self.corridor_head is not None,
+                                               agent_k=int(getattr(cfg, "corridor_agent_k", 32)))
 
         self.det_motion_head = (
             ParaDetMotionHead(
@@ -429,7 +438,7 @@ class ParaSSRModel(nn.Module):
         if self.corridor_head is not None:
             predictions.update(self.corridor_head(bev_embed, det_out))
             rule = str(getattr(cfg, "corridor_select_rule", "v2"))
-            if not self.training and rule != "v2" and "trajectory_offset" in predictions:
+            if not self.training and rule.startswith("pred_") and "trajectory_offset" in predictions:
                 # km 10/17: the submitted trajectory is the corridor-selected candidate (modules/corridor_select.py)
                 from .modules.corridor_select import corridor_select
                 sel = corridor_select(predictions, features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4],
@@ -437,6 +446,30 @@ class ParaSSRModel(nn.Module):
                 predictions["trajectory_v2"] = predictions["trajectory"]
                 predictions["trajectory"] = sel["trajectory"].to(predictions["trajectory"].dtype)
                 predictions["plan_select_index"] = sel["index"]
+        if self.cand_scorer is not None and "trajectory_offset" in predictions:
+            from .modules.torch_tracker import track
+            status = features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4].float()
+            cand = (predictions["trajectory_anchors"].float()[None] + predictions["trajectory_offset"].float()).detach()
+            b, k = cand.shape[:2]
+            with torch.no_grad():
+                init = torch.cat([status, status.new_zeros(b, 3)], -1).repeat_interleave(k, 0)
+                st = track(cand.reshape(b * k, 8, 3), init, full=True).reshape(b, k, 41, 7).float()
+            predictions["cand_states"] = st
+            predictions.update(self.cand_scorer(st, bev_embed, det_out, predictions if self.cand_scorer.use_fields else None))
+            if not self.training and str(getattr(cfg, "corridor_select_rule", "v2")) == "cand_official":
+                # km 10/19 (C v3): expected official PDMS first, expected EPDMS (EC excluded) among the near-ties
+                from .modules.candidate_scorer import expected_official, select_official
+                ex = expected_official(predictions, st)
+                lam = float(getattr(cfg, "cand_select_lam", 0.0))    # km 10/20 (C v3.1): smoothness in the choice
+                rough = None
+                if lam > 0:
+                    from .modules.candidate_scorer import ec_roughness
+                    rough = ec_roughness(st)
+                idx = select_official(ex, float(getattr(cfg, "cand_select_eps", 0.02)), lam, rough)
+                predictions["trajectory_v2"] = predictions["trajectory"]
+                predictions["trajectory"] = cand[torch.arange(b, device=cand.device), idx].to(predictions["trajectory"].dtype)
+                predictions["plan_select_index"] = idx
+                predictions["cand_exp_pdms1"], predictions["cand_exp_epdms2"] = ex["pdms1"], ex["epdms2"]
         if getattr(cfg, "heading_from_path", False) and not self.training:
             predictions["trajectory"] = heading_from_path(predictions["trajectory"])
         if getattr(cfg, "kinematic_projection", False) and not self.training:

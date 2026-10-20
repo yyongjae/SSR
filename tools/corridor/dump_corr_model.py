@@ -50,13 +50,19 @@ def main(argv=None) -> int:
     ap.add_argument("--bs", type=int, default=8)
     ap.add_argument("--workers", type=int, default=5)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--cand-eps", type=float, default=None, help="km 10/20: override cand_select_eps (C runs)")
+    ap.add_argument("--cand-lam", type=float, default=None, help="km 10/20: override cand_select_lam (C v3.1 smoothness)")
+    ap.add_argument("--rows", default="", help="km 10/20: .npy of the row indices to dump (e.g. whole logs, for EC pairs)")
     ap.add_argument("--subset", type=int, default=0,
                     help="dump only the corr_select rows: sorted rng(0).choice(n, subset) (= its --n sample)")
     ap.add_argument("--planes", type=int, default=8, help="corridor_occ_planes of the run (cocc shape)")
     ap.add_argument("--fwd-rows", type=int, default=100, help="corridor rows: 100 (32 m) or 200 (64 m)")
     ap.add_argument("--route", action="store_true", help="the run predicts route channels (corridor_route_weight > 0)")
+    ap.add_argument("--sigma", action="store_true", help="the run has the SDF sigma head (km 10/18): csig.npy")
     ap.add_argument("--det", action="store_true", help="dump only the det/motion head outputs (see the docstring)")
     ap.add_argument("--traj32", action="store_true", help="traj.npy in float32 (navtest submission; f16 is ~3 cm at 60 m)")
+    ap.add_argument("--cand", action="store_true", help="km 10/19 (C): the candidate scorer outputs (cand_*.npy)")
+    ap.add_argument("--no-fields", action="store_true", help="skip csdf / cocc (64 m x 49 planes: ~2 MB per token)")
     ap.add_argument("--select-rule", default=None,
                     help="override corridor_select_rule of the run config (km 10/17; default: the run's own)")
     a = ap.parse_args(argv)
@@ -68,10 +74,18 @@ def main(argv=None) -> int:
                 "det_traj": (np.float16, (64, 6, 8, 2)), "det_tcls": (np.float16, (64, 6))}
     if not a.det:
         SPEC["msel"] = (np.int16, ())          # km 10/17: candidate the forward submitted (corridor_select_rule)
-        SPEC["cocc"] = (np.uint8, (a.planes, a.fwd_rows, 200))
-        SPEC["csdf"] = (np.float16, (a.fwd_rows, 200))
+        if not a.no_fields:
+            SPEC["cocc"] = (np.uint8, (a.planes, a.fwd_rows, 200))
+            SPEC["csdf"] = (np.float16, (a.fwd_rows, 200))
+    if a.cand and not a.det:   # km 10/19 (C v3): every scorer head (raw), the token heads, the expected official scores
+        from navsim.agents.para_ssr.modules.candidate_scorer import HEADS
+        SPEC.update({"cand_heads": (np.float16, (256, sum(HEADS.values()))), "cand_eff": (np.float16, (2,)),
+                     "cand_exp_pdms1": (np.float16, (256,)), "cand_exp_epdms2": (np.float16, (256,)),
+                     "cand_c1": (np.uint8, (256,))})
     if a.route and not a.det:
         SPEC["croute"] = (np.float16, (a.fwd_rows // 2, 100))
+    if a.sigma and not a.det:
+        SPEC["csig"] = (np.float16, (a.fwd_rows, 200))
     import pandas as pd
     import torch
     from hydra.utils import instantiate
@@ -97,6 +111,8 @@ def main(argv=None) -> int:
     pos = np.arange(n)[np.arange(n) % pn == pi]
     if a.subset:
         pos = np.intersect1d(pos, np.random.default_rng(0).choice(np.arange(n), a.subset, replace=False))
+    if a.rows:
+        pos = np.intersect1d(pos, np.load(a.rows))
     pos = pos[~done[pos]]
     if a.limit:
         pos = pos[: a.limit]
@@ -104,12 +120,23 @@ def main(argv=None) -> int:
     if not len(pos):
         return 0
     dev = torch.device("cuda:0")
+    # the aux-metric protocol pins the 32 m range for comparable det/map mAP; this dump computes no mAP, so the
+    # archived range is taken as is (64 m runs: pc_range y 0..64)
+    cfg = OmegaConf.load(Path(a.run_dir) / "train/code/hydra/config.yaml").agent.config
+    RAE.PROTOCOL_PC_RANGE = tuple(float(v) for v in cfg.pc_range)
+    RAE.PROTOCOL_MAP_PC_RANGE = tuple(float(v) for v in cfg.map_pc_range)
     agent = RAE._build_agent(Path(a.run_dir) / "train/code/hydra/config.yaml", Path(a.ckpt), dev)
     agent.eval()
     if a.select_rule is not None:
         agent.config.corridor_select_rule = a.select_rule
         agent.para_ssr_model._config.corridor_select_rule = a.select_rule   # the model holds a copy (ckpt load)
-    print(f"forward selection rule: {getattr(agent.para_ssr_model._config, 'corridor_select_rule', 'v2')}", flush=True)
+    for k, v in (("cand_select_eps", a.cand_eps), ("cand_select_lam", a.cand_lam)):
+        if v is not None:
+            setattr(agent.config, k, v)
+            setattr(agent.para_ssr_model._config, k, v)
+    print(f"forward selection rule: {getattr(agent.para_ssr_model._config, 'corridor_select_rule', 'v2')}"
+          f" (cand eps {getattr(agent.para_ssr_model._config, 'cand_select_eps', 0.02)},"
+          f" lam {getattr(agent.para_ssr_model._config, 'cand_select_lam', 0.0)})", flush=True)
     sp = CM.split(a.split)
     toks = [str(t) for t in tdf.token.to_numpy()[pos]]
     sf = instantiate(OmegaConf.load(CM.resolve_path(sp["scene_filter"])))
@@ -153,10 +180,19 @@ def main(argv=None) -> int:
         traj = anchors[None] + pr["trajectory_offset"].float()
         out = {"traj": traj, "sim": pr["sim_rewards"], "im": pr["im_rewards"], "final": pr["plan_final_rewards"],
                "v2traj": pr.get("trajectory_v2", pr["trajectory"]), "status": fg["status_feature"][:, ncmd:ncmd + 4],
-               "csdf": pr["corridor_sdf"], "cocc": torch.sigmoid(pr["corridor_occ"].float()) * 255,
                "msel": pr.get("plan_select_index", pr["plan_final_rewards"].argmax(1))}
+        if not a.no_fields:
+            out.update({"csdf": pr["corridor_sdf"], "cocc": torch.sigmoid(pr["corridor_occ"].float()) * 255})
+        if a.cand:
+            from navsim.agents.para_ssr.modules.candidate_scorer import HEADS, expected_official
+            ex = expected_official(pr, pr["cand_states"])
+            heads = torch.cat([pr["cand_" + nm].float().reshape(*pr["cand_prog"].shape, -1) for nm in HEADS], -1)
+            out.update({"cand_heads": heads, "cand_eff": torch.stack([pr["cand_eff1"], pr["cand_eff2"]], -1),
+                        "cand_exp_pdms1": ex["pdms1"], "cand_exp_epdms2": ex["epdms2"], "cand_c1": ex["c1"]})
         if a.route:
             out["croute"] = pr["corridor_route_s"]
+        if a.sigma:
+            out["csig"] = pr["corridor_sdf_sigma"]
         for k, v in out.items():
             v = v.float().cpu().numpy()
             arr[k][r] = np.rint(v).astype(np.uint8) if k == "cocc" else v.astype(SPEC[k][0])

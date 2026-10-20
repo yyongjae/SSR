@@ -355,9 +355,32 @@ class ParaSSRConfig:
     corridor_agent_k: int = 32
     corridor_agent_detach: bool = True     # the corridor loss does not update the det/motion head
     corridor_format: str = "dt01"
+    # km 10/18 (v3.2b): corridor GT loss shape.  occ: BCE pos_weight, plane weight 1 + time_weight * k / (P - 1)
+    # (later planes = the TTC / late-NC planes the selector misses); sdf: boundary weight 1 + bw * exp(-|s|).
+    # sdf_sigma: an aleatoric SDF scale head sigma (Gaussian NLL on the detached SDF error), the selector's DAC verdict
+    # becomes p_DAC = Phi(min_corners sdf / sigma) (the verdict loss trains it at the same quantity).
+    corridor_occ_pos_weight: float = 4.0
+    corridor_occ_time_weight: float = 0.0
+    corridor_sdf_boundary_weight: float = 4.0
+    corridor_sdf_sigma: bool = False
     # km 10/17: trajectory the agent submits (modules/corridor_select.py): v2 = the anchor planner's argmax (no corridor)
     # | pred_multiply_t<tau> | pred_replace_t<tau> = every candidate tracked and judged on the predicted corridor
+    # | km 10/18: pred_multiply_sigma (p_DAC from the sigma head) | suffix _ttc adds the predicted TTC verdict
     corridor_select_rule: str = "v2"
+    # km 10/19 (C): candidate scorer (modules/candidate_scorer.py) on the model's own tracked candidates, trained on
+    # their exact GT verdicts (modules/exact_verdict.py, GT tables of tools/corridor/build_exact.py in exact_dir).
+    # corridor_select_rule = cand_expected submits the candidate of the highest expected PDMS.  0 = off.
+    cand_scorer_weight: float = 0.0
+    cand_scorer_fields: bool = True        # + the predicted corridor read-out along each candidate (needs corridor head)
+    cand_scorer_prog_weight: float = 1.0
+    exact_dir: str = "/home/external-user/ssd/kyungmin_ck/exact"
+    # km 10/19 (C v3): official PDMS (v1) + EPDMS (v2, EC excluded) of every candidate (modules/exact_score.py): v1
+    # tables in exact_dir (+ build_exact.py --only pdm,ego), v2 tables of the v2 metric cache in exact2_dir.
+    # corridor_select_rule = cand_official: argmax expected EPDMS among the candidates within cand_select_eps of the
+    # best expected PDMS (eps tuned on navtrain_train only)
+    cand_official: bool = False
+    exact2_dir: str = "/home/external-user/ssd/kyungmin_ck/exact2"
+    cand_select_eps: float = 0.02
     # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
     # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
     # always uses GT.

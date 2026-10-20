@@ -30,8 +30,15 @@ def main(argv=None) -> int:
     import pandas as pd
     d = Path(a.dump) / a.split
     D = {k: np.load(d / f"{k}.npy", mmap_mode="r") for k in ("traj", "sim", "im", "final")}
-    V = dict(np.load(d / "verdict.npz"))
-    rows = V["rows"]
+    if (d / "verdict.npz").exists():
+        V = dict(np.load(d / "verdict.npz"))
+        rows = V["rows"]
+    else:                              # km 10/19 (C): no field verdicts; every dumped token
+        assert a.rule in ("v2", "model"), f"{a.rule} needs verdict.npz (corr_verdict.py)"
+        done = np.zeros(len(D["traj"]), bool)
+        for f in d.glob("done_*.npy"):
+            done |= np.load(f)
+        rows = np.flatnonzero(done)
     if a.rule == "v2":
         ch = np.asarray(D["final"][rows]).argmax(1)
     elif a.rule == "model":            # km 10/17: the forward's own choice (corridor_select_rule)

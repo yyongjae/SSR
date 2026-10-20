@@ -1221,7 +1221,8 @@ def test_launcher_placeholder_and_z_stats_check(tmp_path):
     pd_, pm_ = tmp_path / "zd.json", tmp_path / "zm.json"
     v5 = {"enabled": True, "relation": "student", "corrector": True, "z_adapt": True, "z_stats_det": str(pd_),
           "z_stats_map": str(pm_)}
-    c = CKE2E2Config.from_any({"v4": {"v5": v5}, "teacher_det_run": str(td), "teacher_map_run": str(tm)})
+    c = CKE2E2Config.from_any({"v4": {"readout": "range", "exec_model": "lqr", "ev_tbins": 20, "v5": v5}, "teacher_det_run": str(td),
+                               "teacher_map_run": str(tm)})
     assert LU2.z_stats_check(CKE2E2Config.from_any({"v4": {"v5": dict(v5, z_adapt=False)}}), teachers) == {}
     with pytest.raises(LU2.LaunchError, match="fit_z_stats.py"):
         LU2.z_stats_check(c, teachers)
@@ -1234,6 +1235,15 @@ def test_launcher_placeholder_and_z_stats_check(tmp_path):
     pm_.write_text(_json.dumps(_zrec("M", run=str(tm), ckpt_sha16="c" * 16)))
     with pytest.raises(LU2.LaunchError, match="sha16"):
         LU2.z_stats_check(c, teachers, "smoke")
+    # the no-LQR student ('ref') refuses records read at the teachers' LQR states, accepts --zq-exec ref ones
+    pm_.write_text(_json.dumps(_zrec("M", run=str(tm), ckpt_sha16="b" * 16)))
+    c_ref = CKE2E2Config.from_any({"v4": {"readout": "range", "exec_model": "ref", "ev_tbins": 20, "v5": v5}, "teacher_det_run": str(td),
+                                   "teacher_map_run": str(tm)})
+    with pytest.raises(LU2.LaunchError, match="zq-exec ref"):
+        LU2.z_stats_check(c_ref, teachers, "smoke")
+    pd_.write_text(_json.dumps(_zrec("T", run=str(td), ckpt_sha16="a" * 16, zq_exec="ref")))
+    pm_.write_text(_json.dumps(_zrec("M", run=str(tm), ckpt_sha16="b" * 16, zq_exec="ref")))
+    assert LU2.z_stats_check(c_ref, teachers, "smoke")["det"]["sha16"] == ZA.file_sha16(pd_)
 
 
 def test_teacher_checkpoints_still_load_strict_without_adapter():

@@ -30,13 +30,17 @@
 #     Hungarian at t0, ghosts y = 0, duplicates masked).
 # Teachers: the v5 teachers (tools/ck/v5/run_teachers_v5.sh); their KD calibration files are PLACEHOLDERS until fitted
 # (tools/ck/e2e2/fit_kd_calib.py after the teachers finish) or kd_calib.enabled=false via E2E_CK_SET; the Z-adapter
-# statistics are PLACEHOLDERS until fitted by tools/ck/v5/fit_z_stats.py (CPU, --tokens 4096, after the teachers
-# finish; refused at launch while v4.v5.z_adapt is on, launch_util2.placeholder_check / z_stats_check).
+# statistics are PLACEHOLDERS until fitted by tools/ck/v5/fit_z_stats.py (CPU, --tokens 4096 --zq-exec ref: Z read at
+# this student's 'ref' states, after the teachers finish; refused at launch while v4.v5.z_adapt is on or when a record's
+# zq_exec is not the student's exec_model, launch_util2.placeholder_check / z_stats_check).
 # Not trained without the user's approval (GPUs 0-3).
 bev_kd.enabled=false
 bev_kd.teachers=[det]
 v4.readout=range
-v4.exec_model=lqr
+# no-LQR student (user 2026-10-20): the student's readers, relation re-reads and L_refine take the tracker's 41-state
+# reference (lqr.reference_rollout) -- the LQR rollout was 47 % of the step's GPU launches (8 rollouts / micro-batch);
+# the teachers keep 'lqr' (their own run configs), their two rollouts of the same candidates shared (shared_states)
+v4.exec_model=ref
 v4.ev_tbins=20
 v4.ev_tbin_s=0.25
 v4.ep_evidence=true

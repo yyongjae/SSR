@@ -329,8 +329,11 @@ class CKNet(nn.Module):
                   return_ctx: bool = False, parent_index: Optional[torch.Tensor] = None, pctx: Optional[Dict] = None,
                   return_pctx: bool = False, dedupe: Optional[bool] = None,
                   priv: Optional[Dict[str, torch.Tensor]] = None,
-                  rel_objs: Optional[Dict[str, torch.Tensor]] = None) -> Dict:
-        """Score one candidate set with the token's scene (feat, mem from trunk.scene).  priv: the batch's ref_obj_*
+                  rel_objs: Optional[Dict[str, torch.Tensor]] = None, zq_exec: Optional[str] = None) -> Dict:
+        """Score one candidate set with the token's scene (feat, mem from trunk.scene).  zq_exec (refiner v5, range +
+        v5 nets; a KD teacher of the no-LQR student): an exec model other than v4.exec_model adds haz['zq_kd'] = the
+        per-state reads zq (+ the relation's H channels) of the same fields at THOSE states of the candidates (no
+        scoring; every other output unchanged); None / the own exec model: no zq_kd.  priv: the batch's ref_obj_*
         dict (losses.EV_REF_KEYS) of a PRIVILEGED range teacher (V4Cfg.rg_priv != 'off'; required then, refused
         otherwise; range_targets.priv_channels on the parent rows, reused from a range pctx):
         cand [T, K, 8, 3] -> score_logit [T, K, 5] f32, w_lat / z_lon [T, K, 6] f32, gate_logit [T, K], and for the v4
@@ -341,8 +344,8 @@ class CKNet(nn.Module):
         occ_logit [T, K, 48, 17, M] (B of the candidate's parent), margin [T, K, 48, 17] (D), the same once per
         parent row occ_logit_u / ovl_logit_u (U) [T, U, 48, 17, M] (+ bp_logit_u (Bp, the plain not-behind B that
         TTC reads) with v4.rg_stopped_aware), margin_u [T, U, 48, 17] with parent_index
-        [T, K] (row of each candidate; U = K and index k without dedupe), exec_states [T, K, Q, 6] (Q 41 'lqr' / 9
-        'plan'), lp_nc / lp_ttc / lp_dac, slack_nc / slack_ttc [s] / slack_dac (= min_margin) [m], exec_ratio,
+        [T, K] (row of each candidate; U = K and index k without dedupe), exec_states [T, K, Q, 6] (Q 41 'lqr' / 'ref',
+        9 'plan'), lp_nc / lp_ttc / lp_dac, slack_nc / slack_ttc [s] / slack_dac (= min_margin) [m], exec_ratio,
         S_exec [m], overspeed [m/s] [T, K], crit_station / crit_lat (long) / crit_time [T, K, 3] (nc, ttc, dac),
         crit_chan [T, K], pts}.
         readout 'mean': exactly trunk.candidates + score (the CK2 / v3 ops; parents and every v4 argument ignored).
@@ -447,7 +450,8 @@ class CKNet(nn.Module):
             haz = {k: sh(r[k]) for k in ("occ_logit", "margin", "lp_nc", "lp_ttc", "lp_dac", "min_margin")}
             haz["pts"] = sh(pgeom.points.detach().float())
         else:                                                           # range (V4_3 M4): fields once per parent row
-            r, haz, rg = self._range_read(P, rows, pidx, T, K, flat, ego, x, g, cgeom, sib, pr, priv, rel_objs)
+            r, haz, rg = self._range_read(P, rows, pidx, T, K, flat, ego, x, g, cgeom, sib, pr, priv, rel_objs,
+                                          zq_exec=zq_exec)
             haz["pts"] = sh(pgeom.points.detach().float())
         haz.update(haz_mask=sh(r["mask"]), t_arr=sh(sib["t"]), t_in=sh(sib["t_in"]), t_out=sh(r["t_out"]),
                    d_lat=sh(sib["d"]), is_self=sh(is_self))
@@ -472,7 +476,7 @@ class CKNet(nn.Module):
     def _range_read(self, P: Dict, rows: Optional[torch.Tensor], pidx: Optional[torch.Tensor], T: int, K: int,
                     flat: torch.Tensor, ego, x: torch.Tensor, g: torch.Tensor, cgeom, sib: Dict, pr,
                     priv: Optional[Dict[str, torch.Tensor]] = None,
-                    rel_objs: Optional[Dict[str, torch.Tensor]] = None):
+                    rel_objs: Optional[Dict[str, torch.Tensor]] = None, zq_exec: Optional[str] = None):
         """score_set's readout 'range' (spec V4_3 M4; ck/v4/range_readout.py): scene fields on the R rows of the parent
         pass P (R = T * U unique parents, or T * K without dedupe; reused from P['rg_fields'] / P['rg_frame'] when P is
         a range pctx), the candidates' states (exec_model; ego (vx, ax) = eds[:, 0], eds[:, 2], i.e. status[..., 4] /
@@ -547,6 +551,17 @@ class CKNet(nn.Module):
                     haz["rel_top_idx"] = sh(rel["top_idx"])
                 if "lr_nc" in rel:                       # relation 'student': log r for the relation BCE (report 102 N1)
                     haz.update(rel_lr_nc=sh(rel["lr_nc"]), rel_lr_ttc=sh(rel["lr_ttc"]))
+            if zq_exec is not None and zq_exec != self.v4.exec_model:   # Z-KD targets at the student's states
+                with torch.autocast(device_type=dev.type, enabled=False):
+                    st2, tq2 = candidate_states(flat, rep(eds[:, 0]), rep(eds[:, 2]), zq_exec)
+                z2 = self.v4_readout.zq_at(Fs, prow, fr_u, st2, tq2)
+                if self.relation is not None:
+                    zs = int(self.v5.z_stride)
+                    rel2 = self.relation(rel_objs, st2[:, ::zs], tq2[::zs], torch.arange(B, device=dev) // K)
+                    z2 = torch.cat([z2, rel2["H"].float()], -1)
+                haz["zq_kd"] = sh(z2)
+        elif zq_exec is not None and zq_exec != self.v4.exec_model:
+            raise ValueError("CKNet.score_set: zq_exec needs a v5 net (per-state reads)")
         return r, haz, (Fs, fr_u)
 
     def correct_topk(self, feat: torch.Tensor, mem: torch.Tensor, ego, pool: torch.Tensor, parents: torch.Tensor,
@@ -805,8 +820,8 @@ class CKNet(nn.Module):
         return torch.cat([top.float().reshape(T, R, N_TOP, N_TOP_REL_V2), dr], -1).reshape(T, R, -1)
 
     def relation_reread(self, O: Dict[str, torch.Tensor], traj: torch.Tensor, ego, grad: bool = False) -> Dict:
-        """refiner v5 relation RE-READ primitive (design §3.7: the Delta r probes of top_feats 'v2'; X1 = LQR(tau1) for
-        L_edit-Bernoulli): the relation channel of the token rows O (haz['rel_objs_tok'] of a score_set of the same T
+        """refiner v5 relation RE-READ primitive (design §3.7: the Delta r probes of top_feats 'v2'; X1 = exec(tau1) for
+        L_edit-Bernoulli, LQR / 'ref' by V4Cfg.exec_model): the relation channel of the token rows O (haz['rel_objs_tok'] of a score_set of the same T
         tokens) on arbitrary drafts traj [T, R, 8, 3] or [T, R, P, 8, 3], executed by the critic's own model
         (range_readout.candidate_states, V4Cfg.exec_model, ego (vx, ax) = eds[:, 0], eds[:, 2] as score_set) and read
         at the same strided states (V5Cfg.z_stride) -> {r_nc, r_ttc [T, R(, P), N], H [T, R(, P), Q', 2], a_tok [T, N],

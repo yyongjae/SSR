@@ -354,6 +354,54 @@ def simulate(traj: torch.Tensor, ego, dtype: Optional[torch.dtype] = None, fit: 
     return states, info
 
 
+def reference_rollout(traj: torch.Tensor, ego, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    """Tracker-free stand-in of `simulate` (exec_model 'ref'; refiner v5 student, user 2026-10-20: the student reads the
+    plan, the teachers keep the LQR): the tracker's own 41-state reference (`reference_states`: origin + the 8 poses,
+    positions linear in time, heading unwrapped then linear) as the states, so every 41-state reader / loss runs
+    unchanged.  Report 89 §3-2 measured this read against the executed one (GT fields, held-out 12,179).
+      x, y   : the reference positions;
+      heading: the reference heading changes clamped to the bicycle's turn limit |dh_n| <= len_n tan(MAX_STEER) /
+               WHEEL_BASE (len_n = |p_n - p_{n-1}|): equal to the reference wherever its curvature is drivable (radius
+               >= 1.78 m), but a near-stop plan whose knot headings flip (v2 stop parents, ~2.9 rad) keeps the ego
+               pointing forward instead of a mirrored footprint (review 2026-10-20); principal-valued;
+      v      : v_0 = v0, v_n = (p_{n+1} - p_n) . (cos h_n, sin h_n) / DT for n = 1..39 (signed; the speed that moves
+               state n, as the bicycle's), v_40 = v_39;
+      a      : a_0 = a0, a_n = (v_n - v_{n-1}) / DT -- impulses at the knots, NOT a tracked acceleration (comfort
+               cannot be judged without the tracker: refine_loss drops its comfort factor for 'ref');
+      steer  : steer_0 = steer0, 0 after (no reader uses it).
+    traj [..., 8, 3], ego as `simulate` -> states [..., 41, 6] in `dtype` (default traj.dtype if floating, else
+    float32); differentiable w.r.t. traj (finite gradient at standstill).  Tens of GPU launches against `simulate`'s
+    4,741 (2026-10-20 profile)."""
+    if traj.shape[-2:] != (8, 3):
+        raise ValueError(f"traj must be [..., 8, 3], got {tuple(traj.shape)}")
+    lead = traj.shape[:-2]
+    if dtype is None:
+        dtype = traj.dtype if traj.is_floating_point() else torch.float32
+    ref = reference_states(traj.reshape(-1, 8, 3).to(dtype))                        # [B, 41, 3]
+    v0, a0, s0 = _ego_columns(ego, lead, dtype, traj.device)
+    d = ref[:, 1:, :2] - ref[:, :-1, :2]                                           # [B, 40, 2] step n -> n + 1
+    lim = safe_norm(d) * (math.tan(MAX_STEER) / WHEEL_BASE)
+    dh = principal_value(ref[:, 1:, 2] - ref[:, :-1, 2])
+    dh = torch.maximum(torch.minimum(dh, lim), -lim)
+    h = torch.cat([ref[:, :1, 2], ref[:, :1, 2] + torch.cumsum(dh, 1)], 1)         # [B, 41] (ref heading 0 at n = 0)
+    vs = (d[..., 0] * torch.cos(h[:, :-1]) + d[..., 1] * torch.sin(h[:, :-1])) / DT  # [B, 40] speed of step n -> n + 1
+    v = torch.cat([v0[:, None], vs[:, 1:], vs[:, -1:]], 1)                          # [B, 41]
+    a = torch.cat([a0[:, None], (v[:, 1:] - v[:, :-1]) / DT], 1)
+    st = torch.cat([s0[:, None], torch.zeros_like(v[:, 1:])], 1)
+    out = torch.cat([ref[..., :2], principal_value(h)[..., None], v[..., None], a[..., None], st[..., None]], -1)
+    return out.reshape(tuple(lead) + (NT, 6))
+
+
+EXECUTORS = {"lqr": "simulate", "ref": "reference_rollout"}
+
+
+def executor(exec_model: str):
+    """exec_model 'lqr' -> simulate, 'ref' -> reference_rollout (both (traj, ego, dtype=) -> [..., 41, 6])."""
+    if exec_model not in EXECUTORS:
+        raise ValueError(f"exec_model {exec_model!r} has no 41-state executor (one of {tuple(EXECUTORS)})")
+    return globals()[EXECUTORS[exec_model]]
+
+
 class LQRSimulator(nn.Module):
     """nn.Module wrapper of `simulate` (no parameters, no buffers: attaching it leaves state dicts unchanged)."""
 
@@ -397,5 +445,5 @@ def executed_geometry(states: torch.Tensor, sdf: Optional[torch.Tensor] = None,
     return out
 
 
-__all__ = ["simulate", "reference_states", "fit_profiles", "executed_progress", "executed_geometry", "LQRSimulator",
+__all__ = ["simulate", "reference_rollout", "executor", "EXECUTORS", "reference_states", "fit_profiles", "executed_progress", "executed_geometry", "LQRSimulator",
            "official_banded", "principal_value", "normalize_angle", "STATE_COLS", "NT", "FITS"]

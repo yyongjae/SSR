@@ -241,7 +241,7 @@ def get_parser() -> argparse.ArgumentParser:
                          "occupancy / drivable margin on the parent grid + the official rules (report 77); range = "
                          "v4_3 allowed-range critic (blocked field B / U + margin D per parent, read at the executed "
                          "states; docs/refiner_v4/V4_3_SPEC.md M4; defaults = V4Cfg.range_arm)")
-    ap.add_argument("--v4-exec-model", choices=("plan", "lqr"), default=None,
+    ap.add_argument("--v4-exec-model", choices=("plan", "lqr", "ref"), default=None,
                     help="range: candidate states read (default lqr = the official tracker port, ck/v4/lqr.py)")
     ap.add_argument("--v4-ev-tbin-s", type=float, default=None,
                     help="range: time bin width [s] (default 0.25; ev_tbins = 5.0 s / bin)")
@@ -1074,7 +1074,8 @@ def add_v5_losses(loss, st: Dict[str, float], out: Dict, batch: Dict, a):
         if lr > 0 and n:
             eds = out["ego"][2].float()
             w = getattr(a, "ref_weights", None) or RL.parse_weights("")
-            l_ref, s_ref = RL.refine_loss(rf["tau1"][idx], rf["tau_base"][idx], eds[idx, 0], eds[idx, 2], gt, w)
+            l_ref, s_ref = RL.refine_loss(rf["tau1"][idx], rf["tau_base"][idx], eds[idx, 0], eds[idx, 2], gt, w,
+                                          exec_model=getattr(a, "v4_exec_model", None) or "lqr")
             l_u = (rf["mu"][idx].float() ** 2).mean()
             loss = loss + lr * (l_ref + float(w.get("u", 0.0)) * l_u)
             st.update(s_ref)

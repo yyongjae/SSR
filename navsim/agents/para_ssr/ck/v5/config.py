@@ -3,7 +3,7 @@ config.json 'v5' (teachers); absent / {} = V5Cfg() = off = the v4_3 network bit 
 RNG draw, no output key).  v5 needs the v4_3 range readout (V4Cfg.readout 'range' with its residual MLP).
 
 relation    'off' | 'teacher'   object channel (ck/v5/relation.py): per-object relation r_i of the t0 object rows with
-            every candidate's executed LQR states (SAT overlap, modes hold / constant velocity / constant acceleration
+            every candidate's executed states (exec_model 'lqr' | 'ref'; SAT overlap, modes hold / constant velocity / constant acceleration
             from the causal past frames), learned reliability a_i, per-state attributed hazard H_j (NC, TTC).  Adds 4
             residual inputs (lp_rel_nc, lp_rel_ttc, max_i a_i r_i, sum_i a_i) and a direct log-pass term per key
             (zero-initialised weights).  'teacher' = BEVFusion detections + past frames (refiner-v3 object pack,
@@ -15,11 +15,11 @@ corrector   corrector A (ck/v5/corrector.py): 12 decoder controls (z_lon 6 + w_l
             columns from the per-state reads Z (NOT detached: the correction loss trains the reader, add.md (3)) + the
             critic context (detached, as v4 A) + the top-3 related objects; tau1 = decode(tau0, mu_lon, w_lat_head +
             mu_lat) (the lateral head is folded in: at init tau1 = today's laterally corrected draft).  Trained by the
-            executed-state GT surrogate L_refine(X1), X1 = LQR(tau1) (ck/v5/refine_loss.py).
+            executed-state GT surrogate L_refine(X1), X1 = exec(tau1) (ck/v5/refine_loss.py).
 z_channels  which per-state reads the corrector sees: 'all'; 'det' (b_nc, b_ttc, unknown, H -- a DET teacher's D field
             is unsupervised); 'map' (d_min, unknown -- a MAP teacher's B / U fields are unsupervised); the other channels
             are zeroed (no gradient into fields nothing else trains; review 2026-10-20 f11 / f24).
-z_stride    per-state reads Z at every z_stride-th LQR state (2: t = 0, 0.2, .., 4.0 s, 21 states); the relation runs on
+z_stride    per-state reads Z at every z_stride-th executed state (2: t = 0, 0.2, .., 4.0 s, 21 states); the relation runs on
             the same states.
 rel_pstop   relation 'student' only: the reliability MLP a_i also reads p_stop_i = sigmoid(stop logit) of the student's
             det-head V1c stop_branch (design §3.3 a_i = sigma(MLP_a([det_hidden, score, class, range, p_stop])); the
@@ -149,8 +149,9 @@ class V5Cfg:
                 raise ValueError("v5 needs the v4_3 range readout (V4Cfg.readout 'range')")
             if not bool(getattr(v4, "ev_resid", True)):
                 raise ValueError("v5 needs the range readout's residual MLP (V4Cfg.ev_resid)")
-            if getattr(v4, "exec_model", "lqr") != "lqr":
-                raise ValueError("v5 reads the executed LQR states (V4Cfg.exec_model 'lqr')")
+            if getattr(v4, "exec_model", "lqr") not in ("lqr", "ref"):
+                raise ValueError("v5 reads 41 states (V4Cfg.exec_model 'lqr' = the tracked rollout | 'ref' = its "
+                                 "reference, the no-LQR student)")
             if getattr(v4, "corrector", False):
                 raise ValueError("v5.corrector replaces the v4 corrector (V4Cfg.corrector must be off)")
         return self

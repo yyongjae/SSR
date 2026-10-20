@@ -1,6 +1,6 @@
 """refiner v5 per-state reads Z of the range fields (V5Cfg on; report 97 §2-8, add.md (2) Z_k,j).
 
-For every executed LQR state n of a candidate (the range readout's read_geometry, same cells / bins / channels as the
+For every executed state n of a candidate (V4Cfg.exec_model: LQR, or 'ref' for the no-LQR student) (the range readout's read_geometry, same cells / bins / channels as the
 NC / TTC / DAC evidence, before the soft max over the states):
   b_nc   [B, Q]  B logit at the NC read (rear axle, bin(t_n)); 'any4' = max over the distinct 2 x 2 cells; FLOOR where the
                  state is not read (stopped ego, off grid, bin out of range);

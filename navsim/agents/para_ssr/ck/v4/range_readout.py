@@ -50,7 +50,8 @@ Scene fields (learned, candidate-free, once per UNIQUE parent: CKNet.score_set's
 Candidate states (no parameters, no gradient; candidate_states):
   exec_model 'lqr': the official LQR tracker + bicycle (ck/v4/lqr.simulate, float32) from ego (v0, a0) =
       (status[..., 4], status[..., 6]) -> Q = 41 states (x, y, heading, v, a, steer) at t = 0.1 n;
-  exec_model 'plan': the origin + the 8 planned poses at t = 0.5 k (Q = 9), v_k = |p_k - p_{k-1}| / 0.5 (v_0 = vx).
+  exec_model 'plan': the origin + the 8 planned poses at t = 0.5 k (Q = 9), v_k = |p_k - p_{k-1}| / 0.5 (v_0 = vx);
+  exec_model 'ref': the tracker's 41-state reference, no tracker (lqr.reference_rollout; Q = 41, t = 0.1 n).
   Points projected on the parent's station frame (temporal.raster.frenet, exact for any point set) -> (s, d); an NC /
   TTC point is on the grid when s in [-ds / 2, 48 ds) and d in [-5.1, 5.1) (range_targets._cells' nearest-cell
   domain), a DAC corner when |d| <= 4.8 m at any arc length (range_targets.read_field 'grid').  B / U are read at the
@@ -94,6 +95,7 @@ Not modelled (as the GT field, range_targets 'What the field does NOT model'): a
 """
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -129,23 +131,64 @@ I_CNC, I_CTTC, I_CDAC = RT.I_NC, RT.I_TTC, RT.I_DAC   # crit_* columns (0 nc, 1 
 
 
 # ----------------------------------------------------------------------------------------------- states
+_MEMO: Optional[list] = None                     # open shared_states() scope: [(key, states)], at most _MEMO_N entries
+_MEMO_N = 4
+
+
+@contextlib.contextmanager
+def shared_states():
+    """Within the scope, candidate_states returns the states it already computed for EQUAL inputs (same exec model,
+    torch.equal cand / vx / ax after its finite / nan cleaning) instead of rolling them out again -- TeacherPair2.run:
+    the DET and MAP teachers score the same candidates from the same ego, one LQR rollout instead of two (2026-10-20
+    profile: 4,741 GPU launches per rollout).  Exact: the cached tensor is returned as a clone."""
+    global _MEMO
+    prev, _MEMO = _MEMO, []
+    try:
+        yield
+    finally:
+        _MEMO = prev
+
+
+def _memo_get(key):
+    if _MEMO is None:
+        return None
+    m, c, v0, a0 = key
+    for (m2, c2, v2, a2), st in _MEMO:
+        if (m2 == m and c2.shape == c.shape and c2.dtype == c.dtype and c2.device == c.device and v2.shape == v0.shape
+                and torch.equal(c2, c) and torch.equal(v2, v0) and torch.equal(a2, a0)):
+            return st.clone()
+    return None
+
+
+def _memo_put(key, st) -> None:
+    if _MEMO is not None:                        # a private copy: no consumer's in-place write reaches the next one
+        _MEMO.append((key, st.clone()))
+        del _MEMO[:-_MEMO_N]
+
+
 @torch.no_grad()
 def candidate_states(cand: Tensor, vx: Tensor, ax: Tensor, model: str = "lqr") -> Tuple[Tensor, Tensor]:
     """cand [B, 8, 3] (N frame, t = 0.5 k s), ego vx / ax [B] (status[..., 4] / status[..., 6]: the rear-axle
     longitudinal velocity / acceleration, lqr docstring) -> (states [B, Q, 6] f32 (x, y, heading, v, a, steer), t [Q]
-    float64 s).  'lqr': lqr.simulate (Q 41, t = 0.1 n); 'plan': origin + the 8 poses (Q 9, t = 0.5 k; v_k = |p_k -
-    p_{k-1}| / 0.5, v_0 = vx, a = steer = 0).  Non-finite rows are simulated as zeros (as the scorer callers do)."""
+    float64 s).  'lqr': lqr.simulate (Q 41, t = 0.1 n); 'ref': lqr.reference_rollout (Q 41, the tracker's reference,
+    no tracker); 'plan': origin + the 8 poses (Q 9, t = 0.5 k; v_k = |p_k - p_{k-1}| / 0.5, v_0 = vx, a = steer = 0).
+    Non-finite rows are simulated as zeros (as the scorer callers do).  'lqr' / 'ref' reuse equal inputs' states inside
+    a shared_states() scope."""
     B = cand.shape[0]
     c = cand.float()
     fin = torch.isfinite(c).flatten(1).all(1)
     c = torch.where(fin[:, None, None], c, torch.zeros_like(c))
     v0 = torch.nan_to_num(vx.float().reshape(B), nan=0.0)
     a0 = torch.nan_to_num(ax.float().reshape(B), nan=0.0)
-    if model == "lqr":
-        st = LQR.simulate(c, torch.stack([v0, a0], -1), dtype=torch.float32)
+    if model in LQR.EXECUTORS:
+        key = (model, c, v0, a0)
+        st = _memo_get(key)
+        if st is None:
+            st = LQR.executor(model)(c, torch.stack([v0, a0], -1), dtype=torch.float32)
+            _memo_put(key, st)
         return st, torch.arange(LQR.NT, dtype=torch.float64, device=c.device) * LQR.DT
     if model != "plan":
-        raise ValueError(f"exec model {model!r} not in ('plan', 'lqr')")
+        raise ValueError(f"exec model {model!r} not in ('plan', 'lqr', 'ref')")
     pose = torch.cat([torch.zeros(B, 1, 3, dtype=c.dtype, device=c.device), c], 1)          # [B, 9, 3]
     v = torch.cat([v0[:, None], torch.linalg.vector_norm(pose[:, 1:, :2] - pose[:, :-1, :2], dim=-1) / 0.5], 1)
     st = torch.cat([pose, v[..., None], torch.zeros(B, 9, 2, dtype=c.dtype, device=c.device)], -1)
@@ -504,10 +547,10 @@ class RangeReadout(nn.Module):
     @torch.no_grad()
     def set_prior(self, prior: Sequence[float]) -> None:
         """B / U logits biased so that a uniform field read at every executed state gives the NC pass prior (logit
-        -logit(p_nc) - tau ln Q, Q = 41 states for 'lqr', 9 for 'plan'), margins +2 m, EP / comfort heads
+        -logit(p_nc) - tau ln Q, Q = 41 states for 'lqr' / 'ref', 9 for 'plan'), margins +2 m, EP / comfort heads
         logit(prior); NC / TTC / DAC pass rates then follow from the evidence (the residual starts at 0)."""
         p = np.clip(np.asarray(prior, np.float64), 1e-4, 1 - 1e-4)
-        q = LQR.NT if self.cfg.exec_model == "lqr" else 9
+        q = LQR.NT if self.cfg.exec_model in LQR.EXECUTORS else 9
         if self.cfg.rg_read == "any4":                  # the soft max also runs over the 4 cells of each read
             q *= 4
         self.blk_head[-1].bias.fill_(-math.log(p[I_NC] / (1 - p[I_NC])) - SMAX_TAU * math.log(q))
@@ -545,6 +588,21 @@ class RangeReadout(nn.Module):
             raise ValueError("priv given to a range readout without rg_priv")
         return {"blk": self._cell_mlp(self.blk_head, xs, Hc, hb),
                 "margin": self._cell_mlp(self.marg_head, xs, Hc, hm)[..., 0]}
+
+    def zq_at(self, fields: Dict[str, Tensor], rows: Tensor, fr: Dict[str, Tensor], states: Tensor, t: Tensor
+              ) -> Tensor:
+        """refiner v5: the per-state reads zq [B, Q', 4] of these fields at the given states, no scoring -- forward()'s
+        zq for the same (fields, rows, fr, states, t) bit for bit.  The teachers' Z-KD targets at the no-LQR student's
+        states (CKNet.score_set zq_exec, TeacherPair2.run): the same cells as the student's own reads."""
+        from ..v5.zread import state_reads, zq_of
+        if not self.v5_on:
+            raise ValueError("range readout: zq_at needs the v5 per-state reads (v5 on)")
+        with torch.autocast(device_type=states.device.type, enabled=False):
+            fr_rows = RT.gather_frame({k: fr[k].float() for k in ("p", "u", "n", "s", "ds")}, rows)
+            st = states.float()
+            geo = read_geometry(fr_rows, st, t, self.M, self.tbin, ttc_b_chan=self.ttc_b_chan)
+            sr = state_reads(fields["blk"], fields["margin"], rows, geo, self.M, self.cfg.rg_read, states=st)
+            return zq_of(sr, self.v5_stride)
 
     def forward(self, fields: Dict[str, Tensor], rows: Tensor, fr: Dict[str, Tensor], states: Tensor, t: Tensor,
                 xs: Tensor, xd: Tensor, Hc: Tensor, g: Tensor, S8: Tensor, d_st: Tensor, t_in: Tensor,

@@ -40,7 +40,8 @@ readout
             official ego box with its rear axle at the cell overlaps a not-behind object in time bin m of ev_tbin_s),
             U overlap logits [48, 17, M] (the same without the not-behind filter: lets TTC apply the not-behind rule
             from the CURRENT ego), D margin [48, 17] (m) -- read at each candidate's executed states (exec_model
-            'lqr': the official LQR tracker port ck/v4/lqr.py, 41 states; 'plan': the 9 planned knots): NC / TTC /
+            'lqr': the official LQR tracker port ck/v4/lqr.py, 41 states; 'ref': its 41-state reference without the
+            tracker, lqr.reference_rollout; 'plan': the 9 planned knots): NC / TTC /
             DAC = soft max over the states of B / B-or-U at the 0 / 0.3 / 0.6 / 0.9 s projections / -D / eps at the
             4 corners, + time / margin slacks and the critical station / time from the thresholded fields, + a
             zero-initialised residual; EP head optionally on the detached evidence (ep_evidence), lateral head on
@@ -54,7 +55,8 @@ v4_3 options (all OFF / unused by default; only 'range' reads them, validate() r
 them (V43_KEYS) with another readout).  readout 'range' alone keeps exec_model 'plan' and ep_evidence off (new options
 default off); the spec arm (lqr, ep_evidence, 20 x 0.25 s, P_ref head) is V4Cfg.range_arm(), which callers building a
 range critic should use:
-  exec_model 'plan' | 'lqr'   candidate states the range readout reads (the edits always use 'lqr').
+  exec_model 'plan' | 'lqr' | 'ref'   candidate states the range readout reads (the edits always use 'lqr'); 'ref' =
+                              the tracker's 41-state reference without the tracker (lqr.reference_rollout).
   ev_tbin_s                   range time bin width [s] (bin m = [m tbin, (m + 1) tbin), range_targets convention).
   ep_evidence                 EP head input += detached [lp_nc, lp_ttc, lp_dac, slack_nc, slack_ttc, slack_dac,
                               executed 4 s progress ratio, margin-weighted station features] (report 80 E1).
@@ -114,7 +116,7 @@ READOUTS = ("mean", "hazard", "evidence", "range")
 CONFIG_VERSION = "v4_3"          # v4_3: range readout (M4) + computed edits (M5); v4_2: interval station reads +
                                  # feasibility, matched head sizes, 10 ev bins
 READ_VERSIONS = ("v4_2", CONFIG_VERSION)        # from_dict accepts these (and upgrades to CONFIG_VERSION)
-EXEC_MODELS = ("plan", "lqr")
+EXEC_MODELS = ("plan", "lqr", "ref")
 VMAX_MODES = ("off", "feature")
 EDIT_MODES = ("off", "computed")
 RG_READS = ("nearest", "any4")
@@ -147,7 +149,7 @@ class V4Cfg:
     corrector: bool = False            # learned corrector A on the critic's top-corr_k (needs a parent-pass readout)
     corr_k: int = 8
     # ---- v4_3 (readout 'range' / computed edits; docstring 'v4_3 options')
-    exec_model: str = "plan"           # range: candidate states read ('plan' 9 knots | 'lqr' 41 tracked states)
+    exec_model: str = "plan"           # range: candidate states read ('plan' 9 knots | 'lqr' 41 tracked | 'ref' 41 reference)
     ev_tbin_s: float = 0.25            # range: time bin width [s]
     ep_evidence: bool = False          # range: EP head on the detached evidence + executed progress ratio
     vmax: str = "off"                  # range: 'feature' = executed curvature overspeed as a residual input

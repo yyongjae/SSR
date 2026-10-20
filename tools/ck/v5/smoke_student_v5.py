@@ -69,12 +69,15 @@ V5_AGENT = dict(det_vel_code_weights=[1.05, 0.41], expose_det_outputs=True,     
 DET_V5_LOSS = ("loss_stop", "loss_acc", "loss_stop2s")      # the det-head fixes' loss keys (+ loss_stop_d<l>)
 
 
+EXEC_MODEL = "ref"          # the student's V4Cfg.exec_model (--exec-model; v5_arm.set: ref = no-LQR student, 2026-10-20)
+
+
 def v5_ck2(io_dir: Path, zkd: bool, stage2: bool = False, zstats=None) -> dict:
     d = CD.ck2_dict(io_dir, "main")
     d.update(teacher_det_run=str(T_DET), teacher_map_run=str(T_MAP), teacher_require_done=False,
              kd_score_keys=["nc", "dac"])
     d["bev_kd"] = {"enabled": False, "teachers": ["det"]}
-    d["v4"] = {"readout": "range", "exec_model": "lqr", "ev_tbins": 20, "ev_tbin_s": 0.25, "ep_evidence": True,
+    d["v4"] = {"readout": "range", "exec_model": EXEC_MODEL, "ev_tbins": 20, "ev_tbin_s": 0.25, "ep_evidence": True,
                "pref_head": True, "corridor_version": 2, "rg_read": "any4", "rg_stopped_aware": True, "edits": "off",
                "corrector": False, "kd_parent_only": True, "kd_score_scope": "all",
                "kd_constraint": {"enabled": False}, "rg_gt_aux": {"enabled": True, "lambda": 0.5, "max_parents": 8},
@@ -105,7 +108,8 @@ def fit_zstats(root: Path, tokens: int, det: str = "", mp: str = "") -> dict:
             out[name] = Path(given)
             continue
         p = root / f"z_stats_{name}.json"
-        FZ.main(["--run", str(run), "--which", "last", "--tokens", str(int(tokens)), "--out", str(p)])
+        FZ.main(["--run", str(run), "--which", "last", "--tokens", str(int(tokens)), "--out", str(p),
+                 "--zq-exec", EXEC_MODEL])
         out[name] = p
     return out
 
@@ -402,6 +406,7 @@ def probe_valid_objects(agent) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--zkd", type=int, default=1)
+    ap.add_argument("--exec-model", choices=("lqr", "ref"), default="ref", help="the student's exec model (v5_arm.set)")
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--tag", default="cpu")
     ap.add_argument("--roundtrip", type=int, default=0, help="1: the Stage-2 labeler round trip (module docstring)")
@@ -411,6 +416,8 @@ def main(argv=None) -> int:
     ap.add_argument("--zstats-map", default="", help="roundtrip: the MAP teacher's fit_z_stats record (else fitted)")
     ap.add_argument("--zstats-tokens", type=int, default=8, help="tokens of the on-the-fly fit_z_stats dry run")
     a = ap.parse_args(argv)
+    global EXEC_MODEL
+    EXEC_MODEL = a.exec_model
     global T_DET, T_MAP
     T_DET = Path(a.teacher_det) if a.teacher_det else T_DET
     T_MAP = Path(a.teacher_map) if a.teacher_map else T_MAP
@@ -458,7 +465,7 @@ def main(argv=None) -> int:
     else:
         CD.fit(agent, root, a.epochs)
     steps = CD.read_jsonl(io / "steps_rank0.jsonl")
-    res = {"tag": a.tag, "zkd": bool(a.zkd), "sec_fit": round(time.time() - t0, 1), "n_steps_logged": len(steps),
+    res = {"tag": a.tag, "zkd": bool(a.zkd), "exec_model": EXEC_MODEL, "sec_fit": round(time.time() - t0, 1), "n_steps_logged": len(steps),
            "teachers": [str(T_DET), str(T_MAP)]}
     keys = sorted({k for s in steps for k in s if k.startswith(("ck2/", "v5/"))})
     res["v5_keys"] = [k for k in keys if k.startswith("v5/")]

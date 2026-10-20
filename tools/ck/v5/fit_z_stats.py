@@ -95,9 +95,11 @@ def resolve_run(run: str) -> Path:
     raise SystemExit(f"teacher run not found: {run} (a dir, or a name under {[str(CK_DATA / r) for r in RUN_ROOTS]})")
 
 
-def default_out(run: Path, which: str) -> Path:
+def default_out(run: Path, which: str, zq_exec: str = "") -> Path:
+    """CK_DATA/v5/z_stats/<run>__<which>[__zq<exec>].json (the suffix for --zq-exec: never overwrites the teacher's own
+    states' record)."""
     w = Path(which).stem if which.endswith(".pt") else which
-    return CK_DATA / "v5" / "z_stats" / f"{run.name}__{w}.json"
+    return CK_DATA / "v5" / "z_stats" / (f"{run.name}__{w}" + (f"__zq{zq_exec}" if zq_exec else "") + ".json")
 
 
 def check_out(out: Path) -> Path:
@@ -169,8 +171,11 @@ def load_teacher(run: Path, which: str, device: str):
 
 
 def run_stats(net, arm: str, split: str, rows: np.ndarray, device, batch: int, workers: int, amp: bool,
-              rel_tc=None, vcfg: Optional[Dict[str, Any]] = None, root=None) -> Dict[str, Any]:
-    """the 96-pool teacher forward over rows -> {acc (ZStatsAcc), n_bev_ok, n_obj_ok, n_cols_ok, sec, Q, C}."""
+              rel_tc=None, vcfg: Optional[Dict[str, Any]] = None, root=None,
+              zq_exec: Optional[str] = None) -> Dict[str, Any]:
+    """the 96-pool teacher forward over rows -> {acc (ZStatsAcc), n_bev_ok, n_obj_ok, n_cols_ok, sec, Q, C}.
+    zq_exec: read Z at that exec model's states of the pool (the student's: 'ref' for the no-LQR student, = the Z-KD
+    targets TeacherPair2.run(zq_exec) hands over); None = the teacher's own states."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -207,7 +212,7 @@ def run_stats(net, arm: str, split: str, rows: np.ndarray, device, batch: int, w
         extras: Dict[str, Any] = {}
         with torch.no_grad(), ac:
             teacher_forward(net, b["bev"].to(dev).float(), cand96, ego, parents=par96, rel_objs=rel_objs,
-                            extras=extras)
+                            extras=extras, zq_exec=zq_exec)
         if "zq" not in extras:
             raise SystemExit("teacher_forward returned no zq (not a v5 net?)")
         zq = extras["zq"].float()                                           # [B, 96, Q', C]
@@ -245,6 +250,8 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     ap.add_argument("--amp", type=int, default=1, help="fp16 autocast on CUDA (= ck_e2e2.teacher_amp true)")
     ap.add_argument("--batch", type=int, default=4)
+    ap.add_argument("--zq-exec", default="", choices=["", "lqr", "ref"],
+                    help="read Z at this exec model's states (the student's: ref = no-LQR student); '' = the teacher's")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--allow-unfinished", action="store_true",
                     help="no done.json required (smoke only: the record is flagged unfinished and refused by consumers)")
@@ -263,7 +270,7 @@ def main(argv=None) -> Dict[str, Any]:
         raise SystemExit(f"{run}: arm {arm!r} (z statistics are fitted for the DET (T) / MAP (M) teachers)")
     if info["temporal"].on:
         raise SystemExit(f"{run}: a temporal-branch teacher has no v5 per-state reads")
-    out = check_out(Path(a.out) if a.out else default_out(run, a.which))
+    out = check_out(Path(a.out) if a.out else default_out(run, a.which, a.zq_exec))
     if a.device == "cuda":
         U.gpu_guard("cuda")
         device = "cuda:0"
@@ -281,7 +288,7 @@ def main(argv=None) -> Dict[str, Any]:
     from navsim.agents.para_ssr.ck.online2 import _d_variants
     vcfg = _d_variants()
     R = run_stats(net, arm, info["split"], rows, device, a.batch, a.workers, bool(a.amp), rel_tc=info.get("v5_rel"),
-                  vcfg=vcfg, root=a.data_root)
+                  vcfg=vcfg, root=a.data_root, zq_exec=a.zq_exec or None)
     dry = bool(a.limit) or len(rows) < ZA.DRY_RUN_BELOW
     try:
         chans = R["acc"].channels(ZA.N_MIN, allow_small=False)
@@ -295,7 +302,8 @@ def main(argv=None) -> Dict[str, Any]:
     rec = {"version": ZA.STATS_VERSION, "run": str(run), "run_realpath": os.path.realpath(str(run)),
            "run_name": run.name, "which": a.which, "arm": arm, "teacher": ZA.TEACHER_OF_ARM[arm], "ckpt": str(ck),
            "ckpt_sha16": ck_sha16, "v5": net.v5.to_dict(),
-           "grid": grid_of(cfg, net.v5), "zq_layout": list(ZA.Z_CHANNELS[:R["C"] or 0]), "Q": R["Q"],
+           "grid": grid_of(cfg, net.v5), "zq_exec": a.zq_exec or (net.v4.exec_model if net.v4 is not None else None),
+           "zq_layout": list(ZA.Z_CHANNELS[:R["C"] or 0]), "Q": R["Q"],
            "channels": chans, "mask_rule": ZA.MASK_RULE, "std_floor": ZA.STD_FLOOR, "n_min": ZA.N_MIN,
            "data": {"split": info["split"], "n_tokens_requested": int(a.tokens), "limit": int(a.limit),
                     "n_tokens": int(len(rows)), "n_tokens_bev_ok": R["n_bev_ok"], "n_tokens_obj_ok": R["n_obj_ok"],

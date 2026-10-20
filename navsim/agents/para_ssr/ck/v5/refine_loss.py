@@ -3,7 +3,8 @@ per-state GT block targets of the relation hazard H, the reliability targets of 
 GT is a TARGET only (never a network input): the batch's ref_* (GTLoader: refiner.gt_future objects 360 deg / 5 s with
 the metric-cache presence rule, the official DAC SDF) and the object pack's matched GT futures (fc_xyh / fc_state).
 
-L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable): a SOFT PDMS of the executed rollout,
+L_refine(X1), X1 = LQR(tau1) (ck/v4/lqr.simulate, 41 states, differentiable; the no-LQR student's exec_model 'ref': the
+tracker's reference states, lqr.reference_rollout, comfort factor off): a SOFT PDMS of the executed rollout,
   S_hat = p_nc p_dac (5 p_ttc + 2 p_c + 5 ep) / 12 (the official PDMS structure: NC and DAC multiply, TTC / comfort /
   EP are the weighted average), with soft passes of the WORST state (not means over the states -- review 2026-10-20:
   state-averaged hazards against a per-draft progress fraction ranked braking that fixes a collision as worse, PT-6
@@ -304,25 +305,34 @@ def _terms(X: Tensor, gt: Dict[str, Tensor], t: Tensor, w: Dict[str, float]) -> 
     return out
 
 
-def refine_loss(tau1: Tensor, tau0: Tensor, v0: Tensor, a0: Tensor, gt: Dict[str, Tensor], w: Dict[str, float]
-                ) -> Tuple[Tensor, Dict[str, float]]:
-    """tau1 (differentiable) / tau0 [n, R, 8, 3], v0 / a0 [n], gt = gt_of(batch, idx) -> (loss scalar f32, stats)."""
+def refine_loss(tau1: Tensor, tau0: Tensor, v0: Tensor, a0: Tensor, gt: Dict[str, Tensor], w: Dict[str, float],
+                exec_model: str = "lqr") -> Tuple[Tensor, Dict[str, float]]:
+    """tau1 (differentiable) / tau0 [n, R, 8, 3], v0 / a0 [n], gt = gt_of(batch, idx) -> (loss scalar f32, stats).
+    exec_model: the net's V4Cfg.exec_model -- 'lqr' rolls X0 / X1 out with the tracker (the teachers), 'ref' takes the
+    tracker's reference states (lqr.reference_rollout; the no-LQR student, 2026-10-20) and drops the comfort factor
+    (w cmf = 0): the official comfort filters judge a TRACKED acceleration / yaw, the reference's finite differences
+    flagged 7.4 % of real KD parents against 0.25 % tracked, with a gradient uncorrelated with it (review
+    2026-10-20, navtrain_val CPU check)."""
     n, R = tau1.shape[:2]
     dev = tau1.device
+    sim = LQR.executor(exec_model)
+    if exec_model == "ref":
+        w = dict(w, cmf=0.0)
     with torch.autocast(device_type=dev.type, enabled=False):
         ego = torch.stack([v0.float(), a0.float()], -1)[:, None, :]                      # [n, 1, 2]
         t = torch.arange(LQR.NT, dtype=torch.float64, device=dev) * LQR.DT
         with torch.no_grad():
-            X0 = LQR.simulate(tau0.float(), ego, dtype=torch.float32)
-            sweep = torch.cat([X0, LQR.simulate(tau1.detach().float(), ego, dtype=torch.float32)], 1)
+            X0 = sim(tau0.float(), ego, dtype=torch.float32)
+            sweep = torch.cat([X0, sim(tau1.detach().float(), ego, dtype=torch.float32)], 1)
             gt, rs = relevant_objects(gt, sweep) if (w.get("obj", 0.0) or w.get("ttc", 0.0)) else (gt, {})
             T0 = _terms(X0, gt, t, w)
-        X1 = LQR.simulate(tau1.float(), ego, dtype=torch.float32)
+        X1 = sim(tau1.float(), ego, dtype=torch.float32)
         T1 = _terms(X1, gt, t, w)
         L = (T0["logS"] - T1["logS"]) / (-T0["logS"]).clamp(min=1.0)
         loss = torch.nan_to_num(L, nan=0.0, posinf=10.0, neginf=-10.0).mean()
         st = {f"ref_{k}{i}": float(T[k].detach().mean()) for i, T in (("0", T0), ("1", T1))
-              for k in ("S_hat", "p_nc", "p_dac", "p_ttc", "ep", "p_c", "offroad", "cmf_fail")}
+              for k in ("S_hat", "p_nc", "p_dac", "p_ttc", "ep", "p_c", "offroad", "cmf_fail")
+              if not (k == "cmf_fail" and exec_model == "ref")}     # 'ref': finite-difference comfort, not logged
         H0, H1 = T0, T1
         if "coll" not in T0:                    # object factors off (MAP): the hazard stats still reported
             with torch.no_grad():

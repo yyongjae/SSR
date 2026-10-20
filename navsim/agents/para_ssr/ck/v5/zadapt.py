@@ -144,11 +144,13 @@ def _same_path(a, b) -> bool:
 
 def check_z_stats(rec: Dict[str, Any], arm: str, run=None, which: Optional[str] = None,
                   ckpt_sha16: Optional[str] = None, z_stride: Optional[int] = None, allow_dry_run: bool = True,
-                  where: str = "z-stats") -> None:
+                  where: str = "z-stats", exec_model: Optional[str] = None) -> None:
     """refuse (ValueError) a record that does not belong to the teacher it is used for: arm (T = DET, M = MAP), the
     run dir (resolved), which, the checkpoint's sha16, the grid's z_stride; an 'unfinished' record (a teacher that had
     not finished, --allow-unfinished); a channel of TEACHER_CHANNELS[arm] missing / non-finite; a dry run (fewer than
-    DRY_RUN_BELOW tokens or --limit) unless allow_dry_run (the launcher's strict mode refuses those)."""
+    DRY_RUN_BELOW tokens or --limit) unless allow_dry_run (the launcher's strict mode refuses those); exec_model (the
+    STUDENT's V4Cfg.exec_model): the states the record read Z at (its zq_exec; older records: the teacher grid's
+    exec_model, 'lqr') must be the student's -- the no-LQR 'ref' student needs records of fit_z_stats --zq-exec ref."""
     if rec.get("version") != STATS_VERSION:
         raise ValueError(f"{where}: version {rec.get('version')!r} != {STATS_VERSION!r}")
     if rec.get("arm") != arm:
@@ -166,6 +168,11 @@ def check_z_stats(rec: Dict[str, Any], arm: str, run=None, which: Optional[str] 
                          f"{ckpt_sha16!r} (refit tools/ck/v5/fit_z_stats.py)")
     if z_stride is not None and int((rec.get("grid") or {}).get("z_stride", -1)) != int(z_stride):
         raise ValueError(f"{where}: record z_stride {(rec.get('grid') or {}).get('z_stride')!r} != {z_stride}")
+    if exec_model is not None:
+        got = rec.get("zq_exec") or (rec.get("grid") or {}).get("exec_model") or "lqr"
+        if got != exec_model:
+            raise ValueError(f"{where}: record read Z at {got!r} states, the student's exec_model is {exec_model!r} "
+                             f"(refit tools/ck/v5/fit_z_stats.py --zq-exec {exec_model})")
     chans = rec.get("channels") or {}
     for n in TEACHER_CHANNELS[arm]:
         c = chans.get(n)

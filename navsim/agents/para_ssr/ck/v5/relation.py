@@ -19,7 +19,8 @@ Modes at the times t_n (+ delta for TTC): hold (c0), constant velocity (c0 + v0 
   head's L_traj / L_traj_cls only; design V2's box gradient reaches (x, y, vx, vy) through hold / CV); eps, cv_prior
   and the reliability get gradients through them.  Mode m7 (constant acceleration of the student, 'cv+fut+ca') is NOT
   implemented: conditional on PT-11 / PT-B3 (design §3.2 / §3.3), refused by V5Cfg.validate.
-Executed states: the candidate's LQR states [B, Q, 6] (every z_stride-th of the 41), ego box = the official footprint
+Executed states: the candidate's exec_model states [B, Q, 6] (LQR; 'ref' = the tracker's reference for the no-LQR
+student) (every z_stride-th of the 41), ego box = the official footprint
   (centre 1.461 m ahead of the rear axle, 5.176 x 2.297 m) at the state (NC, delta 0) and projected |v| delta along the
   heading (TTC, delta 0.3 / 0.6 / 0.9 s; objects at t + delta).
 Overlap: p = sum_m w_m sigmoid(-sep_m / eps) (SAT separation temporal.raster.sat_sep, eps = exp(log_eps) learned, init
@@ -44,9 +45,9 @@ Outputs per candidate b:
   > a r^nc]; + top_idx [B, 3] (object slot of each top entry, -1 for an invalid / padding slot).  Invalid slots: zeros.
 Gradients: eps, the CA weights and the reliability MLP (object rows and states are inputs; the separations run under
 no_grad).  Float32 (autocast off).
-Re-read primitive (design §3.7 X1 = LQR(tau1) re-read, Delta r probes): read(O, states, t, tok) on the token rows O
+Re-read primitive (design §3.7 X1 = exec(tau1) re-read, Delta r probes): read(O, states, t, tok) on the token rows O
 (rows(objs) / the 'objs_tok' output of an earlier pass) and any executed states; forward = read(rows(objs), ...).
-CKNet.relation_reread wraps it with the LQR execution of arbitrary drafts.
+CKNet.relation_reread wraps it with the critic's execution (exec_model) of arbitrary drafts.
 """
 from __future__ import annotations
 

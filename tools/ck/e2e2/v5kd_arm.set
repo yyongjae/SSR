@@ -1,3 +1,6 @@
 # refiner v5 student, Stage-2 arm D (ARM=v5kd = v5_arm.set + this line): + Z-KD of the per-state reads to the v5 teachers
 # (DET b_nc / b_ttc / H_nc / H_ttc, MAP d_min; masked SmoothL1 on states readable for both, ramped like the other KD).
+# With the no-LQR student (v5_arm.set v4.exec_model=ref) the teachers read these Z targets at the STUDENT's 'ref'
+# states (TeacherPair2.run zq_exec; same cells as the student's reads), their scores stay on their LQR states; the
+# z-stats records are fitted the same way (fit_z_stats --zq-exec ref).
 v4.v5.z_kd=true

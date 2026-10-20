@@ -268,7 +268,7 @@ def _d_v5() -> Dict[str, Any]:
     #     _map unchanged, D7; per-channel magnitudes v5/zkd_<ch>, and the old raw-unit values v5/zkd_raw_det / _map for
     #     the scale);
     #   lambda_edit = L_edit-Bernoulli (design §3.7 item 3): tau1 of the corrector's edited KD parents is re-read by the
-    #     SAME relation reader (CKNet.relation_reread on X1 = LQR(tau1), detached tau1: it trains the reader -- eps, the
+    #     SAME relation reader (CKNet.relation_reread on X1 = exec(tau1) (LQR; 'ref' for the no-LQR student), detached tau1: it trains the reader -- eps, the
     #     CV prior, the reliability, the matched rows' boxes under rel_det_grad -- never the corrector, whose credit is
     #     L_refine / AWR) and per-object BCE(r_i(tau1), y_i(tau1)) against the matched GT track (the step's one-to-one
     #     2 m Hungarian at t0, refine_loss.match_t0; true ghosts (no GT observed at t0 within 2 m, any class) y = 0,
@@ -914,7 +914,8 @@ def set_student_z_stats(net, cfg: CKE2E2Config) -> Dict[str, Any]:
             if not ck.is_file():
                 raise FileNotFoundError(f"teacher {t} checkpoint {ck} missing (the z-stats record is tied to it)")
             ZA.check_z_stats(rec, arm, run=run, which=cfg.teacher_which, ckpt_sha16=_sha16(ck),
-                             z_stride=int(q["z_stride"]), where=f"ck_e2e2.v4.v5.z_stats_{t}")
+                             z_stride=int(q["z_stride"]), where=f"ck_e2e2.v4.v5.z_stats_{t}",
+                             exec_model=net.v4.exec_model)
         except (ValueError, FileNotFoundError) as e:
             raise ValueError(f"ck_e2e2.v4.v5.z_adapt: {e}") from None
         recs[t] = rec
@@ -1075,7 +1076,8 @@ def field_groups(spec) -> Tuple[str, ...]:
 
 def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optional[Dict[str, torch.Tensor]] = None,
                     parents: Optional[torch.Tensor] = None, return_fields=False,
-                    rel_objs: Optional[Dict[str, torch.Tensor]] = None, extras: Optional[Dict] = None):
+                    rel_objs: Optional[Dict[str, torch.Tensor]] = None, extras: Optional[Dict] = None,
+                    zq_exec: Optional[str] = None):
     """The KD teacher ops under the caller's autocast / no_grad: trunk.scene once, trunk.candidates on `cand`, score
     -> (score logits [B,K,5] f32, w_lat [B,K,6]).  A temporal teacher (net.temporal, refiner-v3) additionally runs
     TemporalBranch.scene(objs) once and binds its hook to this candidate set -- the order and ops of
@@ -1110,9 +1112,11 @@ def teacher_forward(net, bev: torch.Tensor, cand: torch.Tensor, ego, objs: Optio
         kw = {"return_pctx": True} if return_fields else {}
         if rel_objs is not None:                        # refiner v5 relation DET teacher: its object pack rows
             kw["rel_objs"] = rel_objs
+        if extras is not None and zq_exec is not None:  # Z-KD targets at the student's exec model's states
+            kw["zq_exec"] = zq_exec
         o = net.score_set(feat, mem, ego, cand, parents, pref=net.scene_pref(mem, ego), **kw)
         if extras is not None and "zq" in (o.get("haz") or {}):   # refiner v5: per-state reads (Z-KD targets)
-            extras["zq"] = o["haz"]["zq"].float()
+            extras["zq"] = o["haz"].get("zq_kd", o["haz"]["zq"]).float()
         if not return_fields:
             return o["score_logit"], o["w_lat"]
         h = o["haz"]
@@ -1302,7 +1306,7 @@ class TeacherPair2:
     def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None, objs_det=None,
             obj_ok_det=None, parents: Optional[torch.Tensor] = None,
             family: Optional[torch.Tensor] = None, fields=False, rel_objs_det=None, rel_ok_det=None,
-            zq: bool = False) -> Dict[str, torch.Tensor]:
+            zq: bool = False, zq_exec: Optional[str] = None) -> Dict[str, torch.Tensor]:
         """bev_* [B, 256, 50, 100] (f16 cache), ok_* [B], cand [B, K, 8, 3] (finite), status [B, 8], cand_ok [B, K]
         -> kd_score_prob f32 [B,K,5] (combine_teacher: nc/ttc DET, dac MAP, ep/comfort mean), kd_e_lat f32 [B,K,6]
         = 0.5 (e_DET + e_MAP) (decode z_lon = 0, slope 0), kd_ok bool [B,K] = DET ok & MAP ok (per token) & finite
@@ -1347,19 +1351,21 @@ class TeacherPair2:
         v0 = ego[0]
         ac = torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=self.amp and dev.type == "cuda")
         logits, ws, flds, exs = [], [], [], []
-        for net, bev, objs, rel in ((self.det, bev_det, objs_det, rel_objs_det), (self.map, bev_map, None, None)):
-            ex: Dict[str, torch.Tensor] = {}
-            exs.append(ex)
-            with ac:
-                r = teacher_forward(net, bev.to(dev).float(), cand, ego, objs,
-                                    None if parents is None else parents.detach().float().to(dev),
-                                    **({"return_fields": fields} if fields else {}),
-                                    **({"rel_objs": rel} if rel is not None else {}),
-                                    **({"extras": ex} if zq else {}))
-            logits.append(r[0].float())
-            ws.append(r[1].float())
-            if fields:
-                flds.append(r[2])
+        from .v4 import range_readout as RR
+        with RR.shared_states():          # both teachers roll the same candidates out from the same ego: once (exact)
+            for net, bev, objs, rel in ((self.det, bev_det, objs_det, rel_objs_det), (self.map, bev_map, None, None)):
+                ex: Dict[str, torch.Tensor] = {}
+                exs.append(ex)
+                with ac:
+                    r = teacher_forward(net, bev.to(dev).float(), cand, ego, objs,
+                                        None if parents is None else parents.detach().float().to(dev),
+                                        **({"return_fields": fields} if fields else {}),
+                                        **({"rel_objs": rel} if rel is not None else {}),
+                                        **({"extras": ex, "zq_exec": zq_exec} if zq else {}))
+                logits.append(r[0].float())
+                ws.append(r[1].float())
+                if fields:
+                    flds.append(r[2])
         if self.calib is not None:            # KD calibration: Platt on the logits, per teacher and key
             for i, name in enumerate(("det", "map")):
                 ab = self.calib.get(name)
@@ -2348,7 +2354,8 @@ class CKE2E2:
             if n and q["lambda_ref"] > 0:
                 eds = ego[2].float()
                 w = RL.parse_weights(q["ref_w"])
-                l_ref, s_ref = RL.refine_loss(rf["tau1"][idx], rf["tau_base"][idx], eds[idx, 0], eds[idx, 2], gt, w)
+                l_ref, s_ref = RL.refine_loss(rf["tau1"][idx], rf["tau_base"][idx], eds[idx, 0], eds[idx, 2], gt, w,
+                                              exec_model=student.v4.exec_model)
                 l_u = (rf["mu"][idx].float() ** 2).mean()
                 inner = inner + q["lambda_ref"] * (l_ref + float(w.get("u", 0.0)) * l_u)
                 logs.update({f"v5/{k}": float(v) for k, v in s_ref.items()})
@@ -2403,7 +2410,7 @@ class CKE2E2:
                        cols: torch.Tensor, tz: torch.Tensor, logs: Dict[str, float]) -> torch.Tensor:
         """refiner v5 L_edit-Bernoulli (design §3.7 item 3; _d_v5 'zkd' group): tau1 of the corrector's edited KD
         columns cols (refine_drafts rf) of the GT-ok tokens idx, DETACHED, re-read by the same relation reader on the
-        same token rows (CKNet.relation_reread with its graph: X1 = LQR(tau1), the reader's strided states) -> per-object
+        same token rows (CKNet.relation_reread with its graph: X1 = exec(tau1) (LQR; 'ref' for the no-LQR student), the reader's strided states) -> per-object
         BCE(r_i^k(tau1), y_i^k(tau1)) (k = NC, TTC) against the matched GT track (rel_match = the step's one-to-one 2 m
         Hungarian at t0; refine_loss.rel_object_targets / rel_object_mask: true ghosts y = 0, duplicate rows masked, the
         horizon censored as L_rel); columns with a non-finite tau1 or a KD-invalid draft are masked."""
@@ -2713,6 +2720,7 @@ class CKE2E2:
             tkw.update(rel_objs_det=objs_r, rel_ok_det=ok_r)
         if v5c["enabled"] and v5c["z_kd"]:              # refiner v5 Z-KD: the teachers' per-state reads
             tkw["zq"] = True
+            tkw["zq_exec"] = student.v4.exec_model     # the teachers read Z at the student's states (no-LQR 'ref')
         rel_rows = student_rel_rows(predictions, v5c)    # refiner v5 student relation rows (None when off)
         rel_match = None
         if rel_rows is not None and v5_needs_match(v5c):  # the rows' t0 GT match (D3 graph, L_rel targets)

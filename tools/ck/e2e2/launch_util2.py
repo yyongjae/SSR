@@ -458,12 +458,13 @@ def z_stats_check(c, teachers: Dict[str, Any], mode: str = "strict") -> Dict[str
                 f"ck_e2e2.v4.v5.z_stats_{name}: teacher-statistics file {p!r} missing (Z adapters of teacher {run} "
                 f"'{c.teacher_which}' not fitted yet): after the teacher has finished run (CPU)  CUDA_VISIBLE_DEVICES= "
                 f"OMP_NUM_THREADS=8 PYTHONPATH={REPO} {PY} {REPO}/tools/ck/v5/fit_z_stats.py --run {run} --which "
-                f"{c.teacher_which} --tokens 4096 --out {p}   (or set v4.v5.z_adapt=false)")
+                f"{c.teacher_which} --tokens 4096 --zq-exec {c.v4_net().exec_model} --out {p}   (or set v4.v5.z_adapt=false)")
         try:
             rec, info = ZA.load_z_stats(p)
             ZA.check_z_stats(rec, arm, run=run, which=c.teacher_which,
                              ckpt_sha16=(teachers.get(name) or {}).get("ckpt_sha16"), z_stride=int(v5["z_stride"]),
-                             allow_dry_run=mode != "strict", where=f"ck_e2e2.v4.v5.z_stats_{name}")
+                             allow_dry_run=mode != "strict", where=f"ck_e2e2.v4.v5.z_stats_{name}",
+                             exec_model=c.v4_net().exec_model)
         except (ValueError, FileNotFoundError) as e:
             raise LaunchError(str(e)) from None
         out[name] = dict(info, n_tokens=(rec.get("data") or {}).get("n_tokens"), dry_run=bool(rec.get("dry_run")),

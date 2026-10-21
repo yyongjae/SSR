@@ -325,7 +325,8 @@ class ParaSSRAgent(AbstractAgent):
             self._stage_e = StageE(config)
 
         if resume_from_checkpoint and checkpoint_path:
-            self.initialize()
+            # training init: new modules (v1 -> v2 anchor planner, offset_embed) may start fresh
+            self.initialize(allow_fresh_modules=True)
         if bool(getattr(config, "finetune_score_only", False)):
             n = self.para_ssr_model.freeze_all_but_score_heads()
             for p in self._loss.parameters():
@@ -603,7 +604,7 @@ class ParaSSRAgent(AbstractAgent):
     def name(self) -> str:
         return self.__class__.__name__
 
-    def initialize(self) -> None:
+    def initialize(self, allow_fresh_modules: bool = False) -> None:
         """Load an exact PARA-SSR agent checkpoint.
 
         Lightning prefixes agent parameters with ``agent.``.  Strip that
@@ -612,6 +613,13 @@ class ParaSSRAgent(AbstractAgent):
         with randomly initialised parameters, which is worse than failing
         before scoring.  Loading through CPU also keeps DDP checkpoints
         portable across CUDA device layouts.
+
+        ``allow_fresh_modules`` is for TRAINING initialisation only (the
+        constructor's resume path): it lets the v2 anchor planner and the
+        offset_embed start fresh from a checkpoint that never had them.  The
+        evaluation scripts call ``initialize()`` bare, so a checkpoint that
+        lacks a module the forward pass needs fails here instead of scoring
+        with random weights (review 2026-10-21 #3).
         """
         if not self._checkpoint_path:
             raise ValueError("checkpoint_path must be set before initialize()")
@@ -659,7 +667,7 @@ class ParaSSRAgent(AbstractAgent):
         # modules start fresh, but only when the checkpoint has NONE of them (a
         # partial match is a different vocabulary/architecture, not an upgrade).
         anchor_prefix = "para_ssr_model.pts_bbox_head.anchor_planner."
-        if not any(k.startswith(anchor_prefix) for k in state_dict):
+        if allow_fresh_modules and not any(k.startswith(anchor_prefix) for k in state_dict):
             fresh = [k for k in missing if k.startswith(anchor_prefix)]
             if fresh:
                 logger.info("v1 checkpoint: %d anchor-planner tensors start fresh", len(fresh))
@@ -668,7 +676,7 @@ class ParaSSRAgent(AbstractAgent):
         # zero-initialised, so the fresh module leaves every score exactly as the checkpoint had it.
         embed_prefix = anchor_prefix + "offset_embed."
         fresh = [k for k in missing if k.startswith(embed_prefix)]
-        if fresh and not any(k.startswith(embed_prefix) for k in state_dict):
+        if allow_fresh_modules and fresh and not any(k.startswith(embed_prefix) for k in state_dict):
             logger.info("offset_embed starts fresh (zero output): %d tensors", len(fresh))
             missing = [k for k in missing if not k.startswith(embed_prefix)]
         if missing or result.unexpected_keys:

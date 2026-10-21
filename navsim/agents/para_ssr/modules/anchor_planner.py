@@ -189,10 +189,19 @@ class AnchorPlanner(nn.Module):
         The gate only reorders; nothing downstream differentiates through it (plan_final_rewards
         feeds an argmax, and the feasibility weighting detaches it).  A scene with no admissible
         candidate keeps its ungated order, or the argmax would be arbitrary.
+
+        The shift is per scene -- the gap between the best inadmissible and the worst admissible
+        score, plus ``select_gate`` as a margin -- so an admissible candidate wins whatever the raw
+        scores are.  A fixed offset let an inadmissible candidate through whenever the raw gap
+        exceeded it (review 2026-10-21 #4).
         """
         admissible = admit >= self.select_dac_thr
         any_ok = admissible.any(dim=-1, keepdim=True)
-        return rest - self.select_gate * (~admissible & any_ok).to(rest.dtype), rest
+        worst_ok = torch.where(admissible, rest, torch.full_like(rest, float("inf"))).amin(dim=-1, keepdim=True)
+        best_bad = torch.where(admissible, torch.full_like(rest, float("-inf")), rest).amax(dim=-1, keepdim=True)
+        shift = torch.where(any_ok, (best_bad - worst_ok).clamp(min=0.0) + self.select_gate,
+                            torch.zeros_like(worst_ok))
+        return rest - shift * (~admissible & any_ok).to(rest.dtype), rest
 
     def score(self, h: torch.Tensor, offset: Optional[torch.Tensor] = None):
         """Queries after the planner layers [B, K, C] -> (im [B, K], sim [B, H, K], final, ungated).

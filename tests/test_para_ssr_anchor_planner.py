@@ -39,6 +39,39 @@ def test_outputs_selection_and_topk(anchor_file):
     assert "trajectory_anchors" in dict(m.named_buffers()) and not any("anchors" in n for n, _ in m.named_parameters())
 
 
+def test_gate_always_prefers_an_admissible_candidate():
+    g = SimpleNamespace(select_dac_thr=0.5, select_gate=20.0)
+    rest = torch.tensor([[50.0, 0.0, -3.0], [1.0, 2.0, 3.0]])
+    admit = torch.tensor([[0.1, 0.9, 0.9], [0.1, 0.1, 0.1]])
+    gated, ungated = AnchorPlanner._gate(g, rest, admit)
+    assert torch.equal(ungated, rest)                                   # the loss weighting keeps the raw score
+    assert int(gated[0].argmax()) == 1                                  # raw gap 50 > 20: inadmissible used to win
+    assert (gated[0, 1:] > gated[0, 0]).all() and torch.equal(gated[0, 1:], rest[0, 1:])
+    assert torch.equal(gated[1], rest[1])                               # nobody admissible: ungated order kept
+
+
+def test_corridor_first_exposes_the_pre_gate_score_and_picks_an_admissible_candidate(anchor_file):
+    torch.manual_seed(0)
+    kw = dict(transformer=torch.nn.Identity(), bev_h=5, bev_w=6, embed_dims=C, num_heads=4,
+              feedforward_channels=128, use_task_interaction=False, plan_anchor_file=anchor_file,
+              plan_heading_from_xy=True)
+    head = ParaSSRPlannerHead(**kw, plan_select_mode="corridor_first").eval()
+    bev, cmd, ego = torch.randn(2, 30, C), torch.eye(4)[[1, 2]], torch.randn(2, 4)
+    with torch.no_grad():
+        out = head.plan_from_bev(bev, cmd, ego_status=ego)
+    final, rank = out["plan_final_rewards"], out["plan_rank_rewards"]            # gated / pre-gate
+    admissible = out["sim_rewards"][:, 1] >= head.anchor_planner.select_dac_thr  # DAC column
+    assert (final <= rank + 1e-6).all() and torch.equal(final[admissible], rank[admissible])
+    for b in range(2):
+        if admissible[b].any():
+            assert bool(admissible[b, out["plan_topk_index"][b, 0]])
+    # weighted mode: no gate, the two scores coincide
+    plain = ParaSSRPlannerHead(**kw).eval()
+    with torch.no_grad():
+        o = plain.plan_from_bev(bev, cmd, ego_status=ego)
+    assert torch.equal(o["plan_final_rewards"], o["plan_rank_rewards"])
+
+
 def test_weighted_reward_is_wote_formula(anchor_file):
     m = AnchorPlanner(anchor_file, embed_dims=C)
     im = torch.softmax(torch.randn(2, K), -1)
@@ -208,6 +241,14 @@ def test_rescore_refined_is_eval_only_and_selects_among_refined(anchor_file):
     assert torch.allclose(o1["trajectory"], refined[torch.arange(2), idx], atol=1e-6)
     assert torch.allclose(o1["ego_fut_preds"][:, 0].cumsum(1), o1["trajectory"], atol=1e-5)
     assert "plan_rescore_final_rewards" not in o0
+    # the whole bundle describes the rescored pick: index, top-k, scores (a consumer re-reading
+    # the pick by plan_topk_index, e.g. refine.py, must land on the submitted trajectory)
+    assert torch.equal(o1["plan_topk_index"][:, 0], idx)
+    assert torch.equal(o1["plan_final_rewards"], o1["plan_rescore_final_rewards"])
+    assert torch.allclose(o1["plan_topk_trajectory"][:, 0], o1["trajectory"])
+    assert torch.allclose(refined[torch.arange(2), o1["plan_topk_index"][:, 0]], o1["trajectory"], atol=1e-6)
+    assert torch.equal(o1["plan_prerescore_topk_index"], o0["plan_topk_index"])
+    assert torch.equal(o1["plan_prerescore_final_rewards"], o0["plan_final_rewards"])
     # re-encoding the fixed anchors reproduces the first-pass rewards
     h = resc.anchor_planner.queries(torch.randn(2, 1, C))
     h_same = resc.anchor_planner.queries(h[:, :1] * 0 + h[:, :1], trajectories=None)

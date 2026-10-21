@@ -530,8 +530,9 @@ class ParaSSRModel(nn.Module):
         if "trajectory_offset" in outs:  # v2 anchor planner: selected anchor + offset, and what its losses need
             predictions.update({k: outs[k] for k in (
                 "trajectory", "plan_topk_trajectory", "plan_topk_reward", "plan_topk_index",
-                "plan_final_rewards", "trajectory_offset", "im_rewards", "sim_rewards", "trajectory_anchors")})
-            predictions.update({k: v for k, v in outs.items() if k.startswith("plan_rescore_")})
+                "plan_final_rewards", "plan_rank_rewards",   # pre-gate score: the feasibility weighting reads it
+                "trajectory_offset", "im_rewards", "sim_rewards", "trajectory_anchors")})
+            predictions.update({k: v for k, v in outs.items() if k.startswith(("plan_rescore_", "plan_prerescore_"))})
             if not self.training and bool(getattr(cfg, "feas_select_gate", False)):
                 # Re-select by reading the corridor field itself, not the head that copied it.
                 from .feasibility import field_gate_select

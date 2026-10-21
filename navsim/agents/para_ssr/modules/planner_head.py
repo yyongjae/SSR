@@ -511,14 +511,27 @@ class ParaSSRPlannerHead(nn.Module):
         h2 = ap.queries(h_ego, trajectories=refined)
         for layer in self.planner_layers:
             h2 = layer(h2, plan_pos, bev_embed, bev_pos, **memories)
-        _, sim2, final2, _ = ap.score(self.final_norm(h2))
+        _, sim2, final2, ungated2 = ap.score(self.final_norm(h2))
         k = min(ap.topk, ap.num_anchors)
         top = final2.topk(k, dim=-1).indices
         gather = top[:, :, None, None].expand(-1, -1, ap.fut_ts, ap.traj_dims)
         top_traj = refined.gather(1, gather)
-        return {"trajectory": top_traj[:, 0], "plan_rescore_final_rewards": final2,
-                "plan_rescore_sim_rewards": sim2, "plan_rescore_topk_index": top,
-                "plan_rescore_topk_trajectory": top_traj}
+        # One consistent bundle: trajectory, top-k, index and scores all describe the rescored pick,
+        # so a consumer that re-reads the pick by index (refine.py: plan_topk_index) cannot pair the
+        # first-pass index with the rescored trajectory (review 2026-10-21 #2).  The first-pass
+        # values stay available under plan_prerescore_* for diagnostics.
+        pre = {"plan_prerescore_topk_trajectory": out["plan_topk_trajectory"],
+               "plan_prerescore_topk_reward": out["plan_topk_reward"],
+               "plan_prerescore_topk_index": out["plan_topk_index"],
+               "plan_prerescore_final_rewards": out["plan_final_rewards"],
+               "plan_prerescore_rank_rewards": out["plan_rank_rewards"],
+               "plan_prerescore_sim_rewards": out["sim_rewards"]}
+        return {**pre,
+                "trajectory": top_traj[:, 0], "plan_topk_trajectory": top_traj,
+                "plan_topk_reward": final2.gather(1, top), "plan_topk_index": top,
+                "plan_final_rewards": final2, "plan_rank_rewards": ungated2, "sim_rewards": sim2,
+                "plan_rescore_final_rewards": final2, "plan_rescore_sim_rewards": sim2,
+                "plan_rescore_topk_index": top, "plan_rescore_topk_trajectory": top_traj}
 
     CMD_NAMES = ("left", "straight", "right", "unknown")
 

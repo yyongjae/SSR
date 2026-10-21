@@ -668,10 +668,10 @@ class ParaSSRAgent(AbstractAgent):
         if not any(bool(getattr(config, k, False))
                    for k in ("distill_selector_v6", "distill_selector_v7", "distill_selector_v8",
                              "distill_selector_v9", "distill_selector_v10", "distill_selector_v11",
-                             "distill_selector_v12", "distill_selector_v13")):
+                             "distill_selector_v12", "distill_selector_v13", "distill_selector_v14")):
             raise NotImplementedError(
                 "use_distill on this core supports only the trajectory-anchor path "
-                "(distill_selector_v6/v7/v8/v9/v10/v11/v12/v13); the stage-1 adapter / corridor / "
+                "(distill_selector_v6/v7/v8/v9/v10/v11/v12/v13/v14); the stage-1 adapter / corridor / "
                 "register-selector paths need aux_distill's own v2 port")
         anchor_file = getattr(config, "plan_anchor_file", None)
         if not getattr(config, "plan_anchor", False) or not anchor_file or not os.path.isfile(str(anchor_file)):
@@ -690,6 +690,7 @@ class ParaSSRAgent(AbstractAgent):
             or getattr(config, "distill_selector_v11", False)
             or getattr(config, "distill_selector_v12", False)
             or getattr(config, "distill_selector_v13", False)
+            or getattr(config, "distill_selector_v14", False)
         )
         trainable_prefix = "anchor_distill." if is_pgp else "anchor_distill.student_proj."
         for name, param in module.named_parameters():
@@ -782,6 +783,7 @@ class ParaSSRAgent(AbstractAgent):
                 and torch.is_grad_enabled()
             ):
                 from .modules.grad_balance import all_reduce_mean
+                has_probe_ctrl = getattr(ad, "probe_ratio_ctrl", None) is not None
                 g_local = {}
                 for tk in ("det", "map"):
                     u_loss = ad.last_unit_losses.get(tk)
@@ -791,11 +793,23 @@ class ParaSSRAgent(AbstractAgent):
                         g_local[tk] = 0.0 if gg is None else float(gg.detach().float().norm())
                     else:
                         g_local[tk] = 0.0
+                    if has_probe_ctrl:
+                        pu_loss = ad.last_probe_unit_losses.get(tk)
+                        pu_in = ad.last_probe_unit_inputs.get(tk)
+                        if not dead and isinstance(pu_loss, torch.Tensor) and pu_loss.requires_grad and pu_in is not None:
+                            pgg = torch.autograd.grad(weight * pu_loss, pu_in, retain_graph=True, allow_unused=True)[0]
+                            g_local[f"probe_{tk}"] = 0.0 if pgg is None else float(pgg.detach().float().norm())
+                        else:
+                            g_local[f"probe_{tk}"] = 0.0
                 g_red = all_reduce_mean(g_local, bev.device)
                 g_plan = float(logs["gnorm/plan"])
-                ad.ratio_ctrl.update(g_red, g_plan)
+                ad.ratio_ctrl.update({"det": g_red["det"], "map": g_red["map"]}, g_plan)
                 out["distill/g_unit_det"] = bev.new_tensor(float(g_red["det"]))
                 out["distill/g_unit_map"] = bev.new_tensor(float(g_red["map"]))
+                if has_probe_ctrl:
+                    ad.probe_ratio_ctrl.update({"det": g_red["probe_det"], "map": g_red["probe_map"]}, g_plan)
+                    out["distill/g_unit_probe_det"] = bev.new_tensor(float(g_red["probe_det"]))
+                    out["distill/g_unit_probe_map"] = bev.new_tensor(float(g_red["probe_map"]))
             self._log_distill_bev_grad(bev, total, out)
         return total, out
 
@@ -1119,6 +1133,7 @@ class ParaSSRAgent(AbstractAgent):
                     getattr(cfg, "distill_selector_v11", False)
                     or getattr(cfg, "distill_selector_v12", False)
                     or getattr(cfg, "distill_selector_v13", False)
+                    or getattr(cfg, "distill_selector_v14", False)
                 ):
                     proj_mult = float(getattr(cfg, "distill_proj_lr_mult", 2.0))
                     groups.append({

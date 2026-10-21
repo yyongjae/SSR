@@ -1,0 +1,78 @@
+# BEV Selector v14: PARA-SSR v2 Student Multi-Task + Dual-Stream Gradient-Decoupled & Adapter-Isolated Multi-Resolution KD
+# - Student: km/para-ssr-v2 full multi-task architecture (ResNet-34) + optional CK2 Refiner v2 E2E
+# - Distill v14 (docs/bev_selector_v14.md):
+#     * Fix 1 (Dual-Stream Decoupled Gradient Controller):
+#       Splits each bank (DET, MAP) into two independent GradScale & RatioController streams:
+#       - Grid Stream (85% cell_1x1 + 15% edge_3x3): ratio=0.090, cap=0.22 (restoring ck2e2e_bevkd spatial alignment budget)
+#       - Probe Stream (40% feat_kd + 40% sibling_diff + 40% attn_kl): ratio=0.025, cap=0.06 (preventing high-Jacobian probe from starving grid KD)
+#     * Fix 2 (Stop-Grad Adapter Isolation & lr_mult=3.0 Restoration):
+#       Detaches proj.weight & proj.bias on the Probe Stream (s_bev_probe) so student_proj is trained 100% by Grid KD,
+#       eliminating 20.4x probe bias gradient hijacking and restoring distill_proj_lr_mult=3.0 (matching ck2e2e_bevkd).
+#     * Fix 3 (Prune Dead 5x5 AvgPool -> High-Resolution 85/15 Corridor Grid KD):
+#       Removes dead 5x5 boxcar pooling (g_BEV=0.00012) from backpropagation (kept as no_grad metric) and reallocates
+#       100% of Grid KD budget to sub-meter 1x1 cell MSE (85%) and 3x3 corridor spatial-derivative edge MSE (15%).
+#     * Fix 4 (Domain-Specific Spatial Ribbon Shaping):
+#       DET retains far-field row_gain in [1.0, 1.5] and w_pgp = 0.75 + 0.25*m_cap_norm for TTC/NC look-ahead;
+#       MAP uses unskewed row_gain=1.0 (preserving 0..18m intersection curbs) and raised floor w_pgp = 0.85 + 0.15*m_cap_norm for DAC.
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Student architecture (ResNet-34 camera backbone)
+  image_architecture: resnet34.tv_in1k
+
+  # km/para-ssr-v2 Student Multi-Task Configuration
+  use_task_interaction: true
+  use_det_motion_head: true
+  use_map_head: true
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+  plan_heading_from_xy: true
+
+  # Task Gradient Balancing (Closed-loop balancer across Plan, Det, Map)
+  grad_balance_target:
+    plan: 0.4
+    det: 0.3
+    map: 0.3
+  grad_balance_warmup_iters: 10600
+  grad_balance_interval: 200
+
+  # v14 Dual-Stream Gradient-Decoupled & Adapter-Isolated Multi-Resolution KD
+  distill_selector: false
+  distill_selector_v6: false
+  distill_selector_v7: false
+  distill_selector_v8: false
+  distill_selector_v9: false
+  distill_selector_v10: false
+  distill_selector_v11: false
+  distill_selector_v12: false
+  distill_selector_v13: false
+  distill_selector_v14: true
+  distill_spatial_sigmas: [2.0, 4.0, 8.0, 16.0]
+  distill_lambda_gt: 0.45
+  distill_lambda_cov: 0.20
+  distill_lambda_risk: 0.35
+  distill_tau_gt: 4.5
+  distill_tau_risk: 8.0
+  distill_attn_loss_scale: 5.0
+  distill_resmap_scale: 3.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  distill_anchor_mode: cross_attn
+  distill_probe_warmup_steps: 1000
+  distill_probe_ramp_steps: 2000
+  distill_probe_loss_weight: 0.5
+  distill_probe_lr_mult: 3.0
+  distill_proj_lr_mult: 3.0
+  distill_probe_use_ema: true
+  distill_probe_ema_decay: 0.99
+
+  # Legacy distill options turned off
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0

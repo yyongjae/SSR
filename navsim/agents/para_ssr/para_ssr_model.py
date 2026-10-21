@@ -30,6 +30,7 @@ from .modules.det_motion_head import ParaDetMotionHead
 from .modules.lidar_encoder import build_lidar_encoder
 from .modules.map_head import ParaMapHead
 from .modules.planner_head import ParaSSRPlannerHead
+from .fact.planner import FactorizedPlanner
 
 
 
@@ -185,8 +186,29 @@ class ParaSSRModel(nn.Module):
             use_cams_embeds=cfg.use_cams_embeds,
             encoder=encoder,
         )
+        fact_enable = bool(getattr(cfg, "fact_enable", False))
+        fact_planner = None
+        if fact_enable:
+            if not cfg.fact_path_file or not cfg.fact_speed_file:
+                raise ValueError("fact_enable=true needs fact_path_file and fact_speed_file")
+            fact_planner = FactorizedPlanner(
+                cfg.fact_path_file, cfg.fact_speed_file, cfg.pc_range,
+                embed_dims=cfg.embed_dims, fut_ts=cfg.fut_ts, num_heads=cfg.num_heads,
+                station_m=cfg.fact_station_m, num_stations=cfg.fact_num_stations,
+                topk_path=cfg.fact_topk_path, topk_speed=cfg.fact_topk_speed, topk=cfg.fact_topk,
+                im_weight=cfg.fact_im_weight, fine_layers=cfg.fact_fine_layers, dropout=cfg.fact_dropout,
+                extra_anchor_file=(cfg.plan_anchor_file if cfg.fact_use_extra_anchors else None),
+            )
+            hidden = int(cfg.fact_aux_hidden)
+            self.fact_sdf_head = nn.Sequential(
+                nn.Conv2d(cfg.embed_dims, hidden, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(hidden, 1, 1))
+            self.fact_occ_head = nn.Sequential(
+                nn.Conv2d(cfg.embed_dims, hidden, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(hidden, cfg.fut_ts, 1))
+        else:
+            self.fact_sdf_head = self.fact_occ_head = None
         self.pts_bbox_head = ParaSSRPlannerHead(
             transformer=transformer,
+            fact_planner=fact_planner,
             bev_h=cfg.bev_h,
             bev_w=cfg.bev_w,
             embed_dims=cfg.embed_dims,
@@ -205,7 +227,8 @@ class ParaSSRModel(nn.Module):
             use_stl=cfg.use_stl,
             plan_num_layers=cfg.plan_num_layers,
             use_task_interaction=self.use_task_interaction,
-            plan_anchor_file=getattr(cfg, "plan_anchor_file", None) if getattr(cfg, "plan_anchor", False) else None,
+            plan_anchor_file=(getattr(cfg, "plan_anchor_file", None)
+                              if (getattr(cfg, "plan_anchor", False) and not fact_enable) else None),
             plan_reward_weights=getattr(cfg, "plan_reward_weights", (0.1, 0.5, 0.5, 1.0)),
             plan_topk=getattr(cfg, "plan_topk", 6),
             plan_kinematic=bool(getattr(cfg, "plan_kinematic", False)),
@@ -467,7 +490,8 @@ class ParaSSRModel(nn.Module):
 
     # ------------------------------------------------------------------ #
     def forward(
-        self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None
+        self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None,
+        targets: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         # Interaction requires perception at inference too. In parallel mode,
         # run_aux only requests optional eval perception; training runs all heads.
@@ -510,11 +534,20 @@ class ParaSSRModel(nn.Module):
                 seg_logits = self.bev_seg_head(bev_embed)
         # in seg mode the token view stands in for the vector head's instances -- planner only
         planner_map_out = map_out if map_out is not None else seg_tokens
+        fact_fields = fact_preds = None
+        if self.fact_sdf_head is not None:
+            B = bev_embed.shape[0]
+            bev_map = bev_embed.transpose(1, 2).reshape(B, cfg.embed_dims, cfg.bev_h, cfg.bev_w)
+            sdf_pred = torch.tanh(self.fact_sdf_head(bev_map)) * float(cfg.plan_map_clip)   # [B, 1, H, W] metres
+            occ_logit = self.fact_occ_head(bev_map)                                          # [B, T, H, W]
+            fact_fields = {"sdf": sdf_pred, "occ": torch.sigmoid(occ_logit)}
+            fact_preds = {"fact_sdf_pred": sdf_pred, "fact_occ_logit": occ_logit, "fact_occ_pred": fact_fields["occ"]}
         outs = self.pts_bbox_head.plan_from_bev(
             bev_embed, features["command"], det_out, planner_map_out,
             # The cached status is command + (vx, vy, ax, ay) in NAVSIM's
             # native ego axes and metric units. Command has its own embedding.
             ego_status=features["status_feature"][:, cfg.num_navi_cmd:],
+            fact_fields=fact_fields, fact_gt=targets,
         )
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
@@ -527,6 +560,10 @@ class ParaSSRModel(nn.Module):
                 outs["ego_fut_preds"], features["command"]
             ),
         }
+        if "fact_final" in outs:  # v3 factorized planner: its candidates, scores and the refined selection
+            predictions["trajectory"] = outs["trajectory"]
+            predictions.update({k: v for k, v in outs.items() if k.startswith(("fact_", "plan_")) or k == "sim_rewards"})
+            predictions.update(fact_preds)
         if "trajectory_offset" in outs:  # v2 anchor planner: selected anchor + offset, and what its losses need
             predictions.update({k: outs[k] for k in (
                 "trajectory", "plan_topk_trajectory", "plan_topk_reward", "plan_topk_index",

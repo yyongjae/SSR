@@ -134,6 +134,42 @@ config:
   plan_sim_reward_weight: 1.0
   heading_from_path: false   # evaluation-only: heading := path direction
   kinematic_projection: false   # evaluation-only: TOAD projection (IK -> clamp -> bicycle rollout)
+  # v3 factorized planner (navsim/agents/para_ssr/fact/).  Off by default; see
+  # scripts/training/train_fact.sh for the recipe (needs input_target: true).
+  fact_enable: false
+  # Lightning passes targets into forward() (forced vocabulary indices); required by fact_enable.
+  input_target: false
+  fact_path_file: null
+  fact_speed_file: null
+  fact_station_m: 1.0
+  fact_num_stations: 16
+  fact_topk_path: 20
+  fact_topk_speed: 20
+  fact_topk: 6
+  fact_im_weight: 0.1
+  fact_fine_layers: 2
+  fact_dropout: 0.1
+  fact_aux_hidden: 64
+  fact_use_extra_anchors: true
+  fact_route_stations: 128
+  fact_route_spacing: 1.0
+  fact_w_path: 1.0
+  fact_w_speed: 1.0
+  fact_w_score: 1.0
+  fact_w_list: 1.0
+  fact_w_margin: 0.5
+  fact_w_im: 1.0
+  fact_w_offset: 1.0
+  fact_w_extra: 1.0
+  fact_tau_path: 1.0
+  fact_tau_speed: 2.0
+  fact_tau_im: 1.0
+  fact_tau_list: 0.05
+  fact_margin: 2.0
+  fact_target_pdms: 0.95
+  fact_sdf_weight: 1.0
+  fact_occ_weight: 1.0
+  fact_occ_pos_weight: 3.0
   # Planning-side map consistency (plan_map.py); 0 = off.
   plan_map_weight: 0.0
   plan_map_margin: 0.0

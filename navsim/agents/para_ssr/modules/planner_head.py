@@ -178,9 +178,12 @@ class ParaSSRPlannerHead(nn.Module):
         plan_select_gate: float = 20.0,
         plan_head_mode: str = "wote",
         plan_score_sees_offset: bool = False,
+        fact_planner: Optional[nn.Module] = None,
     ):
         super().__init__()
         validate_plan_memory_options(plan_det_memory_mode, plan_map_memory_segments)
+        if fact_planner is not None and plan_anchor_file:
+            raise ValueError("the factorized planner and the anchor planner are exclusive")
         if use_stl:
             raise ValueError("PARA-SSR task-memory planner requires use_stl=False")
         if plan_num_layers != 3:
@@ -265,7 +268,12 @@ class ParaSSRPlannerHead(nn.Module):
                           score_sees_offset=plan_score_sees_offset)
             if plan_anchor_file else None
         )
-        self.ego_fut_decoder = nn.Sequential(*reg_layers) if self.anchor_planner is None else None
+        # v3: factorized path x speed vocabulary scored coarse-to-fine (fact/planner.py).
+        # The planner layers then carry only the ego/scene token over the BEV and the
+        # task memories; the candidates read the BEV themselves.
+        self.fact_planner = fact_planner
+        self.ego_fut_decoder = (nn.Sequential(*reg_layers)
+                                if (self.anchor_planner is None and self.fact_planner is None) else None)
         # Evaluation-only diagnostic (never used in training): score the refined
         # trajectories (anchor + offset) instead of the fixed anchors, as WoTE does at
         # test time -- a second pass of the planner layers on re-encoded trajectories.
@@ -436,6 +444,8 @@ class ParaSSRPlannerHead(nn.Module):
         *,
         bev_pos: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
+        fact_fields: Optional[Dict[str, torch.Tensor]] = None,
+        fact_gt: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Plan from BEV and current [vx, vy, ax, ay] ego status.
 
@@ -473,6 +483,25 @@ class ParaSSRPlannerHead(nn.Module):
         plan_pos = self.plan_query_pos.weight.to(bev_embed.dtype).unsqueeze(0).expand(bs, -1, -1)
         memories = self.prepare_task_memories(det_out, map_out) if self.use_task_interaction else {}
         h_ego = h
+        if self.fact_planner is not None:
+            if fact_fields is None:
+                raise ValueError("the factorized planner needs fact_fields (predicted sdf / occupancy)")
+            for layer in self.planner_layers:
+                h = layer(h, plan_pos, bev_embed, bev_pos, **memories)
+            ego_tok = self.final_norm(h)[:, 0]                                        # [B, C]
+            bev_map = bev_embed.transpose(1, 2).reshape(bs, self.embed_dims, self.bev_h, self.bev_w)
+            gt_path = gt_speed = None
+            if fact_gt is not None and self.training:
+                gt_path, gt_speed = fact_gt.get("fact_gt_path"), fact_gt.get("fact_gt_speed")
+            out = self.fact_planner(bev_map, ego_tok, ego_status, fact_fields["sdf"], fact_fields["occ"],
+                                    use_extra=self.training, gt_path=gt_path, gt_speed=gt_speed)
+            poses = out["trajectory"]
+            steps = torch.diff(torch.cat([poses.new_zeros(bs, 1, self.traj_dims), poses], dim=1), dim=1)
+            out.update(
+                bev_embed=bev_embed, scene_query=h.transpose(0, 1), token_attn=None,
+                ego_fut_preds=steps.unsqueeze(1).expand(bs, self.ego_fut_mode, self.fut_ts, self.traj_dims),
+            )
+            return out
         if self.anchor_planner is not None:
             h = self.anchor_planner.queries(h)                      # [B, K, C]
             plan_pos = plan_pos.expand(-1, h.shape[1], -1)

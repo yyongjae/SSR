@@ -320,6 +320,42 @@ class ParaSSRConfig:
     # planned trajectory, i.e. its test-time step without the CEM search.
     kinematic_projection: bool = False
 
+    # ---- v3 factorized planner (fact/): path x speed vocabulary, coarse-to-fine
+    # PDM scoring with proxy labels + exact anchor labels, two auxiliary BEV heads.
+    fact_enable: bool = False
+    fact_path_file: Optional[str] = None       # [P, S+1, 2] path anchors (tools/fact/build_vocab.py)
+    fact_speed_file: Optional[str] = None      # [V, T] cumulative-distance profiles
+    fact_station_m: float = 1.0                # arc-length spacing of the path stations
+    fact_num_stations: int = 16                # stations sampled per path in stage 1
+    fact_topk_path: int = 20
+    fact_topk_speed: int = 20
+    fact_topk: int = 6                         # refined candidates returned
+    fact_im_weight: float = 0.1                # selection: log PDMS + w * log softmax(im)
+    fact_fine_layers: int = 2
+    fact_dropout: float = 0.1
+    fact_aux_hidden: int = 64
+    fact_use_extra_anchors: bool = True        # score the 256 WoTE anchors with their exact labels (training)
+    fact_route_stations: int = 128             # route centerline stations (1 m) for the EP proxy
+    fact_route_spacing: float = 1.0
+    # loss weights and temperatures (fact/losses.py)
+    fact_w_path: float = 1.0
+    fact_w_speed: float = 1.0
+    fact_w_score: float = 1.0
+    fact_w_list: float = 1.0
+    fact_w_margin: float = 0.5
+    fact_w_im: float = 1.0
+    fact_w_offset: float = 1.0
+    fact_w_extra: float = 1.0
+    fact_tau_path: float = 1.0                 # m^2
+    fact_tau_speed: float = 2.0                # m^2
+    fact_tau_im: float = 1.0                   # m^2
+    fact_tau_list: float = 0.05
+    fact_margin: float = 2.0                   # logits
+    fact_target_pdms: float = 0.95             # exact-label anchors above this are imitation targets
+    fact_sdf_weight: float = 1.0               # aux road-SDF head (task map)
+    fact_occ_weight: float = 1.0               # aux future-occupancy head (task det)
+    fact_occ_pos_weight: float = 3.0
+
     plan_map_weight: float = 0.0
     plan_map_margin: float = 0.0
     # (x0, x1, y0, y1) in the current ego frame of NAVSIM trajectories:

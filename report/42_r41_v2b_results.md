@@ -151,3 +151,40 @@ GT drivable 경계까지의 signed margin과 GT 객체 폴리곤까지의 최소
 
 Turing의 archived config(`work_dirs/r41_v2b_motionmap_modetok_s4_resume/code/hydra/config.yaml`)는 Poseidon 절대경로
 `/data4/chanyoung/data/ssr/SSR`을 `/home/chanyoung/SSR`로 바꾼 것이다(원본 `config.yaml.poseidon`).
+
+## 10. 추가 진단 (2026-10-19 저녁, 학습 없음)
+
+### 10.1 test-time readout ablation (`tools/analysis/dump_with_ablation.py`, `ablation_summary.py`)
+
+planner 각 layer의 cross-attention update를 0으로 막고 궤적을 다시 dump해 PDMS를 쟀다 (strict load 유지, 인지 head는 그대로 동작).
+
+| 끈 입력 | PDMS | ΔPDMS [95% CI] | NC | DAC | EP | TTC | score=0 | 종점 이동 중앙값 |
+|---|---|---|---|---|---|---|---|---|
+| 없음 | 88.37 | | 98.72 | 96.25 | 82.02 | 95.67 | 596 | |
+| det memory | 87.51 | −0.86 [−1.18, −0.49] | 98.57 | 95.82 | 80.88 | 95.43 | 666 | 0.37 m |
+| map memory | 84.86 | −3.51 [−3.97, −3.08] | 98.02 | 93.83 | 78.97 | 93.73 | 966 | 0.85 m |
+| det + map | 82.52 | −5.85 [−6.32, −5.34] | 97.57 | 92.58 | 76.09 | 92.59 | 1,152 | 1.25 m |
+| BEV readout | 68.28 | −20.09 [−20.84, −19.41] | 91.40 | 84.96 | 65.68 | 80.08 | 2,761 | 2.41 m |
+
+planner는 map memory에 크게, det memory에 조금 기댄다. 학습된 모델의 입력을 막는 것이라 분포 이탈 효과가 섞여 있고
+"의존도"이지 "정보량"은 아니다. 결과: `work_dirs/eval/ablation/`.
+
+### 10.2 예측 map으로 만든 DAC margin (`tools/analysis/pred_map_dac_margin.py`)
+
+ROI(x_right ±32, y_forward 0~32) 안에서 road polyline까지의 거리에 자차 원점→꼭짓점 선분의 교차 parity로 부호를 붙였다.
+
+| margin 출처 | 모델 궤적 AUC (12,146, DAC 실패 455) | anchor AUC (800 token × 256) |
+|---|---|---|
+| metric cache GT 폴리곤 | 0.975 | 0.972 |
+| GT road polyline (ROI, parity) | 0.944 | 0.966 |
+| 예측 road polyline (score ≥ 0.3) | 0.695 | 0.916 |
+
+GT polyline은 cache 기준에서 0.03만 잃으므로 표현·ROI는 문제가 아니다. 예측 map은 anchor 전체(큰 이탈 포함)에서는 0.92지만
+모델이 실제로 고른 궤적의 실패(경계 근처)에서는 0.70이다. DAC 실패 452건 중 314건(69%)을 자신의 map은 도로 안으로 본다.
+v1의 "map은 아는데 planner가 무시"(report 23 §0-4, 80%)와 달리 v2 r41은 "map이 경계를 모르는" 상태다.
+
+### 10.3 함의
+
+- map memory는 많이 쓰이는데 내용이 부정확하다 → map head 경계 정밀도(Chamfer 0.5 m에서 road AP 0.12)가 직접 병목. GT 수준이면 AUC 0.94.
+- det memory는 거의 쓰이지 않는다 → NC·TTC 실패의 2/3가 객체를 검출한 상태에서 나는 것과 일치. token 표현이 아니라 점수 head가 객체 거리를 쓰게 하는 target이 필요.
+- 수정된 순서: (1) map head 개선, (2) GT map teacher-forcing으로 천장 측정, (3) det 쪽 기하 연속 target(과실 규칙 포함), (4) readout dropout.

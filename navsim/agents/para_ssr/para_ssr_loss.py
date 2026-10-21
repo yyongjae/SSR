@@ -22,6 +22,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from .modules.anchor_planner import anchor_plan_losses
+from .fact.losses import fact_aux_losses, fact_plan_losses
 from .plan_map import plan_map_loss
 from .readout.distill import ReadoutDistiller
 from .modules.grad_balance import (
@@ -234,6 +235,12 @@ class ParaSSRLoss(torch.nn.Module):
                 + float(cfg.plan_im_reward_weight) * al["im_reward_loss"]
                 + float(cfg.plan_sim_reward_weight) * al["sim_reward_loss"])
             logs.update({f"plan_v2/{k}": v.detach() for k, v in al.items()})
+        elif "fact_final" in predictions:
+            # v3 factorized planner (fact/losses.py).  The L1 of the selected
+            # trajectory stays in the logs only, as for v2.
+            fl, fl_logs = fact_plan_losses(predictions, targets, features, cfg, model.pts_bbox_head.fact_planner)
+            task_losses["plan"] = tw.get("plan", 1.0) * fl
+            logs.update(fl_logs)
         # Keep the historical raw metric, but expose the value that actually
         # enters total_loss so plan=2.0 is not hidden in dashboards.
         logs["loss_plan_reg_weighted"] = task_losses["plan"].detach()
@@ -282,6 +289,16 @@ class ParaSSRLoss(torch.nn.Module):
             map_losses = model.map_head.loss(predictions, map_pts, map_labels, map_valid)
             task_losses["map"] = sum(map_losses.values()) * tw.get("map", 1.0)
             logs.update({k: v.detach() for k, v in map_losses.items()})
+
+        # ---- v3 auxiliary BEV heads: road SDF (map) and future occupancy (det) ----
+        if "fact_sdf_pred" in predictions:
+            aux = fact_aux_losses(predictions, targets, cfg)
+            if "map" in aux:
+                task_losses["map"] = task_losses.get("map", 0.0) + float(cfg.fact_sdf_weight) * aux["map"] * tw.get("map", 1.0)
+                logs["loss_fact_sdf"] = aux["map"].detach()
+            if "det" in aux:
+                task_losses["det"] = task_losses.get("det", 0.0) + float(cfg.fact_occ_weight) * aux["det"] * tw.get("det", 1.0)
+                logs["loss_fact_occ"] = aux["det"].detach()
 
         # ---- readout-space distillation (report/19) ---------------------
         if self.distiller is not None and "teacher_bev" in targets:

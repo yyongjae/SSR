@@ -55,6 +55,7 @@ from .readout.distill import KD_DISTANCES, KD_MODES
 from .readout.teacher_targets import ResMapTeacherTargetBuilder
 from .plan_map import DrivableAreaTargetBuilder
 from .plan_score_targets import AnchorScoreTargetBuilder
+from .fact.targets import FactTargetBuilder
 
 
 class WarmupCosLR(_LRScheduler):
@@ -550,6 +551,13 @@ class ParaSSRAgent(AbstractAgent):
                 raise ValueError("kd_mode=readout needs kd_readout_ckpt")
             if min(int(config.kd_warmup_iters), int(config.kd_ramp_iters)) < 0:
                 raise ValueError("kd_warmup_iters and kd_ramp_iters must be non-negative")
+        if getattr(config, "fact_enable", False):
+            if not config.fact_path_file or not config.fact_speed_file:
+                raise ValueError("fact_enable=true needs fact_path_file and fact_speed_file")
+            if config.fact_use_extra_anchors and not config.plan_anchor_file:
+                raise ValueError("fact_use_extra_anchors=true needs plan_anchor_file (the 256 WoTE anchors)")
+            if not getattr(config, "input_target", False):
+                raise ValueError("fact_enable=true needs input_target=true (the forced vocabulary indices)")
         if getattr(config, "plan_anchor", False):
             if not config.plan_anchor_file:
                 raise ValueError("plan_anchor=true needs plan_anchor_file")
@@ -636,12 +644,19 @@ class ParaSSRAgent(AbstractAgent):
         # The v2 anchor planner may be initialised from a v1 checkpoint: its new
         # modules start fresh, but only when the checkpoint has NONE of them (a
         # partial match is a different vocabulary/architecture, not an upgrade).
-        anchor_prefix = "para_ssr_model.pts_bbox_head.anchor_planner."
-        if not any(k.startswith(anchor_prefix) for k in state_dict):
-            fresh = [k for k in missing if k.startswith(anchor_prefix)]
-            if fresh:
-                logger.info("v1 checkpoint: %d anchor-planner tensors start fresh", len(fresh))
-            missing = [k for k in missing if not k.startswith(anchor_prefix)]
+        fresh_prefixes = (
+            "para_ssr_model.pts_bbox_head.anchor_planner.",
+            # v3 factorized planner and its two auxiliary BEV heads (warm start from a v1/v2 checkpoint)
+            "para_ssr_model.pts_bbox_head.fact_planner.",
+            "para_ssr_model.fact_sdf_head.",
+            "para_ssr_model.fact_occ_head.",
+        )
+        for anchor_prefix in fresh_prefixes:
+            if not any(k.startswith(anchor_prefix) for k in state_dict):
+                fresh = [k for k in missing if k.startswith(anchor_prefix)]
+                if fresh:
+                    logger.info("checkpoint without %s: %d tensors start fresh", anchor_prefix, len(fresh))
+                missing = [k for k in missing if not k.startswith(anchor_prefix)]
         if missing or result.unexpected_keys:
             # same wording as torch's strict load, which callers match on
             raise RuntimeError(
@@ -680,10 +695,14 @@ class ParaSSRAgent(AbstractAgent):
         cfg = self._config
         if getattr(cfg, "kd_mode", "none") != "none" or getattr(cfg, "map_label_source", "gt") == "teacher":
             builders.append(ResMapTeacherTargetBuilder(cfg))
-        if float(getattr(cfg, "plan_map_weight", 0.0)) > 0:
+        fact = bool(getattr(cfg, "fact_enable", False))
+        if float(getattr(cfg, "plan_map_weight", 0.0)) > 0 or fact:
             builders.append(DrivableAreaTargetBuilder(cfg))
+        if fact:
+            builders.append(FactTargetBuilder(cfg))
         # plan_score_file is training-only: evaluation leaves it null and gets no builder
-        if getattr(cfg, "plan_anchor", False) and getattr(cfg, "plan_score_file", None):
+        wants_scores = getattr(cfg, "plan_anchor", False) or (fact and getattr(cfg, "fact_use_extra_anchors", False))
+        if wants_scores and getattr(cfg, "plan_score_file", None):
             builders.append(AnchorScoreTargetBuilder(cfg))
         return builders
 
@@ -695,7 +714,7 @@ class ParaSSRAgent(AbstractAgent):
         # scales here also makes zero-share ablations effective on the very first
         # forward, before the first scheduled measurement.
         self._loss.apply_aux_scales(self.para_ssr_model)
-        predictions = self.para_ssr_model(features)
+        predictions = self.para_ssr_model(features, targets=targets)
         if self._stage_e is not None and not self.training:
             # inference: trajectory = tau_final (or tau0 with ref_eval_traj=tau0)
             predictions = self._stage_e.infer(self.ref_student, features, predictions)

@@ -99,7 +99,8 @@ def build_datasets(cfg: DictConfig, agent: AbstractAgent) -> Tuple[Dataset, Data
 @hydra.main(version_base="1.2", config_path=CONFIG_PATH, config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     logger.info("Global Seed set to 0")
-    pl.seed_everything(0, workers=True)
+    # +seed=N on the command line picks the run seed (default 0, the historical value)
+    pl.seed_everything(int(cfg.get("seed", 0)), workers=True)
 
     logger.info(f"Path where all results are stored: {cfg.output_dir}")
 

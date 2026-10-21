@@ -1,0 +1,119 @@
+{
+  "command": "tools/fact/build_vocab.py --split trainval --scene-filter navtrain --paths 1024 --speeds 256 --workers 32 --verify 5 --out /data3/chanyoung/SSR-v3/data/fact_vocab",
+  "args": {
+    "split": "trainval",
+    "scene_filter": "navtrain",
+    "paths": 1024,
+    "speeds": 256,
+    "stations": 50,
+    "station_spacing": 1.0,
+    "limit": null,
+    "max_trajectories": null,
+    "workers": 32,
+    "kmeans_iters": 30,
+    "heldout": 2000,
+    "seed": 0,
+    "out": "/data3/chanyoung/SSR-v3/data/fact_vocab",
+    "trajectories_npz": null,
+    "anchors": "/data3/chanyoung/SSR-v3/data/planning_vb/trajectory_anchors_256.npy",
+    "verify": 5
+  },
+  "verify_max_abs_diff": 0.0,
+  "split": "trainval",
+  "scene_filter": "navtrain",
+  "num_paths": 1024,
+  "num_speeds": 256,
+  "num_stations": 50,
+  "station_spacing_m": 1.0,
+  "path_shape": [
+    1024,
+    51,
+    2
+  ],
+  "speed_shape": [
+    256,
+    8
+  ],
+  "num_future_poses": 8,
+  "interval_length_s": 0.5,
+  "timestamps_s": [
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    3.5,
+    4.0
+  ],
+  "frame": "ego rear-axle frame at the current frame, x forward, y left, heading = path tangent",
+  "num_source_trajectories_loaded": 103288,
+  "num_source_trajectories_used": 103288,
+  "num_fit_trajectories": 101288,
+  "subsampled": false,
+  "limit": null,
+  "speed_augmentation": {
+    "scales": [
+      1.15,
+      1.3
+    ],
+    "max_distance_m": 75.0,
+    "num_speed_samples": 303864
+  },
+  "kmeans": {
+    "init": "k-means++",
+    "iters": 30,
+    "seed": 0
+  },
+  "path_member_counts": {
+    "min": 1,
+    "median": 36.0,
+    "max": 3372
+  },
+  "path_len_m": {
+    "min": 0.8133981227874756,
+    "mean": 13.962203979492188,
+    "max": 37.36774826049805
+  },
+  "coverage_ade_m": {
+    "heldout_trajectories": 2000,
+    "factorized_P1024xV256": {
+      "mean": 0.20015989243984222,
+      "p50": 0.19982776045799255,
+      "p90": 0.3066902339458466,
+      "max": 0.6454496383666992
+    },
+    "factorized_P1024xV256_train_subset": {
+      "mean": 0.1990080326795578,
+      "p50": 0.19493598490953445,
+      "p90": 0.3048623323440552,
+      "max": 0.9462085962295532
+    },
+    "anchors_256": {
+      "mean": 0.4326927959918976,
+      "p50": 0.3723203241825104,
+      "p90": 0.7802667737007142,
+      "max": 3.31290864944458
+    },
+    "anchors_256_train_subset": {
+      "mean": 0.4442474842071533,
+      "p50": 0.3825046718120575,
+      "p90": 0.7863877713680268,
+      "max": 3.3814172744750977
+    },
+    "anchors_file": "/data3/chanyoung/SSR-v3/data/planning_vb/trajectory_anchors_256.npy"
+  },
+  "runtime_s": {
+    "load": 170.9,
+    "total": 675.9
+  },
+  "files": [
+    "build.log",
+    "paths_1024.npy",
+    "paths_1024_len.npy",
+    "source_trajectories.npz",
+    "speeds_256.npy",
+    "test_limit2000",
+    "test_limit2000.log"
+  ]
+}

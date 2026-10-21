@@ -142,6 +142,111 @@ config:
   plan_map_clip: 10.0
   map_label_source: gt
   map_pseudo_score_thr: 0.3
+  # Drivable-area RASTER on the shared BEV grid (bev_seg.py); 0 = off, nothing constructed.
+  # The vector map head keeps running -- this adds the region DAC tests, not a replacement.
+  bev_seg_weight: 0.0
+  bev_seg_hidden: 128
+  bev_seg_pos_weight: 1.0
+  # vector | seg.  seg replaces the polyline head with the raster head (needs bev_seg_weight > 0).
+  map_head_type: vector
+  bev_seg_token_pool: 5
+  # Feasibility cost on the 256 refined candidates (feasibility.py); 0 = off.
+  feas_weight: 0.0
+  feas_field: gt            # gt | pred
+  feas_field_head: true
+  feas_to_offset: true
+  feas_to_score: false
+  feas_weighting: softmax   # softmax | topk | uniform | select
+  feas_temp: 1.0
+  feas_topk: 32
+  feas_margin: 0.4
+  feas_beta: 0.2
+  feas_clip: 8.0
+  feas_offset_weight: 1.0
+  feas_score_weight: 1.0
+  feas_score_tau: 0.5
+  feas_dyn_weight: 0.0      # >0 turns on the per-step agent field (NC); needs agent_sdf_bev
+  feas_dyn_margin: 0.2
+  feas_select_label_k: 16    # feas_weighting=select: anchors refined by label rank
+  feas_select_model_k: 16    # ... and by the model's own rank
+  feas_offset_anchor_weight: 0.0   # >0: hold candidates outside the refined set within the radius of their anchor
+  feas_offset_anchor_radius: 2.0
+  feas_ttc_target: anchor    # anchor | geometric | band | hybrid (feasibility.ttc_label)
+  feas_ttc_margin: 0.0
+  feas_ttc_band_lo: 2.0      # band: geometric TTC label where the candidate's mean |offset| is in [lo, hi)
+  feas_ttc_band_hi: 12.0
+  feas_ep_target: anchor     # anchor | geometric (feasibility.ep_label)
+  feas_progress_weight: 0.0  # feasibility.drive_terms: push S candidates up to the human's route progress
+  feas_lateral_weight: 0.0   # ... resisted by lane deviation beyond feas_lateral_free m
+  feas_lateral_free: 1.0
+  feas_continuity_weight: 0.0   # ... and by a first-step speed that does not continue the current motion
+  feas_continuity_tol: 0.5
+  # stage 2 (refine.py): refine ONLY the selected candidate (select, then refine)
+  feas_field_priors: false   # field head reads the seg head's drivable prob + det/motion forecast occupancy
+  feas_prior_topk: 40
+  rank_weight: 0.0          # listwise top-1 ranking inside the corridor (feasibility.admissible_rank_loss)
+  rank_set: gate            # gate (deployment field-gate set, full label) | corridor (GT set) | all (control)
+  rank_tau: 0.05
+  rank_temp: 1.0
+  curse_weight: 0.0
+  curse_set: topk
+  curse_topk: 8
+  curse_tau: 0.2
+  finetune_score_only: false   # train only the score heads; the rest frozen and in eval mode
+  finetune_refiner_only: false # train only stage 2 (refiner); the rest frozen and in eval mode
+  refine_enable: false
+  refine_weight: 1.0
+  refine_hidden: 256
+  refine_margin: 0.4
+  refine_dyn_margin: 0.2
+  refine_corridor_weight: 1.0
+  refine_corridor_hinge: false
+  refine_progress_weight: 1.0
+  refine_lateral_weight: 0.1
+  refine_lateral_free: 1.0
+  refine_smooth_weight: 1.0
+  refine_trust_weight: 0.05
+  refine_continuity_weight: 0.5
+  refine_continuity_tol: 0.5
+  refine_imitation_weight: 1.0
+  refine_ttc_weight: 0.0   # do-no-harm on the pick's TTC clearance to other agents
+  refine_ttc_margin: 1.0
+  refine_fallback: true   # inference: discard a refinement that leaves the corridor the pick was inside
+  refine_apply: true      # evaluation: false emits stage 1's pick unrefined (isolates stage 2)
+  # BEV selector v7 distillation (teammate's, docs/bev_selector_v7.md on origin/aux_distill), training only
+  distill_v7: false
+  distill_v7_weight: 1.0
+  distill_v7_root: /home/external-user/datasets/teacher_cache
+  distill_v7_resmap_flip: false   # teammate flips ReSMap L/R; measured mirrored (distill/teacher_store.py)
+  distill_v7_heads: 4
+  distill_spatial_sigma: 4.0
+  distill_attn_loss_scale: 5.0
+  distill_resmap_scale: 3.0
+  distill_anchor_winner_boost: 2.0
+  distill_anchor_tau: 1.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  feas_route_file: ""        # packed route centerlines (tools/plan_v2/dump_route_centerline.py), no .npy suffix
+  feas_route_max_offset: 5.0   # a route farther than this from the ego is a failed extraction -> treated as no route
+  feas_select_gate: false    # INFERENCE only: gate candidates on the predicted field itself, not the head
+  feas_select_margin: 0.1
+  feas_select_dyn_margin: 0.0
+  feas_field_weight: 1.0
+  feas_hidden: 128
+  feas_target_upsample: 4   # GT field grid = bev x4 (0.16 m); the predicted field stays on the BEV grid
+  plan_head_mode: wote
+  plan_score_sees_offset: false   # score heads also see the candidate's (detached) offset
+  plan_offset_hold_weight: 0.0
+  plan_offset_hold_radius: 1.0
+  plan_select_mode: weighted   # weighted | corridor_first
+  plan_select_dac_thr: 0.5
+  plan_select_gate: 20.0
+  feas_ground_band: 1.0
+  feas_ground_floor: 0.05
+  feas_cost_grad_to_field: false
+  feas_warmup_iters: 0
+  feas_ramp_iters: 0
 
   # --- optimisation (WoTE/SeerDrive recipe, report #09 4) -----------------
   training_precision: 32

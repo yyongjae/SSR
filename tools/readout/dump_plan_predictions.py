@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--v2-extras", action="store_true",
                     help="also save the anchor planner's candidates and scores (top-k, all offsets, rewards)")
+    ap.add_argument("--field", action="store_true",
+                    help="also dump drivable_sdf_pred (needs a corridor arm; large)")
     args, overrides = ap.parse_known_args()
 
     from navsim.common.dataloader import SceneLoader
@@ -51,8 +53,16 @@ def main():
     dl = DataLoader(FeatureData(tokens, loader, agent.get_feature_builders()), batch_size=args.batch_size,
                     num_workers=args.workers, collate_fn=collate)
     names, traj, preds, cmds, missing = [], [], [], [], []
-    extras = {k: [] for k in ("plan_topk_index", "plan_topk_trajectory", "plan_final_rewards", "sim_rewards",
-                              "im_rewards", "trajectory_offset")} if args.v2_extras else {}
+    # `drivable_sdf_pred` is what the corridor arms predict at INFERENCE and currently never use for
+    # selection; dumping it is what lets a geometric gate be tested without retraining.
+    V2_KEYS = ("plan_topk_index", "plan_topk_trajectory", "plan_final_rewards", "sim_rewards",
+               "im_rewards", "trajectory_offset")
+    # the dynamic field is one plane per ego step, so it is 8x the static one; float16 keeps the
+    # pair near 1 GB for navtest, which is what a margin sweep over a finished checkpoint costs
+    # instead of one GPU pass per margin.
+    FIELD_KEYS = ("drivable_sdf_pred", "agent_sdf_pred")
+    extras = {k: [] for k in (V2_KEYS + (FIELD_KEYS if args.field else ()))} if args.v2_extras else {}
+    optional = set(FIELD_KEYS) - {"drivable_sdf_pred"}
     t0 = time.time()
     with torch.no_grad():
         for toks, feats, failed in dl:
@@ -65,9 +75,20 @@ def main():
             traj.append(out["trajectory"].float().cpu().numpy())
             preds.append(out["ego_fut_preds"].float().cpu().numpy())
             cmds.append(feats["command"].float().cpu().numpy())
-            for k in extras:
+            for k in list(extras):
+                if k not in out:
+                    if k in optional:      # feas_dyn_weight=0 arms have no dynamic field
+                        extras.pop(k)
+                        continue
+                    raise KeyError(f"model produced no {k!r}; is this a corridor arm?")
                 v = out[k].cpu().numpy()
-                extras[k].append(v if v.dtype.kind in "iu" else v.astype(np.float16))
+                # The SCORES stay float32.  In fp16 the top-1/top-2 gap (median 0.051) is only 26
+                # fp16 steps at their magnitude, and 0.45% of scenes had their argmax flip -- enough
+                # that a selection-rule experiment could not reproduce its own deployed control.
+                # Offsets and fields keep fp16: measured 0.008 m max on the reconstructed trajectory
+                # and 0.004 m on an 8 m-clipped SDF, both far under the 0.142 m sampling floor.
+                keep32 = k in ("plan_final_rewards", "im_rewards", "sim_rewards")
+                extras[k].append(v if v.dtype.kind in "iu" or keep32 else v.astype(np.float16))
             if len(names) % 2000 < args.batch_size:
                 print(f"{len(names)}/{len(tokens)}  {(time.time() - t0) / len(names):.3f} s/frame", flush=True)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

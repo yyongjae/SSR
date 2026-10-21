@@ -128,6 +128,11 @@ class ParaSSRModel(nn.Module):
         self.use_task_interaction = bool(cfg.use_task_interaction)
         if self.use_task_interaction and (not cfg.use_det_motion_head or not cfg.use_map_head):
             raise ValueError("the planner requires both det/motion and map heads")
+        self.map_head_type = str(getattr(cfg, "map_head_type", "vector"))
+        if self.map_head_type not in ("vector", "seg"):
+            raise ValueError(f"map_head_type must be 'vector' or 'seg', got {self.map_head_type!r}")
+        if self.map_head_type == "seg" and float(getattr(cfg, "bev_seg_weight", 0.0)) <= 0:
+            raise ValueError("map_head_type='seg' needs bev_seg_weight > 0: the seg loss IS the map loss")
         if tuple(cfg.map_pc_range) != tuple(cfg.pc_range):
             raise ValueError("shared BEV/detection/map must use one physical ROI")
         active_tasks = ["plan"]
@@ -208,6 +213,11 @@ class ParaSSRModel(nn.Module):
             plan_rescore_refined=bool(getattr(cfg, "plan_rescore_refined", False)),
             plan_det_memory_mode=getattr(cfg, "plan_det_memory_mode", "mean"),
             plan_map_memory_segments=getattr(cfg, "plan_map_memory_segments", 1),
+            plan_select_mode=str(getattr(cfg, "plan_select_mode", "weighted")),
+            plan_select_dac_thr=float(getattr(cfg, "plan_select_dac_thr", 0.5)),
+            plan_select_gate=float(getattr(cfg, "plan_select_gate", 20.0)),
+            plan_head_mode=str(getattr(cfg, "plan_head_mode", "wote")),
+            plan_score_sees_offset=bool(getattr(cfg, "plan_score_sees_offset", False)),
         )
         self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
 
@@ -256,9 +266,58 @@ class ParaSSRModel(nn.Module):
                 loss_map_pts_weight=cfg.loss_map_pts_weight,
                 loss_map_dir_weight=cfg.loss_map_dir_weight,
             )
-            if cfg.use_map_head
+            if cfg.use_map_head and self.map_head_type == "vector"
             else None
         )
+
+        # Drivable-area raster (bev_seg.py).  Two roles, one flag:
+        #   map_head_type = "vector": OFF unless bev_seg_weight > 0, then it runs NEXT TO the vector
+        #                             head and adds the region DAC tests;
+        #   map_head_type = "seg":    it IS the map head.  The vector head is not built, and the
+        #                             seg head's token view feeds the planner's map memories.
+        self.bev_seg_head = None
+        if cfg.use_map_head and (self.map_head_type == "seg" or float(getattr(cfg, "bev_seg_weight", 0.0)) > 0):
+            from .bev_seg import BevSegHead
+
+            self.bev_seg_head = BevSegHead(
+                embed_dims=cfg.embed_dims, bev_h=cfg.bev_h, bev_w=cfg.bev_w,
+                hidden=int(getattr(cfg, "bev_seg_hidden", 128)),
+                token_pool=int(getattr(cfg, "bev_seg_token_pool", 5)),
+            )
+
+        # Signed-distance field for the feasibility cost (feasibility.py). Built whenever the term
+        # is on, so the "gt" arm can still log the predicted field's cost as a diagnostic --
+        # unless feas_field_head=false with the gt field: then nothing new trains on the BEV, which a
+        # fine-tune that only changes the score heads' targets needs to stay comparable to its control.
+        self.drivable_field_head = None
+        need_head = bool(getattr(cfg, "feas_field_head", True)) or str(getattr(cfg, "feas_field", "gt")) == "pred"
+        if float(getattr(cfg, "feas_weight", 0.0)) > 0 and need_head:
+            from .feasibility import DrivableFieldHead
+
+            dyn_steps = (int(cfg.trajectory_sampling.num_poses)
+                         if float(getattr(cfg, "feas_dyn_weight", 0.0)) > 0 else 0)
+            # field_priors: the field reads the seg head and the det/motion head, not the BEV alone
+            self.field_prior_seg = bool(getattr(cfg, "feas_field_priors", False)) and float(getattr(cfg, "bev_seg_weight", 0.0)) > 0
+            self.field_prior_dyn = bool(getattr(cfg, "feas_field_priors", False)) and bool(cfg.use_det_motion_head) and dyn_steps > 0
+            self.drivable_field_head = DrivableFieldHead(
+                embed_dims=cfg.embed_dims, bev_h=cfg.bev_h, bev_w=cfg.bev_w,
+                hidden=int(getattr(cfg, "feas_hidden", 128)),
+                clip=float(getattr(cfg, "feas_clip", 8.0)),
+                dyn_steps=dyn_steps,
+                prior_channels=int(self.field_prior_seg) + (dyn_steps if self.field_prior_dyn else 0),
+            )
+
+        # Stage 2 (refine.py): refine only the candidate the selector picked.  Needs the predicted
+        # field, so it is built only alongside the field head.
+        self.refiner = None
+        if bool(getattr(cfg, "refine_enable", False)):
+            if self.drivable_field_head is None:
+                raise ValueError("refine_enable needs the field head (feas_weight > 0)")
+            from .refine import SelectedRefiner
+
+            self.refiner = SelectedRefiner(cfg.embed_dims, cfg.map_pc_range,
+                                           fut_ts=int(cfg.trajectory_sampling.num_poses),
+                                           hidden=int(getattr(cfg, "refine_hidden", 256)))
 
         # set by the loss when a GradBalancer is active
         self.aux_grad_scale: Dict[str, float] = {"det": 1.0, "map": 1.0}
@@ -291,11 +350,6 @@ class ParaSSRModel(nn.Module):
                     module.eval()
                 if not self._backbone_norm_requires_grad:
                     module.requires_grad_(False)
-
-    def train(self, mode: bool = True) -> "ParaSSRModel":
-        super().train(mode)
-        self._apply_backbone_train_policy()
-        return self
 
     # ------------------------------------------------------------------ #
     def extract_img_feat(self, img: torch.Tensor) -> List[torch.Tensor]:
@@ -364,6 +418,53 @@ class ParaSSRModel(nn.Module):
             torch.set_autocast_cache_enabled(was_cache_enabled)
             self.train(was_training)
 
+    SCORE_HEAD_PREFIXES = ("pts_bbox_head.anchor_planner.reward_head.",
+                           "pts_bbox_head.anchor_planner.sim_reward_heads.",
+                           "pts_bbox_head.anchor_planner.offset_embed.")
+
+    REFINER_PREFIXES = ("refiner.",)
+
+    def _trainable_prefixes(self):
+        if bool(getattr(self._config, "finetune_score_only", False)):
+            return self.SCORE_HEAD_PREFIXES
+        if bool(getattr(self._config, "finetune_refiner_only", False)):
+            return self.REFINER_PREFIXES
+        return None
+
+    def freeze_all_but_score_heads(self) -> int:
+        """finetune_score_only: only the selection's score heads learn.  Returns the trainable count."""
+        return self.freeze_all_but(self.SCORE_HEAD_PREFIXES)
+
+    def freeze_all_but(self, prefixes) -> int:
+        n = 0
+        for name, p in self.named_parameters():
+            p.requires_grad_(name.startswith(tuple(prefixes)))
+            n += p.numel() if p.requires_grad else 0
+        return n
+
+    def train(self, mode: bool = True) -> "ParaSSRModel":
+        # One override only: a second ``def train`` silently replaced the backbone policy
+        # (frozen stages / BatchNorm kept in eval) when finetune_* was added.
+        super().train(mode)
+        self._apply_backbone_train_policy()
+        prefixes = self._trainable_prefixes()
+        if mode and prefixes:
+            # frozen parts stay in eval mode: BatchNorm statistics and dropout must not drift either
+            for name, m in self.named_modules():
+                if name and not any((name + ".").startswith(p) or p.startswith(name + ".") for p in prefixes):
+                    m.eval()
+        return self
+
+    def _field_priors(self, det_out, seg_logits):
+        if not (getattr(self, "field_prior_seg", False) or getattr(self, "field_prior_dyn", False)):
+            return None
+        from .feasibility import field_priors
+        cfg = self._config
+        return field_priors(det_out if self.field_prior_dyn else None,
+                            seg_logits if self.field_prior_seg else None, cfg, cfg.bev_h, cfg.bev_w,
+                            self.drivable_field_head.dyn_steps if self.field_prior_dyn else 0,
+                            topk=int(getattr(cfg, "feas_prior_topk", 40)))
+
     # ------------------------------------------------------------------ #
     def forward(
         self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None
@@ -401,8 +502,16 @@ class ParaSSRModel(nn.Module):
             self.map_head(bev_embed, return_hidden=self.use_task_interaction)
             if run_heads and self.map_head is not None else None
         )
+        seg_logits, seg_tokens = None, None
+        if run_heads and self.bev_seg_head is not None:
+            if self.map_head_type == "seg" and self.use_task_interaction:
+                seg_logits, seg_tokens = self.bev_seg_head(bev_embed, return_hidden=True)
+            else:
+                seg_logits = self.bev_seg_head(bev_embed)
+        # in seg mode the token view stands in for the vector head's instances -- planner only
+        planner_map_out = map_out if map_out is not None else seg_tokens
         outs = self.pts_bbox_head.plan_from_bev(
-            bev_embed, features["command"], det_out, map_out,
+            bev_embed, features["command"], det_out, planner_map_out,
             # The cached status is command + (vx, vy, ax, ay) in NAVSIM's
             # native ego axes and metric units. Command has its own embedding.
             ego_status=features["status_feature"][:, cfg.num_navi_cmd:],
@@ -410,6 +519,10 @@ class ParaSSRModel(nn.Module):
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,
             "ego_fut_preds": outs["ego_fut_preds"],
+            **({"drivable_seg_logits": seg_logits} if seg_logits is not None else {}),
+            **(dict(zip(("drivable_sdf_pred", "agent_sdf_pred"),
+                        self.drivable_field_head(bev_embed, self._field_priors(det_out, seg_logits))))
+               if run_heads and self.drivable_field_head is not None else {}),
             "trajectory": self.pts_bbox_head.select_trajectory(
                 outs["ego_fut_preds"], features["command"]
             ),
@@ -419,6 +532,17 @@ class ParaSSRModel(nn.Module):
                 "trajectory", "plan_topk_trajectory", "plan_topk_reward", "plan_topk_index",
                 "plan_final_rewards", "trajectory_offset", "im_rewards", "sim_rewards", "trajectory_anchors")})
             predictions.update({k: v for k, v in outs.items() if k.startswith("plan_rescore_")})
+            if not self.training and bool(getattr(cfg, "feas_select_gate", False)):
+                # Re-select by reading the corridor field itself, not the head that copied it.
+                from .feasibility import field_gate_select
+                predictions.update(field_gate_select(predictions, cfg))
+            # stage 1's planner queries, detached: stage 2 reads them but must not move stage 1
+            predictions["plan_query"] = outs["scene_query"].transpose(0, 1).detach()
+            if (self.refiner is not None and not self.training and "drivable_sdf_pred" in predictions
+                    and bool(getattr(cfg, "refine_apply", True))):
+                from .refine import refine_select
+                status = features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4]
+                predictions.update(refine_select(self.refiner, predictions, predictions["plan_query"], status, cfg))
         if getattr(cfg, "heading_from_path", False) and not self.training:
             predictions["trajectory"] = heading_from_path(predictions["trajectory"])
         if getattr(cfg, "kinematic_projection", False) and not self.training:

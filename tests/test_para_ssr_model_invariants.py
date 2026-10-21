@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 import timm
 import torch
 import torch.nn as nn
@@ -192,6 +193,8 @@ def test_grid_mask_mode_one_retained_fraction_and_determinism():
 def test_timm_backbone_freeze_and_norm_eval_survive_train_call():
     model = ParaSSRModel.__new__(ParaSSRModel)
     nn.Module.__init__(model)
+    # train() reads the finetune_* switches from _config (v2-seg); none are set here.
+    model._config = SimpleNamespace()
     model._backbone_frozen_stages = 1
     model._backbone_norm_requires_grad = False
     model._backbone_norm_eval = True

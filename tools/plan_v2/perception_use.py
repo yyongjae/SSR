@@ -129,6 +129,29 @@ def main():
             out[:, idx] = bev.mean(dim=1, keepdim=True)
         return out, len(idx)
 
+    def bev_masked_line(pts_ssr, margin=1.5):
+        """BEV cells within `margin` of a polyline (SSR frame) set to the mean.
+
+        The agent intervention removed the object from BOTH the det tokens and the BEV; the map
+        one only dropped the vector token, so 'the scorer ignores the map' was never tested -- the
+        road could still be read off the BEV. This makes the two symmetric.
+        """
+        bev = captured["args"][0]
+        ys = (np.arange(H) + 0.5) / H * (y1 - y0) + y0
+        xs = (np.arange(W) + 0.5) / W * (x1 - x0) + x0
+        gx, gy = np.meshgrid(xs, ys)                                   # [H, W]
+        seg = np.stack([pts_ssr[:-1], pts_ssr[1:]], axis=1)            # [P-1, 2, 2]
+        d = np.full(gx.shape, 1e9, np.float32)
+        for a, b in seg:                                               # point-to-segment distance
+            ab = b - a
+            t = np.clip(((gx - a[0]) * ab[0] + (gy - a[1]) * ab[1]) / max(float(ab @ ab), 1e-6), 0, 1)
+            d = np.minimum(d, np.hypot(gx - (a[0] + t * ab[0]), gy - (a[1] + t * ab[1])))
+        idx = torch.as_tensor(np.flatnonzero(d.reshape(-1) <= margin), device=bev.device)
+        out = bev.clone()
+        if len(idx):
+            out[:, idx] = bev.mean(dim=1, keepdim=True)
+        return out, len(idx)
+
     def scores(bev=None, **e):
         edit.clear(); edit.update(e)
         a = list(captured["args"])
@@ -150,7 +173,7 @@ def main():
         tokens = list(np.random.default_rng(0).permutation(tokens)[: args.limit])
     dl = DataLoader(FeatureData(tokens, loader, agent.get_feature_builders()), batch_size=1, num_workers=3,
                     collate_fn=collate)
-    rows = {k: [] for k in ("global", "agent", "map", "placebo_agent", "placebo_map")}
+    rows = {k: [] for k in ("global", "agent", "map", "placebo_agent", "placebo_map", "choice")}
     t0, n = time.time(), 0
     for toks, feats, _ in dl:
         if feats is None:
@@ -174,14 +197,19 @@ def main():
         cand = [(agent_gaps(paths, boxes[q]), q) for q in np.flatnonzero(cls >= args.det_thr)]
         near = sorted([c for c in cand if (c[0] < args.conflict).sum() >= 3 and (c[0] > args.far).sum() >= 3],
                       key=lambda c: c[0].min())[: args.per_scene]
+        base_pick = int(base_out["plan_final_rewards"][0].float().argmax())
         for gaps, q in near:
             c, f = gaps < args.conflict, gaps > args.far
             bev_m, ncell = bev_masked(boxes[q])
             con = []
             for e in ({"det": [int(q)]}, {"bev": bev_m}, {"det": [int(q)], "bev": bev_m}):
-                s, _ = scores(**e)
+                s, out_e = scores(**e)
                 d = s - base
                 con += [d[0][c].mean() - d[0][f].mean(), d[3][c].mean() - d[3][f].mean()]
+                if e.get("det") and e.get("bev") is not None:   # the full removal: does the CHOICE move?
+                    new_pick = int(out_e["plan_final_rewards"][0].float().argmax())
+                    rows["choice"].append((toks[0], int(q), base_pick, new_pick,
+                                           float(gaps[base_pick]), float(gaps[new_pick])))
             rows["agent"].append((toks[0], int(q), float(cls[q]), int(c.sum()), *con,
                                   base[0][c].mean(), base[3][c].mean(), ncell))
         far_agents = [q for g, q in cand if g.min() > 2 * args.far]
@@ -199,12 +227,19 @@ def main():
         mc = [(map_gaps(paths, mpts[v]), v) for v in roads]
         cross = sorted([c for c in mc if (c[0] < 0.25).sum() >= 3 and (c[0] > 5.0).sum() >= 3],
                        key=lambda c: -(c[0] < 0.25).sum())[: args.per_scene]
+        mpts_ssr = map_out["all_map_pts_preds"][-1][0].float().cpu().numpy().copy()
+        mpts_ssr[..., 0] = mpts_ssr[..., 0] * (x1 - x0) + x0
+        mpts_ssr[..., 1] = mpts_ssr[..., 1] * (y1 - y0) + y0
         for gaps, v in cross:
-            s, _ = scores(map=[int(v)])
-            d = s - base
             c, f = gaps < 0.25, gaps > 5.0
+            con = []
+            bev_m, ncell = bev_masked_line(mpts_ssr[v])
+            for e in ({"map": [int(v)]}, {"bev": bev_m}, {"map": [int(v)], "bev": bev_m}):
+                s, _ = scores(**e)
+                d = s - base
+                con.append(d[1][c].mean() - d[1][f].mean())
             rows["map"].append((toks[0], int(v), float(mcls[v, ROAD]), int(c.sum()),
-                                d[1][c].mean() - d[1][f].mean(), base[1][c].mean(), base[1][f].mean()))
+                                *con, base[1][c].mean(), base[1][f].mean(), ncell))
         far_roads = [v for g, v in mc if g.min() > 10.0]
         if far_roads:
             s, _ = scores(map=[int(far_roads[0])])
@@ -243,8 +278,10 @@ def report(rows):
         print(f"  위약(먼 차량 제거) 평균 |d| NC {p[:, 0].mean():.4f} TTC {p[:, 1].mean():.4f}")
     m = np.array([r[4:] for r in rows["map"]], dtype=float)
     if len(m):
-        print(f"road 경계 하나 제거 (n={len(m)}): 가로지르는 후보 - 먼 후보 DAC 변화 대비 {m[:, 0].mean():+.4f}"
-              f" (>0.02 {100 * (m[:, 0] > 0.02).mean():.0f}%)  | 원래 예측 DAC 가로지름 {m[:, 1].mean():.3f} / 먼 {m[:, 2].mean():.3f}")
+        print(f"road 경계 하나 제거 (n={len(m)}): 가로지르는 후보 - 먼 후보 DAC 변화 대비")
+        for i, what in enumerate(("map token 만", "BEV 칸만", "둘 다")):
+            print(f"  {what:12s} {m[:, i].mean():+.4f}  (>0.02 {100 * (m[:, i] > 0.02).mean():4.1f}%)")
+        print(f"  (원래 예측 DAC 가로지름 {m[:, 3].mean():.3f} / 먼 {m[:, 4].mean():.3f}; 가린 BEV 칸 평균 {m[:, 5].mean():.0f}개)")
     q = np.array([r[1] for r in rows["placebo_map"]], dtype=float)
     if len(q):
         print(f"  위약(먼 road 경계 제거) 평균 |d| DAC {q.mean():.4f}")

@@ -45,7 +45,10 @@ def test_weighted_reward_is_wote_formula(anchor_file):
     sim = torch.rand(2, 5, K) * 0.9 + 0.05
     nc, dac, ep, ttc, c = sim.unbind(1)
     ref = 0.1 * im.log() + 0.5 * nc.log() + 0.5 * dac.log() + 1.0 * (5 * ttc + 2 * c + 5 * ep).log()
-    assert torch.allclose(m.weighted_reward(im, sim), ref, atol=1e-4)
+    # weighted_reward returns (final, ungated); in the default wote / weighted mode both are the formula.
+    final, ungated = m.weighted_reward(im, sim)
+    assert torch.allclose(final, ref, atol=1e-4)
+    assert torch.allclose(ungated, ref, atol=1e-4)
     assert SIM_KEYS == ("no_at_fault_collisions", "drivable_area_compliance", "ego_progress",
                         "time_to_collision_within_bound", "comfort")
 

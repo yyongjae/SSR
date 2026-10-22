@@ -470,13 +470,22 @@ class TrajectoryAnchorDistillation(nn.Module):
                             cliff_boost.scatter_reduce_(1, idx_fast, cliff, reduce="amax", include_self=True)
                             risk_factor = risk_factor + 0.5 * cliff_boost
                     else:
-                        # v11/v12/v13/v14 Fix 3 (MAP): Explore anchors that cross road/lane drivable area boundaries (1 - DAC).
-                        s_map = dac
+                        # v11/v12/v13/v14 Fix 3 (MAP): Explore anchors that cross road/lane drivable area boundaries (1 - DAC),
+                        # plus in v14: Lane Keeping (LK, slot 3) & Driving Direction Compliance (DDC, slot 4).
+                        if self.version == "v14":
+                            lk = sim_reward[:, 3, :].to(device=dist.device, dtype=dist.dtype).clamp(0.0, 1.0)
+                            ddc = sim_reward[:, 4, :].to(device=dist.device, dtype=dist.dtype).clamp(0.0, 1.0)
+                            s_map = (dac * ddc * (0.4 + 0.6 * lk)).clamp(0.0, 1.0)
+                        else:
+                            s_map = dac
                         risk_factor = 1.0 - s_map
                         if self.version in ("v12", "v13", "v14") and self.sibling_pairs is not None and self.sibling_pairs.numel() > 0:
                             pairs = self.sibling_pairs.to(device=dist.device)
                             i_slow, j_fast = pairs[:, 0], pairs[:, 1]
-                            cliff = (s_map[:, i_slow] - s_map[:, j_fast]).relu()
+                            if self.version == "v14":
+                                cliff = (s_map[:, i_slow] - s_map[:, j_fast]).abs()
+                            else:
+                                cliff = (s_map[:, i_slow] - s_map[:, j_fast]).relu()
                             cliff_boost = torch.zeros_like(s_map)
                             idx_slow = i_slow.unsqueeze(0).expand(bs, -1)
                             idx_fast = j_fast.unsqueeze(0).expand(bs, -1)
@@ -576,6 +585,11 @@ class TrajectoryAnchorDistillation(nn.Module):
                 if domain == "bevfusion":
                     s_b = (nc * ttc).clamp(0.0, 1.0)
                     cliff_b = (s_b[:, i_slow] - s_b[:, j_fast]).relu() * dac[:, j_fast]
+                elif self.version == "v14":
+                    lk = sim_reward[:, 3, :].to(device=student_feat.device, dtype=student_feat.dtype).clamp(0.0, 1.0)
+                    ddc = sim_reward[:, 4, :].to(device=student_feat.device, dtype=student_feat.dtype).clamp(0.0, 1.0)
+                    s_b = (dac * ddc * (0.4 + 0.6 * lk)).clamp(0.0, 1.0)
+                    cliff_b = (s_b[:, i_slow] - s_b[:, j_fast]).abs()
                 else:
                     s_b = dac
                     cliff_b = (s_b[:, i_slow] - s_b[:, j_fast]).relu()
@@ -666,6 +680,93 @@ class TrajectoryAnchorDistillation(nn.Module):
         v = ((y_ssr - y_min) / (y_max - y_min) * 2.0 - 1.0).clamp(-1.0, 1.0)
         return torch.stack([u, v], dim=-1)
 
+    @torch.no_grad()
+    def _compute_map_epdms_targets(
+        self,
+        trajectory_anchors: torch.Tensor,
+        gt_map_pts: Optional[torch.Tensor],
+        gt_map_labels: Optional[torch.Tensor],
+        gt_map_valid: Optional[torch.Tensor],
+        bs: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """v14 Fix 5: Compute per-anchor EPDMS Lane Keeping (LK) & Driving Direction Compliance (DDC)
+        targets [B, K] and a normalized BEV Centerline + Road-Boundary geometry splat [B, HW] directly
+        from gt_map_pts[:, :, 0, :, :] (order 0 = canonical forward direction).
+        """
+        if (
+            gt_map_pts is None
+            or gt_map_labels is None
+            or gt_map_valid is None
+            or gt_map_pts.numel() == 0
+            or gt_map_pts.size(0) != bs
+        ):
+            return None, None, None
+
+        pts_norm = gt_map_pts[:, :, 0, :, :].to(device=device, dtype=torch.float32)  # [B, M, P, 2]
+        labels = gt_map_labels.to(device=device)
+        valid = gt_map_valid.to(device=device).bool()
+        _, m_max, n_pts, _ = pts_norm.shape
+        n_seg = n_pts - 1
+        k, t_steps, _ = trajectory_anchors.shape
+
+        x_min, y_min = float(self.pc_range[0]), float(self.pc_range[1])
+        x_max, y_max = float(self.pc_range[3]), float(self.pc_range[4])
+        x_ssr = x_min + (x_max - x_min) * pts_norm[..., 0]
+        y_ssr = y_min + (y_max - y_min) * pts_norm[..., 1]
+        # Convert to NAVSIM ego frame: x_fwd = y_ssr, y_left = -x_ssr
+        cl_xy = torch.stack([y_ssr, -x_ssr], dim=-1)  # [B, M, P, 2]
+
+        # 1. Exact point-to-segment projection onto centerline segments (label == 2)
+        p0 = cl_xy[:, :, :-1, :].reshape(bs, 1, m_max * n_seg, 2)
+        p1 = cl_xy[:, :, 1:, :].reshape(bs, 1, m_max * n_seg, 2)
+        seg_v = p1 - p0
+        seg_len2 = (seg_v * seg_v).sum(dim=-1).clamp_min(1e-6)  # [B, 1, MS]
+        seg_tan = seg_v / seg_len2.sqrt().unsqueeze(-1)         # [B, 1, MS, 2]
+
+        is_cl = (labels == 2) & valid                           # [B, M]
+        has_cl = is_cl.any(dim=1)                               # [B]
+        cl_mask = is_cl.unsqueeze(-1).expand(bs, m_max, n_seg).reshape(bs, 1, m_max * n_seg)  # [B, 1, MS]
+
+        anc = trajectory_anchors.to(device=device, dtype=torch.float32)
+        a_xy = anc[..., :2].reshape(1, k * t_steps, 1, 2)       # [1, KT, 1, 2]
+        a_hd = anc[..., 2]
+        a_dir = torch.stack([torch.cos(a_hd), torch.sin(a_hd)], dim=-1).reshape(1, k * t_steps, 1, 2)
+
+        in_patch = ((anc[..., 0] >= y_min) & (anc[..., 0] <= y_max - 0.5) & (anc[..., 1].abs() <= x_max - 0.5)).float()
+        step_w = in_patch / in_patch.sum(dim=-1, keepdim=True).clamp_min(1.0)  # [K, T]
+
+        rel = a_xy - p0                                         # [B, KT, MS, 2]
+        alpha = ((rel * seg_v).sum(dim=-1) / seg_len2).clamp(0.0, 1.0)
+        proj = p0 + alpha.unsqueeze(-1) * seg_v
+        dist = (a_xy - proj).norm(dim=-1)                       # [B, KT, MS]
+        cos_dir = (a_dir * seg_tan).sum(dim=-1)                 # [B, KT, MS]
+        dist_valid = torch.where(cl_mask, dist, torch.full_like(dist, 1e4))
+
+        # Per-anchor LK (Lane Keeping): distance to nearest direction-compatible centerline segment (sigma = 0.5m)
+        compat_mask = cl_mask & (cos_dir > 0.25)
+        has_compat = compat_mask.any(dim=-1, keepdim=True)
+        dist_compat = torch.where(compat_mask, dist, torch.full_like(dist, 1e4))
+        min_d_lk = torch.where(has_compat, dist_compat, dist_valid).min(dim=-1).values.view(bs, k, t_steps)
+        step_lk = torch.exp(-0.5 * (min_d_lk / 0.50).pow(2))
+        s_lk = (step_lk * step_w.unsqueeze(0)).sum(dim=-1)      # [B, K]
+
+        # Per-anchor DDC (Driving Direction Compliance): best tangent cosine within 1.2m (or nearest segment)
+        near_mask = cl_mask & (dist < 1.2)
+        has_near = near_mask.any(dim=-1, keepdim=True)
+        cos_near = torch.where(near_mask, cos_dir, torch.full_like(cos_dir, -1e4)).max(dim=-1).values
+        nearest_idx = dist_valid.argmin(dim=-1, keepdim=True)
+        cos_nearest = torch.gather(cos_dir, -1, nearest_idx).squeeze(-1)
+        best_cos = torch.where(has_near.squeeze(-1), cos_near, cos_nearest).view(bs, k, t_steps)
+        step_ddc = torch.sigmoid((best_cos + 0.10) / 0.15)
+        s_ddc = (step_ddc * step_w.unsqueeze(0)).sum(dim=-1)    # [B, K]
+
+        s_lk = torch.where(has_cl.unsqueeze(-1), s_lk, torch.ones_like(s_lk)).to(dtype=dtype)
+        s_ddc = torch.where(has_cl.unsqueeze(-1), s_ddc, torch.ones_like(s_ddc)).to(dtype=dtype)
+
+        return s_lk, s_ddc, None
+
     def forward(
         self,
         student_bev: torch.Tensor,
@@ -677,6 +778,9 @@ class TrajectoryAnchorDistillation(nn.Module):
         bev_pos: Optional[torch.Tensor] = None,
         sim_reward: Optional[torch.Tensor] = None,
         sim_reward_valid: Optional[torch.Tensor] = None,
+        gt_map_pts: Optional[torch.Tensor] = None,
+        gt_map_labels: Optional[torch.Tensor] = None,
+        gt_map_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Compute trajectory-anchor interaction distillation loss.
 
@@ -765,9 +869,33 @@ class TrajectoryAnchorDistillation(nn.Module):
                 self.last_probe_unit_losses = {}
                 tkey = {"bevfusion": "det", "resmap": "map"}
 
+                s_lk_map, s_ddc_map, m_geom_map = (None, None, None)
+                if self.version == "v14":
+                    s_lk_map, s_ddc_map, m_geom_map = self._compute_map_epdms_targets(
+                        trajectory_anchors, gt_map_pts, gt_map_labels, gt_map_valid, bs, device, dtype
+                    )
+                    if s_lk_map is not None:
+                        metrics["distill/map_s_lk_mean"] = s_lk_map.mean().detach()
+                    if s_ddc_map is not None:
+                        metrics["distill/map_s_ddc_mean"] = s_ddc_map.mean().detach()
+
                 for bank, name in enumerate(names):
                     probe = self.probes[bank]
                     t_bev = teacher_by_bank[bank].detach()
+                    sim_reward_b = sim_reward
+                    if (
+                        self.version == "v14"
+                        and name == "resmap"
+                        and sim_reward is not None
+                        and sim_reward.dim() >= 3
+                        and sim_reward.size(-1) == k
+                        and s_lk_map is not None
+                        and s_ddc_map is not None
+                    ):
+                        # v14 Fix 5: Populate unused slots 3 and 4 of resmap sim_reward with EPDMS LK & DDC targets
+                        sim_reward_b = sim_reward.clone()
+                        sim_reward_b[:, 3, :] = s_lk_map.to(device=sim_reward.device, dtype=sim_reward.dtype)
+                        sim_reward_b[:, 4, :] = s_ddc_map.to(device=sim_reward.device, dtype=sim_reward.dtype)
                     if self.version in ("v10", "v11", "v12", "v13", "v14"):
                         zm = getattr(self, f"z_mean_{bank}", None)
                         zs = getattr(self, f"z_std_{bank}", None)
@@ -802,7 +930,7 @@ class TrajectoryAnchorDistillation(nn.Module):
                         preds_t,
                         trajectory_anchors,
                         gt_trajectory=gt_trajectory,
-                        sim_reward=sim_reward,
+                        sim_reward=sim_reward_b,
                         sim_reward_valid=sim_reward_valid,
                         sibling_pairs=self.sibling_pairs if self.version in ("v12", "v13", "v14") else None,
                     )
@@ -811,12 +939,13 @@ class TrajectoryAnchorDistillation(nn.Module):
 
                     domain_scale = self.resmap_scale if name == "resmap" else 1.0
                     if self.version == "v14":
-                        # v14 Fix 1 + Fix 2 + Fix 3 + Fix 4 (docs/bev_selector_v14.md):
+                        # v14 Fix 1 + Fix 2 + Fix 3 + Fix 4 + Fix 5 (docs/bev_selector_v14.md):
                         # - Fix 1: Dual-Stream Decoupled Gradient Controller (Grid ratio=0.09, cap=0.22 + Probe ratio=0.025, cap=0.06)
                         # - Fix 2: Stop-Grad Adapter Isolation (s_bev_probe detaches proj.weight/bias so student_proj is trained 100% by Grid KD at lr_mult=3.0)
                         # - Fix 3: Prune dead 5x5 AvgPool loss (g_BEV=0.00012) -> High-Res 85% 1x1 Cell + 15% 3x3 Edge Grid KD
                         # - Fix 4: Domain-Specific Spatial Ribbon Shaping (DET keeps far-field row_gain in [1.0, 1.5] & w_pgp in [0.75, 2.30];
-                        #          MAP uses unskewed row_gain=1.0 to preserve 0..18m intersection curbs & raised floor w_pgp = 0.85 + 0.15*m_cap_norm)
+                        #          MAP uses unskewed row_gain=1.0 to preserve 0..18m intersection curbs & raised floor w_pgp = 0.85 + 0.15*m_map)
+                        # - Fix 5: EPDMS-Grounded Map Supervision (LK + DDC in P_map sim_head/cliff_loss/w_risk/sibling_diff + Centerline/Boundary m_geom splat)
                         from ..ck.bev_kd_arm import GradScale
                         tk = tkey[name]
                         if self.probe_ratio_ctrl is not None and self.probe_ratio_ctrl[tk].n > 0:
@@ -836,7 +965,7 @@ class TrajectoryAnchorDistillation(nn.Module):
                         with torch.no_grad():
                             if gt_trajectory is not None and gt_trajectory.numel() > 0:
                                 weights_b, _, n_eff_b = self._compute_anchor_weights(
-                                    trajectory_anchors, gt_trajectory, sim_reward=sim_reward, domain=name,
+                                    trajectory_anchors, gt_trajectory, sim_reward=sim_reward_b, domain=name,
                                 )
                             else:
                                 weights_b = weights
@@ -859,7 +988,8 @@ class TrajectoryAnchorDistillation(nn.Module):
                             if name == "bevfusion":
                                 w_pgp = 0.75 + 0.25 * m_cap_norm
                             else:
-                                w_pgp = 0.85 + 0.15 * m_cap_norm
+                                m_map = 0.5 * m_cap_norm + 0.5 * m_geom_map if m_geom_map is not None else m_cap_norm
+                                w_pgp = 0.85 + 0.15 * m_map
                             metrics[f"distill/w_pgp_max/{name}"] = w_pgp.max(dim=-1).values.mean().detach()
                             metrics[f"distill/w_pgp_std/{name}"] = w_pgp.std(dim=-1).mean().detach()
                             metrics[f"distill/w_pgp_far/{name}"] = w_pgp[:, hw // 2:].mean().detach()
@@ -868,7 +998,7 @@ class TrajectoryAnchorDistillation(nn.Module):
                         attn_s, feat_s, preds_s = probe.forward_student(q.detach(), s_bev_probe, s_pos, bias)
                         feat_loss, bank_cos = self._feature_pair_loss(feat_s, feat_t.detach(), weights_b)
                         diff_loss, diff_cos = self._sibling_diff_loss(
-                            feat_s, feat_t.detach(), weights_b, sim_reward=sim_reward, domain=name
+                            feat_s, feat_t.detach(), weights_b, sim_reward=sim_reward_b, domain=name
                         )
                         kl_per_head = F.kl_div(
                             attn_s.clamp_min(1e-8).log(), attn_t.detach(), reduction="none"

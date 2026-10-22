@@ -656,6 +656,7 @@ class PlanningDistillation(nn.Module):
                 command=command, ego_status=ego_status, bev_pos=bev_pos,
                 sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
                 teacher_tokens=teacher_tokens,
+                gt_map_pts=gt_map_pts, gt_map_labels=gt_map_labels, gt_map_valid=gt_map_valid,
             )
         if teacher_tokens is not None:
             raise ValueError("teacher_tokens is only supported on the trajectory-anchor path")
@@ -801,6 +802,9 @@ class PlanningDistillation(nn.Module):
         sim_reward: Optional[torch.Tensor] = None,
         sim_reward_valid: Optional[torch.Tensor] = None,
         teacher_tokens: Optional[Sequence[torch.Tensor]] = None,
+        gt_map_pts: Optional[torch.Tensor] = None,
+        gt_map_labels: Optional[torch.Tensor] = None,
+        gt_map_valid: Optional[torch.Tensor] = None,
     ):
         if self.anchor_distill is None:
             raise RuntimeError("trajectory anchor distillation was not constructed")
@@ -819,6 +823,7 @@ class PlanningDistillation(nn.Module):
                 student_bev, teachers, trajectory_anchors,
                 gt_trajectory=gt_trajectory, command=command, ego_status=ego_status,
                 bev_pos=bev_pos, sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
+                gt_map_pts=gt_map_pts, gt_map_labels=gt_map_labels, gt_map_valid=gt_map_valid,
             )
         teachers = []
         for name in ("bevfusion", "resmap"):
@@ -835,6 +840,7 @@ class PlanningDistillation(nn.Module):
             student_bev, teachers, trajectory_anchors,
             gt_trajectory=gt_trajectory, command=command, ego_status=ego_status,
             bev_pos=bev_pos, sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
+            gt_map_pts=gt_map_pts, gt_map_labels=gt_map_labels, gt_map_valid=gt_map_valid,
         )
 
     def _selector_forward(

@@ -103,7 +103,13 @@ class PlanningGroundedProbe(nn.Module):
             nn.Linear(256, self.fut_ts * self.traj_dims),
         )
 
-        sim_mask = PROBE_SIM_Masks[self.domain]
+        if self.version == "v14" and self.domain == "resmap":
+            # v14 Fix 5 (EPDMS-Grounded Map Probe): Slots 3 and 4 of P_map.sim_head supervise
+            # per-anchor Lane Keeping (LK, weight 1.0) and Driving Direction Compliance (DDC, weight 0.75)
+            # alongside DAC (slot 1, weight 1.0) and EP (slot 2, weight 0.5).
+            sim_mask = (0.0, 1.0, 0.5, 1.0, 0.75)
+        else:
+            sim_mask = PROBE_SIM_Masks[self.domain]
         self.register_buffer("sim_mask", torch.tensor(sim_mask, dtype=torch.float32), persistent=False)
         self.im_weight = 0.2 if self.domain == "bevfusion" else 0.5
         self.offset_weight = 0.5
@@ -301,13 +307,29 @@ class PlanningGroundedProbe(nn.Module):
                 if self.domain == "bevfusion":
                     safe_t = (target[:, 0] * target[:, 3]).clamp(0.0, 1.0)
                     safe_z = 0.5 * (sim_logits[:, 0].float() + sim_logits[:, 3].float())
+                    cliff = (safe_t[:, i_slow] - safe_t[:, j_fast]).clamp(0.0, 1.0)
+                    active = (cliff > 0.25).float() * valid.view(bs, 1)
+                    c_w = active * cliff
+                    d_z = safe_z[:, i_slow] - safe_z[:, j_fast]
+                elif self.version == "v14":
+                    # v14 Fix 5 (EPDMS Map Cliff): Rank sibling anchors by composite Map Compliance
+                    # safe_t = DAC * DDC * (0.4 + 0.6 * LK) in both directions (|diff| > 0.20),
+                    # breaking the in-road DAC=1.0 tie so P_map distinguishes lane-centered vs drifting/oncoming siblings.
+                    safe_t = (target[:, 1] * target[:, 4] * (0.4 + 0.6 * target[:, 3])).clamp(0.0, 1.0)
+                    safe_z = (sim_logits[:, 1].float() + sim_logits[:, 3].float() + sim_logits[:, 4].float()) / 3.0
+                    diff_t = safe_t[:, i_slow] - safe_t[:, j_fast]
+                    cliff = diff_t.abs().clamp(0.0, 1.0)
+                    active = (cliff > 0.20).float() * valid.view(bs, 1)
+                    c_w = active * cliff
+                    sign_t = torch.where(diff_t >= 0.0, 1.0, -1.0)
+                    d_z = sign_t * (safe_z[:, i_slow] - safe_z[:, j_fast])
                 else:
                     safe_t = target[:, 1].clamp(0.0, 1.0)
                     safe_z = sim_logits[:, 1].float()
-                cliff = (safe_t[:, i_slow] - safe_t[:, j_fast]).clamp(0.0, 1.0)
-                active = (cliff > 0.25).float() * valid.view(bs, 1)
-                c_w = active * cliff
-                d_z = safe_z[:, i_slow] - safe_z[:, j_fast]
+                    cliff = (safe_t[:, i_slow] - safe_t[:, j_fast]).clamp(0.0, 1.0)
+                    active = (cliff > 0.25).float() * valid.view(bs, 1)
+                    c_w = active * cliff
+                    d_z = safe_z[:, i_slow] - safe_z[:, j_fast]
                 cliff_loss = ((c_w * F.softplus(1.0 - d_z)).sum() / c_w.sum().clamp_min(1.0)).to(dtype=dtype)
                 metrics[f"probe/{tag}/cliff_loss"] = cliff_loss.detach()
 
@@ -318,6 +340,9 @@ class PlanningGroundedProbe(nn.Module):
                     metrics["probe/det/ttc_err"] = (probs[:, 3] - target[:, 3]).abs().mean()
                 else:
                     metrics["probe/map/dac_err"] = (probs[:, 1] - target[:, 1]).abs().mean()
+                    if self.version == "v14":
+                        metrics["probe/map/lk_err"] = (probs[:, 3] - target[:, 3]).abs().mean()
+                        metrics["probe/map/ddc_err"] = (probs[:, 4] - target[:, 4]).abs().mean()
         else:
             sim_loss = zero_touch
 

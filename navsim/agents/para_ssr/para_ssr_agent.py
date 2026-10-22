@@ -726,7 +726,9 @@ class ParaSSRAgent(AbstractAgent):
         bev_pos = head.positional_encoding(mask).to(bev.dtype).flatten(2).transpose(1, 2)
         inputs = dict(student_bev=bev, tokens=list(targets["scene_token"]), trajectories=targets.get("trajectory"),
                       command=command, ego_status=status, bev_pos=bev_pos, sim_reward=targets.get("sim_reward"),
-                      sim_reward_valid=targets.get("sim_reward_valid"))
+                      sim_reward_valid=targets.get("sim_reward_valid"),
+                      gt_map_pts=targets.get("gt_map_pts"), gt_map_labels=targets.get("gt_map_labels"),
+                      gt_map_valid=targets.get("gt_map_valid"))
         out = {}
         anchors = predictions.get("trajectory_anchors")
         ad = getattr(distill, "anchor_distill", None)

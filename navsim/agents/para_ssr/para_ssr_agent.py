@@ -668,10 +668,11 @@ class ParaSSRAgent(AbstractAgent):
         if not any(bool(getattr(config, k, False))
                    for k in ("distill_selector_v6", "distill_selector_v7", "distill_selector_v8",
                              "distill_selector_v9", "distill_selector_v10", "distill_selector_v11",
-                             "distill_selector_v12", "distill_selector_v13", "distill_selector_v14")):
+                             "distill_selector_v12", "distill_selector_v13", "distill_selector_v14",
+                             "distill_selector_v15")):
             raise NotImplementedError(
                 "use_distill on this core supports only the trajectory-anchor path "
-                "(distill_selector_v6/v7/v8/v9/v10/v11/v12/v13/v14); the stage-1 adapter / corridor / "
+                "(distill_selector_v6/v7/v8/v9/v10/v11/v12/v13/v14/v15); the stage-1 adapter / corridor / "
                 "register-selector paths need aux_distill's own v2 port")
         anchor_file = getattr(config, "plan_anchor_file", None)
         if not getattr(config, "plan_anchor", False) or not anchor_file or not os.path.isfile(str(anchor_file)):
@@ -691,6 +692,7 @@ class ParaSSRAgent(AbstractAgent):
             or getattr(config, "distill_selector_v12", False)
             or getattr(config, "distill_selector_v13", False)
             or getattr(config, "distill_selector_v14", False)
+            or getattr(config, "distill_selector_v15", False)
         )
         trainable_prefix = "anchor_distill." if is_pgp else "anchor_distill.student_proj."
         for name, param in module.named_parameters():
@@ -728,7 +730,8 @@ class ParaSSRAgent(AbstractAgent):
                       command=command, ego_status=status, bev_pos=bev_pos, sim_reward=targets.get("sim_reward"),
                       sim_reward_valid=targets.get("sim_reward_valid"),
                       gt_map_pts=targets.get("gt_map_pts"), gt_map_labels=targets.get("gt_map_labels"),
-                      gt_map_valid=targets.get("gt_map_valid"))
+                      gt_map_valid=targets.get("gt_map_valid"),
+                      plan_topk_trajectory=predictions.get("plan_topk_trajectory"))
         out = {}
         anchors = predictions.get("trajectory_anchors")
         ad = getattr(distill, "anchor_distill", None)
@@ -1136,6 +1139,7 @@ class ParaSSRAgent(AbstractAgent):
                     or getattr(cfg, "distill_selector_v12", False)
                     or getattr(cfg, "distill_selector_v13", False)
                     or getattr(cfg, "distill_selector_v14", False)
+                    or getattr(cfg, "distill_selector_v15", False)
                 ):
                     proj_mult = float(getattr(cfg, "distill_proj_lr_mult", 2.0))
                     groups.append({

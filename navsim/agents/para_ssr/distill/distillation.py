@@ -141,6 +141,7 @@ class PlanningDistillation(nn.Module):
         selector_v12: bool = False,
         selector_v13: bool = False,
         selector_v14: bool = False,
+        selector_v15: bool = False,
         spatial_sigma: float = 4.0,
         spatial_sigmas: Optional[Sequence[float]] = None,
         lambda_gt: float = 0.6,
@@ -224,6 +225,7 @@ class PlanningDistillation(nn.Module):
         self.selector_v12 = bool(selector_v12)
         self.selector_v13 = bool(selector_v13)
         self.selector_v14 = bool(selector_v14)
+        self.selector_v15 = bool(selector_v15)
         self.spatial_sigma = float(spatial_sigma)
         self.spatial_sigmas = tuple(float(s) for s in spatial_sigmas) if spatial_sigmas is not None else None
         self.lambda_gt = float(lambda_gt)
@@ -259,6 +261,7 @@ class PlanningDistillation(nn.Module):
             self.selector_v6 or self.selector_v7 or self.selector_v8
             or self.selector_v9 or self.selector_v10 or self.selector_v11
             or self.selector_v12 or self.selector_v13 or self.selector_v14
+            or self.selector_v15
         )
         if self.selector_mode or is_anchor:
             # Registers / Anchors replace the frozen adapter. Stage-1 checkpoints are not
@@ -345,7 +348,9 @@ class PlanningDistillation(nn.Module):
         if is_anchor:
             from .anchor_distill import TrajectoryAnchorDistillation
 
-            if self.selector_v14:
+            if self.selector_v15:
+                ver = "v15"
+            elif self.selector_v14:
                 ver = "v14"
             elif self.selector_v13:
                 ver = "v13"
@@ -634,6 +639,7 @@ class PlanningDistillation(nn.Module):
         sim_reward: Optional[torch.Tensor] = None,
         sim_reward_valid: Optional[torch.Tensor] = None,
         teacher_tokens: Optional[Sequence[torch.Tensor]] = None,
+        plan_topk_trajectory: Optional[torch.Tensor] = None,
     ):
         """``student_bev`` is ``[B, bev_h*bev_w, C]``; returns (losses, metrics).
 
@@ -650,6 +656,7 @@ class PlanningDistillation(nn.Module):
             or self.selector_v12
             or self.selector_v13
             or self.selector_v14
+            or self.selector_v15
         ):
             return self._anchor_forward(
                 student_bev, tokens, trajectory_anchors, trajectories,
@@ -657,6 +664,7 @@ class PlanningDistillation(nn.Module):
                 sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
                 teacher_tokens=teacher_tokens,
                 gt_map_pts=gt_map_pts, gt_map_labels=gt_map_labels, gt_map_valid=gt_map_valid,
+                plan_topk_trajectory=plan_topk_trajectory,
             )
         if teacher_tokens is not None:
             raise ValueError("teacher_tokens is only supported on the trajectory-anchor path")
@@ -805,6 +813,7 @@ class PlanningDistillation(nn.Module):
         gt_map_pts: Optional[torch.Tensor] = None,
         gt_map_labels: Optional[torch.Tensor] = None,
         gt_map_valid: Optional[torch.Tensor] = None,
+        plan_topk_trajectory: Optional[torch.Tensor] = None,
     ):
         if self.anchor_distill is None:
             raise RuntimeError("trajectory anchor distillation was not constructed")
@@ -824,6 +833,7 @@ class PlanningDistillation(nn.Module):
                 gt_trajectory=gt_trajectory, command=command, ego_status=ego_status,
                 bev_pos=bev_pos, sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
                 gt_map_pts=gt_map_pts, gt_map_labels=gt_map_labels, gt_map_valid=gt_map_valid,
+                plan_topk_trajectory=plan_topk_trajectory,
             )
         teachers = []
         for name in ("bevfusion", "resmap"):
@@ -841,6 +851,7 @@ class PlanningDistillation(nn.Module):
             gt_trajectory=gt_trajectory, command=command, ego_status=ego_status,
             bev_pos=bev_pos, sim_reward=sim_reward, sim_reward_valid=sim_reward_valid,
             gt_map_pts=gt_map_pts, gt_map_labels=gt_map_labels, gt_map_valid=gt_map_valid,
+            plan_topk_trajectory=plan_topk_trajectory,
         )
 
     def _selector_forward(
@@ -951,6 +962,7 @@ def build_planning_distillation(config):
         selector_v12=bool(getattr(config, "distill_selector_v12", False)),
         selector_v13=bool(getattr(config, "distill_selector_v13", False)),
         selector_v14=bool(getattr(config, "distill_selector_v14", False)),
+        selector_v15=bool(getattr(config, "distill_selector_v15", False)),
         spatial_sigma=float(getattr(config, "distill_spatial_sigma", 4.0)),
         spatial_sigmas=getattr(config, "distill_spatial_sigmas", (2.0, 4.0, 8.0, 16.0)),
         lambda_gt=float(getattr(config, "distill_lambda_gt", 0.6)),

@@ -71,10 +71,15 @@ class PlanningGroundedProbe(nn.Module):
         self.v_proj = nn.Linear(self.channels, self.channels)
         self.out_proj = nn.Linear(self.channels, self.channels)
 
-        # v10 Fix 3: Learnable per-head spatial distance bias gate gamma_h in (0.1, 2.0), initialized at 1.0
-        # 0.1 + 1.9 * sigmoid(theta_0) = 1.0  =>  sigmoid(theta_0) = 0.9 / 1.9  =>  theta_0 = log(0.9 / 1.0)
-        init_theta = math.log(0.9 / 1.0)
+        # v10 Fix 3: Learnable per-head spatial distance bias gate gamma_h
+        # - v10..v14: gamma_h in (0.1, 2.0), initialized at 1.0
+        # - v15: gamma_h in (0.2, 3.5), initialized at 1.25 for sharper corridor focus
+        if self.version == "v15":
+            init_theta = math.log(1.05 / 2.25)
+        else:
+            init_theta = math.log(0.9 / 1.0)
         self.bias_theta = nn.Parameter(torch.full((self.num_heads,), init_theta, dtype=torch.float32))
+        self._last_u_far: Optional[torch.Tensor] = None
 
         # v10 Fix 2: Post-attention FFN operating purely on BEV-attended features (no query skip shortcut)
         self.ffn_norm = nn.LayerNorm(self.channels)
@@ -103,8 +108,8 @@ class PlanningGroundedProbe(nn.Module):
             nn.Linear(256, self.fut_ts * self.traj_dims),
         )
 
-        if self.version == "v14" and self.domain == "resmap":
-            # v14 Fix 5 (EPDMS-Grounded Map Probe): Slots 3 and 4 of P_map.sim_head supervise
+        if self.version in ("v14", "v15") and self.domain == "resmap":
+            # v14/v15 Fix 5 (EPDMS-Grounded Map Probe): Slots 3 and 4 of P_map.sim_head supervise
             # per-anchor Lane Keeping (LK, weight 1.0) and Driving Direction Compliance (DDC, weight 0.75)
             # alongside DAC (slot 1, weight 1.0) and EP (slot 2, weight 0.5).
             sim_mask = (0.0, 1.0, 0.5, 1.0, 0.75)
@@ -134,8 +139,44 @@ class PlanningGroundedProbe(nn.Module):
             self.register_buffer(buf_name, param_dict[name].detach().clone(), persistent=False)
 
     def _gamma(self, theta: torch.Tensor) -> torch.Tensor:
-        """Map unconstrained theta [H] to bounded spatial bias scale gamma in (0.1, 2.0)."""
+        """Map unconstrained theta [H] to bounded spatial bias scale gamma."""
+        if self.version == "v15":
+            return 0.2 + 3.3 * torch.sigmoid(theta)
         return 0.1 + 1.9 * torch.sigmoid(theta)
+
+    @torch.no_grad()
+    def channel_importance(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """v15 Pillar 1: Per-channel subspace importance w_ch [1, 1, C] (mean == 1.0) from EMA K/V & Pre-LN."""
+        if self.use_ema:
+            ln_w = getattr(self, "ema__bev_norm__weight").detach().float()
+            k_w = getattr(self, "ema__k_proj__weight").detach().float()
+            v_w = getattr(self, "ema__v_proj__weight").detach().float()
+        else:
+            ln_w = self.bev_norm.weight.detach().float()
+            k_w = self.k_proj.weight.detach().float()
+            v_w = self.v_proj.weight.detach().float()
+        kv_norm = (k_w.pow(2).sum(dim=0) + v_w.pow(2).sum(dim=0)).clamp_min(1e-8).sqrt()
+        energy = ln_w.abs() * kv_norm
+        rel = (energy / energy.mean().clamp_min(1e-6)).clamp(0.4, 2.5)
+        rel = rel / rel.mean().clamp_min(1e-6)
+        w_ch = 0.70 + 0.30 * rel
+        return w_ch.view(1, 1, -1).to(device=device, dtype=dtype)
+
+    def compute_score_kd_loss(
+        self,
+        sim_logits_s: torch.Tensor,
+        sim_probs_t: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """v15 Pillar 5: Functional Safety Decision-Boundary Binary KL across domain-active reward slots."""
+        p_t = sim_probs_t.detach().float().clamp(1e-4, 1.0 - 1e-4)
+        z_s = sim_logits_s.float()
+        bce = F.binary_cross_entropy_with_logits(z_s, p_t, reduction="none")
+        ent = -(p_t * p_t.log() + (1.0 - p_t) * (1.0 - p_t).log())
+        bkl = (bce - ent).clamp_min(0.0)  # [B, 5, K]
+        mask = self.sim_mask.to(device=z_s.device, dtype=torch.float32).view(1, 5, 1)
+        per_anchor = (bkl * mask).sum(dim=1) / mask.sum().clamp_min(1.0)  # [B, K]
+        return (weights.float() * per_anchor).sum(dim=-1).mean().to(dtype=sim_logits_s.dtype)
 
     @torch.no_grad()
     def update_ema(self) -> None:
@@ -181,7 +222,12 @@ class PlanningGroundedProbe(nn.Module):
         logits = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale + gamma * spatial_bias
         attn = F.softmax(logits, dim=-1)  # [B, H, K, HW]
 
-        out = torch.matmul(attn, v_h).transpose(1, 2).contiguous().view(bs, k, c)
+        attn_v = torch.matmul(attn, v_h).transpose(1, 2).contiguous()  # [B, K, H, D]
+        if self.version == "v15" and self.num_heads >= 3:
+            self._last_u_far = attn_v[:, :, 1:3, :].reshape(bs, k, 2 * self.head_dim)
+        else:
+            self._last_u_far = None
+        out = attn_v.view(bs, k, c)
         feat = F.linear(out, params["out_proj.weight"], params["out_proj.bias"])
 
         # v10 Fix 2: Pure BEV post-attention representation (no additive q skip-connection)
@@ -205,6 +251,7 @@ class PlanningGroundedProbe(nn.Module):
 
         live_params = {name: p for name, p in self.named_parameters() if name in self._ema_names}
         attn_live, h_live, gamma_live = self._encode_with_params(q, t_bev, t_pos, spatial_bias, live_params)
+        u_far_live = self._last_u_far.detach() if self._last_u_far is not None else None
 
         # Prediction heads for domain-grounded planning loss
         bs, k, _ = h_live.shape
@@ -234,10 +281,18 @@ class PlanningGroundedProbe(nn.Module):
                 attn_t, h_t, _ = self._encode_with_params(
                     q.detach(), t_bev, t_pos, spatial_bias, ema_params
                 )
+                u_far_t = self._last_u_far.detach() if self._last_u_far is not None else None
+                if self.version == "v15":
+                    preds["sim_probs_ema"] = self.sim_head(h_t).permute(0, 2, 1).float().sigmoid().detach()
         else:
             attn_t = attn_live.detach()
             h_t = h_live.detach()
+            u_far_t = u_far_live
+            if self.version == "v15":
+                preds["sim_probs_ema"] = sim_logits.detach().float().sigmoid()
 
+        if u_far_t is not None:
+            preds["u_far"] = u_far_t
         return attn_t, h_t, preds
 
     def forward_student(
@@ -261,10 +316,23 @@ class PlanningGroundedProbe(nn.Module):
         attn_s, h_s, _ = self._encode_with_params(
             q.detach(), student_bev, bev_pos, spatial_bias, detached_params
         )
+        u_far_s = self._last_u_far
 
         with torch.no_grad():
             sim_s = self.sim_head(h_s.detach()).permute(0, 2, 1).sigmoid()
-        return attn_s, h_s, {"sim_probs": sim_s}
+        out_preds: Dict[str, torch.Tensor] = {"sim_probs": sim_s}
+        if self.version == "v15":
+            h_mid = F.relu(
+                F.linear(h_s, self.sim_head[0].weight.detach(), self.sim_head[0].bias.detach()),
+                inplace=False,
+            )
+            sim_logits_s = F.linear(
+                h_mid, self.sim_head[2].weight.detach(), self.sim_head[2].bias.detach()
+            ).permute(0, 2, 1)
+            out_preds["sim_logits_s"] = sim_logits_s
+            if u_far_s is not None:
+                out_preds["u_far"] = u_far_s
+        return attn_s, h_s, out_preds
 
     def compute_probe_loss(
         self,
@@ -301,7 +369,7 @@ class PlanningGroundedProbe(nn.Module):
             denom = (valid.sum() * mask.sum() * k).clamp_min(1.0)
             sim_loss = ((bce * mask * valid).sum() / denom).to(dtype=dtype) * 5.0
 
-            if self.version in ("v12", "v13", "v14") and sibling_pairs is not None and sibling_pairs.numel() > 0:
+            if self.version in ("v12", "v13", "v14", "v15") and sibling_pairs is not None and sibling_pairs.numel() > 0:
                 sib = sibling_pairs.to(device=device, dtype=torch.long)
                 i_slow, j_fast = sib[:, 0], sib[:, 1]
                 if self.domain == "bevfusion":
@@ -311,8 +379,8 @@ class PlanningGroundedProbe(nn.Module):
                     active = (cliff > 0.25).float() * valid.view(bs, 1)
                     c_w = active * cliff
                     d_z = safe_z[:, i_slow] - safe_z[:, j_fast]
-                elif self.version == "v14":
-                    # v14 Fix 5 (EPDMS Map Cliff): Rank sibling anchors by composite Map Compliance
+                elif self.version in ("v14", "v15"):
+                    # v14/v15 Fix 5 (EPDMS Map Cliff): Rank sibling anchors by composite Map Compliance
                     # safe_t = DAC * DDC * (0.4 + 0.6 * LK) in both directions (|diff| > 0.20),
                     # breaking the in-road DAC=1.0 tie so P_map distinguishes lane-centered vs drifting/oncoming siblings.
                     safe_t = (target[:, 1] * target[:, 4] * (0.4 + 0.6 * target[:, 3])).clamp(0.0, 1.0)
@@ -340,7 +408,7 @@ class PlanningGroundedProbe(nn.Module):
                     metrics["probe/det/ttc_err"] = (probs[:, 3] - target[:, 3]).abs().mean()
                 else:
                     metrics["probe/map/dac_err"] = (probs[:, 1] - target[:, 1]).abs().mean()
-                    if self.version == "v14":
+                    if self.version in ("v14", "v15"):
                         metrics["probe/map/lk_err"] = (probs[:, 3] - target[:, 3]).abs().mean()
                         metrics["probe/map/ddc_err"] = (probs[:, 4] - target[:, 4]).abs().mean()
         else:

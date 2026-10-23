@@ -251,7 +251,116 @@ $$\text{attn}_t = \text{Softmax}\!\left(\frac{Q K_t^{\top}}{\sqrt{d}} + \gamma\c
 
 ---
 
-## 6. 실행 명령어 (Launch Command)
+## 6. `fusion_v14_main` 최종 `navtest` ($N=12,146$) 다중 에폭 평가 결과
+
+### 6.1 최종 체크포인트 (`last.ckpt` / `Epoch 29`) 기준 베이스라인 비교
+
+[`eval_ep29/summary.md`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep29/summary.md) 기준, **`v14` (`last.ckpt`)는 `v13`에서 유일하게 `bevkd` 대비 열세였던 고-$\beta$ 구간의 `noim (β=1.0)` (`92.92%` $\rightarrow$ `93.17%`, `+0.25%p`)을 포함해 전 평가 행에서 `no_kd`, `bevkd`, `v12`, `v13`을 모두 경신**했습니다:
+
+| 평가 모드 / 행 (`last.ckpt`, `Epoch 29`) | `no_kd` | `ck2e2e_bevkd` (`1×1`) | `v12` | `v13` (`last`) | **★ `v14` (`last`, Ep 29)** | `v14` vs `v13` | `v14` vs `bevkd` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`v2` Base Planner** | `88.62` | `88.96` | `88.91` | `89.09` | **`89.10`** (`NC 99.02 / DAC 96.66 / TTC 96.06 / lead 6.89%`) | **`+0.01`** (`lead -0.72%p`) | **`+0.14`** |
+| **`v2_lat` (`v2` + CK2 측방 보정)** | `90.02` | `90.35` | `90.28` | **`90.53`** | `90.49` (`NC 99.15 / DAC 97.96 / TTC 96.43 / lead 6.56%`) | `-0.04` (`lead -0.28%p`) | **`+0.14`** |
+| **★ `default` ($\beta=0.5$, `set=all`, `lat=on`)** | `91.77` | `92.18` | `91.93` | `92.28` | **`92.35`** (`NC 99.11 / DAC 98.77 / EP 87.90 / TTC 95.74`) | **`+0.07`** | **`+0.17`** |
+| **`default` ($\beta=1.0$, `set=all`, `lat=on`)** | `91.85` | `92.17` | `92.06` | `92.23` | **`92.34`** (`NC 99.12 / DAC 98.69 / EP 87.96 / TTC 95.76`) | **`+0.11`** | **`+0.17`** |
+| **`noim` ($\beta=0.5$, `set=all`, `lat=on`)** | `91.79` | `92.20` | `92.04` | `92.36` | **`92.43`** (`NC 99.07 / DAC 98.85 / EP 88.14 / TTC 95.65`) | **`+0.07`** | **`+0.23`** |
+| **★ `noim` ($\beta=1.0$, `set=all`, `lat=on`)** | `92.66` | `93.10` | `93.04` | `92.92` | **`93.17`** (`NC 98.62 / DAC 98.70 / EP 91.21 / TTC 94.62`) | **`+0.25`** (`DAC +0.21`) | **`+0.07`** |
+| **`plugin` ($\beta=0.5$, `set=all`, `lat=on`)** | `91.92` | `92.29` | `92.11` | `92.37` | **`92.55`** (`NC 99.10 / DAC 98.96 / EP 88.01 / TTC 95.81`) | **`+0.18`** | **`+0.26`** |
+| **★ `plugin` ($\beta=1.0$, `set=all`, `lat=on`)** | `92.79` | `92.98` | `92.98` | `93.11` | **`93.31`** (`NC 98.69 / DAC 98.90 / EP 91.11 / TTC 94.81`) | **`+0.20`** (`DAC +0.14`) | **`+0.33`** |
+| **앞차 감속 `lead_fail` (`v2` / `v2_lat` / `default`)** | `8.21 / 7.72 / 9.21%` | `7.77 / 7.28 / 8.82%` | `8.05 / 7.83 / 9.81%` | `7.61 / 6.84 / 8.60%` | **`6.89%` / `6.56%` / `8.54%`** ($N=1,814$) | **`-0.72 / -0.28 / -0.06%p`** | **`-0.88 / -0.72 / -0.28%p`** |
+
+---
+
+### 6.2 후반부 에폭별 (`Epoch 20 ~ 29`) `navtest` ($N=12,146$) PDMS 전수 비교
+
+| 에폭 (체크포인트) | `v2` Base | `v2_lat` | **★ `default` ($\beta=0.5$) [세부 지표]** | `default` ($\beta=1.0$) | **`noim` ($\beta=0.5$)** | **★ `noim` ($\beta=1.0$)** | **`plugin` ($\beta=0.5$)** | **★ `plugin` ($\beta=1.0$)** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `ck2e2e_bevkd` (`last`) | `88.96` | `90.35` | `92.18` (`NC 98.84 / DAC 98.86 / TTC 95.36 / lead 8.82%`) | `92.17` | `92.20` | `93.10` | `92.29` | `92.98` |
+| `v13` 최고 에폭 (`Ep 22/23`) | `89.11` | `90.50` | `92.41` (`NC 99.14 / DAC 98.81 / TTC 96.23 / lead 7.50%`) | `92.33` | `92.44` | `93.11` | `92.50` | `93.19` |
+| **★ Ep 20** ([`eval_ep20`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep20/summary.md)) | `89.31` | `90.66` | **`92.44`** (`NC 99.12 /` **`DAC 99.00`** `/ TTC 96.02 /` **`lead 7.11%`**) | `92.36` | `92.51` | `93.25` | `92.46` | `93.26` |
+| **Ep 21** ([`eval_ep21`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep21/summary.md)) | `88.66` | `90.12` | `92.13` (`NC 99.08 / DAC 98.55 / TTC 95.83 / lead 9.81%`) | `92.13` | `92.23` | `93.04` | `92.32` | `93.11` |
+| **★ Ep 22** ([`eval_ep22`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep22/summary.md)) | `88.52` | `90.41` | `92.26` (`NC 99.16 / DAC 98.78 / TTC 96.13 / lead 7.72%`) | `92.25` | `92.41` | **`93.35`** 🏆 | `92.41` | **`93.45`** 🏆 |
+| **Ep 23** ([`eval_ep23`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep23/summary.md)) | `89.19` | `90.57` | `92.35` (`NC 98.93 /` **`DAC 99.00`** `/ TTC 95.11 / lead 9.81%`) | `92.29` | `92.43` | `92.95` | **`92.55`** 🏆 | `93.12` |
+| **★ Ep 24** ([`eval_ep24`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep24/summary.md)) | **`89.40`** 🏆 | **`90.70`** 🏆 | `92.38` (`NC 99.01 / DAC 98.80 / TTC 95.56 / lead 8.82%`) | `92.30` | `92.43` | `93.14` | `92.50` | `93.29` |
+| **★★ Ep 25** ([`eval_ep25`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep25/summary.md)) | `88.86` | `90.36` | **`92.46`** 🏆 (`NC 99.17 / DAC 98.77 / TTC 96.11 / lead 8.27%`) | **`92.43`** 🏆 | **`92.53`** 🏆 | `93.06` | `92.54` | `93.25` |
+| **Ep 26** ([`eval_ep26`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep26/summary.md)) | `88.85` | `90.38` | `92.24` (`NC 99.12 / DAC 98.62 / TTC 95.83 / lead 8.49%`) | `92.16` | `92.34` | `93.02` | `92.48` | `93.22` |
+| **Ep 27** ([`eval_ep27`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep27/summary.md)) | `88.97` | `90.34` | `92.32` (`NC 99.15 / DAC 98.72 / TTC 95.77 / lead 8.77%`) | `92.24` | `92.38` | `93.04` | `92.49` | `93.12` |
+| **Ep 28** ([`eval_ep28`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep28/summary.md)) | `89.16` | `90.46` | `92.36` (`NC 99.16 / DAC 98.76 / TTC 95.87 / lead 8.60%`) | `92.24` | `92.42` | `93.10` | `92.48` | `93.25` |
+| **★ Ep 29** ([`eval_ep29`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/eval_ep29/summary.md)) | `89.10` | `90.49` | **`92.35`** (`NC 99.11 / DAC 98.77 / TTC 95.74 / lead 8.54%`) | **`92.34`** | **`92.43`** | **`93.17`** | **`92.55`** 🏆 | **`93.31`** |
+
+---
+
+### 6.3 후반부 10개 에폭 (`Epoch 20 ~ 29`) 세부 Sub-metric 추이 및 목적별 Best Checkpoint
+
+| Epoch | `def(0.5)` PDMS | `def(0.5)` NC | `def(0.5)` DAC | `def(0.5)` EP | `def(0.5)` TTC | `def(0.5)` `lead_fail` | `v2` PDMS | `v2` NC | `v2` DAC | `v2` TTC | `v2` `lead_fail` |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`Ep 20`** | `92.44` | `99.12` | **`99.00`** | `87.54` | `96.02` | **`7.11%`** | `89.31` | `99.05` | `96.95` | `96.15` | `6.84%` |
+| **`Ep 21`** | `92.13` | `99.08` | `98.55` | `87.61` | `95.83` | `9.81%` | `88.66` | `98.98` | `96.44` | `95.88` | `8.49%` |
+| **`Ep 22`** | `92.26` | `99.16` | `98.78` | `87.29` | **`96.13`** | `7.72%` | `88.52` | `98.89` | `96.48` | `95.67` | `7.22%` |
+| **`Ep 23`** | `92.35` | `98.93` | **`99.00`** | **`88.32`** | `95.11` | `9.81%` | `89.19` | `98.87` | **`96.99`** | `95.55` | `8.16%` |
+| **`Ep 24`** | `92.38` | `99.01` | `98.80` | `88.14` | `95.56` | `8.82%` | **`89.40`** 🏆 | `98.95` | `96.89` | `96.04` | **`6.78%`** |
+| **`Ep 25`** | **`92.46`** 🏆 | **`99.17`** | `98.77` | `87.81` | `96.11` | `8.27%` | `88.86` | `98.98` | `96.48` | `95.98` | `7.11%` |
+| **`Ep 26`** | `92.24` | `99.12` | `98.62` | `87.81` | `95.83` | `8.49%` | `88.85` | `98.98` | `96.51` | `96.01` | `7.11%` |
+| **`Ep 27`** | `92.32` | `99.15` | `98.72` | `87.86` | `95.77` | `8.77%` | `88.97` | `98.98` | `96.60` | `96.02` | `7.33%` |
+| **`Ep 28`** | `92.36` | `99.16` | `98.76` | `87.86` | `95.87` | `8.60%` | `89.16` | **`99.06`** | `96.64` | **`96.26`** | `7.00%` |
+| **`Ep 29`** | `92.35` | `99.11` | `98.77` | `87.90` | `95.74` | `8.54%` | `89.10` | `99.02` | `96.66` | `96.06` | `6.89%` |
+
+- **수렴 안정성**: `Epoch 23 ~ 29` 7개 연속 에폭 동안 `default` ($\beta=0.5$)가 **`92.24% ~ 92.46%`**, `plugin` ($\beta=0.5$)가 **`92.48% ~ 92.55%`**의 좁고 높은 밴드 내에서 흔들림 없이 수렴했습니다.
+- **목적별 추천 체크포인트**:
+  - **Standard `default` ($\beta=0.5$ & $\beta=1.0$) 및 `noim` ($\beta=0.5$) 최고점**: [`epoch=025.ckpt`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/checkpoints/epoch=025.ckpt) (`default 0.5`: **`92.46%`**, `default 1.0`: **`92.43%`**, `noim 0.5`: **`92.53%`**, `NC 99.17%`, `TTC 96.11%`)
+  - **순수 `v2` Base / `v2_lat` 최고점**: [`epoch=024.ckpt`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/checkpoints/epoch=024.ckpt) (`v2`: **`89.40%`**, `v2_lat`: **`90.70%`**, `v2 lead_fail`: **`6.78%`**)
+  - **고-$\beta$ `noim` ($\beta=1.0$) / `plugin` ($\beta=1.0$) 최고점**: [`epoch=022.ckpt`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/checkpoints/epoch=022.ckpt) (`noim 1.0`: **`93.35%`**, `plugin 1.0`: **`93.45%`**)
+  - **전 모드 밸런스 최종 모델 (`last.ckpt`)**: [`last.ckpt`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/checkpoints/last.ckpt) (`Epoch 29`, 전 평가 행에서 `v13` 및 `bevkd` 상회)
+
+---
+
+## 7. `fusion_v14_main` 학습 로그 정밀 분석 및 차기 BEV Distillation 개선 방향 (`v15` 로드맵)
+
+### 7.1 `v13` vs `v14` 학습 텔레메트리(`wandb-summary.json`) 대조를 통한 병목 진단
+
+[`wandb-summary.json`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v14_main/train/wandb/latest-run/files/wandb-summary.json) 기준 `Epoch 29` 종료 시점의 Stream 1 (Grid KD) 및 Stream 2 (Probe KD) 지표를 `v13`과 1:1 비교하면 다음과 같은 **명확한 트레이드오프와 차기 개선 포인트**가 확인됩니다:
+
+| 구분 | 텔레메트리 지표 (`Epoch 29` 평균) | `fusion_v13_main` | **`fusion_v14_main`** | 진단 및 해석 |
+| :--- | :--- | :---: | :---: | :--- |
+| **Stream 1**<br>(Grid KD) | `distill_uniform_mse/resmap` | `0.59098` | **`0.56127`** (`-5.0%`) | `bevkd (0.534)`와의 격차를 절반 이상 해소 (`noim 1.0` `+0.25%p` 상승의 직접적 원인) |
+| | `distill_edge_3x3/resmap` | `0.24251` | **`0.22622`** (`-6.7%`) | 차선/연석 경계의 공간 1차 미분($\nabla_{x,y}$) 정밀도 대폭 향상 |
+| | `distill_global_5x5_cos/resmap` | `0.72822` | **`0.74525`** (`+0.017`) | `CK2` `M3b` 전역 문맥 토큰($5\times 5$ 풀링) 코사인 유사도 상승 |
+| | `distill_uniform_mse/bevfusion` | `0.77619` | **`0.77177`** | `DET` 전역 격자 복원 오차 감소 (`cell_mse`: `0.956 → 0.947`) |
+| **Stream 2**<br>(Probe KD) | `distill_cos/bevfusion` (`feat_loss`) | `0.85343` | **`0.65700`** (`-0.196`) | **어댑터 100% Stop-Grad로 인해 Probe 부분공간(`W_K, W_V`) 정렬도는 하락** |
+| | `distill_sibling_cos/bevfusion` | `0.76841` | **`0.58091`** (`-0.188`) | 속도 형제 차분 벡터 코사인 정렬도 하락 (`diff_loss`: `0.170 → 0.313`) |
+| | `loss_attn_bevfusion / resmap` | `2.220` / `2.681` | **`3.457` / `3.788`** | 어텐션 KL 발산 잔차 증가 |
+| | `probe/student_gap/bevfusion` | `0.06812` | **`0.10576`** | Teacher Probe와 Student Probe 간 예측 확률 차이 증가 |
+| **공간 집중도** | `probe/head_entropy/bevfusion & resmap` | `6.616` / `6.775` | **`6.615` / `6.668`** | 유효 어텐션 셀 수 $\exp(6.62) \approx \mathbf{745\text{개 셀}}$ (5,000셀 중 15%로 여전히 넓게 퍼짐) |
+
+- **핵심 통찰**: `v14`는 **Stream 1 (Grid KD)**을 독립시키고 어댑터(`student_proj`)를 Grid 전용으로 격리하여 **격자 복원력(`MAP MSE 0.591 → 0.561`)을 극대화**하는 데 성공했으나, 반대로 **Stream 2 (Probe KD)** 입장에서는 어댑터가 자신의 Key/Value 부분공간을 전혀 맞춰주지 않고 `probe_ratio_ctrl`(`0.025 * g_plan`, `lam_probe_det = 0.0446`)로 강하게 억제되면서 **앵커 관계형 특징(`feat_cos 0.657`, `sibling_cos 0.581`)이 충분히 수렴하지 못한 채 학습이 종료**되었습니다. 즉, Stream 2의 정렬도만 `v13` 수준(`cos > 0.85`)으로 함께 끌어올리면 BEV 표현력을 한 단계 더 도약시킬 여지가 남아 있습니다.
+
+---
+
+### 7.2 더 강력한 BEV 표현 학습을 위한 5대 차기 실험 방향 (`BEV Selector v15` 후보)
+
+1. **Subspace-Aware Adapter Alignment (`student_proj`의 등방성 L2 한계 극복)**
+   - **문제점**: `cell_1x1` (`(s_bev - t_bev)^2.mean()`)은 256개 모든 채널 방향을 동일한 가중치($1/256$)로 취급하는 등방성(Isotropic) L2 손실입니다. 반면 주행 안전(`NC, TTC, DAC, LK`)을 실제로 결정하는 정보는 Teacher Probe의 투영 행렬 $W_K, W_V$가 바라보는 하위 부분공간에 몰려 있습니다. `v14`처럼 `student_proj`에서 Probe 그래디언트를 0%로 완전히 끊으면, 어댑터가 주행 핵심 부분공간을 정렬하지 못해 `distill_cos`가 `0.657`에 머무릅니다.
+   - **개선안**: `student_proj.bias`는 `v14`처럼 Stop-Grad로 고정하여 평균 이동(Shift 왜곡)을 원천 차단하되, **`student_proj.weight`에는 완화된 스케일(예: `0.05 ~ 0.10` GradScale)의 Probe 그래디언트를 허용**하거나, Stream 1의 격자 손실 자체에 **Teacher Probe의 $W_K, W_V$ 에너지 가중치(Channel/Subspace Importance Weighting)**를 곱해주어 어댑터가 격자 복원과 Probe 부분공간 정렬을 동시에 달성하도록 만듭니다.
+
+2. **Multi-Horizon Segment Anchor Probing (4초 통짜 앵커의 시간축 평균 희석 해결)**
+   - **문제점**: 현재는 4.0초(연장 시 5.0초, 10개 웨이포인트) 앵커 전체를 **단 1개의 쿼리 토큰 $q_k$**로 묶어 프로빙합니다. 이 때문에 모든 앵커가 겹치고 특징 에너지가 강한 **근거리($0\text{--}8\text{m}$, $t=0.5\text{--}1.5\text{s}$) 특징이 어텐션 가중합을 지배**하고, 정작 속도 형제(`i_slow` vs `j_fast`)가 갈라지는 **원거리($15\text{--}30\text{m}$, $t=3.0\text{--}5.0\text{s}$) 장애물/곡률 특징이 평균에 희석**됩니다.
+   - **개선안**: 각 앵커를 단일 벡터가 아니라 **Near ($0.5\text{--}1.5\text{s}$) / Mid ($2.0\text{--}3.0\text{s}$) / Far ($3.5\text{--}5.0\text{s}$) 3개 구간 쿼리**로 분리하여 프로빙합니다. 특히 `sibling_diff_loss`를 전체 평균이 아닌 **Mid/Far 구간 특징 차분**에 집중하면 전방 제동 경계(`TTC` / `lead_fail`) 해상도를 훨씬 날카롭게 만들 수 있습니다.
+
+3. **On-Policy Dynamic Trajectory Probing (고정 256-앵커 + 학생 예측 `Top-K Refined` 궤적 결합)**
+   - **문제점**: 현재 Distillation은 정적 K-means 256개 앵커(`trajectory_anchors_256.npy`) 위치에서만 수행됩니다. 그러나 추론 시 `v2`는 `anchor + offset`으로 보정된 궤적을 사용하고, `CK2`는 상위 부모(`plan_topk_trajectory`) 주변으로 변형된 96개 후보 코리도를 bilinear 샘플링합니다([`corridor.py`](file:///workspace/byounggun/SSR/navsim/agents/para_ssr/refiner/corridor.py#L83-L88)).
+   - **개선안**: 학습 중 이미 순전파에서 계산되어 있는 **학생 자신의 보정 궤적 `(anchors + offset).detach()` (또는 상위 `Top-32` 후보)**를 동적 프로빙 궤적으로 함께 넣어주면, 고정 앵커와 실제 주행 차선 사이의 $1\text{--}2\text{m}$ 오차 없이 **학생과 `CK2`가 실제로 읽게 될 바로 그 온-폴리시(On-Policy) 코리도 위에서 BEV를 정렬**할 수 있습니다.
+
+4. **Sharpened Corridor Spatial Bias (어텐션 엔트로피 `6.62` $\rightarrow$ 코리도 밀착형 집중)**
+   - **문제점**: 로그의 `probe/head_entropy`가 `6.62` ($\exp(6.62) \approx 745$개 셀)로 높은 이유는 4개 헤드의 공간 시그마가 `(2.0, 4.0, 8.0, 16.0)m`로 넓게 잡혀 있어, $\sigma = 8\text{m}, 16\text{m}$ 헤드가 코리도 바깥 먼 배경까지 수천 개 셀에 어텐션을 분산시키기 때문입니다.
+   - **개선안**: `CK2`의 실제 코리도 반경(`±4.8m`)에 맞춰 4개 헤드 시그마를 **`(1.2, 2.4, 4.0, 6.5)m`**로 조이고 학습 가능한 게이트 $\gamma_h$의 상한을 `2.0` $\rightarrow$ `4.0`으로 확대하여, `attn_kl`과 `w_pgp`가 배경 노이즈 없이 실제 주행 튜브 내 장애물과 차선 경계에 날카롭게 꽂히도록 개선할 수 있습니다.
+
+5. **Student `v2` Planner Cross-Attention Direct Guidance (추론 시에도 남는 어텐션 정렬)**
+   - **문제점**: 현재 `attn_kl`은 학습 후 버려지는 보조 모듈인 `EMA Probe`의 `attn_s`에만 걸립니다. 정작 추론 시 동작하는 학생 본체의 `v2` 플래너([`PlanTaskMemoryLayer.bev_cross_attn`](file:///workspace/byounggun/SSR/navsim/agents/para_ssr/modules/planner_head.py#L69-L75))는 공간 바이어스 없이 5,000개 BEV 셀 전체에 대해 자유 어텐션을 수행합니다.
+   - **개선안**: Teacher Probe(`P_det`, `P_map`)가 형성한 고확신 코리도 어텐션 분포(`attn_t`)를 학생 `v2` 플래너 레이어의 `bev_cross_attn` 가중치에도 가벼운 보조 KL 가이드로 연결하면, `student_bev` 특징뿐만 아니라 **`v2` 플래너가 BEV를 읽는 시선(Attention) 자체**가 직접 교정되어 `v2` 단독 성능과 `CK2`의 부모 궤적 품질을 동시에 높일 수 있습니다.
+
+---
+
+## 8. 실행 명령어 (Launch Command)
 
 ```bash
 RUN=fusion_v14_main CK2_E2E_APPROVED=1 CK_ALLOW_GPU45=1 \

@@ -367,9 +367,6 @@ class ParaSSRAgent(AbstractAgent):
             source = str(getattr(config, "distill_teacher_source", "store"))
             if source not in ("store", "targets"):
                 raise ValueError(f"distill_teacher_source must be 'store' or 'targets', got {source!r}")
-            if source == "targets" and self._ck_e2e2 is None:
-                raise ValueError("distill_teacher_source='targets' needs ck_e2e2 (its target builder loads "
-                                 "kd_bev_0 / kd_bev_1)")
             self._distill = self._build_distill(config)
 
         if resume_from_checkpoint and checkpoint_path:
@@ -669,10 +666,10 @@ class ParaSSRAgent(AbstractAgent):
                    for k in ("distill_selector_v6", "distill_selector_v7", "distill_selector_v8",
                              "distill_selector_v9", "distill_selector_v10", "distill_selector_v11",
                              "distill_selector_v12", "distill_selector_v13", "distill_selector_v14",
-                             "distill_selector_v15")):
+                             "distill_selector_v15", "distill_selector_v16")):
             raise NotImplementedError(
                 "use_distill on this core supports only the trajectory-anchor path "
-                "(distill_selector_v6/v7/v8/v9/v10/v11/v12/v13/v14/v15); the stage-1 adapter / corridor / "
+                "(distill_selector_v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16); the stage-1 adapter / corridor / "
                 "register-selector paths need aux_distill's own v2 port")
         anchor_file = getattr(config, "plan_anchor_file", None)
         if not getattr(config, "plan_anchor", False) or not anchor_file or not os.path.isfile(str(anchor_file)):
@@ -693,6 +690,7 @@ class ParaSSRAgent(AbstractAgent):
             or getattr(config, "distill_selector_v13", False)
             or getattr(config, "distill_selector_v14", False)
             or getattr(config, "distill_selector_v15", False)
+            or getattr(config, "distill_selector_v16", False)
         )
         trainable_prefix = "anchor_distill." if is_pgp else "anchor_distill.student_proj."
         for name, param in module.named_parameters():
@@ -955,7 +953,10 @@ class ParaSSRAgent(AbstractAgent):
             from .ck.e2e_data import CKE2ETargetBuilder
 
             builders.append(CKE2ETargetBuilder(cfg))
-        if self._ck_e2e2 is not None:
+        if self._ck_e2e2 is not None or (
+            getattr(cfg, "use_distill", False)
+            and str(getattr(cfg, "distill_teacher_source", "store")) == "targets"
+        ):
             from .ck.e2e_data2 import CK2E2ETargetBuilder
 
             builders.append(CK2E2ETargetBuilder(cfg))
@@ -1140,6 +1141,7 @@ class ParaSSRAgent(AbstractAgent):
                     or getattr(cfg, "distill_selector_v13", False)
                     or getattr(cfg, "distill_selector_v14", False)
                     or getattr(cfg, "distill_selector_v15", False)
+                    or getattr(cfg, "distill_selector_v16", False)
                 ):
                     proj_mult = float(getattr(cfg, "distill_proj_lr_mult", 2.0))
                     groups.append({

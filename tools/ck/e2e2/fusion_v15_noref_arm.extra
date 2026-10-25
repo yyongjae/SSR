@@ -1,0 +1,34 @@
+# fusion_v15_noref arm: Pure PARA-SSR v2 Student + BEV Selector v15 WITHOUT CK2 Refiner (ck_e2e2.enabled=false).
+# Teachers of the v15 term come from the CK2E2ETargetBuilder targets kd_bev_0 (BEVFusion) / kd_bev_1 (ReSMap, transpose
+# only) loaded in parallel by the DataLoader workers, while ck_e2e2 is disabled (no ck_student, no CKE2E2 loss, no labeler).
+#   E2E_ROOT=/workspace/byounggun/ssr_outputs/ck2_e2e RUN=fusion_v15_noref_main \
+#   E2E_NO_LABELER=1 E2E_NO_WATCHDOG=1 CK2_E2E_APPROVED=1 CK_ALLOW_GPU45=1 \
+#   E2E_EXTRA=tools/ck/e2e2/fusion_v15_noref_arm.extra \
+#   bash tools/ck/e2e2/train_e2e2.sh start --gpus 4,5,6,7
+wandb.entity=e2ekd
+wandb.project=v1_distill
+wandb.group=bev-selector-v15-noref
+++agent.config.ck_e2e2.enabled=false
+++agent.config.use_distill=true
+++agent.config.distill_selector_v8=false
+++agent.config.distill_selector_v9=false
+++agent.config.distill_selector_v10=false
+++agent.config.distill_selector_v11=false
+++agent.config.distill_selector_v12=false
+++agent.config.distill_selector_v13=false
+++agent.config.distill_selector_v14=false
+++agent.config.distill_selector_v15=true
+++agent.config.distill_teacher_source=targets
+++agent.config.distill_feature_root=/workspace/teacher_cache
+++agent.config.distill_lambda_gt=0.45
+++agent.config.distill_lambda_cov=0.20
+++agent.config.distill_lambda_risk=0.35
+++agent.config.distill_tau_gt=4.5
+++agent.config.distill_tau_risk=8.0
+++agent.config.distill_probe_warmup_steps=5300
+++agent.config.distill_probe_ramp_steps=2650
+++agent.config.distill_probe_loss_weight=0.5
+++agent.config.distill_probe_lr_mult=3.0
+++agent.config.distill_proj_lr_mult=3.0
+++agent.config.distill_probe_use_ema=true
+++agent.config.distill_probe_ema_decay=0.99

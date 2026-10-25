@@ -142,6 +142,7 @@ class PlanningDistillation(nn.Module):
         selector_v13: bool = False,
         selector_v14: bool = False,
         selector_v15: bool = False,
+        selector_v16: bool = False,
         spatial_sigma: float = 4.0,
         spatial_sigmas: Optional[Sequence[float]] = None,
         lambda_gt: float = 0.6,
@@ -226,6 +227,7 @@ class PlanningDistillation(nn.Module):
         self.selector_v13 = bool(selector_v13)
         self.selector_v14 = bool(selector_v14)
         self.selector_v15 = bool(selector_v15)
+        self.selector_v16 = bool(selector_v16)
         self.spatial_sigma = float(spatial_sigma)
         self.spatial_sigmas = tuple(float(s) for s in spatial_sigmas) if spatial_sigmas is not None else None
         self.lambda_gt = float(lambda_gt)
@@ -261,7 +263,7 @@ class PlanningDistillation(nn.Module):
             self.selector_v6 or self.selector_v7 or self.selector_v8
             or self.selector_v9 or self.selector_v10 or self.selector_v11
             or self.selector_v12 or self.selector_v13 or self.selector_v14
-            or self.selector_v15
+            or self.selector_v15 or self.selector_v16
         )
         if self.selector_mode or is_anchor:
             # Registers / Anchors replace the frozen adapter. Stage-1 checkpoints are not
@@ -348,7 +350,9 @@ class PlanningDistillation(nn.Module):
         if is_anchor:
             from .anchor_distill import TrajectoryAnchorDistillation
 
-            if self.selector_v15:
+            if self.selector_v16:
+                ver = "v16"
+            elif self.selector_v15:
                 ver = "v15"
             elif self.selector_v14:
                 ver = "v14"
@@ -657,6 +661,7 @@ class PlanningDistillation(nn.Module):
             or self.selector_v13
             or self.selector_v14
             or self.selector_v15
+            or self.selector_v16
         ):
             return self._anchor_forward(
                 student_bev, tokens, trajectory_anchors, trajectories,
@@ -963,6 +968,7 @@ def build_planning_distillation(config):
         selector_v13=bool(getattr(config, "distill_selector_v13", False)),
         selector_v14=bool(getattr(config, "distill_selector_v14", False)),
         selector_v15=bool(getattr(config, "distill_selector_v15", False)),
+        selector_v16=bool(getattr(config, "distill_selector_v16", False)),
         spatial_sigma=float(getattr(config, "distill_spatial_sigma", 4.0)),
         spatial_sigmas=getattr(config, "distill_spatial_sigmas", (2.0, 4.0, 8.0, 16.0)),
         lambda_gt=float(getattr(config, "distill_lambda_gt", 0.6)),

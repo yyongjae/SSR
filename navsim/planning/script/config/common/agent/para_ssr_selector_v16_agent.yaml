@@ -1,0 +1,80 @@
+# BEV Selector v16: Stop-Grad Subspace-Weighted Grid & Lateral-Aware Horizon-Tapering Distillation
+# - Student: km/para-ssr-v2 full multi-task architecture (ResNet-34) + optional CK2 Refiner v2 E2E
+# - Distill v16 (docs/bev_selector_v16.md):
+#     * Pillar 1 (100% Stop-Grad Adapter Isolation + Subspace-Importance Weighted Grid KD):
+#       - Restores 100% Stop-Grad on student_proj.weight & bias in Probe Stream (zero late-epoch adapter drift)
+#       - Weights Stream 1 (82% cell_1x1 + 18% multi-dilation edge) by per-channel importance w_ch in [0.85, 1.38]
+#     * Pillar 2 (Lateral-Aware Horizon-Partitioned 4-Head Spatial Bias & Sweet-Spot Entropy ~5.9):
+#       - Partitions 10-step (5.0s look-ahead) trajectory into 4 temporal horizon heads: Near (0..4 @ 1.8m),
+#         Mid-Lateral (2..7 @ 2.8m), Far-TTC (5..10 @ 4.2m), and Full Corridor (0..10 @ 7.5m), with gamma_h in (0.15, 2.20)
+#       - 70% full post-FFN sibling diff + 30% Mid+Far (Heads 1 & 2) pre-out_proj velocity-sibling diff
+#     * Pillar 3 (Golden 0.090 / 0.025 Dual-Stream Budget + Late-Epoch Probe Cosine Tapering):
+#       - Grid Stream (ratio=0.090, cap=0.22), Probe Stream (ratio=0.025, cap=0.06) with Ep 20..29 cosine taper (1.0 -> 0.65)
+#     * Pillar 4 (Pure Teacher-Grounded Ribbon & Pure 40/40/40 Geometric/Relational Loss Allocation):
+#       - Removes on-policy confirmation bias & uncalibrated L_score_kd; restores MAP uniform floor 0.85
+#     * Pillar 5 (Multi-Dilation Corridor Edge KD):
+#       - 70% Dilation-1 (0.64m local boundary) + 30% Dilation-2 (1.28m lane-width / vehicle-gap contrast) spatial derivative KD
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Student architecture (ResNet-34 camera backbone)
+  image_architecture: resnet34.tv_in1k
+
+  # km/para-ssr-v2 Student Multi-Task Configuration
+  use_task_interaction: true
+  use_det_motion_head: true
+  use_map_head: true
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+  plan_heading_from_xy: true
+
+  # Task Gradient Balancing (Closed-loop balancer across Plan, Det, Map)
+  grad_balance_target:
+    plan: 0.4
+    det: 0.3
+    map: 0.3
+  grad_balance_warmup_iters: 10600
+  grad_balance_interval: 200
+
+  # v16 Stop-Grad Subspace-Weighted Grid & Lateral-Aware Horizon-Tapering KD
+  distill_selector: false
+  distill_selector_v6: false
+  distill_selector_v7: false
+  distill_selector_v8: false
+  distill_selector_v9: false
+  distill_selector_v10: false
+  distill_selector_v11: false
+  distill_selector_v12: false
+  distill_selector_v13: false
+  distill_selector_v14: false
+  distill_selector_v15: false
+  distill_selector_v16: true
+  distill_spatial_sigmas: [2.0, 4.0, 8.0, 16.0]
+  distill_lambda_gt: 0.45
+  distill_lambda_cov: 0.20
+  distill_lambda_risk: 0.35
+  distill_tau_gt: 4.5
+  distill_tau_risk: 8.0
+  distill_attn_loss_scale: 5.0
+  distill_resmap_scale: 3.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  distill_anchor_mode: cross_attn
+  distill_probe_warmup_steps: 1000
+  distill_probe_ramp_steps: 2000
+  distill_probe_loss_weight: 0.5
+  distill_probe_lr_mult: 3.0
+  distill_proj_lr_mult: 3.0
+  distill_probe_use_ema: true
+  distill_probe_ema_decay: 0.99
+
+  # Legacy distill options turned off
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0

@@ -1,0 +1,34 @@
+# fusion_v16 arm: CK2 Refiner v2 E2E main arm + BEV Selector v16 (Stop-Grad Subspace-Weighted Grid & Lateral-Aware Horizon-Tapering Distillation, docs/bev_selector_v16.md).
+# Hydra overrides merged by key into the launcher recipe (E2E_EXTRA). Teachers of the v16 term come from the CK2
+# targets kd_bev_0 (BEVFusion) / kd_bev_1 (ReSMap, transpose only), which the dataloader workers load for the CK2
+# teachers anyway.
+#   RUN=fusion_v16_main CK2_E2E_APPROVED=1 CK_ALLOW_GPU45=1 \
+#   E2E_EXTRA=tools/ck/e2e2/fusion_v16_arm.extra \
+#   bash tools/ck/e2e2/train_e2e2.sh start --gpus 4,5,6,7
+wandb.entity=e2ekd
+wandb.project=v1_distill
+wandb.group=bev-selector-v16
+++agent.config.use_distill=true
+++agent.config.distill_selector_v8=false
+++agent.config.distill_selector_v9=false
+++agent.config.distill_selector_v10=false
+++agent.config.distill_selector_v11=false
+++agent.config.distill_selector_v12=false
+++agent.config.distill_selector_v13=false
+++agent.config.distill_selector_v14=false
+++agent.config.distill_selector_v15=false
+++agent.config.distill_selector_v16=true
+++agent.config.distill_teacher_source=targets
+++agent.config.distill_feature_root=/workspace/teacher_cache
+++agent.config.distill_lambda_gt=0.45
+++agent.config.distill_lambda_cov=0.20
+++agent.config.distill_lambda_risk=0.35
+++agent.config.distill_tau_gt=4.5
+++agent.config.distill_tau_risk=8.0
+++agent.config.distill_probe_warmup_steps=5300
+++agent.config.distill_probe_ramp_steps=2650
+++agent.config.distill_probe_loss_weight=0.5
+++agent.config.distill_probe_lr_mult=3.0
+++agent.config.distill_proj_lr_mult=3.0
+++agent.config.distill_probe_use_ema=true
+++agent.config.distill_probe_ema_decay=0.99

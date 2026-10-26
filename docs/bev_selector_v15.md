@@ -261,3 +261,35 @@ bash tools/ck/e2e2/train_e2e2.sh start --gpus 4,5,6,7
      - `Epoch 23` 이후 `Probe Stream` (`ratio=0.035`)과 `L_score_kd`가 `EP`(주행 진행도: `87.3% -> 88.1~88.3%`)와 `v2` Base PDMS(`89.07 ~ 89.19%`)를 끌어올리는 과정에서, `CK2` 선택기의 `TTC` 보수성이 일부 완화되며 `default(0.5)`는 `92.15 ~ 92.26%` 구간으로 수렴했습니다.
      - 따라서 **Refiner 결합 시에는 `Epoch 20` / `Epoch 22` 체크포인트가 최상의 안전-진행도 밸런스**를 제공합니다.
 
+---
+
+## 6. `fusion_v15_noref_main` (CK2 Refiner 제외, 순수 `PARA-SSR v2` + `BEV Selector v15` 단독) `navtest` ($N=12,146$) 평가 결과
+
+CK2 Refiner (`ck_e2e2.enabled=false`)를 완전히 제거하고 **오직 순수 `BEV Selector v15` Distillation만으로 `PARA-SSR v2` 카메라 플래너의 성능이 얼마나 향상되는지** 검증한 `fusion_v15_noref_main` (`Epoch 20 ~ 29`, [`multi_epoch_summary.json`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/multi_epoch_summary.json)) 결과입니다.
+
+| 모델 / 에폭 (`navtest`, $N=12,146$) | **★ `v2` PDMS** | vs 순수 `v2` (`88.14`) | `NC` | `DAC` | `EP` | `TTC` | `Comfort` | `DDC` | 앞차 감속 `lead_fail` ($N=1,814$) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **순수 `PARA-SSR v2` Baseline (No Refiner, No KD)** | `88.14` | — | `98.70` | `96.08` | `81.74` | `95.54` | `99.98` | `99.99` | `8.16%` |
+| `ck2e2e_no_kd` (`v2` with CK2 E2E, No BEV KD) | `88.62` | `+0.48` | `98.81` | `96.44` | `82.12` | `95.88` | `99.98` | `99.99` | `8.21%` |
+| `ck2e2e_bevkd` (`v2` with CK2 E2E + `1×1` BEV KD) | `88.96` | `+0.82` | `98.87` | `96.65` | `82.58` | `95.82` | `99.98` | `99.99` | `7.77%` |
+| `fusion_v14_main` 최고 `v2` (`Ep 24`, with CK2 E2E) | `89.40` | `+1.26` | `98.95` | `96.89` | `82.99` | `96.04` | `99.98` | `100.00` | `6.78%` |
+| `fusion_v15_main` 최고 `v2` (`Ep 23`, with CK2 E2E) | `89.19` | `+1.05` | `98.87` | `96.87` | `83.05` | `95.56` | `99.98` | `100.00` | `9.26%` |
+| **Ep 20 (`v15_noref`)** ([`eval_ep20`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep20/summary.md)) | `89.09` | **`+0.95`** | **`98.96`** | `96.76` | `82.52` | **`96.05`** | `99.98` | `100.00` | `8.10%` |
+| **Ep 21 (`v15_noref`)** ([`eval_ep21`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep21/summary.md)) | `89.17` | **`+1.03`** | `98.82` | `96.91` | **`83.28`** | `95.36` | `99.98` | `100.00` | `10.47%` |
+| **★★ Ep 22 (`v15_noref`)** ([`eval_ep22`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep22/summary.md)) | **`89.48`** 🏆 | **`+1.34`** 🏆 | `98.91` | **`97.21`** 🏆 | `82.88` | **`96.05`** 🏆 | `99.98` | `100.00` | **`7.22%`** 🏆 |
+| **Ep 23 (`v15_noref`)** ([`eval_ep23`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep23/summary.md)) | `88.91` | **`+0.77`** | `98.67` | `96.90` | `82.98` | `95.14` | `99.99` | `100.00` | `10.03%` |
+| **Ep 24 (`v15_noref`)** ([`eval_ep24`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep24/summary.md)) | `89.00` | **`+0.86`** | `98.74` | `96.80` | `82.90` | `95.51` | `99.98` | `100.00` | `8.71%` |
+| **★★ Ep 25 (`v15_noref`)** ([`eval_ep25`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep25/summary.md)) | **`89.46`** 🏆 | **`+1.32`** 🏆 | `98.87` | **`97.15`** | **`83.16`** | `95.86` | `99.98` | `100.00` | `8.27%` |
+| **Ep 26 (`v15_noref`)** ([`eval_ep26`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep26/summary.md)) | `88.87` | **`+0.73`** | `98.86` | `96.65` | `82.52` | `95.76` | `99.98` | `100.00` | `8.82%` |
+| **Ep 27 (`v15_noref`)** ([`eval_ep27`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep27/summary.md)) | `89.08` | **`+0.94`** | `98.82` | `96.95` | `82.61` | `95.80` | `99.98` | `100.00` | `8.27%` |
+| **★ Ep 28 (`v15_noref`)** ([`eval_ep28`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep28/summary.md)) | **`89.18`** | **`+1.04`** | `98.81` | `96.96` | `82.95` | `95.67` | `99.98` | `100.00` | `8.65%` |
+| **★ Ep 29 (`last.ckpt`, `v15_noref`)** ([`eval_ep29`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/fusion_v15_noref_main/eval_ep29/summary.md)) | **`89.16`** | **`+1.02`** | `98.82` | `96.96` | `82.84` | `95.74` | `99.98` | `100.00` | `8.82%` |
+
+- **핵심 결론**:
+  1. **Refiner 없이 순수 BEV Distillation만으로 `+1.34%p` (`88.14% → 89.48%`) 대폭 향상**:
+     - `Epoch 22`에서 **`89.48%`**, `Epoch 25`에서 **`89.46%`**를 기록하여 전 버전 통틀어 **역대 최고 순수 `PARA-SSR v2` Base Planner 점수**를 달성했습니다.
+     - 세부 지표에서도 순수 `v2` 대비 **`DAC +1.13%p` (`96.08% → 97.21%`)**, **`EP +1.14%p` (`81.74% → 82.88%`)**, **`TTC +0.51%p` (`95.54% → 96.05%`)**, **`NC +0.21%p` (`98.70% → 98.91%`)**, **`lead_fail -0.94%p` (`8.16% → 7.22%`)**로 모든 지표가 동시에 큰 폭으로 상승했습니다.
+  2. **최종 에폭(`Epoch 29`, `last.ckpt`)에서도 `89.16%` (`+1.02%p`) 기록**:
+     - CK2 Refiner의 보조 그래디언트 없이도 순수 `BEV Selector v15` 자체가 카메라 BEV 표현을 강력하게 개선하여, Refiner와 함께 학습된 `no_kd`(`88.62%`), `bevkd`(`88.96%`), `v13`(`89.09%`), `v14`(`89.10%`), `v15`(`89.02%`)의 최종 에폭 `v2` 점수를 모두 상회했습니다.
+
+

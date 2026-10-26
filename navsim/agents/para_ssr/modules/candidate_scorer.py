@@ -89,10 +89,46 @@ def field_readout(st: torch.Tensor, sdf: torch.Tensor, occ: torch.Tensor) -> tor
     return torch.stack([sdf_min, torch.cat([z, occ1], 2), torch.cat([z, ttc1], 2)], -1)
 
 
+# km 10/23 scorer input perturbation (training only): a fraction of the samples sees the network's outputs with the
+# hazards partly hidden (missed / misplaced agents, missed occupancy, a drivable boundary further out), the labels stay the
+# official terms of the GT scene.  DESIGN (not official): on navtest the scorer over-trusts the perception exactly where
+# it misses a hazard (c64 ep25: chosen candidate predicted +29 PDMS above its true value on the 22% of tokens with < 64
+# good candidates, +3.6 on train); in-sample outputs are near-perfect, so the scorer never sees that failure mode.
+# Magnitudes are fixed a priori (not fitted on val / navtest).
+PERT_DEFAULTS = dict(p=0.0,              # fraction of the samples perturbed (0 = off)
+                     agent_drop=0.10,    # each detected agent is missed with this probability
+                     pos_m=0.5,          # agent centre jitter (m, per axis)
+                     motion_scale=0.15,  # per-agent speed error of the predicted motion (relative, std)
+                     motion_step_m=0.10, # per-step motion noise (m, std; a random walk)
+                     sdf_m=0.5,          # the static SDF shifted outward by U(0, sdf_m) m (boundary further out)
+                     occ_blobs=2,        # occupied squares erased (all planes), centred on occupied cells
+                     occ_side_m=(3.0, 6.0),
+                     bev_drop=0.10)      # BEV feature dropout on the sampled features
+
+
+def _pert_fields(sdf: torch.Tensor, occ: torch.Tensor, on: torch.Tensor, P: dict):
+    """sdf [B, H, W] (m), occ [B, P, H, W] probabilities, on [B] bool -> perturbed copies (out of place)"""
+    b, _, hh, ww = occ.shape
+    shift = torch.rand(b, device=sdf.device) * P["sdf_m"] * on.float()
+    sdf = sdf + shift[:, None, None].to(sdf.dtype)
+    keep = torch.ones(b, 1, hh, ww, device=occ.device, dtype=occ.dtype)
+    occ_any = occ.detach().amax(1) > 0.5                                                 # [B, H, W]
+    for i in torch.nonzero(on).flatten().tolist():
+        cells = torch.nonzero(occ_any[i])
+        if len(cells) == 0:
+            continue
+        for c in cells[torch.randint(len(cells), (int(P["occ_blobs"]),), device=cells.device)].tolist():
+            lo, hi = P["occ_side_m"]
+            half = int(round((lo + (hi - lo) * float(torch.rand(()))) / 0.32 / 2))
+            keep[i, 0, max(0, c[0] - half):c[0] + half + 1, max(0, c[1] - half):c[1] + half + 1] = 0
+    return sdf, occ * keep
+
+
 class CandidateScorer(nn.Module):
     def __init__(self, cin: int, bev_h: int, bev_w: int, fwd_m: float, hid: int = 256, use_fields: bool = True,
-                 agent_k: int = 32, nf: int = 8, layers: int = 2):
+                 agent_k: int = 32, nf: int = 8, layers: int = 2, pert: dict = None):
         super().__init__()
+        self.pert = {**PERT_DEFAULTS, **(pert or {})}                                      # km 10/23 (training only)
         self.bev_h, self.bev_w, self.fwd_m = bev_h, bev_w, fwd_m
         self.use_fields, self.agent_k, self.nf = use_fields, agent_k, nf
         nkin = 6 + 4 * nf
@@ -110,18 +146,29 @@ class CandidateScorer(nn.Module):
         self.head = nn.Sequential(nn.Linear(hid, hid), nn.ReLU(inplace=True), nn.Linear(hid, sum(HEADS.values())))
         self.tok_head = nn.Sequential(nn.Linear(hid, hid), nn.ReLU(inplace=True), nn.Linear(hid, 2))  # eff1, eff2
 
-    def _agents(self, det: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """det/motion top-k agent-mode tokens (detached), the corridor head's AgentCrossAttn features"""
+    def _agents(self, det: Dict[str, torch.Tensor], on: torch.Tensor = None) -> torch.Tensor:
+        """det/motion top-k agent-mode tokens (detached), the corridor head's AgentCrossAttn features;
+        on [B] bool (km 10/23): those samples get missed / misplaced agents (self.pert)"""
         cls = det["all_cls_scores"][-1].float().sigmoid().detach()
         box = det["all_bbox_preds"][-1].float().detach()
         traj, tcls, mh = (det[k].float().detach() for k in ("traj_preds", "traj_cls_preds", "motion_hidden"))
-        top = cls.amax(-1).topk(min(self.agent_k, cls.shape[1]), dim=1).indices
+        conf = cls.amax(-1)
+        if on is not None:                                       # a missed agent is not among the top-k at all
+            miss = (torch.rand_like(conf) < self.pert["agent_drop"]) & on[:, None]
+            conf = torch.where(miss, torch.full_like(conf, -1.0), conf)
+        top = conf.topk(min(self.agent_k, cls.shape[1]), dim=1).indices
 
         def g(x):
             return torch.gather(x, 1, top.view(*top.shape, *([1] * (x.dim() - 2))).expand(-1, -1, *x.shape[2:]))
 
         cls, box, traj, tcls, mh = g(cls), g(box), g(traj), g(tcls), g(mh)
         m = traj.shape[2]
+        if on is not None:
+            P, w = self.pert, on.float()[:, None]
+            box = torch.cat([box[..., :2] + torch.randn_like(box[..., :2]) * P["pos_m"] * w[..., None], box[..., 2:]], -1)
+            sc = (1 + torch.randn(*traj.shape[:2], device=traj.device) * P["motion_scale"]).clamp(0.6, 1.4)
+            sc = torch.where(on[:, None], sc, torch.ones_like(sc))
+            traj = traj * sc[..., None, None, None] + torch.randn_like(traj) * P["motion_step_m"] * w[..., None, None, None]
         c0 = box[..., :2] / 32.0                                                            # SSR (x right, y fwd)
         pts = torch.cat([c0[:, :, None, None].expand(-1, -1, m, 1, 2), c0[:, :, None, None] + traj.cumsum(3) / 32.0], 3)
         bcode = torch.cat([c0, box[..., 2:8], box[..., 8:10] / 10.0], -1)
@@ -135,6 +182,9 @@ class CandidateScorer(nn.Module):
         cand_progress [B, K]}"""
         b, k = st.shape[:2]
         dev = st.device
+        on = None
+        if self.training and self.pert["p"] > 0:                                           # km 10/23
+            on = torch.rand(b, device=dev) < self.pert["p"]
         idx = STEPS.to(dev)
         s9 = st[:, :, idx]                                                                  # [B, K, 9, 7]
         x, y, h = s9[..., 0], s9[..., 1], s9[..., 2]
@@ -150,16 +200,22 @@ class CandidateScorer(nn.Module):
                      dev, st.dtype)
         pts = cen[..., None, :] + u[..., None, :] * off[:, :1] + vv[..., None, :] * off[:, 1:]   # [B, K, 9, 5, 2]
         smp = _bev_sample(bev, self.bev_h, self.bev_w, self.fwd_m, pts.reshape(b, -1, 2))       # [B, K*45, C]
+        if on is not None and self.pert["bev_drop"] > 0:
+            dm = (torch.rand_like(smp) >= self.pert["bev_drop"]).to(smp.dtype) / (1 - self.pert["bev_drop"])
+            smp = torch.where(on[:, None, None], smp * dm, smp)
         tok = tok + self.bev(smp.reshape(b, k, len(STEPS), -1))
         if self.fld is not None:
             assert fields is not None, "use_fields needs the corridor head outputs"
-            ro = field_readout(st, fields["corridor_sdf"], torch.sigmoid(fields["corridor_occ"].float()))   # [B, K, 41, 3]
+            sdf_f, occ_f = fields["corridor_sdf"], torch.sigmoid(fields["corridor_occ"].float())
+            if on is not None and bool(on.any()):
+                sdf_f, occ_f = _pert_fields(sdf_f, occ_f, on, self.pert)
+            ro = field_readout(st, sdf_f, occ_f)                                                # [B, K, 41, 3]
             # step 0, then the windows (t - 0.5 s, t]: SDF min, occupancies max
             w_sdf = torch.cat([ro[:, :, :1, :1], ro[:, :, 1:, :1].reshape(b, k, 8, 5, 1).amin(3)], 2)
             w_occ = torch.cat([ro[:, :, :1, 1:], ro[:, :, 1:, 1:].reshape(b, k, 8, 5, 2).amax(3)], 2)
             tok = tok + self.fld(torch.cat([w_sdf / CH.CLIP, w_occ], -1))
         q = self.merge((tok + self.step_pe).flatten(2))                                         # [B, K, hid]
-        kv = self._agents(det) if det is not None else None
+        kv = self._agents(det, on) if det is not None else None
         for ca, sa, ff, (n1, n2, n3) in zip(self.cross, self.selfa, self.ffn, self.norms):
             if kv is not None:
                 q = n1(q + ca(q, kv, kv, need_weights=False)[0])
@@ -275,6 +331,25 @@ def ec_roughness(st: torch.Tensor) -> torch.Tensor:
     j = torch.hypot(s[..., 5], s[..., 6]) @ mj
     ya = hu @ my
     return (j.pow(2).mean(-1).sqrt() / 0.5 + ya.pow(2).mean(-1).sqrt() / 0.1).float()
+
+
+def ec_feature_rms(st: torch.Tensor):
+    """km 10/22: st [..., n, >=7] tracked states (index 0 = now) -> (rms jerk, rms yaw accel) [...], the official EC
+    features of ec_roughness, differentiable (|a| = sqrt(ax^2 + ay^2 + 1e-12): no NaN gradient at a = 0) for the
+    candidate smoothness hinge of corridor_head.corridor_plan_loss"""
+    key = (st.shape[-2], st.device)
+    if key not in _EC_OPS_DEV:
+        _EC_OPS_DEV[key] = tuple(m.to(st.device) for m in _ec_ops(st.shape[-2]))
+    mj, my = _EC_OPS_DEV[key]
+    s = st.double()
+    h = s[..., 2]
+    unwrap = 2 * np.pi * torch.cumsum(torch.round(torch.diff(h, dim=-1) / (2 * np.pi)), -1).detach()
+    hu = torch.cat([h[..., :1], h[..., 1:] - unwrap], -1)
+    j = (s[..., 5].pow(2) + s[..., 6].pow(2) + 1e-12).sqrt() @ mj
+    ya = hu @ my
+    # km 10/24: + 1e-12 inside the outer sqrt too: a candidate with an exactly constant yaw rate has rms 0 and
+    # d sqrt / dx = inf there (0 * inf = NaN through the hinge's inactive relu; corr30_pert NaN at step 4027)
+    return (j.pow(2).mean(-1) + 1e-12).sqrt().float(), (ya.pow(2).mean(-1) + 1e-12).sqrt().float()
 
 
 def select_official(ex: Dict[str, torch.Tensor], eps: float, lam: float = 0.0, rough: torch.Tensor = None) -> torch.Tensor:

@@ -280,7 +280,8 @@ def _sample(field: torch.Tensor, pts: torch.Tensor) -> tuple:
 def corridor_plan_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor],
                        status: torch.Tensor, static_margin: float, occ_margin: float, cap: float,
                        ttc_weight: float = 0.0, per_candidate: bool = False, prog_weight: float = 0.0,
-                       prog_cap: float = 1.2, comfort_weight: float = 0.0):
+                       prog_cap: float = 1.2, comfort_weight: float = 0.0, ec_smooth_weight: float = 0.0,
+                       track_slot: int = 0):
     """Every candidate's tracked footprint vs the GT corridor -> (loss, logs).
     status [B, 4] = (vx, vy, ax, ay) of the rear axle, NAVSIM ego frame (the model's status_feature).
     ttc_weight > 0 adds the TTC term: official PDMScorer._calculate_ttc projects the footprint at step t along the
@@ -294,14 +295,24 @@ def corridor_plan_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, 
         measures), saturating at prog_cap x the GT trajectory's progress (EP is normalised by the best progress, so
         going further than that earns nothing).
       comfort_weight > 0 : hinge on the official comfort thresholds of the tracked states (lon accel [-4.05, 2.40],
-        lat accel |vx * yaw rate| <= 4.89), every candidate, so the reward cannot buy progress with discomfort."""
+        lat accel |vx * yaw rate| <= 4.89), every candidate, so the reward cannot buy progress with discomfort.
+    km 10/22:
+      ec_smooth_weight > 0 : hinge on the candidate's own official EC features (two-frame extended comfort),
+        rms(jerk) above max(0.25 m/s^3, its bare anchor's rms jerk) and rms(yaw accel) above max(0.05 rad/s^2, the
+        anchor's), each / its EC threshold (0.5, 0.1), every candidate except the imitation winner (the GT binds it).
+        DESIGN (not official): EC compares two consecutive plans; with both plans under HALF the EC thresholds the RMS
+        of their difference is under the threshold (triangle inequality), so smooth candidates give the selector
+        EC-safe options.  The anchor floor keeps the anchor set's diversity (hard braking / turning anchors are rough
+        by themselves): the offset may not ADD roughness (measured ep25 navtest: median 14 anchors / token under 0.25,
+        0 candidates after the offsets).  Acceleration / yaw rate (absolute levels) are not constrained."""
     from .torch_tracker import track
 
     traj = predictions["trajectory_anchors"][None].to(predictions["trajectory_offset"].dtype) \
         + predictions["trajectory_offset"]                                                 # [B, K, 8, 3]
     b, k = traj.shape[:2]
     init = torch.cat([status.float(), status.new_zeros(b, 3).float()], -1)
-    full = track(traj.reshape(b * k, 8, 3).float(), init.repeat_interleave(k, 0), full=True).reshape(b, k, 41, 7)
+    full = track(traj.reshape(b * k, 8, 3).float(), init.repeat_interleave(k, 0), full=True,
+                 slot=track_slot).reshape(b, k, 41, 7)                                     # km 10/25: track_slot
     st = full[:, :, 1:]
     x, y, h = st[..., 0], st[..., 1], st[..., 2]                                          # [B, K, 40]
     c, s = torch.cos(h)[..., None], torch.sin(h)[..., None]
@@ -363,6 +374,26 @@ def corridor_plan_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, 
             loss = loss + comfort_weight * l_c
             logs["corr_plan/comfort"] = l_c.detach()
             logs["corr_plan/frac_comfort_viol"] = (((v_comf > 0).float() * valid).sum() / nv).detach()
+    if ec_smooth_weight > 0:
+        from .candidate_scorer import ec_feature_rms
+        rj, ry = ec_feature_rms(full)                                                      # [B, K], all 41 states
+        with torch.no_grad():                                                              # the bare anchors, same init
+            anc8 = predictions["trajectory_anchors"].float()                               # [K, 8, 3]
+            fa = track(anc8[None].expand(b, -1, -1, -1).reshape(b * k, 8, 3), init.repeat_interleave(k, 0),
+                       full=True).reshape(b, k, 41, 7)
+            rja, rya = ec_feature_rms(fa)
+            ec_w = valid.expand(b, k).clone()
+            if "trajectory" in targets:                                                    # the imitation winner is free
+                gt8 = targets["trajectory"].float()
+                win = torch.cdist(gt8.reshape(b, 1, -1), anc8.reshape(1, k, -1).expand(b, -1, -1))[:, 0].argmin(-1)
+                ec_w[torch.arange(b, device=x.device), win] = 0.0
+        v_ec = F.relu(rj - rja.clamp(min=0.25)) / 0.5 + F.relu(ry - rya.clamp(min=0.05)) / 0.1
+        l_e = (v_ec * ec_w).sum() / ec_w.sum().clamp(min=1.0)
+        loss = loss + ec_smooth_weight * l_e
+        logs["corr_plan/ec_smooth"] = l_e.detach()
+        logs["corr_plan/frac_ec_smooth_viol"] = (((v_ec > 0).float() * ec_w).sum() / ec_w.sum().clamp(min=1.0)).detach()
+        logs["corr_plan/rms_jerk"] = ((rj * valid).sum() / nv).detach()
+        logs["corr_plan/rms_yaw_accel"] = ((ry * valid).sum() / nv).detach()
     if prog_weight > 0 and "corridor_route_s" in targets and "trajectory" in targets:
         rs = targets["corridor_route_s"].float()[:, None]
         rd = targets["corridor_route_d"].float()[:, None]

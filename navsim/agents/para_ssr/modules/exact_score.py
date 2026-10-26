@@ -361,4 +361,7 @@ class ExactFullTargetBuilder(AbstractTargetBuilder):
         out = {**pack_full(t1, "ex1_"), **pack_full(t2, "ex2_")}
         out["ex1_valid"], out["ex2_valid"] = torch.tensor(float(v1)), torch.tensor(float(v2))
         out["ex_ego"] = torch.from_numpy(ego.reshape(9).astype(np.float32))
+        # km 10/25: log-disjoint cross-fit fold (cand_cf_folds); a fixed hash of the log name, no labels involved
+        import zlib
+        out["cf_fold"] = torch.tensor(zlib.crc32(str(scene.scene_metadata.log_name).encode()) % 2, dtype=torch.long)
         return out

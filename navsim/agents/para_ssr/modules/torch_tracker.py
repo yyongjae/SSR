@@ -246,14 +246,18 @@ def _capture(args, full, angular, grad):
     return g
 
 
-def track(poses: torch.Tensor, init: torch.Tensor, full: bool = False, angular: bool = False) -> torch.Tensor:
+def track(poses: torch.Tensor, init: torch.Tensor, full: bool = False, angular: bool = False,
+          slot: int = 0) -> torch.Tensor:
+    """slot (km 10/25): a graphed callable's backward reads its static buffers, so two grad calls of the same shape in
+    one forward (the cross-fit planners' plan loss next to the main one) need separate graphs: distinct slots."""
     if not poses.is_cuda or os.environ.get("KM_TRACK_GRAPH", "1") == "0" or torch.cuda.is_current_stream_capturing():
         return _track(poses, init, full, angular)
     ref = interpolate(poses.to(torch.float64))
     vprof, kprof = _profiles(ref)
     args = (ref, vprof, kprof, init.detach())
     grad = torch.is_grad_enabled() and any(a.requires_grad for a in args)
-    key = tuple((tuple(a.shape), a.dtype, a.requires_grad and grad) for a in args) + (poses.device, full, angular, grad)
+    key = tuple((tuple(a.shape), a.dtype, a.requires_grad and grad) for a in args) + (poses.device, full, angular, grad,
+                                                                                    slot)
     return _graphed(key, args, full, angular, grad)(*args).to(poses.dtype)
 
 

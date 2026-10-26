@@ -94,6 +94,59 @@ class PlanTaskMemoryLayer(nn.Module):
         return h + self.ffn(self.ffn_norm(h))
 
 
+
+class CrossFitPlanner(nn.Module):
+    """km 10/25 (cross-fitting): a second, independent copy of the anchor planner's offset path -- anchor queries
+    (mlp_planning_vb, cluster_encoder, encode_ego_feat_mlp), the 3 planner layers, final norm, offset head -- that reads
+    the main planner's inputs DETACHED (ego query, BEV, task memories) and is trained only on the scenes of its own
+    fold (log-disjoint).  Its offsets on the OTHER fold's scenes are candidates of scenes it never fitted, like the
+    main head's on navtest; the candidate scorer trains on those.  Training only: never used at eval."""
+
+    def __init__(self, ap: AnchorPlanner, embed_dims: int, num_heads: int, feedforward_channels: int,
+                 use_task_interaction: bool, num_layers: int):
+        super().__init__()
+        if ap.kinematic:
+            raise ValueError("cross-fit planner: kinematic anchor planner not supported")
+        self.heading_from_xy = ap.heading_from_xy
+        self.fut_ts, self.traj_dims, self.num_anchors = ap.fut_ts, ap.traj_dims, ap.num_anchors
+        hidden = 128
+        self.mlp_planning_vb = nn.Sequential(
+            nn.Linear(ap.fut_ts * ap.traj_dims, hidden), nn.ReLU(), nn.Linear(hidden, embed_dims))
+        layer = nn.TransformerEncoderLayer(d_model=embed_dims, nhead=8, dim_feedforward=512,
+                                           dropout=0.1, batch_first=True)
+        self.cluster_encoder = nn.TransformerEncoder(layer, num_layers=2)
+        self.encode_ego_feat_mlp = nn.Sequential(
+            nn.Linear(2 * embed_dims, embed_dims), nn.ReLU(), nn.Linear(embed_dims, embed_dims))
+        self.layers = nn.ModuleList(
+            PlanTaskMemoryLayer(embed_dims, num_heads, feedforward_channels, use_task_interaction)
+            for _ in range(num_layers))
+        self.final_norm = nn.LayerNorm(embed_dims)
+        self.offset_head = nn.Sequential(
+            nn.Linear(embed_dims, 1024), nn.ReLU(),
+            nn.Linear(1024, ap.fut_ts * (2 if self.heading_from_xy else ap.traj_dims)))
+        for lay in self.layers:
+            for parameter in lay.parameters():
+                if parameter.dim() > 1:
+                    nn.init.xavier_uniform_(parameter)
+
+    def forward(self, anchors, h_ego, plan_pos, bev_embed, bev_pos, memories):
+        """anchors [K, T, 3]; every other input already detached -> offset [B, K, T, 3] (AnchorPlanner's convention)."""
+        bs, k = h_ego.shape[0], self.num_anchors
+        flat = anchors.reshape(1, k, -1).to(h_ego.dtype).expand(bs, -1, -1)
+        h = self.encode_ego_feat_mlp(torch.cat([h_ego.expand(-1, k, -1), self.cluster_encoder(self.mlp_planning_vb(flat))], -1))
+        for lay in self.layers:
+            h = lay(h, plan_pos, bev_embed, bev_pos, **memories)
+        h = self.final_norm(h)
+        if self.heading_from_xy:
+            from .kinematics import bezier_xyyaw
+            anc = anchors.to(h.dtype).unsqueeze(0).expand(bs, -1, -1, -1)
+            xy = anc[..., :2] + self.offset_head(h).view(bs, k, self.fut_ts, 2)
+            return bezier_xyyaw(xy, anc[..., 2]) - anc
+        offset = self.offset_head(h).view(bs, k, self.fut_ts, self.traj_dims)
+        if self.traj_dims == 3:
+            offset = torch.cat([offset[..., :2], offset[..., 2:].tanh() * torch.pi], dim=-1)
+        return offset
+
 class ParaSSRPlannerHead(nn.Module):
     """BEV encoder wrapper and three-layer planner using all task queries.
 
@@ -134,6 +187,7 @@ class ParaSSRPlannerHead(nn.Module):
         plan_kinematic: bool = False,
         plan_heading_from_xy: bool = False,
         plan_rescore_refined: bool = False,
+        cf_folds: int = 0,
     ):
         super().__init__()
         if use_stl:
@@ -219,6 +273,10 @@ class ParaSSRPlannerHead(nn.Module):
         # trajectories (anchor + offset) instead of the fixed anchors, as WoTE does at
         # test time -- a second pass of the planner layers on re-encoded trajectories.
         self.plan_rescore_refined = bool(plan_rescore_refined)
+        # km 10/25: cross-fit planners (CrossFitPlanner), one per fold; training only
+        self.cf_planners = (nn.ModuleList(
+            CrossFitPlanner(self.anchor_planner, embed_dims, num_heads, feedforward_channels, use_task_interaction,
+                            plan_num_layers) for _ in range(cf_folds)) if cf_folds and self.anchor_planner is not None else None)
 
         for layer in self.planner_layers:
             for parameter in layer.parameters():
@@ -374,6 +432,11 @@ class ParaSSRPlannerHead(nn.Module):
         if self.anchor_planner is not None:
             # NAVSIM ego status is (vx, vy, ax, ay) in the ego frame: vx is the speed along heading
             out = self.anchor_planner(h, init_speed=ego_status[:, 0])
+            if self.cf_planners is not None and self.training:
+                dm = {kk: (v.detach() if torch.is_tensor(v) else v) for kk, v in memories.items()}
+                args = (self.anchor_planner.trajectory_anchors, h_ego.detach(), plan_pos.detach(), bev_embed.detach(),
+                        bev_pos.detach(), dm)
+                out["cf_offset"] = torch.stack([cf(*args) for cf in self.cf_planners], 1)    # [B, F, K, T, 3]
             if self.plan_rescore_refined and not self.training:
                 out.update(self._rescore_refined(out, h_ego, plan_pos, bev_embed, bev_pos, memories))
             poses = out["trajectory"]                               # absolute poses [B, T, 3]

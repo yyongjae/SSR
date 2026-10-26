@@ -349,6 +349,22 @@ class ParaSSRConfig:
     corridor_plan_prog_weight: float = 0.0     # km 10/16 v3.1: progress reward inside the GT-safe corridor
     corridor_plan_prog_cap: float = 1.2        # reward saturates at cap x the GT trajectory's route progress
     corridor_plan_comfort_weight: float = 0.0  # official comfort thresholds as a hinge on every tracked candidate
+    # km 10/22: hinge on every tracked candidate's own EC features (rms jerk > 0.25, rms yaw accel > 0.05 = half the
+    # two-frame EC thresholds), corridor_head.corridor_plan_loss.  0 = off.
+    corridor_plan_ec_smooth_weight: float = 0.0
+    # km 10/23: fraction of the training samples whose scorer inputs are perturbed (hazards partly hidden;
+    # candidate_scorer.PERT_DEFAULTS, magnitudes fixed a priori).  0 = off; never active at eval.
+    cand_scorer_pert_p: float = 0.0
+    # km 10/25: fraction of each training sample's scorer candidates replaced by anchor + u * offset, u ~ U(0, 1)
+    # (the fitted offsets almost never fail on train scenes: NC fail 0.4% vs 6.0% on navtest, c64 ep25).  Labels stay
+    # the official terms of exactly these candidates vs GT.  0 = off; never active at eval.
+    cand_scorer_mix_p: float = 0.0
+    # km 10/25 (cross-fitting): 2 = two CrossFitPlanner copies (planner_head.py), each trained only on the scenes of
+    # its log-disjoint fold (crc32(log_name) % 2, exact_score.ExactFullTargetBuilder 'cf_fold'); the candidate scorer
+    # trains on the OTHER fold's planner's candidates (scenes that planner never fitted), labelled by their own official
+    # terms.  Needs input_target=true (the fold reaches the forward).  0 = off; eval always scores the main candidates.
+    cand_cf_folds: int = 0
+    cand_cf_weight: float = 1.0          # the cross-fit planners' own loss (imitation L1 + corridor_plan_weight x plan)
     corridor_verdict_weight: float = 0.0       # km 10/16 v3.1: predicted-corridor verdicts vs GT verdicts
     corridor_verdict_anchors: int = 64
     corridor_agent_attn: bool = False      # km 10/16 v3.1: corridor pixels attend to det/motion agent tokens

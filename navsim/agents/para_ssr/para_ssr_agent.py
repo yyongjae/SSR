@@ -698,6 +698,14 @@ class ParaSSRAgent(AbstractAgent):
             if fresh:
                 logger.info("v1 checkpoint: %d anchor-planner tensors start fresh", len(fresh))
             missing = [k for k in missing if not k.startswith(anchor_prefix)]
+        # km 10/25: the cross-fit planners are training-only and start fresh from a checkpoint that has none of them
+        # (initialising them from the main planner would hand them its fit of every training scene)
+        cf_prefix = "para_ssr_model.pts_bbox_head.cf_planners."
+        if not any(k.startswith(cf_prefix) for k in state_dict):
+            fresh = [k for k in missing if k.startswith(cf_prefix)]
+            if fresh:
+                logger.info("cross-fit planners: %d tensors start fresh", len(fresh))
+            missing = [k for k in missing if not k.startswith(cf_prefix)]
         if missing or result.unexpected_keys:
             # same wording as torch's strict load, which callers match on
             raise RuntimeError(
@@ -772,7 +780,10 @@ class ParaSSRAgent(AbstractAgent):
         # scales here also makes zero-share ablations effective on the very first
         # forward, before the first scheduled measurement.
         self._loss.apply_aux_scales(self.para_ssr_model)
-        predictions = self.para_ssr_model(features)
+        cf_fold = targets.get("cf_fold") if (targets is not None and self.training
+                                              and int(getattr(self._config, "cand_cf_folds", 0))) else None
+        predictions = (self.para_ssr_model(features, cf_fold=cf_fold) if cf_fold is not None
+                       else self.para_ssr_model(features))
         if self._stage_e is not None and not self.training:
             # inference: trajectory = tau_final (or tau0 with ref_eval_traj=tau0)
             predictions = self._stage_e.infer(self.ref_student, features, predictions)
@@ -819,8 +830,32 @@ class ParaSSRAgent(AbstractAgent):
                     float(cfg.corridor_plan_cap), float(getattr(cfg, "corridor_plan_ttc_weight", 0.0)),
                     prog_weight=float(getattr(cfg, "corridor_plan_prog_weight", 0.0)),
                     prog_cap=float(getattr(cfg, "corridor_plan_prog_cap", 1.2)),
-                    comfort_weight=float(getattr(cfg, "corridor_plan_comfort_weight", 0.0)))
+                    comfort_weight=float(getattr(cfg, "corridor_plan_comfort_weight", 0.0)),
+                    ec_smooth_weight=float(getattr(cfg, "corridor_plan_ec_smooth_weight", 0.0)))
                 loss = loss + float(cfg.corridor_plan_weight) * p_loss
+                if "cf_offset" in predictions and "cf_fold" in targets:
+                    # km 10/25 (cross-fitting): each sample trains ONLY its own fold's planner: the imitation L1 of
+                    # the anchor nearest the GT (anchor_plan_losses' WTA term) + the same corridor plan loss
+                    cfo = predictions["cf_offset"]
+                    rows = torch.arange(cfo.shape[0], device=cfo.device)
+                    own = cfo[rows, targets["cf_fold"].long().clamp(0, 1).to(cfo.device)]          # [B, K, T, 3]
+                    anc = predictions["trajectory_anchors"].to(own.dtype)
+                    gt = targets["trajectory"].reshape(own.shape[0], -1).to(own.dtype)
+                    win = (anc.reshape(1, anc.shape[0], -1) - gt[:, None]).norm(dim=-1).argmin(1)
+                    cf_l1 = torch.nn.functional.l1_loss(own.reshape(own.shape[0], own.shape[1], -1)[rows, win],
+                                      gt - anc.reshape(anc.shape[0], -1)[win])
+                    cf_p, cf_logs = corridor_plan_loss(
+                        {**predictions, "trajectory_offset": own}, targets,
+                        features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4],
+                        float(cfg.corridor_plan_static_margin), float(cfg.corridor_plan_occ_margin),
+                        float(cfg.corridor_plan_cap), float(getattr(cfg, "corridor_plan_ttc_weight", 0.0)),
+                        prog_weight=float(getattr(cfg, "corridor_plan_prog_weight", 0.0)),
+                        prog_cap=float(getattr(cfg, "corridor_plan_prog_cap", 1.2)),
+                        comfort_weight=float(getattr(cfg, "corridor_plan_comfort_weight", 0.0)),
+                        ec_smooth_weight=float(getattr(cfg, "corridor_plan_ec_smooth_weight", 0.0)), track_slot=1)
+                    loss = loss + float(cfg.cand_cf_weight) * (cf_l1 + float(cfg.corridor_plan_weight) * cf_p)
+                    logs["cf/l1"], logs["cf/plan"] = cf_l1.detach(), cf_p.detach()
+                    logs.update({"cf/" + kk.split("/")[-1]: v for kk, v in cf_logs.items()})
                 logs.update(p_logs)
                 if float(getattr(cfg, "corridor_verdict_weight", 0.0)) > 0:
                     # km 10/16 (v3.1): the predicted corridor's verdicts of model-free footprints vs the GT verdicts
@@ -837,7 +872,7 @@ class ParaSSRAgent(AbstractAgent):
             from .modules import exact_score as ES
             from .modules.candidate_scorer import cand_scorer_loss
             from .modules.torch_tracker import track
-            cand = (predictions["trajectory_anchors"].float()[None] + predictions["trajectory_offset"].float()).detach()
+            cand = predictions["cand_traj"]                  # km 10/25: may hold anchor + u * offset rows (cand_scorer_mix_p)
             b, k = cand.shape[:2]
             with torch.no_grad():
                 init = ES.ego_init(targets["ex_ego"].double())
@@ -856,6 +891,16 @@ class ParaSSRAgent(AbstractAgent):
                 logs["cand/ex2_valid"] = targets["ex2_valid"].float().mean()
                 logs["cand/gt_best_pdms1"] = torch.nan_to_num(ex["pdms1"], nan=0.0).amax(1).mean()
                 logs["cand/gt_best_epdms2"] = torch.nan_to_num(ex["epdms2"], nan=0.0).amax(1).mean()
+                if "cf_offset" in predictions:               # km 10/25: official NC / DAC failure rate of the cf candidates
+                    for nm in ("nc1", "dac1"):
+                        f, v = ex[nm] < 1, torch.isfinite(ex[nm])
+                        logs[f"cand/cf_fail_{nm}"] = (f & v).float().sum() / v.float().sum().clamp(min=1)
+                if "cand_mix_u" in predictions:              # km 10/25: official NC / DAC failure rate, mixed vs fitted
+                    mx = predictions["cand_mix_u"] < 1
+                    for nm in ("nc1", "dac1"):
+                        f, v = ex[nm] < 1, torch.isfinite(ex[nm])
+                        logs[f"cand/mix_fail_{nm}"] = (f & v & mx).float().sum() / (v & mx).float().sum().clamp(min=1)
+                        logs[f"cand/fit_fail_{nm}"] = (f & v & ~mx).float().sum() / (v & ~mx).float().sum().clamp(min=1)
             logs["loss"] = loss.detach()
         elif self.para_ssr_model.cand_scorer is not None and "ex_valid" in targets and "cand_states" in predictions:
             # km 10/19 (C): candidate scorer vs the exact GT verdicts of the same tracked candidates (after the balancer)

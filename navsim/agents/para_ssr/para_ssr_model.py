@@ -207,6 +207,7 @@ class ParaSSRModel(nn.Module):
             plan_kinematic=bool(getattr(cfg, "plan_kinematic", False)),
             plan_heading_from_xy=bool(getattr(cfg, "plan_heading_from_xy", False)),
             plan_rescore_refined=bool(getattr(cfg, "plan_rescore_refined", False)),
+            cf_folds=int(getattr(cfg, "cand_cf_folds", 0)),
         )
         self.lidar_encoder = build_lidar_encoder(cfg) if cfg.use_lidar else None
         # km 10/15: corridor head (GT corridor of the metric cache), see modules/corridor_head.py
@@ -225,7 +226,8 @@ class ParaSSRModel(nn.Module):
             from .modules.candidate_scorer import CandidateScorer
             self.cand_scorer = CandidateScorer(cfg.embed_dims, cfg.bev_h, cfg.bev_w, float(cfg.pc_range[4] - cfg.pc_range[1]),
                                                use_fields=bool(getattr(cfg, "cand_scorer_fields", True)) and self.corridor_head is not None,
-                                               agent_k=int(getattr(cfg, "corridor_agent_k", 32)))
+                                               agent_k=int(getattr(cfg, "corridor_agent_k", 32)),
+                                               pert=dict(p=float(getattr(cfg, "cand_scorer_pert_p", 0.0))))
 
         self.det_motion_head = (
             ParaDetMotionHead(
@@ -382,7 +384,8 @@ class ParaSSRModel(nn.Module):
 
     # ------------------------------------------------------------------ #
     def forward(
-        self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None
+        self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None,
+        cf_fold: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         # Interaction requires perception at inference too. In parallel mode,
         # run_aux only requests optional eval perception; training runs all heads.
@@ -435,6 +438,8 @@ class ParaSSRModel(nn.Module):
                 "trajectory", "plan_topk_trajectory", "plan_topk_reward", "plan_topk_index",
                 "plan_final_rewards", "trajectory_offset", "im_rewards", "sim_rewards", "trajectory_anchors")})
             predictions.update({k: v for k, v in outs.items() if k.startswith("plan_rescore_")})
+            if "cf_offset" in outs:
+                predictions["cf_offset"] = outs["cf_offset"]
         if self.corridor_head is not None:
             predictions.update(self.corridor_head(bev_embed, det_out))
             rule = str(getattr(cfg, "corridor_select_rule", "v2"))
@@ -449,7 +454,20 @@ class ParaSSRModel(nn.Module):
         if self.cand_scorer is not None and "trajectory_offset" in predictions:
             from .modules.torch_tracker import track
             status = features["status_feature"][:, cfg.num_navi_cmd:cfg.num_navi_cmd + 4].float()
-            cand = (predictions["trajectory_anchors"].float()[None] + predictions["trajectory_offset"].float()).detach()
+            off = predictions["trajectory_offset"].float().detach()
+            if self.training and "cf_offset" in predictions and cf_fold is not None:
+                # km 10/25 (cross-fitting): the scorer's candidates = the OTHER fold's planner (never fitted this scene)
+                other = (1 - cf_fold.long().clamp(0, 1)).to(off.device)
+                off = predictions["cf_offset"].float().detach()[torch.arange(off.shape[0], device=off.device), other]
+            mix = float(getattr(cfg, "cand_scorer_mix_p", 0.0))
+            if self.training and mix > 0:
+                # km 10/25: part of the scorer's candidates only partly offset (fail far more often than the fitted ones)
+                u = torch.rand(off.shape[:2], device=off.device)
+                u = torch.where(torch.rand_like(u) < mix, u, torch.ones_like(u))
+                off = off * u[..., None, None]
+                predictions["cand_mix_u"] = u
+            cand = predictions["trajectory_anchors"].float().detach()[None] + off
+            predictions["cand_traj"] = cand        # the scorer's candidates; the agent's official labels use the same
             b, k = cand.shape[:2]
             with torch.no_grad():
                 init = torch.cat([status, status.new_zeros(b, 3)], -1).repeat_interleave(k, 0)

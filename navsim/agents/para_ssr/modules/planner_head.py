@@ -377,6 +377,31 @@ class ParaSSRPlannerHead(nn.Module):
             "map_confidence": self.map_confidence_encoder(map_score),
         }
 
+    def _cf_offsets(self, args, cf_fold: torch.Tensor) -> torch.Tensor:
+        """km 10/26: cross-fit offsets [B, F, K, T, 3] with gradients only where they are trained.  A copy's loss
+        reads only its own fold's rows; on the other rows its offsets are scorer candidates (detached), so those rows
+        run under no_grad -- same values, about half the cf backward.  A copy with no own row in the batch is tied
+        to the graph by a zero term so DDP (find_unused_parameters=False) still sees every parameter."""
+        anchors, rest, dm = args[0], args[1:-1], args[-1]
+        fold = cf_fold.long().clamp(0, len(self.cf_planners) - 1).to(rest[0].device)
+        cols = []
+        for f, cf in enumerate(self.cf_planners):
+            own, res = fold == f, None
+            for rows, grad in ((own, True), (~own, False)):
+                idx = rows.nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    continue
+                sub = [t[idx] for t in rest]
+                sdm = {kk: (v[idx] if torch.is_tensor(v) else v) for kk, v in dm.items()}
+                with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
+                    o = cf(anchors, *sub, sdm)
+                res = o.new_zeros((fold.shape[0],) + o.shape[1:]) if res is None else res
+                res = res.index_put((idx,), o)
+            if not bool(own.any()) and torch.is_grad_enabled():
+                res = res + 0.0 * sum(p.sum() for p in cf.parameters())
+            cols.append(res)
+        return torch.stack(cols, 1)
+
     def plan_from_bev(
         self,
         bev_embed: torch.Tensor,
@@ -386,6 +411,7 @@ class ParaSSRPlannerHead(nn.Module):
         *,
         bev_pos: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
+        cf_fold: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Plan from BEV and current [vx, vy, ax, ay] ego status.
 
@@ -436,7 +462,8 @@ class ParaSSRPlannerHead(nn.Module):
                 dm = {kk: (v.detach() if torch.is_tensor(v) else v) for kk, v in memories.items()}
                 args = (self.anchor_planner.trajectory_anchors, h_ego.detach(), plan_pos.detach(), bev_embed.detach(),
                         bev_pos.detach(), dm)
-                out["cf_offset"] = torch.stack([cf(*args) for cf in self.cf_planners], 1)    # [B, F, K, T, 3]
+                out["cf_offset"] = (torch.stack([cf(*args) for cf in self.cf_planners], 1) if cf_fold is None
+                                    else self._cf_offsets(args, cf_fold))                      # [B, F, K, T, 3]
             if self.plan_rescore_refined and not self.training:
                 out.update(self._rescore_refined(out, h_ego, plan_pos, bev_embed, bev_pos, memories))
             poses = out["trajectory"]                               # absolute poses [B, T, 3]

@@ -425,6 +425,7 @@ class ParaSSRModel(nn.Module):
             # The cached status is command + (vx, vy, ax, ay) in NAVSIM's
             # native ego axes and metric units. Command has its own embedding.
             ego_status=features["status_feature"][:, cfg.num_navi_cmd:],
+            cf_fold=cf_fold if self.training else None,
         )
         predictions: Dict[str, torch.Tensor] = {
             "bev_embed": bev_embed,

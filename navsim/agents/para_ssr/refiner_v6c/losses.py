@@ -176,9 +176,12 @@ def corr_loss(S_g: torch.Tensor, S_base: torch.Tensor, targets: Dict[str, torch.
     teacher_discount gamma: the teacher term's steps weighted gamma^t (normalised), 1 = the plain time mean (default).
     At Delta = 0 the time mean asks a decel-only corrector to pass crossing objects faster (a dead zone, report 124
     §4-4); gamma < 1 makes a later contact cheaper (arm).
-    fix_source 'gt' (control B, report 124 §5): the fixing part 1[tau_base fails] * mean_t h(S_v6) reads the GT
-    occupancy distance instead of the teacher field (and the teacher term is off), so B and D differ only in the
-    source of the fixing signal and in K-E / K-M."""
+    fix_source 'gt': the fixing part 1[tau_base fails] * mean_t h(S_v6) reads the GT occupancy distance instead of the
+    teacher field (and the teacher term is off).  K-E / K-M are switched separately (cfg.v6c_kd, feedback 10-27), so
+    the source of the fixing signal and the KD can be compared one at a time; report 124 control B = gt + no KD.
+    The GT guard [h_GT(v6) - h_GT(base)]+ only penalises an edit that RAISES the GT risk (a surrogate on 12 front
+    points, not the official collision rule); at Delta = 0 it is 0 with zero gradient, so it never fixes a risky
+    tau_base by itself: fixing comes only from the term gated by the official tau_base failure."""
     S_base = S_base.detach()
     v = targets["corridor_valid"].float() if valid is None else valid.float()
     nv = v.sum().clamp(min=1.0)

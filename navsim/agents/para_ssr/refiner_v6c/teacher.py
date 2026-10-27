@@ -18,6 +18,7 @@ Baseline facts this relies on (report 125):
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Dict, Optional
 
@@ -28,7 +29,9 @@ import torch.nn as nn
 from ..modules.corridor_head import CLIP, CorridorHead
 from . import nets as N
 
+logger = logging.getLogger(__name__)
 TIME_BINS = (0, 10, 25, 41)                 # 0-1, 1-2.5, 2.5-4 s on the 41-step axis (report 124 D4 'Platt')
+TTC_LAST_DT = 0.9                 # the TTC rule's largest projection (dt 0, 0.3, 0.6, 0.9 s; labels.py)
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 
 
@@ -130,8 +133,12 @@ class TeacherSet(nn.Module):
     def path_outputs(self, S: torch.Tensor, flds: Dict[str, torch.Tensor], area: torch.Tensor, copy: torch.Tensor,
                      cin: int = 256) -> Dict[str, torch.Tensor]:
         """S [B, R, 41, 7] paths; area [B, R, T, 3] GT area flags along them ->
-        p [B, R, T, 7] KD targets in E's units (probabilities on the 3 logit channels), g_obj [B, R, T] gate (teacher
-        window), g_off [B, R, T] the off-road gate (all 4 corners inside 0 <= x <= 64, |y| <= 32)"""
+        p [B, R, T, 7] KD targets in E's units (probabilities on the 3 logit channels) and three gates [B, R, T]:
+          g_obj  the overlap channel: all 4 corners of the box inside the teacher window 0 <= x <= 64, |y| <= 32
+          g_ttc  the TTC-based channels (ttc, gap, vapp, px, py): g_obj AND the box shifted by speed * 0.9 s along the
+                 heading (the TTC rule's farthest projection, labels.py) also inside the window (report 124 D2 /
+                 report 127 §3.4: beyond 64 m the teacher sees nothing, so its 'no approach' there is not evidence)
+          g_off  the off-road channel (= g_obj)"""
         reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], self.bev_h, self.bev_w, 64.0)
         E = self._per_copy(self.te, copy, lambda m, s: {"E": m({k: v[s] for k, v in reads.items()}, area=area[s])["E"]})["E"]
         t21 = N.T21.to(S.device)
@@ -142,8 +149,16 @@ class TeacherSet(nn.Module):
         p = torch.cat([p_ovl[..., None], p_ttc[..., None], E[..., 2:6], p_off[..., None]], -1)
         s21 = S[:, :, t21]
         corners = N.footprint5(s21)[..., 1:, :]                                         # [B, R, T, 4, 2]
-        inwin = ((corners[..., 0] >= 0) & (corners[..., 0] <= 64.0) & (corners[..., 1].abs() <= 32.0)).all(-1)
-        return {"p": p, "g_obj": inwin.float(), "g_off": inwin.float()}
+
+        def win(c):
+            return ((c[..., 0] >= 0) & (c[..., 0] <= 64.0) & (c[..., 1].abs() <= 32.0)).all(-1)
+
+        inwin = win(corners)
+        # the window is convex and the shift is linear in dt, so dt = 0 and the last dt (0.9 s) cover 0.3 / 0.6 s too
+        shift = (torch.hypot(s21[..., 3], s21[..., 4]) * TTC_LAST_DT)[..., None]
+        u = torch.stack([torch.cos(s21[..., 2]), torch.sin(s21[..., 2])], -1)
+        inproj = inwin & win(corners + (u * shift)[..., None, :])
+        return {"p": p, "g_obj": inwin.float(), "g_ttc": inproj.float(), "g_off": inwin.float()}
 
 
 def load_teachers(path: str, cfg) -> TeacherSet:
@@ -152,6 +167,17 @@ def load_teachers(path: str, cfg) -> TeacherSet:
     meta = ck.get("meta", {})
     ts = TeacherSet(int(cfg.embed_dims), int(cfg.bev_h), int(cfg.bev_w), folds=int(meta.get("folds", 2)),
                     hid_e=int(meta.get("hid_e", 192)), planes=int(meta.get("planes", 49)))
+    # every stage-T phase saves the whole TeacherSet (untrained T-E included): only a checkpoint saved after the last
+    # phase ('te': T-E trained + its Platt maps + the T-M off-road Platt) is a complete teacher (report 127 §3.2)
+    need = ("fields", "platt_occ", "te")
+    phases = meta.get("phases")
+    if meta.get("phase_done") != "te" or (phases is not None and not all(x in phases for x in need)):
+        raise RuntimeError(f"teacher checkpoint {path} is incomplete (phase_done={meta.get('phase_done')!r}, "
+                           f"phases={phases}); use the checkpoint written after train_teachers.py --phase te "
+                           f"(teachers_te.pt) of a run that went through {need}")
+    if phases is None:
+        logger.warning("teacher checkpoint %s has no phase record (written before 10-28): only phase_done='te' checked",
+                       path)
     missing, unexpected = ts.load_state_dict(ck["state_dict"], strict=False)
     if unexpected or [k for k in missing if not k.startswith(("te.", "platt_"))]:
         raise RuntimeError(f"teacher checkpoint {path}: missing {missing[:8]}, unexpected {unexpected[:8]}")

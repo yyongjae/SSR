@@ -193,6 +193,28 @@ def exact_step_masks(st: torch.Tensor, t: Dict[str, torch.Tensor], prefix: str =
     return out
 
 
+def observed_horizon(t: Dict[str, torch.Tensor], prefix: str = "ex1_") -> torch.Tensor:
+    """[B] long: the step horizon the v6c labels use = max(packed nobs, last step holding any object row).
+    exact_verdict.pack_token sets nobs = the largest STORED row time, but objects stored once with t = 0 are copied to
+    every step: a token whose objects are all constant gets nobs = 0, and one whose moving objects end early gets that
+    step, although the constant objects exist at every step (report 125 / 127 §3.1, feedback 10-27 #1).  The same rule
+    as exact_step_masks; used for the official row labels of v6c (R-J targets, the tau_base failure flag) too."""
+    am = t[prefix + "amask"]                                                               # [B, 50, A]
+    steps = torch.arange(am.shape[1], device=am.device)
+    last = torch.where(am.any(-1), steps, torch.full_like(steps, -1)).amax(-1)            # [B]
+    return torch.maximum(t[prefix + "nobs"].reshape(-1).long(), last)
+
+
+def with_observed_horizon(t: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """shallow copy of the packed v1 / v2 tables with ex1_nobs / ex2_nobs replaced by observed_horizon (the baseline's
+    own tables and its scorer labels are untouched, so C0 and the stage-D baseline keep the original rule)"""
+    out = dict(t)
+    for pre in ("ex1_", "ex2_"):
+        if pre + "nobs" in t and pre + "amask" in t:
+            out[pre + "nobs"] = observed_horizon(t, pre).to(t[pre + "nobs"].dtype).reshape(t[pre + "nobs"].shape)
+    return out
+
+
 def stride2(lab: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """41 steps (0.1 s) -> the 21 refiner times (0, 0.2, .., 4.0 s), max-pooled over the odd step that the
     subsampling would drop (a 0.1 s positive at an odd step stays visible: bin max over (t - 0.1, t]), continuous

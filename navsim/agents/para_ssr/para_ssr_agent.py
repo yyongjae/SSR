@@ -389,13 +389,13 @@ class ParaSSRAgent(AbstractAgent):
         # (loaded lazily at the first training loss, so evaluation hosts do not need the stage-T checkpoint; kept in a
         # plain list: never in the state_dict, the optimizer or DDP)
         self._v6c_teacher_box: List = [None]
+        # set by initialize(): stage P may only TRAIN on a loaded C0 (checked in get_optimizers, report 127 §2.3: the
+        # evaluation loader builds the agent with resume_from_checkpoint=false and calls initialize() afterwards)
+        self._v6c_weights_loaded = False
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
         if self.para_ssr_model.v6c_frozen_base():
-            if not (checkpoint_path and resume_from_checkpoint):
-                raise ValueError("v6c stage P freezes C0: set agent.checkpoint_path=<C0> and agent.resume_from_checkpoint=true "
-                                 "(without both, initialize() never runs and the frozen baseline is random)")
             # stage P: only refiner v6c learns; the frozen baseline gets no optimizer state and no DDP gradient
             for name, prm in self.para_ssr_model.named_parameters():
                 if not name.startswith("v6c."):
@@ -438,6 +438,9 @@ class ParaSSRAgent(AbstractAgent):
                       ("v6c_h_arm", ("E", "EH", "H")), ("v6c_fix_source", ("teacher", "gt"))):
             if str(getattr(config, k)) not in ok:
                 bad[k] = getattr(config, k)
+        # every reader does bool(v6c_kd): a string 'False' (a quoted override) would read as True, so only real bools
+        if type(getattr(config, "v6c_kd", True)).__name__ not in ("bool", "bool_"):
+            bad["v6c_kd"] = f"must be a bool, got {getattr(config, 'v6c_kd')!r}"
         if str(getattr(config, "v6c_stage", "D")) == "P" and getattr(config, "use_distill", False):
             # stage P returns the v6c loss only: the v15 module would get no gradient (DDP error) and C0 is frozen anyway
             bad["use_distill"] = "must be false in stage P"
@@ -991,6 +994,7 @@ class ParaSSRAgent(AbstractAgent):
                 f"Missing key(s): {missing[:10]}; "
                 f"Unexpected key(s): {list(result.unexpected_keys)[:10]}"
             )
+        self._v6c_weights_loaded = True
 
     def get_sensor_config(self) -> SensorConfig:
         """Load only the cameras, LiDAR frames and history this config consumes.
@@ -1275,7 +1279,23 @@ class ParaSSRAgent(AbstractAgent):
         return callbacks
 
     # ------------------------------------------------------------------ #
+    def _check_v6c_training(self) -> None:
+        """refiner v6c preconditions that only TRAINING needs (evaluation builds the agent without them, report 127)"""
+        cfg = self._config
+        if not getattr(cfg, "v6c", False):
+            return
+        if self.para_ssr_model.v6c_frozen_base() and not self._v6c_weights_loaded:
+            raise ValueError("v6c stage P freezes C0: set agent.checkpoint_path=<C0> and agent.resume_from_checkpoint=true "
+                             "(without both, initialize() never runs and the frozen baseline is random)")
+        # teacher KD (K-E / K-M) and the teacher fixing term both need the stage-T checkpoint; without it they would be
+        # silently absent (report 127 §5): the GT-only arm is v6c_fix_source=gt + v6c_kd=false
+        uses_teacher = bool(getattr(cfg, "v6c_kd", True)) or str(getattr(cfg, "v6c_fix_source", "teacher")) == "teacher"
+        if uses_teacher and not str(getattr(cfg, "v6c_teacher_ckpt", "") or ""):
+            raise ValueError("v6c: v6c_kd=true or v6c_fix_source=teacher needs v6c_teacher_ckpt (the stage-T checkpoint); "
+                             "the GT-only arm is v6c_fix_source=gt with v6c_kd=false")
+
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
+        self._check_v6c_training()
         cfg = self._config
         backbone_params, other_params = [], []
         for name, param in self.para_ssr_model.named_parameters():

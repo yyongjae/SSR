@@ -283,3 +283,112 @@ def test_dead_flag_only_in_decel_only_mode():
     ctrl[:, :6] = 3.0                                                                          # push toward speeding up
     assert float(N.decode_v6(tau, ctrl, v0, mode="A")["lon_dead"].min()) == 1.0
     assert N.decode_v6(tau, ctrl, v0, mode="B")["lon_dead"] is None                           # a live speed-up in mode B
+
+
+# ---------------------------------------------------------------- fixes after reports 127 and the 10-27 feedback
+def _const_table(extra_rows=None):
+    """one stopped car stored once with t = 0 at x = 25 m (+ optional moving rows), road and centerline straight"""
+    tab = ES._empty(ES.V1_TABLES)
+    rows = [[0, 25.0, 0.0, 0.0, 2.4, 1.0, 1.0, 3, 1.0]] + (extra_rows or [])
+    tab["agent_rows"] = np.array(rows, np.float32)
+    tab["drv_seg"] = _rect_segs(-20, 120, -6, 6)
+    tab["lane_seg"] = _rect_segs(-20, 120, -6, 6)
+    tab["cl"] = np.stack([np.linspace(-20, 120, 141), np.zeros(141), np.linspace(0, 140, 141)], -1).astype(np.float32)
+    tab["pdm"] = np.zeros((41, 9), np.float32)
+    t = ES.pack_full(tab, "ex1_")
+    t["ex1_valid"] = torch.tensor(1.0)
+    return {k: v[None] for k, v in t.items()}
+
+
+@pytest.mark.parametrize("moving_until", [None, 15])
+def test_official_row_labels_use_the_step_label_horizon(moving_until):
+    """feedback 10-27 #1 / report 127 §3.1: the official row terms v6c trains R-J on (and the tau_base failure flag)
+    must see the same constant object the R-E step labels see.  Two cases: only constant objects (nobs 0) and a
+    moving object whose rows end at step 15 (nobs 15) next to the constant one."""
+    extra = None if moving_until is None else [[ti, -30.0 + ti, 8.0, 0.0, 2.4, 1.0, 1.0, 3, 1.0]
+                                               for ti in range(1, moving_until + 1)]
+    t = _const_table(extra)
+    assert int(t["ex1_nobs"][0]) == (0 if moving_until is None else moving_until)
+    assert int(L.observed_horizon(t)[0]) == 49                                                # constants copied to 49
+    t_obs = L.with_observed_horizon(t)
+    assert int(t["ex1_nobs"][0]) == (0 if moving_until is None else moving_until)            # the input is untouched
+    st7 = _straight(10.0)
+    st9 = torch.cat([st7, torch.zeros(*st7.shape[:-1], 2)], -1)
+    raw, fixed = ES.official_scores(st9, t, None), ES.official_scores(st9, t_obs, None)
+    assert float(raw["nc1"][0, 0]) == 1.0                                                     # the baseline engine misses it
+    assert float(fixed["nc1"][0, 0]) < 1.0                                                    # v6c's official rows see it
+    lab = L.exact_step_masks(st7, t)
+    assert lab["ovl"][0, 0].sum() > 0                                                         # ... like the R-E labels
+
+
+def _random_teacher(tmp_path, phase="te", phases=("fields", "platt_occ", "te")):
+    from navsim.agents.para_ssr.refiner_v6c.teacher import TeacherSet
+    torch.manual_seed(0)
+    ts = TeacherSet()
+    p = tmp_path / f"teachers_{phase}_{len(phases)}.pt"
+    meta = {"folds": 2, "hid_e": 192, "planes": 49, "phase_done": phase, "phases": list(phases)}
+    torch.save({"state_dict": ts.state_dict(), "meta": meta}, p)
+    return p
+
+
+def test_incomplete_teacher_checkpoint_is_refused(tmp_path):
+    """report 127 §3.2: every stage-T phase saves the whole TeacherSet (untrained T-E included); only 'te' is complete"""
+    from types import SimpleNamespace
+    from navsim.agents.para_ssr.refiner_v6c.teacher import load_teachers
+    cfg = SimpleNamespace(embed_dims=256, bev_h=100, bev_w=100)
+    for phase, phases in (("fields", ("fields",)), ("platt_occ", ("fields", "platt_occ")),
+                          ("te", ("fields", "te"))):                                       # resumed te, platt_occ skipped
+        with pytest.raises(RuntimeError, match="incomplete"):
+            load_teachers(str(_random_teacher(tmp_path, phase, phases)), cfg)
+    ts = load_teachers(str(_random_teacher(tmp_path, "te")), cfg)
+    assert ts.loaded_parts["te"] and not ts.training
+
+
+def test_teacher_ttc_gate_needs_the_projected_box_in_the_window(tmp_path):
+    """report 127 §3.4 / feedback 10-27: the TTC-based KD channels need the box shifted by speed * 0.9 s inside the
+    teacher window too; the overlap and off-road gates need only the current box"""
+    from types import SimpleNamespace
+    from navsim.agents.para_ssr.refiner_v6c.teacher import load_teachers
+    ts = load_teachers(str(_random_teacher(tmp_path)), SimpleNamespace(embed_dims=256, bev_h=100, bev_w=100))
+    S = torch.zeros(1, 2, 41, 7)
+    S[:, :, :, 0] = 52.0                                                                     # box front ~55 m, inside
+    S[:, 0, :, 3] = 20.0                                                                     # fast: 0.9 s ahead is ~73 m
+    S[:, 1, :, 3] = 1.0                                                                      # slow: ~56 m, inside
+    flds = {"tok_det": torch.zeros(1, 100 * 100, 256), "sdf_m": torch.full((1, 200, 200), 5.0),
+            "occ_prob": torch.zeros(1, 49, 200, 200)}
+    po = ts.path_outputs(S, flds, torch.zeros(1, 2, 21, 3), torch.zeros(1, dtype=torch.long))
+    assert bool((po["g_obj"] == 1).all()) and bool((po["g_off"] == 1).all())
+    assert bool((po["g_ttc"][0, 0] == 0).all()) and bool((po["g_ttc"][0, 1] == 1).all())
+
+
+def test_occupancy_platt_weighted_fit_recovers_the_real_rates():
+    """report 127 §7.2 counterexample: per-batch class-balanced draws of a 1 % batch and a 9 % batch (each with its own
+    constant logit).  The inverse-inclusion weighted fit gives back 1 % and 9 %; a bin with too few positives keeps
+    its previous map and reports it (no shift is added any more, §7.3)"""
+    from navsim.agents.para_ssr.refiner_v6c.teacher import Platt
+    import tools.refiner_v6c.train_teachers as TT
+    g = torch.Generator().manual_seed(0)
+    xs, ys, ws = [[], [], []], [[], [], []], [[], [], []]
+    for rate, logit, n in ((0.01, -1.0, 400_000), (0.09, 1.0, 400_000)):
+        y = (torch.rand(n, generator=g) < rate).float()
+        pos, neg = y.nonzero().flatten(), (y == 0).nonzero().flatten()
+        tp, tn = pos[:4096], neg[:4096]
+        for kk in range(2):
+            xs[kk].append(torch.full((len(tp) + len(tn),), logit))
+            ys[kk].append(torch.cat([y[tp], y[tn]]))
+            ws[kk].append(torch.cat([torch.full((len(tp),), len(pos) / len(tp)), torch.full((len(tn),), len(neg) / len(tn))]))
+    xs[2], ys[2], ws[2] = [torch.zeros(60)], [torch.cat([torch.ones(2), torch.zeros(58)])], [torch.ones(60)]
+    pl = Platt()
+    pl.b[2] = -0.7
+    done = TT._fit(pl, xs, ys, lambda d: None, "occ", ws=ws)
+    assert done == [True, True, False] and float(pl.b[2]) == pytest.approx(-0.7)
+    p = torch.sigmoid(pl.a[0] * torch.tensor([-1.0, 1.0]) + pl.b[0])
+    assert float(p[0]) == pytest.approx(0.01, abs=0.002) and float(p[1]) == pytest.approx(0.09, abs=0.005)
+
+
+def test_resumed_teacher_set_starts_frozen():
+    """report 127 §2.2: a stage-T run that restores a checkpoint must not run T-D / T-M BatchNorm in train mode"""
+    import tools.refiner_v6c.train_teachers as TT
+    ts = TT.frozen_teacher_set(torch.device("cpu"))
+    assert not any(m.training for m in ts.modules())
+    assert not any(p.requires_grad for p in ts.parameters())

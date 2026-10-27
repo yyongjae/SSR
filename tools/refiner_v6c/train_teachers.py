@@ -143,11 +143,18 @@ def train_fields(ts: TeacherSet, data_by_fold, args, dev, log):
 
 @torch.no_grad()
 def fit_platt_occ(ts: TeacherSet, data_by_fold, args, dev, log, n_px: int = 4096):
-    """OOF: copy f on fold 1 - f tokens; logistic regression of GT occupancy on the logit, per time bin"""
-    xs = [[] for _ in range(len(TIME_BINS) - 1)]
-    ys = [[] for _ in range(len(TIME_BINS) - 1)]
-    npos_all = [0.0] * (len(TIME_BINS) - 1)          # every pixel seen, for the prior correction below
-    nall = [0.0] * (len(TIME_BINS) - 1)
+    """OOF: copy f on fold 1 - f tokens; logistic regression of GT occupancy on the logit, per time bin.
+    Per batch and bin up to n_px positive and n_px negative pixels are drawn (occupancy is ~3 %, so a uniform draw would
+    hold few positives).  Each drawn pixel is weighted by 1 / its inclusion probability (class count in that batch-bin /
+    number drawn), so the weighted fit is the fit on every pixel: the real occupancy rate, and the batch-to-batch
+    density differences (1-6 % per batch) are undone too.  A single global prior shift (e7ae16a) only fixed the mean
+    and left the slope ~1.2-2x too steep (report 127 §7.2, measured on the GPU smoke teacher)."""
+    nb = len(TIME_BINS) - 1
+    xs = [[] for _ in range(nb)]
+    ys = [[] for _ in range(nb)]
+    ws = [[] for _ in range(nb)]
+    npos_all = [0.0] * nb
+    nall = [0.0] * nb
     for f in range(2):
         dl = torch.utils.data.DataLoader(data_by_fold[1 - f], batch_size=args.batch, num_workers=args.workers)
         for n, bt in enumerate(dl):
@@ -161,54 +168,59 @@ def fit_platt_occ(ts: TeacherSet, data_by_fold, args, dev, log, n_px: int = 4096
             gt = (bt["corridor_occ_dist"][ok] < 0).float()
             planes = torch.arange(1, lg.shape[1] + 1, device=dev)
             kb = ts.platt_occ.bins(planes)
-            for kk in range(len(xs)):
+            for kk in range(nb):
                 sel = (kb == kk).nonzero(as_tuple=True)[0]
                 lv, gv = lg[:, sel].reshape(-1), gt[:, sel].reshape(-1)
                 npos_all[kk] += float(gv.sum())
                 nall[kk] += float(gv.numel())
                 pos = gv.nonzero(as_tuple=True)[0]
                 neg = (gv == 0).nonzero(as_tuple=True)[0]
-                take = torch.cat([pos[torch.randperm(len(pos), device=dev)[:n_px]],
-                                  neg[torch.randperm(len(neg), device=dev)[:n_px]]])
-                xs[kk].append(lv[take])
-                ys[kk].append(gv[take])
-    _fit(ts.platt_occ, xs, ys, log, "occ")
-    # the fit saw class-balanced pixels; move the intercept to the real occupancy rate (logit prior correction), so
-    # the teacher term's 0.3 margin reads a probability of the real rate (report 126 review)
-    for kk in range(len(xs)):
+                tp = pos[torch.randperm(len(pos), device=dev)[:n_px]]
+                tn = neg[torch.randperm(len(neg), device=dev)[:n_px]]
+                xs[kk].append(torch.cat([lv[tp], lv[tn]]))
+                ys[kk].append(torch.cat([gv[tp], gv[tn]]))
+                ws[kk].append(torch.cat([torch.full((len(tp),), len(pos) / max(len(tp), 1), device=dev),
+                                         torch.full((len(tn),), len(neg) / max(len(tn), 1), device=dev)]))
+    done = _fit(ts.platt_occ, xs, ys, log, "occ", ws=ws)
+    for kk in range(nb):
         if not xs[kk] or nall[kk] == 0:
             continue
-        y = torch.cat(ys[kk])
-        ps, pr = float(y.mean()), npos_all[kk] / nall[kk]
-        if 0 < ps < 1 and 0 < pr < 1:
-            shift = float(np.log(pr / (1 - pr)) - np.log(ps / (1 - ps)))
-            ts.platt_occ.b[kk] += shift
-            log({"phase": "platt", "map": "occ_prior", "bin": kk, "rate": pr, "sample_rate": ps, "b_shift": shift})
+        y, w = torch.cat(ys[kk]), torch.cat(ws[kk])
+        log({"phase": "platt", "map": "occ_rate", "bin": kk, "fitted": bool(done[kk]), "rate": npos_all[kk] / nall[kk],
+             "sample_rate": float(y.mean()), "weighted_rate": float((w * y).sum() / w.sum())})
 
 
-def _fit(platt, xs, ys, log, name, iters: int = 300, min_each: int = 50):
+def _fit(platt, xs, ys, log, name, iters: int = 300, min_each: int = 50, ws=None):
+    """per bin: (weighted) BCE logistic fit of p = sigmoid(a x + b); a bin with fewer than min_each positives or
+    negatives keeps its previous map.  -> list of bools: fitted per bin"""
+    done = [False] * len(xs)
     for kk in range(len(xs)):
         if not xs[kk]:
             continue
         x, y = torch.cat(xs[kk]).float().cpu(), torch.cat(ys[kk]).float().cpu()
+        w = None if ws is None else torch.cat(ws[kk]).float().cpu()
         npos, nneg = int((y > 0.5).sum()), int((y <= 0.5).sum())
         if npos < min_each or nneg < min_each:                     # too few of one class: keep the previous map
             log({"phase": "platt", "map": name, "bin": kk, "skipped": True, "npos": npos, "nneg": nneg})
             continue
+        w = None if w is None else w / w.mean()
         a = torch.tensor(float(platt.a[kk]), requires_grad=True)
         bb = torch.tensor(float(platt.b[kk]), requires_grad=True)
         opt = torch.optim.LBFGS([a, bb], max_iter=iters)
 
         def closure():
             opt.zero_grad()
-            l = F.binary_cross_entropy_with_logits(a * x + bb, y)
+            l = F.binary_cross_entropy_with_logits(a * x + bb, y, weight=w)
             l.backward()
             return l
 
         opt.step(closure)
         platt.a[kk] = float(a.detach())
         platt.b[kk] = float(bb.detach())
-        log({"phase": "platt", "map": name, "bin": kk, "a": float(a), "b": float(bb), "n": int(len(x))})
+        done[kk] = True
+        log({"phase": "platt", "map": name, "bin": kk, "a": float(a), "b": float(bb), "n": int(len(x)),
+             "weighted": w is not None})
+    return done
 
 
 def train_te(ts: TeacherSet, data_by_fold, anchors, args, dev, log):
@@ -314,6 +326,19 @@ def fit_platt_te_off(ts: TeacherSet, data_by_fold, anchors, args, dev, log):
     _fit(ts.platt_off, *acc["off"], log, "tm_off")
 
 
+def frozen_teacher_set(dev, resume: str = "") -> TeacherSet:
+    """TeacherSet (optionally restored), every module frozen and in eval (BatchNorm running stats, no dropout) until a
+    phase switches the ones it trains: train_fields -> td[f] / tm[f], train_te -> te[f].  A fresh nn.Module is in
+    train mode, so without this a '--phase platt_occ / te --resume' run would read the T-D / T-M fields with batch
+    statistics and overwrite their running stats (report 127 §2.2).  TeacherSet.train() always maps to eval."""
+    ts = TeacherSet().to(dev)
+    if resume:
+        ts.load_state_dict(torch.load(resume, map_location="cpu")["state_dict"])
+    ts.eval()
+    ts.requires_grad_(False)
+    return ts
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -345,13 +370,18 @@ def main():
     cfg = builder_cfg(args.km_root, args.teacher_root)
     data = {f: TokenDataset(args.split, cfg, folds=(f,), limit=args.limit) for f in (0, 1)}
     log({"phase": "data", "fold0": len(data[0]), "fold1": len(data[1]), "args": vars(args)})
-    ts = TeacherSet().to(dev)
-    if args.resume:
-        ts.load_state_dict(torch.load(args.resume, map_location="cpu")["state_dict"])
+    ts = frozen_teacher_set(dev, args.resume)
     anchors = torch.tensor(np.load(REPO / "resources/km_corridor/trajectory_anchors_256.npy"), dtype=torch.float32)
 
+    # phases already in the restored checkpoint + the ones this run completes (load_teachers needs all three, so a
+    # '--phase te' run resumed from a fields-only checkpoint, without platt_occ, is not taken for a complete teacher)
+    phases = list(torch.load(args.resume, map_location="cpu").get("meta", {}).get("phases", [])) if args.resume else []
+
     def save(tag):
-        meta = {"folds": 2, "hid_e": 192, "planes": 49, "phase_done": tag, "norm": "resources/km_corridor/norm_*_100x100.npz",
+        if tag not in phases:
+            phases.append(tag)
+        meta = {"folds": 2, "hid_e": 192, "planes": 49, "phase_done": tag, "phases": list(phases),
+                "norm": "resources/km_corridor/norm_*_100x100.npz",
                 "teacher_inputs": "kd_bev_0 BEVFusion (W flip), kd_bev_1 ReSMap front64 (transpose), student grid"}
         torch.save({"state_dict": ts.state_dict(), "meta": meta}, out / f"teachers_{tag}.pt")
         torch.save({"state_dict": ts.state_dict(), "meta": meta}, out / "teachers.pt")

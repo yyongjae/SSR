@@ -175,11 +175,76 @@ def test_gradient_contract(batch):
     assert n_re > 0
 
 
-def test_stage_p_needs_c0_and_no_distill(c0_ckpt):
-    with pytest.raises(ValueError):
-        build_agent(0, v6c=True, v6c_stage="P")                                            # no checkpoint
+GT_ONLY = dict(v6c_fix_source="gt", v6c_kd=False)                                           # the arm without a teacher
+
+
+def test_stage_p_needs_c0_to_train_and_no_distill(c0_ckpt):
+    """report 127 §2.3: a stage-P agent may be BUILT without C0 (the evaluation loader builds it with
+    resume_from_checkpoint=false and calls initialize() afterwards); TRAINING it without C0 is refused"""
+    a = build_agent(0, v6c=True, v6c_stage="P", **GT_ONLY)
+    with pytest.raises(ValueError, match="stage P freezes C0"):
+        a.get_optimizers()
+    a._checkpoint_path = str(c0_ckpt)
+    a.initialize()                                                                          # the evaluation loader's order
+    a.get_optimizers()
     with pytest.raises(ValueError):
         build_agent(0, ckpt=c0_ckpt, v6c=True, v6c_stage="P", use_distill=True)
+
+
+def test_stage_p_checkpoint_loads_in_the_evaluation_order(c0_ckpt, tmp_path):
+    """a stage-P checkpoint (C0 + trained v6c) through the evaluation loader's order: build without resume, then
+    initialize(): every tensor, v6c included, is restored"""
+    a = build_agent(0, ckpt=c0_ckpt, v6c=True, v6c_stage="P", **GT_ONLY)
+    with torch.no_grad():
+        for prm in a.para_ssr_model.v6c.parameters():
+            prm.add_(0.01)                                                                  # 'trained' v6c weights
+    path = tmp_path / "p.ckpt"
+    torch.save({"state_dict": {"agent." + k: v for k, v in a.state_dict().items()}}, path)
+    b = build_agent(1, v6c=True, v6c_stage="P", **GT_ONLY)
+    b._checkpoint_path = str(path)
+    b.initialize()
+    sa, sb = a.state_dict(), b.state_dict()
+    ks = [k for k in sa if torch.is_tensor(sa[k])]
+    assert any(k.startswith("para_ssr_model.v6c.") for k in ks)
+    assert all(torch.equal(sa[k], sb[k]) for k in ks)
+
+
+def test_v6c_kd_must_be_a_real_bool():
+    """review 10-28: every reader does bool(v6c_kd), so a string 'False' would silently mean KD on"""
+    with pytest.raises(ValueError, match="v6c_kd"):
+        build_agent(0, v6c=True, v6c_kd="False")
+
+
+def test_training_without_teacher_is_refused_unless_gt_only():
+    """report 127 §5: K-E / K-M or the teacher fixing term without a stage-T checkpoint would be silently absent"""
+    for over in (dict(v6c_fix_source="teacher", v6c_kd=False), dict(v6c_fix_source="gt", v6c_kd=True)):
+        with pytest.raises(ValueError, match="v6c_teacher_ckpt"):
+            build_agent(0, v6c=True, **over).get_optimizers()
+    build_agent(0, v6c=True, **GT_ONLY).get_optimizers()
+
+
+def test_kd_and_fix_source_switch_independently(batch, tmp_path):
+    """feedback 10-27 #5: K-E / K-M (v6c_kd) and the source of the fixing term (v6c_fix_source) are separate switches;
+    before, fix_source=gt also turned KD off, so 'KD on + GT fixing' could not be built"""
+    from navsim.agents.para_ssr.refiner_v6c.teacher import TeacherSet
+    torch.manual_seed(0)
+    ck = tmp_path / "teachers_te.pt"
+    torch.save({"state_dict": TeacherSet().state_dict(),
+                "meta": {"folds": 2, "hid_e": 192, "planes": 49, "phase_done": "te",
+                         "phases": ["fields", "platt_occ", "te"]}}, ck)
+    seen = {}
+    for fix, kd in (("gt", True), ("gt", False), ("teacher", False)):
+        a = build_agent(0, v6c=True, v6c_stage="D", v6c_fix_source=fix, v6c_kd=kd, v6c_teacher_ckpt=str(ck))
+        a.train()
+        f, t = _fresh(batch)
+        p = a.forward(f, t)
+        a.compute_loss(f, t, p)
+        lg = a.latest_logs
+        seen[(fix, kd)] = (any(k.startswith("v6c/KD_") for k in lg), float(lg.get("v6c/corr_nz_teacher", 0.0)),
+                           "v6c/nobs_raised" in lg)
+    assert seen[("gt", True)][0] and not seen[("gt", False)][0] and not seen[("teacher", False)][0]
+    assert seen[("gt", True)][1] == 0.0 and seen[("gt", False)][1] == 0.0                    # no teacher fixing term
+    assert all(v[2] for v in seen.values())
 
 
 def test_stage_p_loads_c0_and_v6c_starts_fresh(c0_ckpt):

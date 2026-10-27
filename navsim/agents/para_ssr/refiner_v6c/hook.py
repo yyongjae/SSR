@@ -198,7 +198,11 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
                    angular=True).reshape(b, 2, 41, 9).float()
         if "ex2_hum_st" not in targets:
             ES.track_human(targets, init)
-        ex = ES.official_scores(st9, targets, targets)                                 # [B, 2] per term
+        # the official row terms (R-J targets, the tau_base failure flag that gates the fixing term) on the SAME
+        # observation horizon as the R-E step labels (feedback 10-27 #1); the baseline's tables stay untouched
+        t_obs = LB.with_observed_horizon(targets)
+        logs["v6c/nobs_raised"] = (t_obs["ex1_nobs"].reshape(-1) != targets["ex1_nobs"].reshape(-1)).float().mean()
+        ex = ES.official_scores(st9, t_obs, t_obs)                                     # [B, 2] per term
         lab = LB.stride2(LB.exact_step_masks(st9[..., :7], targets))                   # [B, 2, T]
         base_fail = ((ex["nc1"][:, 0] < 1) | (ex["ttc1"][:, 0] < 1)) & torch.isfinite(ex["nc1"][:, 0])
         # teachers (online, OOF copy of the other fold)
@@ -214,8 +218,9 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
             area = _area_flags(S_rows, targets)
             po = teachers.path_outputs(S_rows, flds, area, copy)
             g_obj = po["g_obj"] * (ok0 & ok1).float()[:, None, None]
+            g_ttc = po["g_ttc"] * (ok0 & ok1).float()[:, None, None]                    # ttc, gap, vapp, px, py
             g_off = po["g_off"] * ok1.float()[:, None, None]
-            g = torch.stack([g_obj, g_obj, g_obj, g_obj, g_obj, g_obj, g_off], -1)
+            g = torch.stack([g_obj, g_ttc, g_ttc, g_ttc, g_ttc, g_ttc, g_off], -1)
             if not getattr(teachers, "loaded_parts", {}).get("te", True):
                 g[..., :6] = 0.0                                                         # no T-E in this checkpoint
             kd = {"p": po["p"], "g": g}
@@ -223,8 +228,9 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
             logs["v6c/teacher_ok_frac_map"] = ok1.float().mean()
     lam = {nm: float(getattr(cfg, "v6c_kd_lambda", 0.5)) for nm in ("ovl", "ttc", "gap", "vapp", "px", "py")}
     lam["offroad"] = float(getattr(cfg, "v6c_kd_lambda_off", 0.5))
-    if str(getattr(cfg, "v6c_fix_source", "teacher")) == "gt":
-        kd = None                                                                       # control B: no KD
+    if not bool(getattr(cfg, "v6c_kd", True)):
+        kd = None                                                                       # K-E / K-M off (independent of
+                                                                                        # v6c_fix_source, feedback 10-27)
     rowmask = has.float()[:, None, None]
     lab = {k: (v * rowmask if v.dim() == 3 else v) for k, v in lab.items()}
     pw = float(getattr(cfg, "v6c_pos_weight", 4.0))
@@ -336,8 +342,7 @@ def warmup_risk_loss(v6c: RefinerV6c, cfg, features, targets, predictions, kd_te
     reads = N.path_reads(S, bev, sdf, occ, v6c.bev_h, v6c.bev_w, v6c.fwd_m)
     E = v6c.re(reads, agents)["E"]
     kd = None
-    if kd_teachers is not None and "kd_bev_0" in targets and "cf_fold" in targets \
-            and str(getattr(cfg, "v6c_fix_source", "teacher")) != "gt":
+    if kd_teachers is not None and "kd_bev_0" in targets and "cf_fold" in targets and bool(getattr(cfg, "v6c_kd", True)):
         with torch.no_grad():
             copy = kd_teachers.oof_copy(targets["cf_fold"].to(dev))
             flds = kd_teachers.fields(targets["kd_bev_0"], targets["kd_bev_1"], copy)
@@ -345,7 +350,11 @@ def warmup_risk_loss(v6c: RefinerV6c, cfg, features, targets, predictions, kd_te
             ok0 = targets["kd_ok_0"].bool() if "kd_ok_0" in targets else torch.ones(b, dtype=torch.bool, device=dev)
             ok1 = targets["kd_ok_1"].bool() if "kd_ok_1" in targets else torch.ones(b, dtype=torch.bool, device=dev)
             g_obj = po["g_obj"] * (ok0 & ok1).float()[:, None, None]
-            kd = {"p": po["p"], "g": torch.stack([g_obj] * 6 + [po["g_off"] * ok1.float()[:, None, None]], -1)}
+            g_ttc = po["g_ttc"] * (ok0 & ok1).float()[:, None, None]
+            g = torch.stack([g_obj] + [g_ttc] * 5 + [po["g_off"] * ok1.float()[:, None, None]], -1)
+            if not getattr(kd_teachers, "loaded_parts", {}).get("te", True):
+                g[..., :6] = 0.0                                                         # no T-E: same rule as v6c_loss
+            kd = {"p": po["p"], "g": g}
     lam = {nm: float(getattr(cfg, "v6c_kd_lambda", 0.5)) for nm in ("ovl", "ttc", "gap", "vapp", "px", "py")}
     lam["offroad"] = float(getattr(cfg, "v6c_kd_lambda_off", 0.5))
     return LS.risk_loss(E, lab, kd, lam, float(getattr(cfg, "v6c_pos_weight", 4.0)))

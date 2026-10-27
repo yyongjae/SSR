@@ -8,7 +8,9 @@ Per token it scores three trajectories with the official simulator + scorer (too
   out   the submitted one (mode B: v6_switch ? v6 : base; the dump records the forward's switch)
 and reports the pre-registered endpoints of report 124 §5: mean PDMS of each, the paired difference v6 - base and
 out - base with a token bootstrap CI, the safety layer (tokens where base passes NC, DAC and TTC) difference, the EP
-change on the safety layer (2nd endpoint), and the switch rate.
+change on the safety layer (2nd endpoint), and the switch rate.  Also the official v1 driving direction compliance
+(DDC, a multiplicative PDMS term) of each trajectory and how many tokens change DDC between base and v6 / out: R-J's
+expected PDMS assumes DDC = 1 (report 126 §2-7), so this measures that assumption.  EPDMS / EC: val_epdms.py.
 
   $PY tools/refiner_v6c/val_score.py --dump <dir> --split navtrain_val [--n 0] [--workers 10]
 """
@@ -27,7 +29,7 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-TERMS = ("pdms", "nc", "dac", "ep", "ttc", "comfort")
+TERMS = ("pdms", "nc", "dac", "ep", "ttc", "comfort", "ddc")       # ddc appended: the indices 0..5 above are kept
 
 
 def work(job):
@@ -82,7 +84,7 @@ def main(argv=None) -> int:
         for x in ex.map(work, jobs):
             res += x
     ok = np.array([not isinstance(x, str) for x in res])
-    R = np.array([x for x in res if not isinstance(x, str)], np.float64)                 # [n_ok, 2, 6]
+    R = np.array([x for x in res if not isinstance(x, str)], np.float64)                 # [n_ok, 2, 7]
     swo = sw[ok]
     out = np.where(swo[:, None], R[:, 1], R[:, 0])
     summ = {"split": a.split, "tokens": int(len(rows)), "scored": int(ok.sum()), "switch_rate": float(swo.mean())}
@@ -97,6 +99,15 @@ def main(argv=None) -> int:
                             if safe.any() else None,
                             "out_minus_base_ep": round(100 * float((out[safe, 3] - R[safe, 0, 3]).mean()), 3)
                             if safe.any() else None}
+    di = TERMS.index("ddc")                                                              # DDC = 1 assumption of R-J
+    summ["ddc"] = {"base_lt1_frac": float((R[:, 0, di] < 1).mean()), "v6_lt1_frac": float((R[:, 1, di] < 1).mean()),
+                   "out_lt1_frac": float((out[:, di] < 1).mean())}
+    for nm, M in (("v6", R[:, 1, di]), ("out", out[:, di])):
+        dd = M - R[:, 0, di]
+        lo, hi = boot_ci(dd)
+        summ["ddc"][f"{nm}_minus_base"] = {"mean": round(100 * float(dd.mean()), 3), "ci95": [round(100 * lo, 3),
+                                           round(100 * hi, 3)], "n_differ": int((dd != 0).sum()),
+                                           "n_lower": int((dd < 0).sum()), "n_higher": int((dd > 0).sum())}
     if (~ok).any():
         summ["first_error"] = [x for x in res if isinstance(x, str)][0]
     print(json.dumps(summ, indent=1))

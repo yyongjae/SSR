@@ -27,13 +27,16 @@
 #                  distillation on the 64 m (100x100) BEV grid (BEVFusion + ReSMap stage1_front64)
 #            cf_vec_v15 : cf (vector map head) + BEV Selector v15 distillation
 #            cf_seg_v15_v6c : (yongjae 10/27, refiner v6c stage D, SSR/report/124 + 125) cf_seg_v15 + refiner v6c trained
-#                  jointly from scratch; V6C_TEACHER=<stage-T teachers.pt> turns on the OOF teachers (K-E / K-M / teacher
-#                  object term), empty = GT-only.  V6C_WARMUP (micro-batches of R-E-only warm-up, default 5 epochs).
+#                  jointly from scratch; V6C_TEACHER=<stage-T teachers_te.pt> (the checkpoint written after --phase te)
+#                  feeds the OOF teachers (K-E / K-M, teacher object term).  Without V6C_TEACHER training is refused
+#                  unless the GT-only arm is chosen explicitly: V6C_FIX=gt V6C_KD=false (= report 124 control B).
+#                  V6C_WARMUP (micro-batches of R-E-only warm-up, default 5 epochs).
 #                  cand_select eps / lam 0.05 / 0.05 in training, val and navtest (report 124 V8)
 #            cf_seg_v6cP : refiner v6c stage P: C0_CKPT=<a cf_seg_v15 checkpoint> frozen (BN / dropout / GridMask in
 #                  eval, the cf copy candidates kept), only v6c learns; v15 distillation OFF (it would keep training its
 #                  probes), the teacher BEVs still load when V6C_TEACHER is set
-#            extra v6c knobs: V6C_FIX=gt (control B), V6C_MODE=A, V6C_HARM=EH|H, V6C_DISCOUNT=0.93 (arms, report 124 §4-3)
+#            extra v6c knobs: V6C_FIX=gt (GT fixing term), V6C_KD=false (no K-E / K-M), V6C_MODE=A, V6C_HARM=EH|H,
+#            V6C_DISCOUNT=0.93 (arms, report 124 §4-3).  Control B of report 124 = V6C_FIX=gt V6C_KD=false.
 #   LR / MAXEP (km 10/25): agent.lr and the cosine schedule length (default 1e-4 / 30)
 #   smoke: EPOCHS=1 LIMIT_TRAIN=40 LIMIT_VAL=5 VAL_EVERY=1 WANDB=false
 #   SELECT_RULE (km 10/17): trajectory the agent submits at inference, default pred_multiply_t0.25 (corridor); v2 = no corridor
@@ -77,7 +80,7 @@ V15_DISTILL=(
 )
 V6C=(
   ++agent.config.v6c=true ++agent.config.v6c_mode=${V6C_MODE:-B} ++agent.config.v6c_h_arm=${V6C_HARM:-E}
-  ++agent.config.v6c_fix_source=${V6C_FIX:-teacher} ++agent.config.v6c_teacher_discount=${V6C_DISCOUNT:-1.0}
+  ++agent.config.v6c_fix_source=${V6C_FIX:-teacher} ++agent.config.v6c_kd=${V6C_KD:-true} ++agent.config.v6c_teacher_discount=${V6C_DISCOUNT:-1.0}
   "++agent.config.v6c_teacher_ckpt=${V6C_TEACHER:-}"
   ++agent.config.cand_select_eps=0.05 ++agent.config.cand_select_lam=0.05
 )

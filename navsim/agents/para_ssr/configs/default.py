@@ -438,7 +438,9 @@ class ParaSSRConfig:
     v6c_gt_margin: float = 0.1        # GT guard margin on the occupancy distance (m)
     v6c_teacher_margin: float = 0.3   # teacher term margin on the calibrated occupancy probability
     v6c_teacher_discount: float = 1.0 # teacher term step weight gamma^t (1 = time mean; arm)
-    v6c_fix_source: str = "teacher"   # teacher (D) | gt (control B: GT guard + GT fixing term, no KD)
+    v6c_fix_source: str = "teacher"   # source of the fixing term on a failing tau_base: teacher (D) | gt (GT fixing
+                                      # term); independent of v6c_kd (report 124 control B = gt + v6c_kd false)
+    v6c_kd: bool = True               # K-E / K-M teacher KD into R-E (independent of v6c_fix_source, feedback 10-27)
     v6c_kd_lambda: float = 0.5        # lambda_c start value (every learned channel; per-channel overrides below)
     v6c_kd_lambda_off: float = 0.5    # K-M (off-road <- T-M)
     v6c_teacher_ckpt: str = ""        # stage-T teacher checkpoint (T-D / T-M / T-E fold copies + Platt); "" = none

@@ -6,7 +6,7 @@
 set -uo pipefail
 if [ -f "$(dirname "$0")/env.sh" ]; then source "$(dirname "$0")/env.sh"; else source "$(dirname "$0")/env.example.sh"; fi; cd $REPO
 SPL=$1; RUN=$2; CKPT=$3; GPU=$4; TAG=$5; P=${6:-8}; RT=${7:-0}; FR=${8:-100}
-R=$KM_ROOT/km_runs/corr30/$RUN; OUT=$R/eval_$TAG
+R=${KM_RUN_ROOT:-$REPO/work_dirs/km_runs}/corr30/$RUN; OUT=$R/eval_$TAG
 export CUDA_VISIBLE_DEVICES=$GPU
 ROUTE=(); [ "$RT" = 1 ] && ROUTE=(--route)
 [ "${SIGMA:-0}" = 1 ] && ROUTE+=(--sigma)       # km 10/18: v32b runs (sigma head) -> csig.npy

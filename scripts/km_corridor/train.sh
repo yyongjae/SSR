@@ -30,7 +30,7 @@ set -uo pipefail
 if [ -f "$(dirname "$0")/env.sh" ]; then source "$(dirname "$0")/env.sh"; else source "$(dirname "$0")/env.example.sh"; fi; cd $REPO
 VAR=$1; RUN=$2; GPUS=$3; shift 3
 NG=$(echo $GPUS | tr ',' '\n' | wc -l)
-OUT=$KM_ROOT/km_runs/corr30/$RUN; mkdir -p $OUT
+OUT=${KM_RUN_ROOT:-$REPO/work_dirs/km_runs}/corr30/$RUN; mkdir -p $OUT
 export CUDA_VISIBLE_DEVICES=$GPUS CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_SOCKET_IFNAME=lo OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 [ "$VAR" = v32b ] && PLANES=49 && SELECT_RULE=${SELECT_RULE:-pred_multiply_sigma_ttc}
 case $VAR in c64|c64_traj|pert|mix|cf|cf_v15) PLANES=49; SELECT_RULE=${SELECT_RULE:-cand_official} ;; esac

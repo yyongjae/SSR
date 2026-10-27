@@ -4,7 +4,7 @@
 #   64      -> $KM_ROOT/corridor64     (0-64 m SDF, route progress/distance, agent polygons) ~16 GB, ~3.5 h at 12 workers
 #   route32 -> $KM_ROOT/route32        (first 50 rows of corridor64 route channels; v3 32 m needs it, build 64 first)
 set -uo pipefail
-source "$(dirname "$0")/env.sh"; cd $REPO
+if [ -f "$(dirname "$0")/env.sh" ]; then source "$(dirname "$0")/env.sh"; else source "$(dirname "$0")/env.example.sh"; fi; cd $REPO
 W=${2:-9}
 case $1 in
   32) for s in navtrain_val navtrain_train; do nice $PY tools/corridor/build_corridor_dt01.py --split $s --out $KM_ROOT/corridor_dt01 --workers $W --root $(dirname $TOKENS_ROOT) || exit 1; done ;;

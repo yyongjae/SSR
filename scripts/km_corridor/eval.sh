@@ -4,7 +4,7 @@
 #   navtest : 12,146 tokens -> dump -> verdicts -> RULE (default pred_multiply_t0.25, fixed on val) + the same model's v2
 #             selection -> official PDMS and EPDMS (score_npz.sh of the SSR-v2 checkout: V2_REPO)
 set -uo pipefail
-source "$(dirname "$0")/env.sh"; cd $REPO
+if [ -f "$(dirname "$0")/env.sh" ]; then source "$(dirname "$0")/env.sh"; else source "$(dirname "$0")/env.example.sh"; fi; cd $REPO
 SPL=$1; RUN=$2; CKPT=$3; GPU=$4; TAG=$5; P=${6:-8}; RT=${7:-0}; FR=${8:-100}
 R=$KM_ROOT/km_runs/corr30/$RUN; OUT=$R/eval_$TAG
 export CUDA_VISIBLE_DEVICES=$GPU

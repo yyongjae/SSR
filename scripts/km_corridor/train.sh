@@ -27,7 +27,7 @@
 #   smoke: EPOCHS=1 LIMIT_TRAIN=40 LIMIT_VAL=5 VAL_EVERY=1 WANDB=false
 #   SELECT_RULE (km 10/17): trajectory the agent submits at inference, default pred_multiply_t0.25 (corridor); v2 = no corridor
 set -uo pipefail
-source "$(dirname "$0")/env.sh"; cd $REPO
+if [ -f "$(dirname "$0")/env.sh" ]; then source "$(dirname "$0")/env.sh"; else source "$(dirname "$0")/env.example.sh"; fi; cd $REPO
 VAR=$1; RUN=$2; GPUS=$3; shift 3
 NG=$(echo $GPUS | tr ',' '\n' | wc -l)
 OUT=$KM_ROOT/km_runs/corr30/$RUN; mkdir -p $OUT

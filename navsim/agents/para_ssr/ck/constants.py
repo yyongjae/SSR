@@ -54,8 +54,31 @@ LEAD_SRC = {"navtrain_train": Path("/home/external-user/ssd/kyungmin_ck/directio
             "navtest": Path("/home/external-user/ssd/kyungmin_ck/direction_analysis/uncertainty/out/"
                             "lead_navtest.parquet")}
 
-_TRAINVAL_LOGS = "/home/external-user/kyungmin/SSR/data/dataset/navsim_logs/trainval"
-_TRAINVAL_SENSORS = "/home/external-user/kyungmin/SSR/data/dataset/sensor_blobs/trainval"
+_TRAINVAL_LOGS = (
+    "/home/external-user/kyungmin/SSR/data/dataset/navsim_logs/trainval"
+    if Path("/home/external-user/kyungmin/SSR/data/dataset/navsim_logs/trainval").exists()
+    else "/home/external-user/yongjae/SSR/data/dataset/navsim_logs/trainval"
+)
+_TRAINVAL_SENSORS = (
+    "/home/external-user/kyungmin/SSR/data/dataset/sensor_blobs/trainval"
+    if Path("/home/external-user/kyungmin/SSR/data/dataset/sensor_blobs/trainval").exists()
+    else "/home/external-user/yongjae/SSR/data/dataset/sensor_blobs/trainval"
+)
+_VAL_MC = (
+    "/home/external-user/ssd/kyungmin_ck/mc_navtrain_val/metric_cache"
+    if Path("/home/external-user/ssd/kyungmin_ck/mc_navtrain_val/metric_cache").exists()
+    else str(METRIC_CACHE["navtrain"])
+)
+_TEST_LOGS = (
+    "/home/external-user/kyungmin/SSR/data/dataset/navsim_logs/test"
+    if Path("/home/external-user/kyungmin/SSR/data/dataset/navsim_logs/test").exists()
+    else "/workspace/navsim_workspace/dataset/navsim_logs/test/test"
+)
+_TEST_SENSORS = (
+    "/home/external-user/kyungmin/SSR/data/dataset/sensor_blobs/test"
+    if Path("/home/external-user/kyungmin/SSR/data/dataset/sensor_blobs/test").exists()
+    else "/workspace/navsim_workspace/dataset/sensor_blobs/test/test"
+)
 _SF = "navsim/planning/script/config/common/scene_filter"      # relative to REPO
 
 SPLITS = {
@@ -71,13 +94,13 @@ SPLITS = {
         "sha16_sorted_tokens": "05b78ec43b95d954",
         "navsim_logs": _TRAINVAL_LOGS, "sensor_blobs": _TRAINVAL_SENSORS, "scene_filter": f"{_SF}/navtrain.yaml",
         "teacher_subset": "navtrain", "gt_surrogate": False, "map_teacher": False,
-        "metric_cache": "/home/external-user/ssd/kyungmin_ck/mc_navtrain_val/metric_cache",   # km: teammate's cache
+        "metric_cache": _VAL_MC,   # km: teammate's cache (or METRIC_CACHE["navtrain"] on shared host)
         "role": "held-out for v2 and CK: weight/blend selection, go/no-go, DET-teacher overfit gap"},
     "navtest": {
         "tokens": str(DATA_ROOT / "splits/navtest.parquet"), "n": 12146, "logs": 136,
         "sha16_sorted_tokens": None,
-        "navsim_logs": "/home/external-user/kyungmin/SSR/data/dataset/navsim_logs/test",
-        "sensor_blobs": "/home/external-user/kyungmin/SSR/data/dataset/sensor_blobs/test",
+        "navsim_logs": _TEST_LOGS,
+        "sensor_blobs": _TEST_SENSORS,
         "scene_filter": f"{_SF}/navtest.yaml",
         "teacher_subset": "navtest", "gt_surrogate": False, "map_teacher": True,
         "metric_cache": str(METRIC_CACHE["navtest"]),

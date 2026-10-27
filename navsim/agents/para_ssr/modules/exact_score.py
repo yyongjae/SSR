@@ -323,7 +323,9 @@ class ExactFullTargetBuilder(AbstractTargetBuilder):
         self._clf = {}
         for sp in self._splits:
             toks = pd.read_parquet(f"{self._troot}/{sp}/tokens.parquet").token.astype(str).to_numpy()
-            ok1 = np.load(f"{self._d1}/{sp}/ok.npy") & np.load(f"{self._d1}/{sp}/ok_ego_pdm.npy")
+            ok1 = np.load(f"{self._d1}/{sp}/ok.npy")
+            if os.path.exists(f"{self._d1}/{sp}/ok_ego_pdm.npy"):
+                ok1 = ok1 & np.load(f"{self._d1}/{sp}/ok_ego_pdm.npy")
             # a split still being filled (merge_exact_parts.py) is read through <split>/current -> a complete version,
             # resolved once per open (= once per epoch for the non-persistent loader workers)
             d2 = f"{self._d2}/{sp}/current" if os.path.exists(f"{self._d2}/{sp}/current") else f"{self._d2}/{sp}"

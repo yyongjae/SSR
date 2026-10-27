@@ -392,3 +392,17 @@ def test_resumed_teacher_set_starts_frozen():
     ts = TT.frozen_teacher_set(torch.device("cpu"))
     assert not any(m.training for m in ts.modules())
     assert not any(p.requires_grad for p in ts.parameters())
+
+
+def test_teacher_store_pread_row_equals_the_memmap_row(tmp_path):
+    """report 128 §5: the sharded teacher store reads a row with one pread instead of faulting it in through the
+    mapping; the bytes must be identical"""
+    from navsim.agents.para_ssr.distill.teacher_store import TeacherFeatureStore
+    a = (np.arange(5 * 3 * 4 * 6) % 251).astype(np.float16).reshape(5, 3, 4, 6)
+    p = tmp_path / "shard.npy"
+    np.save(p, a)
+    mm = np.load(p, mmap_mode="r")
+    st = TeacherFeatureStore.__new__(TeacherFeatureStore)
+    for r in range(5):
+        got = st._read_row("s", mm, r)
+        assert got.dtype == a.dtype and got.shape == a.shape[1:] and np.array_equal(got, a[r])

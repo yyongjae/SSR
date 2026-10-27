@@ -65,7 +65,8 @@ class TokenDataset(torch.utils.data.Dataset):
     1 ReSMap); exact = whether to build the exact v1 / v2 tables (T-E, its Platt).  T-D reads only BEVFusion and T-M
     only ReSMap: the teacher BEV cache read is the dominant cost of stage T (report 124 §3)."""
 
-    def __init__(self, split: str, cfg, folds=(0, 1), limit: int = 0, bev=(0, 1), exact: bool = True):
+    def __init__(self, split: str, cfg, folds=(0, 1), limit: int = 0, bev=(0, 1), exact: bool = True,
+                 corr: str = "full", offset: int = 0):
         import pandas as pd
         import zlib
         df = pd.read_parquet(REPO / "resources/km_corridor/packed" / split / "tokens.parquet")
@@ -73,9 +74,17 @@ class TokenDataset(torch.utils.data.Dataset):
         keep = np.isin(fold, folds)
         self.toks = df.token.astype(str).to_numpy()[keep]
         self.logs = df.log.astype(str).to_numpy()[keep]
+        if offset:
+            self.toks, self.logs = self.toks[offset:], self.logs[offset:]
         if limit:
             self.toks, self.logs = self.toks[:limit], self.logs[:limit]
         self.bev, self.exact = tuple(bev), bool(exact)
+        # corr: 'full' = Corridor64TargetBuilder(plan=True) as the student sees it; 'occ' = only the 49 GT occupancy
+        # planes as uint8 (T-D, its Platt: occ_dist < 0 is exactly the occupancy, so the 98 distance transforms and
+        # the float32 planes are skipped); 'sdf' = only the static SDF (T-M); None = no corridor targets (T-E, its
+        # Platt).  Each sample crosses the loader's shared memory, whose page faults dominated the cost (report 128 §5)
+        assert corr in ("full", "occ", "sdf", None), corr
+        self.corr = corr
         self.b_corr = Corridor64TargetBuilder(cfg, plan=True)
         self.b_kd = DistillTeacherTargetBuilder(cfg)
         self.b_ex = ExactFullTargetBuilder(cfg) if self.exact else None
@@ -98,9 +107,34 @@ class TokenDataset(torch.utils.data.Dataset):
             out[f"kd_ok_{i}"] = torch.tensor(ok, dtype=torch.bool)
         return out
 
+    def _corr_light(self, sc) -> dict:
+        from navsim.agents.para_ssr.modules.corridor_head import raster_agents
+        b = self.b_corr
+        b._open()
+        hit = b._index.get(str(sc.frames[0].token))
+        if hit is None:
+            out = {"corridor_valid": torch.tensor(0.0)}
+            if self.corr == "occ":
+                out["corridor_occ_u8"] = torch.zeros((49, 200, 200), dtype=torch.uint8)
+            else:
+                out["corridor_sdf"] = torch.zeros(200, 200)
+            return out
+        A, r = b._arr[hit[0]], hit[1]
+        out = {"corridor_valid": torch.tensor(1.0)}
+        if self.corr == "occ":
+            occ = raster_agents(np.asarray(A["agent_rows"][A["agent_off"][r]:A["agent_off"][r + 1]]))   # [49, 200, 200]
+            out["corridor_occ_u8"] = torch.from_numpy(np.ascontiguousarray(occ, dtype=np.uint8))
+        else:
+            out["corridor_sdf"] = torch.from_numpy(np.asarray(A["static_sdf"][r], np.float32))
+        return out
+
     def __getitem__(self, i):
         sc = _Scene(self.toks[i], self.logs[i])
-        out = dict(self.b_corr.compute_targets(sc))
+        out = {}
+        if self.corr == "full":
+            out.update(self.b_corr.compute_targets(sc))
+        elif self.corr is not None:
+            out.update(self._corr_light(sc))
         out.update(self._kd(sc))
         if self.b_ex is not None:
             out.update(self.b_ex.compute_targets(sc))
@@ -121,6 +155,13 @@ def to_dev(b, dev):
 
 # ------------------------------------------------------------------------------------------------- paths (T-E)
 # ------------------------------------------------------------------------------------------------- phases
+def occ_target(bt) -> torch.Tensor:
+    """GT occupancy [B, 49, 200, 200] float: the uint8 planes of corr='occ', else occ_dist < 0 (identical)"""
+    if "corridor_occ_u8" in bt:
+        return bt["corridor_occ_u8"].float()
+    return (bt["corridor_occ_dist"] < 0).float()
+
+
 def occ_bce(logits, gt, pw=4.0):
     return F.binary_cross_entropy_with_logits(logits, gt, pos_weight=torch.tensor(pw, device=logits.device))
 
@@ -178,7 +219,7 @@ def train_field_copy(ts: TeacherSet, kind: str, f: int, ds, args, dev, log, ckpt
                 if not bool(ok.any()):
                     continue
                 z = ts.norm_det(bt["kd_bev_0"][ok]).flatten(2).transpose(1, 2)
-                loss = occ_bce(mod(z)["corridor_occ"].float(), (bt["corridor_occ_dist"][ok] < 0).float())
+                loss = occ_bce(mod(z)["corridor_occ"].float(), occ_target(bt)[ok])
             else:
                 ok = bt["kd_ok_1"].bool() & (bt["corridor_valid"] > 0.5)
                 if not bool(ok.any()):
@@ -235,7 +276,7 @@ def fit_platt_occ(ts: TeacherSet, data_by_fold, args, dev, log, n_px: int = 4096
             if not bool(ok.any()):
                 continue
             lg = ts.td[f](ts.norm_det(bt["kd_bev_0"][ok]).flatten(2).transpose(1, 2))["corridor_occ"].float()
-            gt = (bt["corridor_occ_dist"][ok] < 0).float()
+            gt = occ_target(bt)[ok]
             planes = torch.arange(1, lg.shape[1] + 1, device=dev)
             kb = ts.platt_occ.bins(planes)
             for kk in range(nb):
@@ -480,6 +521,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--offset", type=int, default=0, help="skip the first N tokens of each fold (timing probes)")
     ap.add_argument("--platt-batches", type=int, default=200)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--device", default="cuda")
@@ -512,7 +554,7 @@ def main():
     cfg = builder_cfg(args.km_root, args.teacher_root)
 
     def data(f, **kw):
-        return TokenDataset(args.split, cfg, folds=(f,), limit=args.limit, **kw)
+        return TokenDataset(args.split, cfg, folds=(f,), limit=args.limit, offset=args.offset, **kw)
 
     log({"phase": "start", "args": vars(args), "world": world})
     ts = frozen_teacher_set(dev, args.resume)
@@ -535,7 +577,8 @@ def main():
     t0 = time.time()
     # ---- parallel pipeline (report 128 §5): td / tm copies, merge, platt_occ, te copies (DDP), finish
     if args.phase in ("td", "tm"):
-        ds = data(args.fold, bev=(0,) if args.phase == "td" else (1,), exact=False)
+        ds = data(args.fold, bev=(0,) if args.phase == "td" else (1,), exact=False,
+                  corr="occ" if args.phase == "td" else "sdf")
         log({"phase": args.phase, "fold": args.fold, "tokens": len(ds)})
         train_field_copy(ts, args.phase, args.fold, ds, args, dev, log,
                          ckpt=out / (PART[args.phase].format(f=args.fold) + ".ckpt"))
@@ -544,7 +587,7 @@ def main():
         metas = {f"{k}{f}": load_part(ts, k, f, out) for k in ("td", "tm") for f in (0, 1)}
         save("fields", {"parts": metas})
     elif args.phase == "te_fold":
-        ds = data(args.fold)
+        ds = data(args.fold, corr=None)
         log({"phase": "te", "fold": args.fold, "tokens": len(ds), "world": world})
         train_te_copy(ts, args.fold, ds, anchors, args, dev, log,
                       ckpt=out / (PART["te_fold"].format(f=args.fold) + ".ckpt"), world=world, rank=rank)
@@ -556,7 +599,7 @@ def main():
             torch.distributed.destroy_process_group()
     elif args.phase == "finish":
         metas = {f"te{f}": load_part(ts, "te_fold", f, out) for f in (0, 1)}
-        fit_platt_te_off(ts, {f: data(f) for f in (0, 1)}, anchors, args, dev, log)
+        fit_platt_te_off(ts, {f: data(f, corr=None) for f in (0, 1)}, anchors, args, dev, log)
         save("te", {"parts_te": metas})
     # ---- sequential phases (smoke / single GPU)
     else:
@@ -564,10 +607,10 @@ def main():
             train_fields(ts, {f: data(f, bev=(0, 1), exact=False) for f in (0, 1)}, args, dev, log)
             save("fields")
         if args.phase in ("all", "platt_occ"):
-            fit_platt_occ(ts, {f: data(f, bev=(0,), exact=False) for f in (0, 1)}, args, dev, log)
+            fit_platt_occ(ts, {f: data(f, bev=(0,), exact=False, corr="occ") for f in (0, 1)}, args, dev, log)
             save("platt_occ")
         if args.phase in ("all", "te"):
-            dd = {f: data(f) for f in (0, 1)}
+            dd = {f: data(f, corr=None) for f in (0, 1)}
             train_te(ts, dd, anchors, args, dev, log)
             fit_platt_te_off(ts, dd, anchors, args, dev, log)
             save("te")

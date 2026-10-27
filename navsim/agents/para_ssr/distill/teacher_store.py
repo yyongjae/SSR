@@ -309,6 +309,31 @@ class TeacherFeatureStore:
             feature = feature[:, :, ::-1].copy()
         return feature
 
+    def _read_row(self, shard: str, mm: np.ndarray, row: int) -> np.ndarray:
+        """row `row` of a memmapped .npy shard with ONE contiguous pread instead of faulting it in page by page
+        through the mapping (identical bytes).  With dozens of loader workers the page-fault path spent ~3x its
+        compute in the kernel (report 128 §5); the memmap is still used for its parsed header (shape, dtype,
+        offset)."""
+        if not isinstance(mm, np.memmap) or not mm.flags.c_contiguous or mm.ndim < 2:
+            return np.asarray(mm[row])
+        fds = self.__dict__.setdefault("_fds", {})
+        key = (shard, os.getpid())                      # never reuse a descriptor inherited across fork
+        fd = fds.get(key)
+        if fd is None:
+            fd = os.open(mm.filename, os.O_RDONLY)
+            fds[key] = fd
+        shape = mm.shape[1:]
+        nbytes = int(np.prod(shape)) * mm.dtype.itemsize
+        off = int(mm.offset) + int(row) * nbytes
+        buf = bytearray(nbytes)
+        view, got = memoryview(buf), 0
+        while got < nbytes:
+            n = os.preadv(fd, [view[got:]], off + got)
+            if n <= 0:
+                raise OSError(f"{mm.filename}: short read at row {row}")
+            got += n
+        return np.frombuffer(buf, dtype=mm.dtype).reshape(shape)
+
     def _load_sharded_one(self, token: str) -> np.ndarray:
         idx = self._get_index()
         if token not in idx:
@@ -319,7 +344,7 @@ class TeacherFeatureStore:
             if not os.path.isfile(shard_path):
                 raise FileNotFoundError(f"Missing shard file: {shard_path}")
             self._mmap_cache[shard] = np.load(shard_path, mmap_mode="r")
-        raw = np.asarray(self._mmap_cache[shard][row])
+        raw = self._read_row(shard, self._mmap_cache[shard], row)
         # In ReSMap, axes are (C, lateral, forward) = (256, 100, 50) for 32m or (256, 100, 100) for stage1_front64 64m.
         # Always transpose (0, 2, 1) -> (C, forward, lateral) so both 50x100 and 100x100 align with student BEV.
         # fusion_v1: lateral index 0 is y_left = +32 m, i.e. already the student column 0,

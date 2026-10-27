@@ -299,7 +299,9 @@ class ParaSSRModel(nn.Module):
                 raise ValueError("v6c needs the candidate scorer and the corridor head (corridor-cf)")
             from .refiner_v6c.hook import RefinerV6c
             with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(int(getattr(cfg, "v6c_seed", 6)))
+                # CPU generator only: torch.manual_seed would also reseed the CUDA generators, which fork_rng(devices=[])
+                # does not restore (the baseline's GPU dropout stream would change with v6c on)
+                torch.random.default_generator.manual_seed(int(getattr(cfg, "v6c_seed", 6)))
                 self.v6c = RefinerV6c(cfg)
             if str(getattr(cfg, "v6c_stage", "D")) not in ("P", "D"):
                 raise ValueError(f"v6c_stage must be P | D, got {cfg.v6c_stage!r}")

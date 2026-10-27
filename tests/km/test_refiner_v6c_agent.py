@@ -60,10 +60,21 @@ def sampling():
     return TrajectorySampling(time_horizon=4.0, interval_length=0.5)
 
 
-def build_agent(seed=0, **over):
+def build_agent(seed=0, ckpt=None, **over):
     from navsim.agents.para_ssr.para_ssr_agent import ParaSSRAgent
     torch.manual_seed(seed)
+    if ckpt is not None:
+        return ParaSSRAgent(make_config(**over), sampling(), lr=1e-4, checkpoint_path=str(ckpt), resume_from_checkpoint=True)
     return ParaSSRAgent(make_config(**over), sampling(), lr=1e-4)
+
+
+@pytest.fixture(scope="module")
+def c0_ckpt(tmp_path_factory):
+    """a 'C0': the v6c-off agent at random init, saved like a Lightning checkpoint (agent. prefix)"""
+    a = build_agent(0)
+    path = tmp_path_factory.mktemp("c0") / "c0.ckpt"
+    torch.save({"state_dict": {"agent." + k: v for k, v in a.state_dict().items()}}, path)
+    return path
 
 
 def make_fixture(path: Path = FIX) -> Path:
@@ -164,8 +175,22 @@ def test_gradient_contract(batch):
     assert n_re > 0
 
 
-def test_stage_p_freezes_baseline(batch):
-    a = build_agent(0, v6c=True, v6c_stage="P")
+def test_stage_p_needs_c0_and_no_distill(c0_ckpt):
+    with pytest.raises(ValueError):
+        build_agent(0, v6c=True, v6c_stage="P")                                            # no checkpoint
+    with pytest.raises(ValueError):
+        build_agent(0, ckpt=c0_ckpt, v6c=True, v6c_stage="P", use_distill=True)
+
+
+def test_stage_p_loads_c0_and_v6c_starts_fresh(c0_ckpt):
+    a = build_agent(1, ckpt=c0_ckpt, v6c=True, v6c_stage="P")
+    sd = torch.load(c0_ckpt)["state_dict"]
+    k = "agent.para_ssr_model.corridor_head.out.weight"
+    assert torch.equal(a.state_dict()[k[len("agent."):]], sd[k])                            # C0 weights loaded
+
+
+def test_stage_p_freezes_baseline(batch, c0_ckpt):
+    a = build_agent(0, ckpt=c0_ckpt, v6c=True, v6c_stage="P")
     a.train()
     m = a.para_ssr_model
     assert all(not prm.requires_grad for n, prm in m.named_parameters() if not n.startswith("v6c."))
@@ -204,8 +229,8 @@ def test_warmup_trains_re_only_on_the_mixture(batch):
     assert any(float(x.grad.abs().sum()) > 0 for x in v6c.re.parameters())
 
 
-def test_stage_p_attention_dropout_off(batch):
-    a = build_agent(0, v6c=True, v6c_stage="P")
+def test_stage_p_attention_dropout_off(batch, c0_ckpt):
+    a = build_agent(0, ckpt=c0_ckpt, v6c=True, v6c_stage="P")
     a.train()
     mha = [m for n, m in a.para_ssr_model.named_modules() if isinstance(m, torch.nn.MultiheadAttention)
            and not n.startswith("v6c")]
@@ -221,3 +246,16 @@ def test_stage_p_attention_dropout_off(batch):
 def test_bad_v6c_config_rejected():
     with pytest.raises(ValueError):
         build_agent(0, v6c=True, cand_cf_folds=0)
+
+
+def test_v6c_on_keeps_baseline_init_and_cuda_free_seeding():
+    """building v6c last under fork_rng (CPU generator only) leaves every baseline parameter as in the v6c-off build"""
+    a = build_agent(0)
+    ra = torch.rand(3)                                                                       # CPU stream after the build
+    b = build_agent(0, v6c=True)
+    rb = torch.rand(3)
+    sa, sb = a.state_dict(), b.state_dict()
+    for k, v in sa.items():
+        if torch.is_tensor(v):
+            assert torch.equal(v, sb[k]), k
+    assert torch.equal(ra, rb)

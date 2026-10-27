@@ -386,14 +386,16 @@ class ParaSSRAgent(AbstractAgent):
             self._distill = self._build_distill(config)
         # refiner v6c (report 124): frozen OOF teachers (T-D / T-M / T-E fold copies) loaded from the stage-T
         # checkpoint; training-only state under the prefix '_v6c_teachers.' (never in a student checkpoint load)
-        if getattr(config, "v6c", False) and str(getattr(config, "v6c_teacher_ckpt", "") or ""):
-            from .refiner_v6c.teacher import load_teachers
-
-            self._v6c_teachers = load_teachers(str(config.v6c_teacher_ckpt), config)
+        # (loaded lazily at the first training loss, so evaluation hosts do not need the stage-T checkpoint; kept in a
+        # plain list: never in the state_dict, the optimizer or DDP)
+        self._v6c_teacher_box: List = [None]
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
         if self.para_ssr_model.v6c_frozen_base():
+            if not (checkpoint_path and resume_from_checkpoint):
+                raise ValueError("v6c stage P freezes C0: set agent.checkpoint_path=<C0> and agent.resume_from_checkpoint=true "
+                                 "(without both, initialize() never runs and the frozen baseline is random)")
             # stage P: only refiner v6c learns; the frozen baseline gets no optimizer state and no DDP gradient
             for name, prm in self.para_ssr_model.named_parameters():
                 if not name.startswith("v6c."):
@@ -436,8 +438,22 @@ class ParaSSRAgent(AbstractAgent):
                       ("v6c_h_arm", ("E", "EH", "H")), ("v6c_fix_source", ("teacher", "gt"))):
             if str(getattr(config, k)) not in ok:
                 bad[k] = getattr(config, k)
+        if str(getattr(config, "v6c_stage", "D")) == "P" and getattr(config, "use_distill", False):
+            # stage P returns the v6c loss only: the v15 module would get no gradient (DDP error) and C0 is frozen anyway
+            bad["use_distill"] = "must be false in stage P"
         if bad:
             raise ValueError(f"v6c configuration: {bad}")
+
+    def _v6c_teachers(self, device):
+        """the frozen OOF teachers (stage-T checkpoint), loaded at the first training use; None without a checkpoint"""
+        path = str(getattr(self._config, "v6c_teacher_ckpt", "") or "")
+        if not path or not self.training:
+            return self._v6c_teacher_box[0] if path else None
+        if self._v6c_teacher_box[0] is None:
+            from .refiner_v6c.teacher import load_teachers
+
+            self._v6c_teacher_box[0] = load_teachers(path, self._config).to(device)
+        return self._v6c_teacher_box[0]
 
     @staticmethod
     def _validate_config(config, trajectory_sampling: TrajectorySampling) -> None:
@@ -1082,7 +1098,7 @@ class ParaSSRAgent(AbstractAgent):
             # stage P (report 124 §4-3): the baseline is frozen, only the v6c losses train
             from .refiner_v6c.hook import v6c_loss
 
-            loss, logs = v6c_loss(self.para_ssr_model.v6c, getattr(self, "_v6c_teachers", None), self._config,
+            loss, logs = v6c_loss(self.para_ssr_model.v6c, self._v6c_teachers(predictions["bev_embed"].device), self._config,
                                   features, targets, predictions, self.training)
             logs["loss"] = loss.detach()
             self.latest_logs = logs
@@ -1225,7 +1241,7 @@ class ParaSSRAgent(AbstractAgent):
             # ParaSSRLoss task_losses['plan'] (that would move g_plan and every distillation lambda)
             from .refiner_v6c.hook import v6c_loss
 
-            v_loss, v_logs = v6c_loss(self.para_ssr_model.v6c, getattr(self, "_v6c_teachers", None), self._config,
+            v_loss, v_logs = v6c_loss(self.para_ssr_model.v6c, self._v6c_teachers(predictions["bev_embed"].device), self._config,
                                       features, targets, predictions, self.training)
             logs["loss_pre_v6c"] = logs["loss"]
             loss = loss + v_loss

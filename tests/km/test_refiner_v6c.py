@@ -219,10 +219,13 @@ def _bump_occ(t0, t1, x):
 
 def test_teacher_hinge_gradient_direction_at_zero():
     """report 124 §4-4 / 126 §7-3 (10-27): at Delta = 0 the sign of the time-mean occupancy hinge's gradient is set by
-    WHERE the object is relative to tau_base's reach, not by its kind: near or beyond the 4 s end point (contact that a
-    1 m/s^2 brake, ~8 m less travel in 4 s, can avoid or shorten) it asks for braking; well inside the reach (contact
-    the brake cannot avoid, stopped or crossing) it asks to pass faster, which the decel-only decoder blocks (dead
-    zone; v6c/lon_dead).  A strong time discount (gamma 0.93 per 0.1 s) turns this late crossing into braking."""
+    WHERE the object sits relative to tau_base's front-footprint and TTC-shifted points over time, not by its kind.
+    Braking pulls later steps back more; a point still before the object centre moves away from it (brake sign), a
+    point already past it moves back toward it (faster sign).  The sum is NOT monotonic in distance (10 m/s straight,
+    4 s end 40 m, stopped object: 27.5-32.5 m and 35.5-38.5 m faster, 26.5-27 m, 33-35 m and 39-55 m brake, >= 55.5 m
+    zero).  a_max only scales it (dz'/dz = a_max / 4 at z = 0), so it is not a brake-budget rule.  The decel-only
+    decoder blocks the faster sign (dead zone; v6c/lon_dead).  A time discount (gamma 0.93 per 0.1 s) turns this late
+    crossing into braking."""
     assert float(_hinge_grad(_bump_occ(0, 49, 29.0))[:6].sum()) < 0                            # stopped but inside reach
     assert float(_hinge_grad(_bump_occ(0, 49, 40.0))[:6].sum()) > 0                            # lead: brake
     assert float(_hinge_grad(_bump_occ(20, 30, 29.0))[:6].sum()) < 0                           # crossing: faster

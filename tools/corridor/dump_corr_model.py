@@ -63,6 +63,8 @@ def main(argv=None) -> int:
     ap.add_argument("--traj32", action="store_true", help="traj.npy in float32 (navtest submission; f16 is ~3 cm at 60 m)")
     ap.add_argument("--cand", action="store_true", help="km 10/19 (C): the candidate scorer outputs (cand_*.npy)")
     ap.add_argument("--no-fields", action="store_true", help="skip csdf / cocc (64 m x 49 planes: ~2 MB per token)")
+    ap.add_argument("--v6", action="store_true",
+                    help="refiner v6c (report 124): tau_base / tau_v6 (f32), the switch, E of both rows, R-J's scores")
     ap.add_argument("--select-rule", default=None,
                     help="override corridor_select_rule of the run config (km 10/17; default: the run's own)")
     a = ap.parse_args(argv)
@@ -82,6 +84,11 @@ def main(argv=None) -> int:
         SPEC.update({"cand_heads": (np.float16, (256, sum(HEADS.values()))), "cand_eff": (np.float16, (2,)),
                      "cand_exp_pdms1": (np.float16, (256,)), "cand_exp_epdms2": (np.float16, (256,)),
                      "cand_c1": (np.uint8, (256,))})
+    if a.v6 and not a.det:     # refiner v6c: the submitted trajectory is v6_base or v6_traj (msel = tau_base's index)
+        SPEC.update({"v6_base": (np.float32, (8, 3)), "v6_traj": (np.float32, (8, 3)), "v6_switch": (np.uint8, ()),
+                     "v6_E_base": (np.float16, (21, 12)), "v6_E_v6": (np.float16, (21, 12)),
+                     "v6_pdms_hat": (np.float16, (2,)), "v6_m_hat": (np.float16, (2,)), "v6_ep_hat": (np.float16, (2,)),
+                     "v6_ctrl": (np.float16, (12,))})
     if a.route and not a.det:
         SPEC["croute"] = (np.float16, (a.fwd_rows // 2, 100))
     if a.sigma and not a.det:
@@ -189,6 +196,11 @@ def main(argv=None) -> int:
             heads = torch.cat([pr["cand_" + nm].float().reshape(*pr["cand_prog"].shape, -1) for nm in HEADS], -1)
             out.update({"cand_heads": heads, "cand_eff": torch.stack([pr["cand_eff1"], pr["cand_eff2"]], -1),
                         "cand_exp_pdms1": ex["pdms1"], "cand_exp_epdms2": ex["epdms2"], "cand_c1": ex["c1"]})
+        if a.v6:
+            out.update({"v6_base": pr["v6c_tau_base"], "v6_traj": pr["v6c_tau_v6"],
+                        "v6_switch": pr["v6c_switch"].to(torch.uint8), "v6_E_base": pr["v6c_E_base"][:, 0],
+                        "v6_E_v6": pr["v6c_E_v6"][:, 0], "v6_pdms_hat": pr["v6c_pdms_hat"], "v6_m_hat": pr["v6c_m_hat"],
+                        "v6_ep_hat": pr["v6c_ep_hat"], "v6_ctrl": pr["v6c_ctrl"]})
         if a.route:
             out["croute"] = pr["corridor_route_s"]
         if a.sigma:

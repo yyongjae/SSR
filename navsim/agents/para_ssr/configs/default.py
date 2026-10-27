@@ -403,6 +403,48 @@ class ParaSSRConfig:
     cand_official: bool = False
     exact2_dir: str = "/home/external-user/ssd/kyungmin_ck/exact2"
     cand_select_eps: float = 0.02
+    # smoothness weight in the cand_official choice (km 10/20 C v3.1).  Read through getattr before; a field now so a
+    # hydra override can set it (report 124 V8: the training copy pick, val and navtest share eps / lam)
+    cand_select_lam: float = 0.0
+
+    # ------------------------------------------------------------------ #
+    # refiner v6c (SSR/report/124_refiner_v6c_design_on_corridor_cf.md; navsim/agents/para_ssr/refiner_v6c/).
+    # Off by default: no module is built and the forward / loss are bit-identical to the baseline.
+    # ------------------------------------------------------------------ #
+    v6c: bool = False
+    v6c_stage: str = "D"              # P: the baseline is frozen (no_grad, BN / dropout / GridMask in eval, cf copy
+                                      # candidates kept); D: joint training from scratch
+    v6c_mode: str = "B"               # B: R-J picks tau_base or tau_v6 (submitted); A: always tau_v6
+    v6c_hid: int = 192
+    v6c_r: float = 0.1                # stage D: share of R-E's loss reaching the BEV / corridor fields (GradScale); P: 0
+    v6c_a_max: float = 1.0            # deceleration amplitude (m/s^2), V7
+    v6c_d_max: float = 0.5            # lateral residual bound (m), V7
+    v6c_decoder_mode: str = "A"       # A: deceleration only; B: the acceleration arm (V7)
+    v6c_lon_st_slope: float = 0.0     # straight-through slope of the mode-A clamp (0 = off; V7 rule)
+    v6c_h_arm: str = "E"              # R-C input: E (default) | EH (E + H detached) | H (H only)
+    v6c_switch_delta: float = 0.0     # R-J switch margin on the expected PDMS (V9)
+    v6c_switch_kappa: float = -1.0    # EC-proxy guard on the switch (< 0: off = kappa infinite)
+    v6c_pos_weight: float = 4.0       # BCE pos_weight of the per-step logit channels
+    v6c_w_E: float = 1.0
+    v6c_w_E_re: float = 1.0           # L_E on tau_v6's states (D14)
+    v6c_w_corr: float = 1.0
+    v6c_w_J: float = 1.0
+    v6c_corr_teacher: float = 1.0
+    v6c_corr_gt: float = 1.0
+    v6c_corr_road: float = 1.0
+    v6c_corr_comfort: float = 1.0
+    v6c_corr_ec: float = 0.1
+    v6c_corr_prog: float = 0.2
+    v6c_gt_margin: float = 0.1        # GT guard margin on the occupancy distance (m)
+    v6c_teacher_margin: float = 0.3   # teacher term margin on the calibrated occupancy probability
+    v6c_teacher_discount: float = 1.0 # teacher term step weight gamma^t (1 = time mean; arm)
+    v6c_fix_source: str = "teacher"   # teacher (D) | gt (control B: GT guard + GT fixing term, no KD)
+    v6c_kd_lambda: float = 0.5        # lambda_c start value (every learned channel; per-channel overrides below)
+    v6c_kd_lambda_off: float = 0.5    # K-M (off-road <- T-M)
+    v6c_teacher_ckpt: str = ""        # stage-T teacher checkpoint (T-D / T-M / T-E fold copies + Platt); "" = none
+    v6c_seed: int = 6                 # v6c init under fork_rng (the baseline init / RNG stream stay unchanged)
+    v6c_warmup_steps: int = 0         # stage D: micro-batches of R-E-only warm-up on the path mixture (0 = off;
+                                      # report 124 §4-3: epochs 0-4 = 5 * 85109 / (4 * NG) micro-batches per rank)
     # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
     # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
     # always uses GT.

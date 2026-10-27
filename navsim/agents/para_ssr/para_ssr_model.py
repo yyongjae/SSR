@@ -291,6 +291,19 @@ class ParaSSRModel(nn.Module):
         # set by the loss when a GradBalancer is active
         self.aux_grad_scale: Dict[str, float] = {"det": 1.0, "map": 1.0}
 
+        # refiner v6c (report 124; refiner_v6c/): built last and under fork_rng, so with v6c off nothing changes and
+        # with v6c on the baseline modules keep their init and the global RNG stream
+        self.v6c = None
+        if bool(getattr(cfg, "v6c", False)):
+            if self.cand_scorer is None or self.corridor_head is None:
+                raise ValueError("v6c needs the candidate scorer and the corridor head (corridor-cf)")
+            from .refiner_v6c.hook import RefinerV6c
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(int(getattr(cfg, "v6c_seed", 6)))
+                self.v6c = RefinerV6c(cfg)
+            if str(getattr(cfg, "v6c_stage", "D")) not in ("P", "D"):
+                raise ValueError(f"v6c_stage must be P | D, got {cfg.v6c_stage!r}")
+
     # ------------------------------------------------------------------ #
     def _apply_backbone_train_policy(self) -> None:
         """Apply the original mmdet ResNet freeze and BatchNorm policy."""
@@ -323,7 +336,20 @@ class ParaSSRModel(nn.Module):
     def train(self, mode: bool = True) -> "ParaSSRModel":
         super().train(mode)
         self._apply_backbone_train_policy()
+        if mode and self.v6c_frozen_base():
+            # stage P: the baseline (C0) is frozen.  Its training-only CODE paths stay on (the cross-fit copy
+            # candidates and the copy pick need self.training), but every stochastic or statistics-updating LAYER
+            # runs as at evaluation: BatchNorm (running stats, no update), Dropout, GridMask
+            for name, m in self.named_modules():
+                if name.startswith("v6c"):
+                    continue
+                # (nn.MultiheadAttention applies its attention dropout through its own .training flag)
+                if isinstance(m, (nn.modules.batchnorm._BatchNorm, nn.Dropout, nn.MultiheadAttention, GridMask)):
+                    m.eval()
         return self
+
+    def v6c_frozen_base(self) -> bool:
+        return getattr(self, "v6c", None) is not None and str(getattr(self._config, "v6c_stage", "D")) == "P"
 
     # ------------------------------------------------------------------ #
     def extract_img_feat(self, img: torch.Tensor) -> List[torch.Tensor]:
@@ -394,6 +420,27 @@ class ParaSSRModel(nn.Module):
 
     # ------------------------------------------------------------------ #
     def forward(
+        self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None,
+        cf_fold: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if self.v6c is None:
+            return self._forward_base(features, run_aux, cf_fold)
+        # refiner v6c after the baseline forward (report 124 §2): stage P runs the frozen baseline without a graph
+        import contextlib
+        frozen = self.training and self.v6c_frozen_base()
+        with (torch.no_grad() if frozen else contextlib.nullcontext()):
+            predictions = self._forward_base(features, run_aux, cf_fold)
+        det_out = predictions.pop("_v6c_det_out", None)
+        if "cand_states" not in predictions:
+            return predictions
+        out = self.v6c(predictions, features, det_out, self.training)
+        predictions.update(out)
+        if not self.training:
+            predictions["trajectory_base"] = out["v6c_tau_base"]
+            predictions["trajectory"] = out["v6c_out"].to(predictions["trajectory"].dtype)
+        return predictions
+
+    def _forward_base(
         self, features: Dict[str, torch.Tensor], run_aux: Optional[bool] = None,
         cf_fold: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -499,6 +546,9 @@ class ParaSSRModel(nn.Module):
                 predictions["trajectory"] = cand[torch.arange(b, device=cand.device), idx].to(predictions["trajectory"].dtype)
                 predictions["plan_select_index"] = idx
                 predictions["cand_exp_pdms1"], predictions["cand_exp_epdms2"] = ex["pdms1"], ex["epdms2"]
+        if self.v6c is not None:
+            # refiner v6c reads the det / motion tokens without test_aux_heads (they are a local here)
+            predictions["_v6c_det_out"] = det_out
         if getattr(cfg, "heading_from_path", False) and not self.training:
             predictions["trajectory"] = heading_from_path(predictions["trajectory"])
         if getattr(cfg, "kinematic_projection", False) and not self.training:

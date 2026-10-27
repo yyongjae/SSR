@@ -322,6 +322,7 @@ class ParaSSRAgent(AbstractAgent):
     ):
         super().__init__()
         self._validate_config(config, trajectory_sampling)
+        self._validate_v6c(config)
         self._config = config
         # ``run_training.py`` and ``AgentLightningModule`` both reach for
         # ``agent.config`` directly, so it has to exist under that name.
@@ -383,9 +384,21 @@ class ParaSSRAgent(AbstractAgent):
             if source not in ("store", "targets"):
                 raise ValueError(f"distill_teacher_source must be 'store' or 'targets', got {source!r}")
             self._distill = self._build_distill(config)
+        # refiner v6c (report 124): frozen OOF teachers (T-D / T-M / T-E fold copies) loaded from the stage-T
+        # checkpoint; training-only state under the prefix '_v6c_teachers.' (never in a student checkpoint load)
+        if getattr(config, "v6c", False) and str(getattr(config, "v6c_teacher_ckpt", "") or ""):
+            from .refiner_v6c.teacher import load_teachers
+
+            self._v6c_teachers = load_teachers(str(config.v6c_teacher_ckpt), config)
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
+        if self.para_ssr_model.v6c_frozen_base():
+            # stage P: only refiner v6c learns; the frozen baseline gets no optimizer state and no DDP gradient
+            for name, prm in self.para_ssr_model.named_parameters():
+                if not name.startswith("v6c."):
+                    prm.requires_grad_(False)
+            self.para_ssr_model.train(self.para_ssr_model.training)
 
     @staticmethod
     def _ck_e2e_config(config):
@@ -406,6 +419,25 @@ class ParaSSRAgent(AbstractAgent):
         from .ck.online2 import CKE2E2Config
 
         return CKE2E2Config.from_any(raw)
+
+    @staticmethod
+    def _validate_v6c(config) -> None:
+        """refiner v6c needs the corridor-cf candidate path it is built on (report 124 / 125)"""
+        if not getattr(config, "v6c", False):
+            return
+        need = {"cand_official": True, "cand_scorer_fields": True, "corridor_format": "c64", "bev_h": 100,
+                "bev_w": 100, "corridor_occ_planes": 49}
+        bad = {k: getattr(config, k, None) for k, v in need.items() if getattr(config, k, None) != v}
+        if float(getattr(config, "cand_scorer_weight", 0.0)) <= 0 or float(getattr(config, "corridor_weight", 0.0)) <= 0:
+            bad["cand_scorer_weight / corridor_weight"] = "must be > 0"
+        if int(getattr(config, "cand_cf_folds", 0)) != 2:
+            bad["cand_cf_folds"] = getattr(config, "cand_cf_folds", None)
+        for k, ok in (("v6c_stage", ("P", "D")), ("v6c_mode", ("A", "B")), ("v6c_decoder_mode", ("A", "B")),
+                      ("v6c_h_arm", ("E", "EH", "H")), ("v6c_fix_source", ("teacher", "gt"))):
+            if str(getattr(config, k)) not in ok:
+                bad[k] = getattr(config, k)
+        if bad:
+            raise ValueError(f"v6c configuration: {bad}")
 
     @staticmethod
     def _validate_config(config, trajectory_sampling: TrajectorySampling) -> None:
@@ -901,7 +933,7 @@ class ParaSSRAgent(AbstractAgent):
         kd_prefix = "_loss.distiller."
         # Same for the aux_distill BEV distillation module (training-only): a distillation checkpoint evaluates with
         # use_distill off, and a distillation run may start from a checkpoint that never had it.
-        train_only = (kd_prefix, self._DISTILL_PREFIX)
+        train_only = (kd_prefix, self._DISTILL_PREFIX, "_v6c_teachers.")
         own = self.state_dict()
         state_dict = {
             k: v for k, v in state_dict.items() if not k.startswith(train_only) or k in own
@@ -929,6 +961,13 @@ class ParaSSRAgent(AbstractAgent):
             if fresh:
                 logger.info("cross-fit planners: %d tensors start fresh", len(fresh))
             missing = [k for k in missing if not k.startswith(cf_prefix)]
+        # refiner v6c starts fresh from a checkpoint that has none of it (stage P from C0); a v6c checkpoint loads strictly
+        v6c_prefix = "para_ssr_model.v6c."
+        if not any(k.startswith(v6c_prefix) for k in state_dict):
+            fresh = [k for k in missing if k.startswith(v6c_prefix)]
+            if fresh:
+                logger.info("refiner v6c: %d tensors start fresh", len(fresh))
+            missing = [k for k in missing if not k.startswith(v6c_prefix)]
         if missing or result.unexpected_keys:
             # same wording as torch's strict load, which callers match on
             raise RuntimeError(
@@ -993,7 +1032,9 @@ class ParaSSRAgent(AbstractAgent):
             from .ck.e2e_data2 import CK2E2ETargetBuilder
 
             builders.append(CK2E2ETargetBuilder(cfg))
-        elif getattr(cfg, "use_distill", False) and str(getattr(cfg, "distill_teacher_source", "store")) == "targets":
+        elif (getattr(cfg, "use_distill", False) and str(getattr(cfg, "distill_teacher_source", "store")) == "targets") \
+                or (getattr(cfg, "v6c", False) and str(getattr(cfg, "v6c_teacher_ckpt", "") or "")):
+            # kd_bev_0 / kd_bev_1: the v15 distillation and the v6c online teachers read the same tensors
             from .distill.teacher_store import DistillTeacherTargetBuilder
 
             builders.append(DistillTeacherTargetBuilder(cfg))
@@ -1037,6 +1078,15 @@ class ParaSSRAgent(AbstractAgent):
         returning it would double-count. The breakdown is published on
         ``latest_logs`` and picked up by :class:`ParaSSRLoggingCallback`.
         """
+        if self.para_ssr_model.v6c_frozen_base():
+            # stage P (report 124 §4-3): the baseline is frozen, only the v6c losses train
+            from .refiner_v6c.hook import v6c_loss
+
+            loss, logs = v6c_loss(self.para_ssr_model.v6c, getattr(self, "_v6c_teachers", None), self._config,
+                                  features, targets, predictions, self.training)
+            logs["loss"] = loss.detach()
+            self.latest_logs = logs
+            return loss
         loss, logs = self._loss(self.para_ssr_model, features, targets, predictions)
         if self.para_ssr_model.corridor_head is not None and "corridor_valid" in targets:
             # km 10/15: corridor loss added AFTER the grad balancer (v2's plan/det/map shares unchanged)
@@ -1168,6 +1218,18 @@ class ParaSSRAgent(AbstractAgent):
             logs["loss_v2"] = logs["loss"]
             loss = loss + ck_loss
             logs.update(ck_logs)
+            logs["loss"] = loss.detach()
+        if self.para_ssr_model.v6c is not None and "v6c_tau_v6" in predictions and "ex1_valid" in targets:
+            predictions["_v6c_iteration"] = int(self._loss.iteration)
+            # refiner v6c (report 124), after the balancer and the scorer, before the distillation; never part of
+            # ParaSSRLoss task_losses['plan'] (that would move g_plan and every distillation lambda)
+            from .refiner_v6c.hook import v6c_loss
+
+            v_loss, v_logs = v6c_loss(self.para_ssr_model.v6c, getattr(self, "_v6c_teachers", None), self._config,
+                                      features, targets, predictions, self.training)
+            logs["loss_pre_v6c"] = logs["loss"]
+            loss = loss + v_loss
+            logs.update(v_logs)
             logs["loss"] = loss.detach()
         distill = getattr(self, "_distill", None)
         if distill is not None and self.training:

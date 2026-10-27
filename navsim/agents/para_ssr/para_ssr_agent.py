@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -360,6 +361,15 @@ class ParaSSRAgent(AbstractAgent):
                 from .ck.bev_kd_arm import build_bev_kd_arm
 
                 self.ck_bev_kd = build_bev_kd_arm(ck2)       # nn.Module: state_dict / DDP / own optimiser group
+        # BEV planning distillation merged from aux_distill (distill/, docs/bev_selector_v15.md): built only when
+        # config.use_distill (default off: nothing imported, built or loaded).  A registered submodule `_distill`
+        # (state_dict prefix '_distill.'); deliberately NO class attribute of that name (it would hide the registered
+        # module), so read it with getattr(self, "_distill", None).
+        if getattr(config, "use_distill", False):
+            source = str(getattr(config, "distill_teacher_source", "store"))
+            if source not in ("store", "targets"):
+                raise ValueError(f"distill_teacher_source must be 'store' or 'targets', got {source!r}")
+            self._distill = self._build_distill(config)
 
         if resume_from_checkpoint and checkpoint_path:
             self.initialize()
@@ -637,6 +647,203 @@ class ParaSSRAgent(AbstractAgent):
     def name(self) -> str:
         return self.__class__.__name__
 
+    # ------------------------------------------------------------------ #
+    # aux_distill BEV planning distillation (fusion_v1 / corridor-cf-distill port)
+    # ------------------------------------------------------------------ #
+    _DISTILL_PREFIX = "_distill."
+
+    @staticmethod
+    def _build_distill(config):
+        """PlanningDistillation of the trajectory-anchor path (v6..v16) on this kyungmin-v2 / corridor-cf core.
+
+        Differences to aux_distill, none of which changes the distillation math:
+        - the probe is drawn under torch.random.fork_rng(seed=distill_probe_seed), so switching the distillation on
+          leaves the v2 / corridor-cf init and the global RNG stream (data order) of the distillation-off run unchanged;
+        - for v6/v7/v8, everything but student_proj is frozen HERE, before Lightning's DDP wrap; for v9..v16, both
+          student_proj and the PlanningGroundedProbe (+ anchor/cmd/status query encoders) remain trainable;
+        - the spatial bias is built from config.plan_anchor_file (the planner's own anchors) and is not saved in
+          checkpoints (it is a function of that file).
+        """
+        if not any(bool(getattr(config, k, False))
+                   for k in ("distill_selector_v6", "distill_selector_v7", "distill_selector_v8",
+                             "distill_selector_v9", "distill_selector_v10", "distill_selector_v11",
+                             "distill_selector_v12", "distill_selector_v13", "distill_selector_v14",
+                             "distill_selector_v15", "distill_selector_v16")):
+            raise NotImplementedError(
+                "use_distill on this core supports only the trajectory-anchor path "
+                "(distill_selector_v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16); the stage-1 adapter / corridor / "
+                "register-selector paths need aux_distill's own v2 port")
+        anchor_file = getattr(config, "plan_anchor_file", None)
+        if not getattr(config, "plan_anchor", False) or not anchor_file or not os.path.isfile(str(anchor_file)):
+            raise ValueError("use_distill (trajectory-anchor path) needs the anchor planner: plan_anchor true and an "
+                             f"existing plan_anchor_file (got plan_anchor={getattr(config, 'plan_anchor', None)}, "
+                             f"plan_anchor_file={anchor_file})")
+        from .distill.distillation import build_planning_distillation
+
+        # CPU generator only: torch.manual_seed would also re-seed the (queued) CUDA generators
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(int(getattr(config, "distill_probe_seed", 0)))
+            module = build_planning_distillation(config)
+        is_pgp = bool(
+            getattr(config, "distill_selector_v9", False)
+            or getattr(config, "distill_selector_v10", False)
+            or getattr(config, "distill_selector_v11", False)
+            or getattr(config, "distill_selector_v12", False)
+            or getattr(config, "distill_selector_v13", False)
+            or getattr(config, "distill_selector_v14", False)
+            or getattr(config, "distill_selector_v15", False)
+            or getattr(config, "distill_selector_v16", False)
+        )
+        trainable_prefix = "anchor_distill." if is_pgp else "anchor_distill.student_proj."
+        for name, param in module.named_parameters():
+            param.requires_grad_(name.startswith(trainable_prefix))
+        return module
+
+    def distill_parameters(self) -> List[torch.nn.Parameter]:
+        distill = getattr(self, "_distill", None)
+        if distill is None:
+            return []
+        return [p for p in distill.parameters() if p.requires_grad]
+
+    def _distill_loss(self, distill, features, targets, predictions, logs):
+        """aux_distill's compute_loss block (v6..v16 anchor path), added after the v2 balancer and the
+        corridor / scorer terms.  bev_pos is recomputed from the planner's LearnedPositionalEncoding exactly as
+        plan_from_bev does (same parameters, not detached: the distillation gradient reaches the shared positional
+        embedding as in aux_distill, where the planner returned the same tensor)."""
+        cfg = self._config
+        if "scene_token" not in targets:
+            raise ValueError("planning distillation needs targets['scene_token'] (ParaSSRTargetBuilder emits it when "
+                             "use_distill is on; regenerate a target cache built with use_distill off)")
+        status = features.get("ego_status")
+        status_feature = features.get("status_feature")
+        command = features.get("command")
+        n_cmd = int(cfg.num_navi_cmd)
+        if status is None and status_feature is not None and status_feature.shape[-1] > n_cmd:
+            status = status_feature[:, n_cmd:]
+            if command is None:
+                command = status_feature[:, :n_cmd]
+        bev = predictions["bev_embed"]
+        head = self.para_ssr_model.pts_bbox_head
+        mask = bev.new_zeros((bev.shape[0], head.bev_h, head.bev_w))
+        bev_pos = head.positional_encoding(mask).to(bev.dtype).flatten(2).transpose(1, 2)
+        inputs = dict(student_bev=bev, tokens=list(targets["scene_token"]), trajectories=targets.get("trajectory"),
+                      command=command, ego_status=status, bev_pos=bev_pos, sim_reward=targets.get("sim_reward"),
+                      sim_reward_valid=targets.get("sim_reward_valid"),
+                      gt_map_pts=targets.get("gt_map_pts"), gt_map_labels=targets.get("gt_map_labels"),
+                      gt_map_valid=targets.get("gt_map_valid"),
+                      plan_topk_trajectory=predictions.get("plan_topk_trajectory"))
+        out = {}
+        anchors = predictions.get("trajectory_anchors")
+        ad = getattr(distill, "anchor_distill", None)
+        if ad is not None and anchors is not None and ad.sync_spatial_bias(anchors):
+            logger.warning("distillation spatial bias rebuilt from the planner's anchors (they differ from the ones "
+                           "it was built from, e.g. after a checkpoint restore)")
+        frac, dead = 1.0, False
+        if str(getattr(cfg, "distill_teacher_source", "store")) == "targets":
+            # S-grid f16 targets from DistillTeacherTargetBuilder or CK2E2ETargetBuilder:
+            # kd_bev_0 = DET / BEVFusion, kd_bev_1 = MAP / ReSMap
+            from .distill.adapter import bev_map_to_tokens
+
+            ok = targets["kd_ok_0"].bool() & targets["kd_ok_1"].bool()
+            inputs["teacher_tokens"] = (bev_map_to_tokens(targets["kd_bev_0"]).float(),
+                                        bev_map_to_tokens(targets["kd_bev_1"]).float())
+            out["distill/teacher_ok_frac"] = ok.float().mean().detach()
+            if not bool(ok.any()):
+                # no teacher at all on this rank: run the term on the student's own (detached) BEV with weight 0, so
+                # every rank logs the same keys (sync_dist logging) and every trainable distillation parameter gets
+                # a (zero) gradient (plain DDP)
+                dead = True
+                inputs["teacher_tokens"] = (bev.detach(), bev.detach())
+            elif not bool(ok.all()):
+                # left-out tokens contribute 0 and every kept token keeps the per-sample weight 1 / B it has in a
+                # full micro-batch (the term is a batch mean), so ranks with different teacher coverage weigh the
+                # same under DDP's gradient average
+                idx = ok.nonzero(as_tuple=True)[0]
+                frac = float(idx.numel()) / float(ok.numel())
+                inputs = {k: (None if v is None else
+                              [v[i] for i in idx.tolist()] if k == "tokens" else
+                              tuple(t[idx] for t in v) if k == "teacher_tokens" else v[idx])
+                          for k, v in inputs.items()}
+        losses, metrics = distill(
+            inputs.pop("student_bev"),
+            inputs.pop("tokens"),
+            trajectory_anchors=anchors,
+            **inputs,
+        )
+        weight = float(cfg.distill_loss_weight) * (0.0 if dead else frac)
+        keep = 0.0 if dead else 1.0
+        total = None
+        for name, value in losses.items():
+            total = weight * value if total is None else total + weight * value
+            out[name] = value.detach() * keep           # per kept token (0 when no teacher)
+        out.update({k: v.detach() * keep for k, v in metrics.items()})
+        if total is None:
+            total = bev.new_zeros(())
+        else:
+            if (
+                ad is not None
+                and getattr(ad, "ratio_ctrl", None) is not None
+                and "gnorm/plan" in logs
+                and self.training
+                and bev.requires_grad
+                and torch.is_grad_enabled()
+            ):
+                from .modules.grad_balance import all_reduce_mean
+                has_probe_ctrl = getattr(ad, "probe_ratio_ctrl", None) is not None
+                g_local = {}
+                for tk in ("det", "map"):
+                    u_loss = ad.last_unit_losses.get(tk)
+                    u_in = ad.last_unit_inputs.get(tk)
+                    if not dead and isinstance(u_loss, torch.Tensor) and u_loss.requires_grad and u_in is not None:
+                        gg = torch.autograd.grad(weight * u_loss, u_in, retain_graph=True, allow_unused=True)[0]
+                        g_local[tk] = 0.0 if gg is None else float(gg.detach().float().norm())
+                    else:
+                        g_local[tk] = 0.0
+                    if has_probe_ctrl:
+                        pu_loss = ad.last_probe_unit_losses.get(tk)
+                        pu_in = ad.last_probe_unit_inputs.get(tk)
+                        if not dead and isinstance(pu_loss, torch.Tensor) and pu_loss.requires_grad and pu_in is not None:
+                            pgg = torch.autograd.grad(weight * pu_loss, pu_in, retain_graph=True, allow_unused=True)[0]
+                            g_local[f"probe_{tk}"] = 0.0 if pgg is None else float(pgg.detach().float().norm())
+                        else:
+                            g_local[f"probe_{tk}"] = 0.0
+                g_red = all_reduce_mean(g_local, bev.device)
+                g_plan = float(logs["gnorm/plan"])
+                ad.ratio_ctrl.update({"det": g_red["det"], "map": g_red["map"]}, g_plan)
+                out["distill/g_unit_det"] = bev.new_tensor(float(g_red["det"]))
+                out["distill/g_unit_map"] = bev.new_tensor(float(g_red["map"]))
+                if has_probe_ctrl:
+                    ad.probe_ratio_ctrl.update({"det": g_red["probe_det"], "map": g_red["probe_map"]}, g_plan)
+                    out["distill/g_unit_probe_det"] = bev.new_tensor(float(g_red["probe_det"]))
+                    out["distill/g_unit_probe_map"] = bev.new_tensor(float(g_red["probe_map"]))
+            self._log_distill_bev_grad(bev, total, out)
+        return total, out
+
+    def _log_distill_bev_grad(self, bev: torch.Tensor, distill_loss: torch.Tensor, logs: Dict) -> None:
+        """||d L_distill / d bev_embed|| on the gnorm/plan cadence (aux_distill telemetry; same micro-batches on every
+        rank).  Logged as gnorm/distill_v8: gnorm/distill is the readout-KD slot of ParaSSRLoss."""
+        interval = int(getattr(self._config, "grad_norm_log_interval", 0) or 0)
+        if interval <= 0 or not self.training or not distill_loss.requires_grad or not bev.requires_grad:
+            return
+        if (int(getattr(self._loss, "iteration", 1)) - 1) % interval != 0:
+            return
+        grad = torch.autograd.grad(distill_loss, bev, retain_graph=True, allow_unused=True)[0]
+        norm = 0.0 if grad is None else float(grad.detach().norm())
+        from .modules.grad_balance import all_reduce_mean
+
+        reduced = all_reduce_mean({"distill_v8": norm}, bev.device)
+        logs["gnorm/distill_v8"] = bev.new_tensor(float(reduced["distill_v8"]))
+
+    def filter_datasets_to_teacher_cache(self, train_data, val_data) -> None:
+        """Keep only training tokens present in every teacher store (run_training hook); no-op when distillation is
+        off.  The distillation is a training-only term here, so validation keeps all its tokens."""
+        distill = getattr(self, "_distill", None)
+        if distill is None or str(getattr(self._config, "distill_teacher_source", "store")) == "targets":
+            return       # the 'targets' source masks a missing teacher per token (kd_ok) instead
+        from .distill.teacher_store import restrict_dataset_to_stores
+
+        restrict_dataset_to_stores(train_data, list(distill.stores.values()), name="train")
+
     def initialize(self) -> None:
         """Load an exact PARA-SSR agent checkpoint.
 
@@ -679,16 +886,19 @@ class ParaSSRAgent(AbstractAgent):
         # it is training-only, so a KD checkpoint must evaluate without it and
         # a KD fine-tune must start from a checkpoint that never had it.
         kd_prefix = "_loss.distiller."
+        # Same for the aux_distill BEV distillation module (training-only): a distillation checkpoint evaluates with
+        # use_distill off, and a distillation run may start from a checkpoint that never had it.
+        train_only = (kd_prefix, self._DISTILL_PREFIX)
         own = self.state_dict()
         state_dict = {
-            k: v for k, v in state_dict.items() if not k.startswith(kd_prefix) or k in own
+            k: v for k, v in state_dict.items() if not k.startswith(train_only) or k in own
         }
         # v1 -> v2 init: the anchor planner replaces the single-trajectory regressor.
         v1_regressor = "para_ssr_model.pts_bbox_head.ego_fut_decoder."
         if not any(k.startswith(v1_regressor) for k in own):
             state_dict = {k: v for k, v in state_dict.items() if not k.startswith(v1_regressor)}
         result = self.load_state_dict(state_dict, strict=False)
-        missing = [k for k in result.missing_keys if not k.startswith(kd_prefix)]
+        missing = [k for k in result.missing_keys if not k.startswith(train_only)]
         # The v2 anchor planner may be initialised from a v1 checkpoint: its new
         # modules start fresh, but only when the checkpoint has NONE of them (a
         # partial match is a different vocabulary/architecture, not an upgrade).
@@ -770,6 +980,10 @@ class ParaSSRAgent(AbstractAgent):
             from .ck.e2e_data2 import CK2E2ETargetBuilder
 
             builders.append(CK2E2ETargetBuilder(cfg))
+        elif getattr(cfg, "use_distill", False) and str(getattr(cfg, "distill_teacher_source", "store")) == "targets":
+            from .distill.teacher_store import DistillTeacherTargetBuilder
+
+            builders.append(DistillTeacherTargetBuilder(cfg))
         return builders
 
     # ------------------------------------------------------------------ #
@@ -942,6 +1156,14 @@ class ParaSSRAgent(AbstractAgent):
             loss = loss + ck_loss
             logs.update(ck_logs)
             logs["loss"] = loss.detach()
+        distill = getattr(self, "_distill", None)
+        if distill is not None and self.training:
+            # aux_distill BEV distillation, added after the balancer and the corridor/scorer/refiner terms
+            d_loss, d_logs = self._distill_loss(distill, features, targets, predictions, logs)
+            logs["loss_pre_distill"] = logs["loss"]
+            loss = loss + d_loss
+            logs.update(d_logs)
+            logs["loss"] = loss.detach()
         self.latest_logs = logs
         return loss
 
@@ -1031,6 +1253,43 @@ class ParaSSRAgent(AbstractAgent):
                         "weight_decay": bk["weight_decay"],
                     }
                 )
+        distill = getattr(self, "_distill", None)
+        if distill is not None:
+            proj_params = [
+                p for n, p in distill.named_parameters()
+                if p.requires_grad and n.startswith("anchor_distill.student_proj.")
+            ]
+            probe_params = [
+                p for n, p in distill.named_parameters()
+                if p.requires_grad and not n.startswith("anchor_distill.student_proj.")
+            ]
+            if proj_params:
+                if bool(
+                    getattr(cfg, "distill_selector_v11", False)
+                    or getattr(cfg, "distill_selector_v12", False)
+                    or getattr(cfg, "distill_selector_v13", False)
+                    or getattr(cfg, "distill_selector_v14", False)
+                    or getattr(cfg, "distill_selector_v15", False)
+                    or getattr(cfg, "distill_selector_v16", False)
+                ):
+                    proj_mult = float(getattr(cfg, "distill_proj_lr_mult", 2.0))
+                    groups.append({
+                        "params": proj_params,
+                        "lr": self._lr * proj_mult,
+                        "lr_scale": proj_mult,
+                        "weight_decay": 0.0,
+                    })
+                else:
+                    # aux_distill trains student_proj with the base group (lr, lr_scale 1, weight_decay): same AdamW math in
+                    # a group of its own, so the distillation-off group layout is unchanged
+                    groups.append({"params": proj_params, "lr": self._lr, "lr_scale": 1.0})
+            if probe_params:
+                probe_mult = float(getattr(cfg, "distill_probe_lr_mult", 3.0))
+                groups.append({
+                    "params": probe_params,
+                    "lr": self._lr * probe_mult,
+                    "lr_scale": probe_mult,
+                })
         optimizer_cls = getattr(torch.optim, cfg.optimizer_type)
         optimizer = optimizer_cls(groups, lr=self._lr, weight_decay=cfg.weight_decay)
 

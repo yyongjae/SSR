@@ -15,3 +15,5 @@ export NAVSIM_DEVKIT_ROOT=$REPO PYTHONPATH=$REPO
 export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 # metric caches (GT corridor source = what the official scorer reads) are set in tools/ck/data/common.py (MC_ROOT)
 export KM_CORR_ROOT=$(dirname $TOKENS_ROOT)
+# 64m (100x100) frozen teacher BEV caches for BEV Selector v15 distillation (bevfusion/cache_{train,val}_100x100 + resmap/stage1_front64)
+export TEACHER_CACHE_ROOT=/workspace/teacher_cache

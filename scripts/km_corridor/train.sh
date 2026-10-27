@@ -21,6 +21,8 @@
 #                  u ~ U(0, 1) (cand_scorer_mix_p 0.5), labelled by their own official terms; no input perturbation
 #            cf  : (km 10/25) c64 + EC-smoothness hinge 0.1 + cross-fitting (cand_cf_folds 2): the scorer trains on the
 #                  candidates of a planner copy that never fitted the scene (log-disjoint folds); no perturbation / mix
+#            cf_v15 : cf + BEV Selector v15 distillation on the 64 m (100x100) BEV grid (BEVFusion + ReSMap stage1_front64,
+#                     worker-parallel loading via DistillTeacherTargetBuilder)
 #   LR / MAXEP (km 10/25): agent.lr and the cosine schedule length (default 1e-4 / 30)
 #   smoke: EPOCHS=1 LIMIT_TRAIN=40 LIMIT_VAL=5 VAL_EVERY=1 WANDB=false
 #   SELECT_RULE (km 10/17): trajectory the agent submits at inference, default pred_multiply_t0.25 (corridor); v2 = no corridor
@@ -31,10 +33,32 @@ NG=$(echo $GPUS | tr ',' '\n' | wc -l)
 OUT=$KM_ROOT/km_runs/corr30/$RUN; mkdir -p $OUT
 export CUDA_VISIBLE_DEVICES=$GPUS CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_SOCKET_IFNAME=lo OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 [ "$VAR" = v32b ] && PLANES=49 && SELECT_RULE=${SELECT_RULE:-pred_multiply_sigma_ttc}
-case $VAR in c64|c64_traj|pert|mix|cf) PLANES=49; SELECT_RULE=${SELECT_RULE:-cand_official} ;; esac
+case $VAR in c64|c64_traj|pert|mix|cf|cf_v15) PLANES=49; SELECT_RULE=${SELECT_RULE:-cand_official} ;; esac
 V31=(++agent.config.corridor_plan_weight=20.0 ++agent.config.corridor_plan_ttc_weight=1.0 ++agent.config.plan_ep_feasible_only=true
      ++agent.config.corridor_occ_planes=${PLANES:-40} ++agent.config.corridor_route_weight=1.0
      ++agent.config.corridor_plan_prog_weight=0.2 ++agent.config.corridor_plan_comfort_weight=1.0 ++agent.config.corridor_verdict_weight=1.0)
+V15_DISTILL=(
+  ++agent.config.use_distill=true
+  ++agent.config.distill_feature_root=${TEACHER_CACHE_ROOT:-/workspace/teacher_cache}
+  ++agent.config.distill_teacher_source=${DISTILL_SOURCE:-targets}
+  "++agent.config.distill_cache_size=[100,100]"
+  ++agent.config.distill_selector_v15=true
+  ++agent.config.distill_anchor_mode=cross_attn
+  ++agent.config.distill_anchor_proj=true
+  ++agent.config.distill_anchor_loss_type=hybrid
+  ++agent.config.distill_anchor_loss_scale=10.0
+  ++agent.config.distill_attn_loss_scale=5.0
+  ++agent.config.distill_resmap_scale=1.0
+  ++agent.config.distill_loss_weight=1.0
+  ++agent.config.distill_probe_seed=0
+  ++agent.config.distill_proj_lr_mult=2.0
+  ++agent.config.distill_probe_lr_mult=3.0
+  ++agent.config.distill_probe_warmup_steps=1000
+  ++agent.config.distill_probe_ramp_steps=2000
+  ++agent.config.distill_probe_loss_weight=0.5
+  ++agent.config.distill_probe_use_ema=true
+  ++agent.config.distill_probe_ema_decay=0.99
+)
 case $VAR in
   v2)  EXTRA=(++agent.config.corridor_dir=$KM_ROOT/corridor_dt01) ;;
   v31) EXTRA=("${V31[@]}" ++agent.config.corridor_dir=$KM_ROOT/corridor_dt01 ++agent.config.corridor_route_dir=$KM_ROOT/route32) ;;
@@ -44,7 +68,7 @@ case $VAR in
   v32b) EXTRA=("${V31[@]}" ++agent.config.corridor_dir=$KM_ROOT/corridor32_p49 ++agent.config.corridor_route_dir=$KM_ROOT/route32
          ++agent.config.corridor_occ_pos_weight=8.0 ++agent.config.corridor_occ_time_weight=1.0
          ++agent.config.corridor_sdf_boundary_weight=8.0 ++agent.config.corridor_sdf_sigma=true) ;;
-  c64|c64_traj|pert|mix|cf) V31C=(); for x in "${V31[@]}"; do [[ $x == *corridor_verdict_weight* ]] || V31C+=("$x"); done
+  c64|c64_traj|pert|mix|cf|cf_v15) V31C=(); for x in "${V31[@]}"; do [[ $x == *corridor_verdict_weight* ]] || V31C+=("$x"); done
            EXTRA=("${V31C[@]}" ++agent.config.corridor_format=c64
            ++agent.config.corridor_dir=$KM_ROOT/corridor64
            "++agent.config.pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]" "++agent.config.map_pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]"
@@ -53,10 +77,12 @@ case $VAR in
            ++agent.config.cand_scorer_fields=$([ "$VAR" = c64_traj ] && echo false || echo true))
        [ "$VAR" = pert ] && EXTRA+=(++agent.config.corridor_plan_ec_smooth_weight=0.1 ++agent.config.cand_scorer_pert_p=0.5)
        [ "$VAR" = mix ] && EXTRA+=(++agent.config.corridor_plan_ec_smooth_weight=0.1 ++agent.config.cand_scorer_mix_p=0.5)
-       [ "$VAR" = cf ] && EXTRA+=(++agent.config.corridor_plan_ec_smooth_weight=0.1 ++agent.config.cand_cf_folds=2
-                                  ++agent.config.input_target=true) ;;
-  *) echo "variant: v2 | v31 | v31_64 | v32b | c64 | c64_traj | pert | mix | cf"; exit 2 ;;
+       case $VAR in cf|cf_v15) EXTRA+=(++agent.config.corridor_plan_ec_smooth_weight=0.1 ++agent.config.cand_cf_folds=2
+                                       ++agent.config.input_target=true) ;; esac
+       [ "$VAR" = cf_v15 ] && EXTRA+=("${V15_DISTILL[@]}") ;;
+  *) echo "variant: v2 | v31 | v31_64 | v32b | c64 | c64_traj | pert | mix | cf | cf_v15"; exit 2 ;;
 esac
+[ "${DISTILL:-}" = v15 ] && [ "$VAR" != cf_v15 ] && EXTRA+=("${V15_DISTILL[@]}")
 exec $PY navsim/planning/script/run_training.py \
   agent=para_ssr_agent agent.lr=${LR:-1e-4} agent.config.max_epochs=${MAXEP:-30} experiment_name=$RUN \
   scene_filter=navtrain split=trainval \

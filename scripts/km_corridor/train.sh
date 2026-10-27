@@ -98,7 +98,29 @@ if [ "${DISTILL:-}" = v15 ] && [[ "$VAR" != cf_v15 && "$VAR" != cf_seg_v15 && "$
     *) echo "error: DISTILL=v15 requires a 64m variant (v31_64 | c64 | c64_traj | pert | mix | cf | cf_seg | cf_v15), got $VAR"; exit 2 ;;
   esac
 fi
-exec $PY navsim/planning/script/run_training.py \
+if [ "${WANDB:-true}" != "false" ] && [ "${WANDB:-1}" != "0" ] && [ -f "$REPO/.env" ]; then
+  _wkey=""
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _line="${_line%$'\r'}"
+    case "$_line" in
+      WANDB_API_KEY=*)
+        _wkey="${_line#WANDB_API_KEY=}"
+        _wkey="${_wkey%\"}"; _wkey="${_wkey#\"}"
+        _wkey="${_wkey%\'}"; _wkey="${_wkey#\'}"
+        ;;
+    esac
+  done < "$REPO/.env"
+  if [ -n "$_wkey" ]; then
+    export WANDB_API_KEY="$_wkey"
+    _WANDB_NETRC_FILE="$(mktemp "${TMPDIR:-/tmp}/wandb-netrc.XXXXXX")"
+    chmod 600 "$_WANDB_NETRC_FILE"
+    printf 'machine api.wandb.ai\n  login user\n  password %s\n' "$WANDB_API_KEY" > "$_WANDB_NETRC_FILE"
+    export NETRC="$_WANDB_NETRC_FILE"
+    trap 'rm -f "$_WANDB_NETRC_FILE"' EXIT
+  fi
+  unset _wkey _line
+fi
+$PY navsim/planning/script/run_training.py \
   agent=para_ssr_agent agent.lr=${LR:-1e-4} agent.config.max_epochs=${MAXEP:-30} experiment_name=$RUN \
   scene_filter=navtrain split=trainval \
   dataloader.params.batch_size=4 dataloader.params.num_workers=5 \
@@ -114,5 +136,5 @@ exec $PY navsim/planning/script/run_training.py \
   ++agent.config.log_sync_dist=false ++agent.config.corridor_weight=1.0 ++agent.config.corridor_tokens_root=$TOKENS_ROOT \
   ++agent.config.corridor_select_rule=${SELECT_RULE:-pred_multiply_t0.25} \
   "${EXTRA[@]}" \
-  wandb.enable=${WANDB:-true} wandb.project=para-ssr-v2 wandb.name=$RUN wandb.mode=online wandb.group=corr30 \
+  wandb.enable=${WANDB:-true} wandb.entity=${WANDB_ENTITY:-e2ekd} wandb.project=${WANDB_PROJECT:-v1_distill} wandb.name=$RUN wandb.mode=online wandb.group=${WANDB_GROUP:-bev-selector} \
   output_dir=$OUT/train "$@"

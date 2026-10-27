@@ -157,7 +157,7 @@ class ParaSSRLoggingCallback(pl.Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self._log(pl_module, "train")
-        self._log_progress(trainer, pl_module)
+        self._log_progress(trainer, pl_module, batch_idx=batch_idx)
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         self._log(pl_module, "val")
@@ -173,21 +173,34 @@ class ParaSSRLoggingCallback(pl.Callback):
     def _elapsed(self) -> float:
         return 0.0 if self._train_start is None else time.time() - self._train_start
 
-    def _eta_seconds(self, trainer) -> Optional[float]:
-        """Session-rate extrapolation to ``estimated_stepping_batches``."""
+    def _eta_seconds(self, trainer, batch_idx: Optional[int] = None) -> Optional[float]:
+        """Session-rate extrapolation to total remaining training batches (or ``estimated_stepping_batches``)."""
+        if batch_idx is not None:
+            num_b = getattr(trainer, "num_training_batches", 0)
+            max_ep = getattr(trainer, "max_epochs", 0)
+            if num_b and math.isfinite(float(num_b)) and max_ep and max_ep > 0:
+                done_b = (int(trainer.current_epoch) - self._start_epoch) * float(num_b) + float(batch_idx + 1)
+                rem_b = max((int(max_ep) - 1 - int(trainer.current_epoch)) * float(num_b) + (float(num_b) - float(batch_idx + 1)), 0.0)
+                if done_b > 0:
+                    return self._elapsed() / done_b * rem_b
         done = trainer.global_step - self._start_step
         total = getattr(trainer, "estimated_stepping_batches", None)
         if done <= 0 or not total or not math.isfinite(float(total)):
             return None
         return self._elapsed() / done * max(float(total) - trainer.global_step, 0.0)
 
-    def _log_progress(self, trainer, pl_module) -> None:
+    def _log_progress(self, trainer, pl_module, batch_idx: Optional[int] = None) -> None:
         if self._train_start is None:
             return
         self._log_time(pl_module, "elapsed_hours", self._elapsed() / 3600.0, on_step=True)
-        eta = self._eta_seconds(trainer)
+        eta = self._eta_seconds(trainer, batch_idx=batch_idx)
         if eta is not None:
-            self._log_time(pl_module, "eta_hours", eta / 3600.0, on_step=True)
+            eta_h = eta / 3600.0
+            self._log_time(pl_module, "eta_hours", eta_h, on_step=True)
+            pl_module.log(
+                "eta_h", float(eta_h), on_step=True, on_epoch=False,
+                prog_bar=True, logger=False, rank_zero_only=True,
+            )
 
     def on_train_start(self, trainer, pl_module) -> None:
         self._train_start = time.time()

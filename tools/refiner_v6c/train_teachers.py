@@ -13,8 +13,14 @@ bin, the T-M off-road probability on the min corner SDF).
 No camera images: a token-only dataset feeds the existing target builders (Corridor64TargetBuilder(plan=True),
 DistillTeacherTargetBuilder, ExactFullTargetBuilder) through a minimal scene stub.
 
-Usage (GPU runs need approval, report 124 §4-3; GPUs 0-3 only):
-  CUDA_VISIBLE_DEVICES=0 python tools/refiner_v6c/train_teachers.py --out <dir> --phase all [--epochs 10]
+Usage
+  sequential, one GPU:   python tools/refiner_v6c/train_teachers.py --out <dir> --phase all [--epochs 10]
+  parallel (scripts/km_corridor/v6c_pipeline.sh, report 128): one process per copy
+    --phase td --fold f  /  --phase tm --fold f      -> <dir>/part_{td,tm}{f}.pt  (per-epoch .ckpt, resumed)
+    --phase merge_fields                             -> teachers_fields.pt
+    --phase platt_occ --resume teachers_fields.pt    -> teachers_platt_occ.pt
+    torchrun --nproc_per_node 2 ... --phase te_fold --fold f --resume teachers_platt_occ.pt  -> part_te{f}.pt
+    --phase finish --resume teachers_platt_occ.pt    -> teachers_te.pt (T-E Platt + T-M off-road Platt; complete)
   smoke on CPU: --device cpu --limit 8 --epochs 1 --batch 2
 """
 from __future__ import annotations
@@ -55,7 +61,11 @@ class _Scene:
 
 
 class TokenDataset(torch.utils.data.Dataset):
-    def __init__(self, split: str, cfg, folds=(0, 1), limit: int = 0):
+    """token-only dataset over the packed split, fold-filtered.  bev = which teacher BEVs to read (0 BEVFusion,
+    1 ReSMap); exact = whether to build the exact v1 / v2 tables (T-E, its Platt).  T-D reads only BEVFusion and T-M
+    only ReSMap: the teacher BEV cache read is the dominant cost of stage T (report 124 §3)."""
+
+    def __init__(self, split: str, cfg, folds=(0, 1), limit: int = 0, bev=(0, 1), exact: bool = True):
         import pandas as pd
         import zlib
         df = pd.read_parquet(REPO / "resources/km_corridor/packed" / split / "tokens.parquet")
@@ -65,18 +75,35 @@ class TokenDataset(torch.utils.data.Dataset):
         self.logs = df.log.astype(str).to_numpy()[keep]
         if limit:
             self.toks, self.logs = self.toks[:limit], self.logs[:limit]
+        self.bev, self.exact = tuple(bev), bool(exact)
         self.b_corr = Corridor64TargetBuilder(cfg, plan=True)
         self.b_kd = DistillTeacherTargetBuilder(cfg)
-        self.b_ex = ExactFullTargetBuilder(cfg)
+        self.b_ex = ExactFullTargetBuilder(cfg) if self.exact else None
 
     def __len__(self):
         return len(self.toks)
 
+    def _kd(self, sc) -> dict:
+        if self.bev == (0, 1):
+            return self.b_kd.compute_targets(sc)
+        stores = self.b_kd._open()
+        token = str(sc.frames[0].token)
+        h, w = self.b_kd._cache_size
+        out = {}
+        for i in self.bev:
+            arr = stores[i].load_one_token(token)
+            ok = arr is not None
+            out[f"kd_bev_{i}"] = (torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float16)) if ok
+                                  else torch.zeros((self.b_kd._c, h, w), dtype=torch.float16))
+            out[f"kd_ok_{i}"] = torch.tensor(ok, dtype=torch.bool)
+        return out
+
     def __getitem__(self, i):
         sc = _Scene(self.toks[i], self.logs[i])
-        out = {}
-        for b in (self.b_corr, self.b_kd, self.b_ex):
-            out.update(b.compute_targets(sc))
+        out = dict(self.b_corr.compute_targets(sc))
+        out.update(self._kd(sc))
+        if self.b_ex is not None:
+            out.update(self.b_ex.compute_targets(sc))
         out.pop("corridor_occ", None)                         # the occ_dist / occ planes below are enough
         return out
 
@@ -103,42 +130,85 @@ def sdf_loss(pred, gt, valid, bw=4.0):
     return ((w * F.smooth_l1_loss(pred, gt, beta=0.5, reduction="none")).mean((1, 2)) * valid).sum() / valid.sum().clamp(min=1)
 
 
-def train_fields(ts: TeacherSet, data_by_fold, args, dev, log):
-    """T-D and T-M, copy f on fold f"""
-    for f in range(2):
-        params = list(ts.td[f].parameters()) + list(ts.tm[f].parameters())
-        for p in params:
-            p.requires_grad_(True)
-        ts.td[f].train()
-        ts.tm[f].train()
-        opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
-        dl = torch.utils.data.DataLoader(data_by_fold[f], batch_size=args.batch, shuffle=True, num_workers=args.workers,
-                                         drop_last=True, persistent_workers=False)
-        step = 0
-        for ep in range(args.epochs):
-            for bt in dl:
-                bt = to_dev(bt, dev)
-                ok = bt["kd_ok_0"].bool() & bt["kd_ok_1"].bool() & (bt["corridor_valid"] > 0.5)
+def _atomic_save(obj, path: Path):
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _worker_init(_):
+    """one thread per loader worker: the corridor targets run OpenCV distance transforms, whose default thread pool is
+    every core; with 4 processes x 16 workers that oversubscribes the host (report 128 §5 timing)"""
+    import cv2
+    cv2.setNumThreads(1)
+    torch.set_num_threads(1)
+
+
+def _loader(ds, args, batch, sampler=None, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=sampler is None, sampler=sampler, generator=g,
+                                       num_workers=args.workers, drop_last=True, persistent_workers=False,
+                                       pin_memory=True, worker_init_fn=_worker_init if args.workers > 0 else None)
+
+
+def train_field_copy(ts: TeacherSet, kind: str, f: int, ds, args, dev, log, ckpt: Path = None):
+    """T-D (kind 'td': occupancy BCE pos_weight 4 on BEVFusion) or T-M ('tm': SDF loss on ReSMap), copy f on fold-f
+    tokens.  One copy per process, so the four copies train in parallel (report 128 pipeline).  ckpt: a per-epoch
+    {module, optimizer, epoch, step} checkpoint; an existing one is resumed from the next epoch."""
+    mod = (ts.td if kind == "td" else ts.tm)[f]
+    params = list(mod.parameters())
+    for p in params:
+        p.requires_grad_(True)
+    mod.train()
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
+    ep0, step = 0, 0
+    if ckpt is not None and ckpt.exists():
+        st = torch.load(ckpt, map_location="cpu")
+        mod.load_state_dict(st["module"])
+        opt.load_state_dict(st["opt"])
+        ep0, step = int(st["epoch"]) + 1, int(st["step"])
+        log({"phase": kind, "fold": f, "resumed_from_epoch": ep0 - 1, "step": step})
+    for ep in range(ep0, args.epochs):
+        dl = _loader(ds, args, args.batch, seed=1000 * ep + f)
+        t0, tot, n = time.time(), 0.0, 0
+        for bt in dl:
+            bt = to_dev(bt, dev)
+            if kind == "td":
+                ok = bt["kd_ok_0"].bool() & (bt["corridor_valid"] > 0.5)
                 if not bool(ok.any()):
                     continue
-                zd = ts.norm_det(bt["kd_bev_0"][ok]).flatten(2).transpose(1, 2)
-                zm = ts.norm_map(bt["kd_bev_1"][ok]).flatten(2).transpose(1, 2)
-                occ_gt = (bt["corridor_occ_dist"][ok] < 0).float()                         # [b, 49, 200, 200]
-                lo = occ_bce(ts.td[f](zd)["corridor_occ"].float(), occ_gt)
-                ls = sdf_loss(ts.tm[f](zm)["corridor_sdf"].float(), bt["corridor_sdf"][ok].float(),
-                              torch.ones(int(ok.sum()), device=dev))
-                loss = lo + ls
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, 10.0)
-                opt.step()
-                step += 1
-                if step % args.log_every == 0:
-                    log({"phase": "fields", "fold": f, "epoch": ep, "step": step, "occ": float(lo), "sdf": float(ls)})
-        ts.td[f].eval()
-        ts.tm[f].eval()
-        for p in params:
-            p.requires_grad_(False)
+                z = ts.norm_det(bt["kd_bev_0"][ok]).flatten(2).transpose(1, 2)
+                loss = occ_bce(mod(z)["corridor_occ"].float(), (bt["corridor_occ_dist"][ok] < 0).float())
+            else:
+                ok = bt["kd_ok_1"].bool() & (bt["corridor_valid"] > 0.5)
+                if not bool(ok.any()):
+                    continue
+                z = ts.norm_map(bt["kd_bev_1"][ok]).flatten(2).transpose(1, 2)
+                loss = sdf_loss(mod(z)["corridor_sdf"].float(), bt["corridor_sdf"][ok].float(),
+                                torch.ones(int(ok.sum()), device=dev))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 10.0)
+            opt.step()
+            step += 1
+            tot, n = tot + float(loss), n + 1
+            if step % args.log_every == 0:
+                log({"phase": kind, "fold": f, "epoch": ep, "step": step, "loss": float(loss),
+                     "s_per_step": (time.time() - t0) / max(n, 1)})
+        log({"phase": kind, "fold": f, "epoch_done": ep, "step": step, "mean_loss": tot / max(n, 1), "steps": n,
+             "sec": round(time.time() - t0, 1)})
+        if ckpt is not None:
+            _atomic_save({"module": mod.state_dict(), "opt": opt.state_dict(), "epoch": ep, "step": step}, ckpt)
+    mod.eval()
+    for p in params:
+        p.requires_grad_(False)
+
+
+def train_fields(ts: TeacherSet, data_by_fold, args, dev, log):
+    """T-D and T-M, copy f on fold f, one copy after the other (the sequential '--phase all / fields' path)"""
+    for f in range(2):
+        for kind in ("td", "tm"):
+            train_field_copy(ts, kind, f, data_by_fold[f], args, dev, log)
 
 
 @torch.no_grad()
@@ -223,55 +293,86 @@ def _fit(platt, xs, ys, log, name, iters: int = 300, min_each: int = 50, ws=None
     return done
 
 
-def train_te(ts: TeacherSet, data_by_fold, anchors, args, dev, log):
-    """T-E copy f on fold f tokens, OOF fields from the other fold's T-D / T-M, paths = path_mixture"""
+def train_te_copy(ts: TeacherSet, f: int, ds, anchors, args, dev, log, ckpt: Path = None, world: int = 1,
+                  rank: int = 0):
+    """T-E copy f on fold-f tokens, OOF fields from the other fold's T-D / T-M, paths = path_mixture.  With world > 1
+    (torchrun) the copy trains under DDP with per-rank batch = args.batch / world, so the optimizer sees the same
+    batch size as the single-GPU recipe.  Rows without a teacher BEV or an exact table are masked out of the loss
+    (not dropped: every rank keeps the same number of steps)."""
     from navsim.agents.para_ssr.refiner_v6c.hook import _area_flags
-    gen = torch.Generator().manual_seed(0)
+    te = ts.te[f]
+    for p in te.parameters():
+        p.requires_grad_(True)
+    te.train()
+    model = te
+    if world > 1:
+        model = torch.nn.parallel.DistributedDataParallel(te, device_ids=[dev.index])
+    assert args.batch % world == 0, (args.batch, world)
+    opt = torch.optim.AdamW(te.parameters(), lr=args.lr, weight_decay=1e-4)
+    ep0, step = 0, 0
+    if ckpt is not None and ckpt.exists():
+        st = torch.load(ckpt, map_location="cpu")
+        te.load_state_dict(st["module"])
+        opt.load_state_dict(st["opt"])
+        ep0, step = int(st["epoch"]) + 1, int(st["step"])
+        log({"phase": "te", "fold": f, "resumed_from_epoch": ep0 - 1, "step": step})
+    sampler = None
+    if world > 1:
+        sampler = torch.utils.data.distributed.DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True,
+                                                                  seed=f, drop_last=True)
+    gen = torch.Generator().manual_seed(1000 * f + rank)
+    for ep in range(ep0, args.epochs):
+        if sampler is not None:
+            sampler.set_epoch(ep)
+        dl = _loader(ds, args, args.batch // world, sampler=sampler, seed=1000 * ep + f)
+        t0, tot, n = time.time(), 0.0, 0
+        for bt in dl:
+            bt = to_dev(bt, dev)
+            b = int(bt["ex_ego"].shape[0])
+            ok = (bt["kd_ok_0"].bool() & bt["kd_ok_1"].bool() & (bt["ex1_valid"] > 0.5)).float()
+            with torch.no_grad():
+                copy = torch.full((b,), 1 - f, device=dev, dtype=torch.long)           # OOF fields for fold-f tokens
+                flds = ts.fields(bt["kd_bev_0"], bt["kd_bev_1"], copy)
+                paths = path_mixture(anchors, bt["ex2_hum"].float().cpu(), bt["ex2_hvalid"].cpu(), gen).to(dev)
+                r = paths.shape[1]
+                init_x = ego_init(bt["ex_ego"].double())
+                st9 = track(paths.reshape(b * r, 8, 3).double(), init_x.repeat_interleave(r, 0), full=True,
+                            angular=True).reshape(b, r, 41, 9).float()
+                lab = LB.stride2(LB.exact_step_masks(st9[..., :7], bt))
+                for k in ("valid", "valid_off"):                                       # mask rows, keep the step
+                    lab[k] = lab[k] * ok[:, None, None]
+                status = bt["ex_ego"][:, :4].float()                                    # the student's status init
+                S = track(paths.reshape(b * r, 8, 3).float(),
+                          torch.cat([status, status.new_zeros(b, 3)], -1).repeat_interleave(r, 0),
+                          full=True).reshape(b, r, 41, 7).float()
+                area = _area_flags(S, bt)
+                reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], 100, 100, 64.0)
+            E = model(reads, area=area)["E"]
+            loss, lg = LS.risk_loss(E, lab, None, None, 4.0)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(te.parameters(), 10.0)
+            opt.step()
+            step += 1
+            tot, n = tot + float(loss), n + 1
+            if step % args.log_every == 0:
+                log({"phase": "te", "fold": f, "epoch": ep, "step": step, "loss": float(loss),
+                     "s_per_step": (time.time() - t0) / max(n, 1), **{k: float(v) for k, v in lg.items()}})
+        log({"phase": "te", "fold": f, "epoch_done": ep, "step": step, "mean_loss": tot / max(n, 1), "steps": n,
+             "sec": round(time.time() - t0, 1)})
+        if ckpt is not None and rank == 0:
+            _atomic_save({"module": te.state_dict(), "opt": opt.state_dict(), "epoch": ep, "step": step}, ckpt)
+        if world > 1:
+            torch.distributed.barrier()
+    te.eval()
+    for p in te.parameters():
+        p.requires_grad_(False)
+
+
+def train_te(ts: TeacherSet, data_by_fold, anchors, args, dev, log):
+    """both T-E copies one after the other (the sequential '--phase all / te' path)"""
     for f in range(2):
-        te = ts.te[f]
-        for p in te.parameters():
-            p.requires_grad_(True)
-        te.train()
-        opt = torch.optim.AdamW(te.parameters(), lr=args.lr, weight_decay=1e-4)
-        dl = torch.utils.data.DataLoader(data_by_fold[f], batch_size=args.batch, shuffle=True, num_workers=args.workers,
-                                         drop_last=True)
-        step = 0
-        for ep in range(args.epochs):
-            for bt in dl:
-                bt = to_dev(bt, dev)
-                ok = bt["kd_ok_0"].bool() & bt["kd_ok_1"].bool() & (bt["ex1_valid"] > 0.5)
-                if not bool(ok.any()):
-                    continue
-                bt = {k: (v[ok] if torch.is_tensor(v) and v.shape[:1] == ok.shape else v) for k, v in bt.items()}
-                b = int(ok.sum())
-                with torch.no_grad():
-                    copy = torch.full((b,), 1 - f, device=dev, dtype=torch.long)       # OOF fields for fold-f tokens
-                    flds = ts.fields(bt["kd_bev_0"], bt["kd_bev_1"], copy)
-                    paths = path_mixture(anchors, bt["ex2_hum"].float().cpu(), bt["ex2_hvalid"].cpu(), gen).to(dev)
-                    r = paths.shape[1]
-                    init_x = ego_init(bt["ex_ego"].double())
-                    st9 = track(paths.reshape(b * r, 8, 3).double(), init_x.repeat_interleave(r, 0), full=True,
-                                angular=True).reshape(b, r, 41, 9).float()
-                    lab = LB.stride2(LB.exact_step_masks(st9[..., :7], bt))
-                    status = bt["ex_ego"][:, :4].float()                                # the student's status init
-                    S = track(paths.reshape(b * r, 8, 3).float(),
-                              torch.cat([status, status.new_zeros(b, 3)], -1).repeat_interleave(r, 0),
-                              full=True).reshape(b, r, 41, 7).float()
-                    area = _area_flags(S, bt)
-                    reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], 100, 100, 64.0)
-                E = te(reads, area=area)["E"]
-                loss, lg = LS.risk_loss(E, lab, None, None, 4.0)
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(te.parameters(), 10.0)
-                opt.step()
-                step += 1
-                if step % args.log_every == 0:
-                    log({"phase": "te", "fold": f, "epoch": ep, "step": step, "loss": float(loss),
-                         **{k: float(v) for k, v in lg.items()}})
-        te.eval()
-        for p in te.parameters():
-            p.requires_grad_(False)
+        train_te_copy(ts, f, data_by_fold[f], anchors, args, dev, log)
 
 
 @torch.no_grad()
@@ -339,10 +440,38 @@ def frozen_teacher_set(dev, resume: str = "") -> TeacherSet:
     return ts
 
 
+PARALLEL_PHASES = ("td", "tm", "te_fold")          # one module copy (--fold) per process
+PART = {"td": "part_td{f}", "tm": "part_tm{f}", "te_fold": "part_te{f}"}
+
+
+def _part_keys(ts: TeacherSet, kind: str, f: int):
+    pre = {"td": "td.", "tm": "tm.", "te_fold": "te.", "te": "te."}[kind] + f"{f}."
+    return pre, [k for k in ts.state_dict() if k.startswith(pre)]
+
+
+def save_part(ts: TeacherSet, kind: str, f: int, out: Path, meta: dict):
+    pre, keys = _part_keys(ts, kind, f)
+    sd = ts.state_dict()
+    _atomic_save({"state_dict": {k: sd[k] for k in keys}, "meta": {"kind": kind, "fold": f, **meta}},
+                 out / (PART[kind].format(f=f) + ".pt"))
+
+
+def load_part(ts: TeacherSet, kind: str, f: int, out: Path) -> dict:
+    """load one finished module copy into ts (exactly its keys) -> its meta"""
+    ck = torch.load(out / (PART[kind].format(f=f) + ".pt"), map_location="cpu")
+    pre, keys = _part_keys(ts, kind, f)
+    assert set(ck["state_dict"]) == set(keys), f"{kind}{f}: part keys differ from TeacherSet ({pre})"
+    missing, unexpected = ts.load_state_dict(ck["state_dict"], strict=False)
+    assert not unexpected and not [k for k in keys if k in missing]
+    return ck["meta"]
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--phase", default="all", choices=("all", "fields", "platt_occ", "te"))
+    ap.add_argument("--phase", default="all",
+                    choices=("all", "fields", "platt_occ", "te", "td", "tm", "merge_fields", "te_fold", "finish"))
+    ap.add_argument("--fold", type=int, default=-1, help="td / tm / te_fold: the copy (= its training fold)")
     ap.add_argument("--km-root", default=os.environ.get("KM_ROOT", "/workspace/navsim_workspace/corridor_cache"))
     ap.add_argument("--teacher-root", default=os.environ.get("TEACHER_CACHE_ROOT", "/workspace/teacher_cache"))
     ap.add_argument("--split", default="navtrain_train")
@@ -356,20 +485,36 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--resume", default="")
     args = ap.parse_args()
-    dev = torch.device(args.device)
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world > 1:
+        assert args.phase == "te_fold", "torchrun / DDP is only for --phase te_fold"
+        torch.distributed.init_process_group("nccl")
+        local = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local)
+        dev = torch.device("cuda", local)
+    else:
+        dev = torch.device(args.device)
+    if args.phase in PARALLEL_PHASES:
+        assert args.fold in (0, 1), "--fold 0|1 is needed for td / tm / te_fold"
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    logf = open(out / "log.jsonl", "a")
+    tag = args.phase + (f"_f{args.fold}" if args.phase in PARALLEL_PHASES else "") + (f"_r{rank}" if rank else "")
+    logf = open(out / f"log_{tag}.jsonl", "a")
 
     def log(d):
-        d = {"t": time.time(), **d}
+        d = {"t": time.time(), "rank": rank, **d}
         logf.write(json.dumps(d) + "\n")
         logf.flush()
-        print(d, flush=True)
+        if rank == 0:
+            print(d, flush=True)
 
     cfg = builder_cfg(args.km_root, args.teacher_root)
-    data = {f: TokenDataset(args.split, cfg, folds=(f,), limit=args.limit) for f in (0, 1)}
-    log({"phase": "data", "fold0": len(data[0]), "fold1": len(data[1]), "args": vars(args)})
+
+    def data(f, **kw):
+        return TokenDataset(args.split, cfg, folds=(f,), limit=args.limit, **kw)
+
+    log({"phase": "start", "args": vars(args), "world": world})
     ts = frozen_teacher_set(dev, args.resume)
     anchors = torch.tensor(np.load(REPO / "resources/km_corridor/trajectory_anchors_256.npy"), dtype=torch.float32)
 
@@ -377,26 +522,56 @@ def main():
     # '--phase te' run resumed from a fields-only checkpoint, without platt_occ, is not taken for a complete teacher)
     phases = list(torch.load(args.resume, map_location="cpu").get("meta", {}).get("phases", [])) if args.resume else []
 
-    def save(tag):
+    def save(tag, extra=None):
         if tag not in phases:
             phases.append(tag)
         meta = {"folds": 2, "hid_e": 192, "planes": 49, "phase_done": tag, "phases": list(phases),
-                "norm": "resources/km_corridor/norm_*_100x100.npz",
-                "teacher_inputs": "kd_bev_0 BEVFusion (W flip), kd_bev_1 ReSMap front64 (transpose), student grid"}
-        torch.save({"state_dict": ts.state_dict(), "meta": meta}, out / f"teachers_{tag}.pt")
-        torch.save({"state_dict": ts.state_dict(), "meta": meta}, out / "teachers.pt")
+                "norm": "resources/km_corridor/norm_*_100x100.npz", "epochs": args.epochs, "batch": args.batch,
+                "limit": args.limit, "teacher_inputs": "kd_bev_0 BEVFusion (W flip), kd_bev_1 ReSMap front64 "
+                                                      "(transpose), student grid", **(extra or {})}
+        _atomic_save({"state_dict": ts.state_dict(), "meta": meta}, out / f"teachers_{tag}.pt")
+        _atomic_save({"state_dict": ts.state_dict(), "meta": meta}, out / "teachers.pt")
 
-    if args.phase in ("all", "fields"):
-        train_fields(ts, data, args, dev, log)
-        save("fields")
-    if args.phase in ("all", "platt_occ"):
-        fit_platt_occ(ts, data, args, dev, log)
-        save("platt_occ")
-    if args.phase in ("all", "te"):
-        train_te(ts, data, anchors, args, dev, log)
-        fit_platt_te_off(ts, data, anchors, args, dev, log)
-        save("te")
-    log({"phase": "done"})
+    t0 = time.time()
+    # ---- parallel pipeline (report 128 §5): td / tm copies, merge, platt_occ, te copies (DDP), finish
+    if args.phase in ("td", "tm"):
+        ds = data(args.fold, bev=(0,) if args.phase == "td" else (1,), exact=False)
+        log({"phase": args.phase, "fold": args.fold, "tokens": len(ds)})
+        train_field_copy(ts, args.phase, args.fold, ds, args, dev, log,
+                         ckpt=out / (PART[args.phase].format(f=args.fold) + ".ckpt"))
+        save_part(ts, args.phase, args.fold, out, {"epochs": args.epochs, "tokens": len(ds), "sec": time.time() - t0})
+    elif args.phase == "merge_fields":
+        metas = {f"{k}{f}": load_part(ts, k, f, out) for k in ("td", "tm") for f in (0, 1)}
+        save("fields", {"parts": metas})
+    elif args.phase == "te_fold":
+        ds = data(args.fold)
+        log({"phase": "te", "fold": args.fold, "tokens": len(ds), "world": world})
+        train_te_copy(ts, args.fold, ds, anchors, args, dev, log,
+                      ckpt=out / (PART["te_fold"].format(f=args.fold) + ".ckpt"), world=world, rank=rank)
+        if rank == 0:
+            save_part(ts, "te_fold", args.fold, out, {"epochs": args.epochs, "tokens": len(ds), "world": world,
+                                                      "sec": time.time() - t0})
+        if world > 1:
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+    elif args.phase == "finish":
+        metas = {f"te{f}": load_part(ts, "te_fold", f, out) for f in (0, 1)}
+        fit_platt_te_off(ts, {f: data(f) for f in (0, 1)}, anchors, args, dev, log)
+        save("te", {"parts_te": metas})
+    # ---- sequential phases (smoke / single GPU)
+    else:
+        if args.phase in ("all", "fields"):
+            train_fields(ts, {f: data(f, bev=(0, 1), exact=False) for f in (0, 1)}, args, dev, log)
+            save("fields")
+        if args.phase in ("all", "platt_occ"):
+            fit_platt_occ(ts, {f: data(f, bev=(0,), exact=False) for f in (0, 1)}, args, dev, log)
+            save("platt_occ")
+        if args.phase in ("all", "te"):
+            dd = {f: data(f) for f in (0, 1)}
+            train_te(ts, dd, anchors, args, dev, log)
+            fit_platt_te_off(ts, dd, anchors, args, dev, log)
+            save("te")
+    log({"phase": "done", "sec": round(time.time() - t0, 1)})
 
 
 if __name__ == "__main__":

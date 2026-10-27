@@ -221,9 +221,11 @@ def decode_v6(tau_base: torch.Tensor, ctrl: torch.Tensor, v0: torch.Tensor, a_ma
         dh = torch.atan2(torch.sin(dh), torch.cos(dh))
         out["traj"] = torch.cat([xy, (tau_base[..., 2] + dh)[..., None]], -1)
         out["heading_mode"] = "bezier_delta"
-    with torch.no_grad():                                                                  # mode-A dead zone (report 124 §4-4)
-        c_pre = DEC.lon_c_from_q(DEC.lon_q_from_z(zp)) if hasattr(DEC, "lon_q_from_z") else None
-        out["lon_dead"] = ((c_pre > 0).any(-1) & ~(c_pre < 0).any(-1)).float() if c_pre is not None else None
+    out["lon_dead"] = None
+    if mode == "A":                                                                        # mode-A dead zone (report 124 §4-4)
+        with torch.no_grad():                                                              # (mode B: c > 0 is a live speed-up)
+            c_pre = DEC.lon_c_from_q(DEC.lon_q_from_z(zp))                                 # c_0 = c_1 = 0
+            out["lon_dead"] = ((c_pre > 0).any(-1) & ~(c_pre < 0).any(-1)).float()
     return out
 
 

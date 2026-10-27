@@ -232,8 +232,10 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
     def sl(d, j):
         return None if d is None else {k: v[:, j:j + 1] for k, v in d.items()}
 
+    # ParaSSRLoss.iteration is already incremented for this micro-batch (1 on the first one), so <= gives exactly
+    # v6c_warmup_steps warm-up micro-batches
     warm = training and int(getattr(cfg, "v6c_warmup_steps", 0)) > 0 and \
-        int(predictions.get("_v6c_iteration", 0)) < int(getattr(cfg, "v6c_warmup_steps", 0))
+        int(predictions.get("_v6c_iteration", 0)) <= int(getattr(cfg, "v6c_warmup_steps", 0))
     logs["v6c/warmup"] = torch.tensor(float(warm), device=dev)
     if warm:
         # report 124 §4-3 (D epochs 0-4): the scorer is untrained, so the pick is meaningless; R-E alone learns on

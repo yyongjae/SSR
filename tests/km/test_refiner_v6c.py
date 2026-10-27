@@ -218,10 +218,12 @@ def _bump_occ(t0, t1, x):
 
 
 def test_teacher_hinge_gradient_direction_at_zero():
-    """report 124 §4-4 (T14 finding, 10-27): at Delta = 0 the time-mean occupancy hinge asks for braking in front of a
-    stopped lead object (the dominant fixable failure), but for an object that crosses or stays on the path it asks
-    to pass faster, which the decel-only decoder cannot do (dead zone; logged as v6c/lon_dead).  A strong time
-    discount (gamma 0.93 per 0.1 s) turns a late crossing into braking; it is the teacher_discount arm."""
+    """report 124 §4-4 / 126 §7-3 (10-27): at Delta = 0 the sign of the time-mean occupancy hinge's gradient is set by
+    WHERE the object is relative to tau_base's reach, not by its kind: near or beyond the 4 s end point (contact that a
+    1 m/s^2 brake, ~8 m less travel in 4 s, can avoid or shorten) it asks for braking; well inside the reach (contact
+    the brake cannot avoid, stopped or crossing) it asks to pass faster, which the decel-only decoder blocks (dead
+    zone; v6c/lon_dead).  A strong time discount (gamma 0.93 per 0.1 s) turns this late crossing into braking."""
+    assert float(_hinge_grad(_bump_occ(0, 49, 29.0))[:6].sum()) < 0                            # stopped but inside reach
     assert float(_hinge_grad(_bump_occ(0, 49, 40.0))[:6].sum()) > 0                            # lead: brake
     assert float(_hinge_grad(_bump_occ(20, 30, 29.0))[:6].sum()) < 0                           # crossing: faster
     assert float(_hinge_grad(_bump_occ(20, 30, 29.0), gamma=0.93)[:6].sum()) > 0               # discounted: brake
@@ -270,3 +272,11 @@ def test_step_labels_constant_objects_count_although_nobs_is_zero():
     assert float(nc[0, 0]) == 1.0                                                            # baseline: missed
     lab = L.exact_step_masks(st, t)
     assert lab["ovl"][0, 0].sum() > 0 and lab["valid"][0, 0].all()
+
+
+def test_dead_flag_only_in_decel_only_mode():
+    tau, v0 = _tau()
+    ctrl = torch.zeros(2, 12)
+    ctrl[:, :6] = 3.0                                                                          # push toward speeding up
+    assert float(N.decode_v6(tau, ctrl, v0, mode="A")["lon_dead"].min()) == 1.0
+    assert N.decode_v6(tau, ctrl, v0, mode="B")["lon_dead"] is None                           # a live speed-up in mode B

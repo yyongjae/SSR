@@ -259,3 +259,16 @@ def test_v6c_on_keeps_baseline_init_and_cuda_free_seeding():
         if torch.is_tensor(v):
             assert torch.equal(v, sb[k]), k
     assert torch.equal(ra, rb)
+
+
+def test_warmup_length_is_exact(batch):
+    """v6c_warmup_steps = N gives exactly N warm-up micro-batches (the loss counter is 1 on the first one)"""
+    a = build_agent(0, v6c=True, v6c_stage="D", v6c_warmup_steps=1)
+    a.train()
+    seen = []
+    for _ in range(2):
+        f, t = _fresh(batch)
+        p = a.forward(f, t)
+        a.compute_loss(f, t, p)
+        seen.append(float(a.latest_logs["v6c/warmup"]))
+    assert seen == [1.0, 0.0]

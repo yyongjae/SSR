@@ -146,6 +146,8 @@ def fit_platt_occ(ts: TeacherSet, data_by_fold, args, dev, log, n_px: int = 4096
     """OOF: copy f on fold 1 - f tokens; logistic regression of GT occupancy on the logit, per time bin"""
     xs = [[] for _ in range(len(TIME_BINS) - 1)]
     ys = [[] for _ in range(len(TIME_BINS) - 1)]
+    npos_all = [0.0] * (len(TIME_BINS) - 1)          # every pixel seen, for the prior correction below
+    nall = [0.0] * (len(TIME_BINS) - 1)
     for f in range(2):
         dl = torch.utils.data.DataLoader(data_by_fold[1 - f], batch_size=args.batch, num_workers=args.workers)
         for n, bt in enumerate(dl):
@@ -162,6 +164,8 @@ def fit_platt_occ(ts: TeacherSet, data_by_fold, args, dev, log, n_px: int = 4096
             for kk in range(len(xs)):
                 sel = (kb == kk).nonzero(as_tuple=True)[0]
                 lv, gv = lg[:, sel].reshape(-1), gt[:, sel].reshape(-1)
+                npos_all[kk] += float(gv.sum())
+                nall[kk] += float(gv.numel())
                 pos = gv.nonzero(as_tuple=True)[0]
                 neg = (gv == 0).nonzero(as_tuple=True)[0]
                 take = torch.cat([pos[torch.randperm(len(pos), device=dev)[:n_px]],
@@ -169,6 +173,17 @@ def fit_platt_occ(ts: TeacherSet, data_by_fold, args, dev, log, n_px: int = 4096
                 xs[kk].append(lv[take])
                 ys[kk].append(gv[take])
     _fit(ts.platt_occ, xs, ys, log, "occ")
+    # the fit saw class-balanced pixels; move the intercept to the real occupancy rate (logit prior correction), so
+    # the teacher term's 0.3 margin reads a probability of the real rate (report 126 review)
+    for kk in range(len(xs)):
+        if not xs[kk] or nall[kk] == 0:
+            continue
+        y = torch.cat(ys[kk])
+        ps, pr = float(y.mean()), npos_all[kk] / nall[kk]
+        if 0 < ps < 1 and 0 < pr < 1:
+            shift = float(np.log(pr / (1 - pr)) - np.log(ps / (1 - ps)))
+            ts.platt_occ.b[kk] += shift
+            log({"phase": "platt", "map": "occ_prior", "bin": kk, "rate": pr, "sample_rate": ps, "b_shift": shift})
 
 
 def _fit(platt, xs, ys, log, name, iters: int = 300, min_each: int = 50):

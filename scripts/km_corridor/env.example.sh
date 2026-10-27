@@ -1,5 +1,6 @@
 # km 10/16: copy to scripts/km_corridor/env.sh and edit for the host (or let train.sh source env.example.sh directly).
 export REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+if [ -f "$REPO/.env" ]; then set -a; source "$REPO/.env"; set +a; fi
 if [ -d /home/external-user/ssd/kyungmin_ck ]; then
   export KM_ROOT=${KM_ROOT:-/home/external-user/ssd/kyungmin_ck}          # GT corridor caches
 else

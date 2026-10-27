@@ -13,9 +13,11 @@ case $1 in
   64) for s in navtrain_val navtrain_train; do nice $PY -W ignore tools/corridor/build_corridor64.py --split $s --out $KM_ROOT/corridor64 --workers $W --root $(dirname $TOKENS_ROOT) || exit 1; done ;;
   route32) $PY tools/corridor/crop_route32.py $KM_ROOT/corridor64 $KM_ROOT/route32 ;;
   exact) for s in navtrain_val navtrain_train; do nice $PY -W ignore tools/corridor/build_exact.py --split $s --out $KM_ROOT/exact --workers $W --root $(dirname $TOKENS_ROOT) --cl-full || exit 1; done ;;
+  exact2) for s in navtrain_val navtrain_train; do nice $PY -W ignore tools/corridor/build_exact2_from_v1.py --split $s --exact $KM_ROOT/exact --out $KM_ROOT/exact2 --workers $W --root $(dirname $TOKENS_ROOT) || exit 1; done ;;
   cf)
     for s in navtrain_val navtrain_train; do nice $PY -W ignore tools/corridor/build_corridor64.py --split $s --out $KM_ROOT/corridor64 --workers $W --root $(dirname $TOKENS_ROOT) || exit 1; done
     for s in navtrain_val navtrain_train; do nice $PY -W ignore tools/corridor/build_exact.py --split $s --out $KM_ROOT/exact --workers $W --root $(dirname $TOKENS_ROOT) --cl-full || exit 1; done
+    for s in navtrain_val navtrain_train; do nice $PY -W ignore tools/corridor/build_exact2_from_v1.py --split $s --exact $KM_ROOT/exact --out $KM_ROOT/exact2 --workers $W --root $(dirname $TOKENS_ROOT) || exit 1; done
     ;;
-  *) echo "usage: $0 32|64|route32|exact|cf [workers]"; exit 2 ;;
+  *) echo "usage: $0 32|64|route32|exact|exact2|cf [workers]"; exit 2 ;;
 esac

@@ -604,10 +604,10 @@ class ParaSSRConfig:
     distill_selector_v14: bool = False
     distill_selector_v15: bool = False
     distill_selector_v16: bool = False
-    distill_proj_lr_mult: float = 2.0
-    distill_probe_warmup_steps: int = 1000
-    distill_probe_ramp_steps: int = 2000
-    distill_probe_loss_weight: float = 1.0
+    distill_proj_lr_mult: float = 3.0
+    distill_probe_warmup_steps: int = 5300
+    distill_probe_ramp_steps: int = 2650
+    distill_probe_loss_weight: float = 0.5
     distill_probe_lr_mult: float = 3.0
     distill_probe_use_ema: bool = True
     distill_probe_ema_decay: float = 0.99

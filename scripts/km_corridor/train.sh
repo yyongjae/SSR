@@ -48,13 +48,18 @@ V15_DISTILL=(
   ++agent.config.distill_anchor_loss_type=hybrid
   ++agent.config.distill_anchor_loss_scale=10.0
   ++agent.config.distill_attn_loss_scale=5.0
-  ++agent.config.distill_resmap_scale=1.0
+  ++agent.config.distill_resmap_scale=3.0
+  ++agent.config.distill_lambda_gt=0.45
+  ++agent.config.distill_lambda_cov=0.20
+  ++agent.config.distill_lambda_risk=0.35
+  ++agent.config.distill_tau_gt=4.5
+  ++agent.config.distill_tau_risk=8.0
   ++agent.config.distill_loss_weight=1.0
   ++agent.config.distill_probe_seed=0
-  ++agent.config.distill_proj_lr_mult=2.0
+  ++agent.config.distill_proj_lr_mult=3.0
   ++agent.config.distill_probe_lr_mult=3.0
-  ++agent.config.distill_probe_warmup_steps=1000
-  ++agent.config.distill_probe_ramp_steps=2000
+  ++agent.config.distill_probe_warmup_steps=${DISTILL_WARMUP_STEPS:-$((21200 / NG))}
+  ++agent.config.distill_probe_ramp_steps=${DISTILL_RAMP_STEPS:-$((10600 / NG))}
   ++agent.config.distill_probe_loss_weight=0.5
   ++agent.config.distill_probe_use_ema=true
   ++agent.config.distill_probe_ema_decay=0.99
@@ -82,7 +87,12 @@ case $VAR in
        [ "$VAR" = cf_v15 ] && EXTRA+=("${V15_DISTILL[@]}") ;;
   *) echo "variant: v2 | v31 | v31_64 | v32b | c64 | c64_traj | pert | mix | cf | cf_v15"; exit 2 ;;
 esac
-[ "${DISTILL:-}" = v15 ] && [ "$VAR" != cf_v15 ] && EXTRA+=("${V15_DISTILL[@]}")
+if [ "${DISTILL:-}" = v15 ] && [ "$VAR" != cf_v15 ]; then
+  case $VAR in
+    v31_64|c64|c64_traj|pert|mix|cf) EXTRA+=("${V15_DISTILL[@]}") ;;
+    *) echo "error: DISTILL=v15 requires a 64m variant (v31_64 | c64 | c64_traj | pert | mix | cf | cf_v15), got $VAR"; exit 2 ;;
+  esac
+fi
 exec $PY navsim/planning/script/run_training.py \
   agent=para_ssr_agent agent.lr=${LR:-1e-4} agent.config.max_epochs=${MAXEP:-30} experiment_name=$RUN \
   scene_filter=navtrain split=trainval \

@@ -234,6 +234,8 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         """
         cfg = self._config
         ts = self._trajectory_sampling
+        # km 10/27: the raster map GT only enters the name when it is on, so vector-map cache names are unchanged
+        seg = (("map_repr", "seg"), ("bev_hw", (cfg.bev_h, cfg.bev_w))) if str(getattr(cfg, "map_repr", "vector")) == "seg" else ()
         return cache_key(
             "para_ssr_target",
             (
@@ -250,6 +252,8 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
                 ("use_det_motion_head", cfg.use_det_motion_head),
                 ("use_map_head", cfg.use_map_head),
                 ("traj", (ts.time_horizon, ts.interval_length, ts.num_poses)),
+                *seg,
+                *((("use_distill_map_pts", True),) if str(getattr(cfg, "map_repr", "vector")) == "seg" and getattr(cfg, "use_distill", False) else ()),
                 # aux_distill BEV distillation addresses its teacher caches by the
                 # frame token; the field is only present when it is on, so the
                 # distillation-off cache name is unchanged.
@@ -285,7 +289,11 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         }
         if cfg.use_det_motion_head:
             targets.update(self._compute_agent_targets(scene, cur_idx))
-        if cfg.use_map_head or getattr(cfg, "use_distill", False):
+        if cfg.use_map_head and str(getattr(cfg, "map_repr", "vector")) == "seg":
+            targets.update(self._compute_map_seg_targets(scene, cur_idx))   # km 10/27: raster map GT
+            if getattr(cfg, "use_distill", False):
+                targets.update(self._compute_map_targets(scene, cur_idx))
+        elif cfg.use_map_head or getattr(cfg, "use_distill", False):
             targets.update(self._compute_map_targets(scene, cur_idx))
         if getattr(cfg, "refiner_mode", "off") != "off":
             targets.update(self._stage_e_targets(scene))
@@ -682,6 +690,72 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             "gt_map_labels": torch.tensor(gt_labels),
             "gt_map_valid": torch.tensor(gt_valid),
         }
+
+    def _compute_map_seg_targets(self, scene: Scene, cur_idx: int) -> Dict[str, torch.Tensor]:
+        """km 10/27 (map_repr='seg'): the MAP_CLASS_NAMES layers of the vector GT, rasterised on the 2x BEV grid.
+
+        ``gt_map_seg`` [K, 2 bev_h, 2 bev_w] uint8; row = y_forward from map_pc_range y0, col = x_right from x0, pixel
+        centres at (i + 0.5) * res (the cell convention of the map decoder's normalised reference points).  road =
+        LANE + INTERSECTION polygons, walkway = WALKWAYS, crosswalk = CROSSWALK (filled, holes cleared); centerline =
+        LANE / LANE_CONNECTOR baseline paths drawn about 1 m wide.
+        """
+        import cv2
+
+        cfg = self._config
+        h, w = 2 * cfg.bev_h, 2 * cfg.bev_w
+        mr = cfg.map_pc_range
+        x0, y0, x1, y1 = mr[0], mr[1], mr[3], mr[4]
+        rx, ry = (x1 - x0) / w, (y1 - y0) / h
+        pose = scene.frames[cur_idx].ego_status.ego_pose
+        origin = StateSE2(float(pose[0]), float(pose[1]), float(pose[2]))
+        radius = 1.05 * float(max(math.hypot(x, y) for x in (mr[0], mr[3]) for y in (mr[1], mr[4])))
+        context = f"token={scene.frames[cur_idx].token!r}, map={scene.scene_metadata.map_name!r}"
+        layers = [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR, SemanticMapLayer.INTERSECTION,
+                  SemanticMapLayer.WALKWAYS, SemanticMapLayer.CROSSWALK]
+        try:
+            objects = scene.map_api.get_proximal_map_objects(point=origin.point, radius=radius, layers=layers)
+        except Exception as exc:
+            logger.warning("Map query failed for %s: %s", context, exc, exc_info=True)
+            raise RuntimeError(f"Map query failed for {context}") from exc
+
+        shift = 4
+
+        def pix(geom) -> np.ndarray:
+            """global geometry -> SSR BEV pixel coordinates, fixed point (cv2 shift)"""
+            a = np.asarray(_geometry_local_coords(geom, origin).coords, dtype=np.float64)[:, :2]
+            col = (-a[:, 1] - x0) / rx - 0.5
+            row = (a[:, 0] - y0) / ry - 0.5
+            return np.round(np.stack([col, row], -1) * (1 << shift)).astype(np.int32)
+
+        seg = np.zeros((len(MAP_CLASS_NAMES), h, w), dtype=np.uint8)
+
+        def fill(label: int, poly) -> None:
+            if poly is None or poly.is_empty:
+                return
+            parts = [poly] if poly.geom_type == "Polygon" else [
+                g for g in getattr(poly, "geoms", []) if g.geom_type == "Polygon"]
+            for g in parts:
+                if not g.interiors:
+                    cv2.fillPoly(seg[label], [pix(g.exterior)], 1, lineType=cv2.LINE_8, shift=shift)
+                    continue
+                tmp = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillPoly(tmp, [pix(g.exterior)], 1, lineType=cv2.LINE_8, shift=shift)
+                cv2.fillPoly(tmp, [pix(r) for r in g.interiors], 0, lineType=cv2.LINE_8, shift=shift)
+                seg[label] |= tmp
+
+        for layer in (SemanticMapLayer.LANE, SemanticMapLayer.INTERSECTION):
+            for obj in objects.get(layer, []):
+                fill(0, obj.polygon)
+        for obj in objects.get(SemanticMapLayer.WALKWAYS, []):
+            fill(1, obj.polygon)
+        width = max(1, int(round(1.0 / min(rx, ry))))
+        for layer in (SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR):
+            for obj in objects.get(layer, []):
+                cv2.polylines(seg[2], [pix(obj.baseline_path.linestring)], False, 1, thickness=width,
+                              lineType=cv2.LINE_8, shift=shift)
+        for obj in objects.get(SemanticMapLayer.CROSSWALK, []):
+            fill(3, obj.polygon)
+        return {"gt_map_seg": torch.from_numpy(seg)}
 
     def compute_map_evaluation_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
         """Return every in-patch vector-map instance for held-out mAP.

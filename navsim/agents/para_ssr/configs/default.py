@@ -213,6 +213,12 @@ class ParaSSRConfig:
     loss_map_cls_weight: float = 2.0
     loss_map_pts_weight: float = 1.0
     loss_map_dir_weight: float = 0.005
+    # km 10/27: 'seg' = raster map head (modules/map_seg_head.py): BEV segmentation of the same four classes at the 2x
+    # BEV grid (GT para_ssr_targets._compute_map_seg_targets), planner map memory = map_seg_tokens^2 pooled BEV blocks
+    map_repr: str = "vector"
+    map_seg_tokens: int = 20
+    map_seg_bce_weight: float = 1.0
+    map_seg_dice_weight: float = 1.0
 
     # ------------------------------------------------------------------ #
     # PARA-Drive wiring: per-task loss weights and the shared-BEV gradient valve

@@ -205,7 +205,7 @@ class ParaSSRLoss(torch.nn.Module):
         manual_correction = any(
             prediction_key in predictions and float(active_scales.get(task, 1.0)) != 1.0
             for task, prediction_key in (
-                ("det", "all_cls_scores"), ("map", "all_map_cls_scores")
+                ("det", "all_cls_scores"), ("map", "all_map_cls_scores"), ("map", "map_seg_logits")
             )
         )
         if model.training and (self.balancer is not None or manual_correction):
@@ -281,6 +281,13 @@ class ParaSSRLoss(torch.nn.Module):
         if model.map_head is not None and "all_map_cls_scores" in predictions:
             map_pts, map_labels, map_valid = self._map_labels(targets, logs)
             map_losses = model.map_head.loss(predictions, map_pts, map_labels, map_valid)
+            task_losses["map"] = sum(map_losses.values()) * tw.get("map", 1.0)
+            logs.update({k: v.detach() for k, v in map_losses.items()})
+        # ---- raster map (km 10/27, map_repr='seg') ----------------------
+        if model.map_head is not None and "map_seg_logits" in predictions:
+            if "gt_map_seg" not in targets:
+                raise KeyError("map_repr='seg' needs the gt_map_seg target (ParaSSRTargetBuilder)")
+            map_losses = model.map_head.loss(predictions, targets["gt_map_seg"])
             task_losses["map"] = sum(map_losses.values()) * tw.get("map", 1.0)
             logs.update({k: v.detach() for k, v in map_losses.items()})
 

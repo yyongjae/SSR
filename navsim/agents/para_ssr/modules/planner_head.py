@@ -365,9 +365,12 @@ class ParaSSRPlannerHead(nn.Module):
         xy_origin = det_xy.new_tensor(self.pc_range[:2])
         xy_extent = det_xy.new_tensor((self.real_w, self.real_h))
         det_xy = (det_xy - xy_origin) / xy_extent
-        map_xy = map_out["all_map_pts_preds"][-1].detach()
         det_score = det_out["all_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
-        map_score = map_out["all_map_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
+        if "map_token_xy" in map_out:   # km 10/27: seg map head (map_seg_head.py), one token per BEV block
+            map_xy, map_score = map_out["map_token_xy"].detach(), map_out["map_token_score"].detach()
+        else:
+            map_xy = map_out["all_map_pts_preds"][-1].detach()
+            map_score = map_out["all_map_cls_scores"][-1].detach().sigmoid().amax(dim=-1, keepdim=True)
         return {
             "det_memory": det_memory,
             "det_position": self.det_position_encoder(det_xy),

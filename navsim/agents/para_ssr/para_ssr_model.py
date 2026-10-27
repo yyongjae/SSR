@@ -29,6 +29,7 @@ from .modules.bevformer import BEVFormerEncoder, SSRPerceptionTransformer
 from .modules.det_motion_head import ParaDetMotionHead
 from .modules.lidar_encoder import build_lidar_encoder
 from .modules.map_head import ParaMapHead
+from .modules.map_seg_head import ParaMapSegHead
 from .modules.planner_head import ParaSSRPlannerHead
 from .modules.corridor_head import CorridorHead
 
@@ -255,8 +256,17 @@ class ParaSSRModel(nn.Module):
             else None
         )
 
+        map_repr = str(getattr(cfg, "map_repr", "vector"))
+        if map_repr not in ("vector", "seg"):
+            raise ValueError(f"map_repr must be vector|seg, got {map_repr!r}")
         self.map_head = (
-            ParaMapHead(
+            # km 10/27: raster map head (BEV segmentation of the same four map classes), modules/map_seg_head.py
+            ParaMapSegHead(cfg.embed_dims, cfg.bev_h, cfg.bev_w, cfg.map_num_classes,
+                           tokens=int(getattr(cfg, "map_seg_tokens", 20)),
+                           bce_weight=float(getattr(cfg, "map_seg_bce_weight", 1.0)),
+                           dice_weight=float(getattr(cfg, "map_seg_dice_weight", 1.0)))
+            if cfg.use_map_head and map_repr == "seg"
+            else ParaMapHead(
                 map_num_vec=cfg.map_num_vec,
                 map_num_pts_per_vec=cfg.map_num_pts_per_vec,
                 map_num_classes=cfg.map_num_classes,

@@ -21,8 +21,11 @@
 #                  u ~ U(0, 1) (cand_scorer_mix_p 0.5), labelled by their own official terms; no input perturbation
 #            cf  : (km 10/25) c64 + EC-smoothness hinge 0.1 + cross-fitting (cand_cf_folds 2): the scorer trains on the
 #                  candidates of a planner copy that never fitted the scene (log-disjoint folds); no perturbation / mix
-#            cf_v15 : cf + BEV Selector v15 distillation on the 64 m (100x100) BEV grid (BEVFusion + ReSMap stage1_front64,
-#                     worker-parallel loading via DistillTeacherTargetBuilder)
+#            cf_seg : (km 10/27) cf with the raster map head (map_repr seg: BEV segmentation of road / walkway / centerline /
+#                  crosswalk, modules/map_seg_head.py) in place of the vector map head
+#            cf_v15 / cf_seg_v15 : cf_seg (map_repr=seg by default, override with MAP_REPR=vector) + BEV Selector v15
+#                  distillation on the 64 m (100x100) BEV grid (BEVFusion + ReSMap stage1_front64)
+#            cf_vec_v15 : cf (vector map head) + BEV Selector v15 distillation
 #   LR / MAXEP (km 10/25): agent.lr and the cosine schedule length (default 1e-4 / 30)
 #   smoke: EPOCHS=1 LIMIT_TRAIN=40 LIMIT_VAL=5 VAL_EVERY=1 WANDB=false
 #   SELECT_RULE (km 10/17): trajectory the agent submits at inference, default pred_multiply_t0.25 (corridor); v2 = no corridor
@@ -33,7 +36,7 @@ NG=$(echo $GPUS | tr ',' '\n' | wc -l)
 OUT=${KM_RUN_ROOT:-$REPO/work_dirs/km_runs}/corr30/$RUN; mkdir -p $OUT
 export CUDA_VISIBLE_DEVICES=$GPUS CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_SOCKET_IFNAME=lo OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 [ "$VAR" = v32b ] && PLANES=49 && SELECT_RULE=${SELECT_RULE:-pred_multiply_sigma_ttc}
-case $VAR in c64|c64_traj|pert|mix|cf|cf_v15) PLANES=49; SELECT_RULE=${SELECT_RULE:-cand_official} ;; esac
+case $VAR in c64|c64_traj|pert|mix|cf|cf_seg|cf_v15|cf_seg_v15|cf_vec_v15) PLANES=49; SELECT_RULE=${SELECT_RULE:-cand_official} ;; esac
 V31=(++agent.config.corridor_plan_weight=20.0 ++agent.config.corridor_plan_ttc_weight=1.0 ++agent.config.plan_ep_feasible_only=true
      ++agent.config.corridor_occ_planes=${PLANES:-40} ++agent.config.corridor_route_weight=1.0
      ++agent.config.corridor_plan_prog_weight=0.2 ++agent.config.corridor_plan_comfort_weight=1.0 ++agent.config.corridor_verdict_weight=1.0)
@@ -73,7 +76,7 @@ case $VAR in
   v32b) EXTRA=("${V31[@]}" ++agent.config.corridor_dir=$KM_ROOT/corridor32_p49 ++agent.config.corridor_route_dir=$KM_ROOT/route32
          ++agent.config.corridor_occ_pos_weight=8.0 ++agent.config.corridor_occ_time_weight=1.0
          ++agent.config.corridor_sdf_boundary_weight=8.0 ++agent.config.corridor_sdf_sigma=true) ;;
-  c64|c64_traj|pert|mix|cf|cf_v15) V31C=(); for x in "${V31[@]}"; do [[ $x == *corridor_verdict_weight* ]] || V31C+=("$x"); done
+  c64|c64_traj|pert|mix|cf|cf_seg|cf_v15|cf_seg_v15|cf_vec_v15) V31C=(); for x in "${V31[@]}"; do [[ $x == *corridor_verdict_weight* ]] || V31C+=("$x"); done
            EXTRA=("${V31C[@]}" ++agent.config.corridor_format=c64
            ++agent.config.corridor_dir=$KM_ROOT/corridor64
            "++agent.config.pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]" "++agent.config.map_pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]"
@@ -82,15 +85,17 @@ case $VAR in
            ++agent.config.cand_scorer_fields=$([ "$VAR" = c64_traj ] && echo false || echo true))
        [ "$VAR" = pert ] && EXTRA+=(++agent.config.corridor_plan_ec_smooth_weight=0.1 ++agent.config.cand_scorer_pert_p=0.5)
        [ "$VAR" = mix ] && EXTRA+=(++agent.config.corridor_plan_ec_smooth_weight=0.1 ++agent.config.cand_scorer_mix_p=0.5)
-       case $VAR in cf|cf_v15) EXTRA+=(++agent.config.corridor_plan_ec_smooth_weight=0.1 ++agent.config.cand_cf_folds=2
+       case $VAR in cf|cf_seg|cf_v15|cf_seg_v15|cf_vec_v15) EXTRA+=(++agent.config.corridor_plan_ec_smooth_weight=0.1 ++agent.config.cand_cf_folds=2
                                        ++agent.config.input_target=true) ;; esac
-       [ "$VAR" = cf_v15 ] && EXTRA+=("${V15_DISTILL[@]}") ;;
-  *) echo "variant: v2 | v31 | v31_64 | v32b | c64 | c64_traj | pert | mix | cf | cf_v15"; exit 2 ;;
+       [ "$VAR" = cf_seg ] && EXTRA+=(++agent.config.map_repr=seg)
+       case $VAR in cf_v15|cf_seg_v15) EXTRA+=(++agent.config.map_repr=${MAP_REPR:-seg} "${V15_DISTILL[@]}") ;; esac
+       [ "$VAR" = cf_vec_v15 ] && EXTRA+=(++agent.config.map_repr=vector "${V15_DISTILL[@]}") ;;
+  *) echo "variant: v2 | v31 | v31_64 | v32b | c64 | c64_traj | pert | mix | cf | cf_seg | cf_v15 | cf_seg_v15 | cf_vec_v15"; exit 2 ;;
 esac
-if [ "${DISTILL:-}" = v15 ] && [ "$VAR" != cf_v15 ]; then
+if [ "${DISTILL:-}" = v15 ] && [[ "$VAR" != cf_v15 && "$VAR" != cf_seg_v15 && "$VAR" != cf_vec_v15 ]]; then
   case $VAR in
-    v31_64|c64|c64_traj|pert|mix|cf) EXTRA+=("${V15_DISTILL[@]}") ;;
-    *) echo "error: DISTILL=v15 requires a 64m variant (v31_64 | c64 | c64_traj | pert | mix | cf | cf_v15), got $VAR"; exit 2 ;;
+    v31_64|c64|c64_traj|pert|mix|cf|cf_seg) EXTRA+=("${V15_DISTILL[@]}") ;;
+    *) echo "error: DISTILL=v15 requires a 64m variant (v31_64 | c64 | c64_traj | pert | mix | cf | cf_seg | cf_v15), got $VAR"; exit 2 ;;
   esac
 fi
 exec $PY navsim/planning/script/run_training.py \

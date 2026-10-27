@@ -45,6 +45,7 @@ Normalisation
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Union
 
@@ -53,7 +54,10 @@ import torch
 import torch.nn as nn
 
 # ----------------------------------------------------------------------------------------------- constants
-BEV_H, BEV_W = 50, 100       # S grid rows (x forward), cols (y left, col 0 = left)
+# CK_BEV64=1 (branch ck2-64m, 2026-10-27): front-only 0..64 m teachers (BEVFusion 100x100 / ReSMap front64), S grid
+# [C, 100, 100] with the same 0.64 m cells (row r -> x = (r + 0.5) * 0.64 m up to 64 m).  Unset / 0 = 50 x 100 (0..32 m).
+BEV64 = os.environ.get("CK_BEV64", "0") == "1"
+BEV_H, BEV_W = (100 if BEV64 else 50), 100       # S grid rows (x forward), cols (y left, col 0 = left)
 CELL = 0.64                  # [m]
 IN_CH_T = 256                # teacher bev_feature channels
 IN_CH_M = 256                # ReSMap neck bev channels (map arm)

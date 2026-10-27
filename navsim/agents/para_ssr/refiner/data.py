@@ -84,7 +84,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Un
 import numpy as np
 import pandas as pd
 
-from .adapters import BEV_H, BEV_W, IN_CH_T, compute_norm, teacher_to_s_grid
+from .adapters import BEV64, BEV_H, BEV_W, IN_CH_T, compute_norm, teacher_to_s_grid
 
 # ----------------------------------------------------------------------------------------------- constants
 DATA_ROOT = Path("/home/external-user/ssd/yongjae_refiner")
@@ -94,6 +94,12 @@ TEACHER_ROOTS = {
     "navtest": Path("/home/external-user/datasets/teacher_cache/bevfusion/cache_val_50x100"),
 }
 TEACHER_SHA_HEAD = "cddf943ffec8d6a8"
+if BEV64:   # 64 m BEVFusion teacher (runs/navsim-fusion-64m/epoch_20.pth), cache built 2026-10-27
+    TEACHER_ROOTS = {
+        "navtrain": Path("/home/external-user/datasets/teacher_cache/bevfusion/cache_train_100x100"),
+        "navtest": Path("/home/external-user/datasets/teacher_cache/bevfusion/cache_val_100x100"),
+    }
+    TEACHER_SHA_HEAD = "71ea94f672c89521"
 TEACHER_LAYOUT = "samples/<token[:2]>/<token>.npz"
 SPLIT_SUBSET = {"train": "navtrain", "dev": "navtrain", "navtest": "navtest"}
 MC_ROOTS = (

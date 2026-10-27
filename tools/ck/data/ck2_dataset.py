@@ -62,7 +62,8 @@ import torch  # noqa: E402
 from navsim.agents.para_ssr.ck import anchor_sampler as AS  # noqa: E402
 from navsim.agents.para_ssr.ck.ep_target import check_ep_target, ck_targets  # noqa: E402
 
-BEV_SHAPE = (256, 50, 100)
+from navsim.agents.para_ssr.refiner.adapters import BEV_H as _BEV_H, BEV_W as _BEV_W  # noqa: E402
+BEV_SHAPE = (256, _BEV_H, _BEV_W)          # (256, 50, 100); (256, 100, 100) with CK_BEV64=1
 CK_LABEL_IDX = tuple(CM.C.CK_LABEL_IDX)
 PDMS_IDX = CM.LABEL_COLS.index("pdms")
 VAR_NAME = "var_separate_sampler16"

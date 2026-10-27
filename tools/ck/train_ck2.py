@@ -207,7 +207,7 @@ def resolve_args(a):
         a.ep_target = check_ep_target(getattr(a, "ep_target", "official"))
     except ValueError as e:
         raise SystemExit(f"--ep-target: {e}") from None
-    if a.arm == "M" and a.val_split != "none":
+    if a.arm == "M" and a.val_split != "none" and not C().SPLITS[a.val_split].get("map_teacher", False):
         raise SystemExit("arm M: no ReSMap cache for the val split (--val-split none)")
     if a.workers > 16:
         raise SystemExit("--workers <= 16 per rank")

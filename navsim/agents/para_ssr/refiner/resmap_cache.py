@@ -61,6 +61,27 @@ LOG_SPLIT_YAML = Path(__file__).resolve().parents[3] / \
     "planning/script/config/training/default_train_val_test_log_split.yaml"
 RESMAP_ORIGIN_NOTE = "rear axle; measured |offset| < 0.05 m (report/refiner_T/resmap_axes_*.json origin_scan)"
 
+# CK_BEV64=1 (branch ck2-64m, 2026-10-27): ReSMap front64 stage-1 cache (kyungmin resmap_nav_rideflux_front64, iter
+# 189054; downloaded to teacher_cache/resmap/stage1_front64).  Root covers ALL navtrain logs (152,495 frames; navtrain_train
+# and navtrain_val tokens all present; meta split 'none'), navtest/ = 12,146 navtest tokens.  bev (256, 100, 100) =
+# (C, lateral [0 = +32 m left], forward [0 = rear axle], 0.64 m) up to x = 64 m; seg (4, 200, 200) at 0.32 m.  Axes
+# MEASURED 2026-10-27 on 120 navtrain_val tokens (seg road IoU vs GT drivable SDF 0.88 for the pure transpose vs <= 0.40
+# for the 7 other swap / flip hypotheses; bev -> sdf>0 linear probe AUC 0.989 vs <= 0.79): same convention as above.
+# No 'vectors' / 'scores' / 'labels' / 'props' fields in this stage-1 cache.
+from .adapters import BEV64 as _BEV64  # noqa: E402
+
+if _BEV64:
+    RESMAP_ROOT = Path("/home/external-user/datasets/teacher_cache/resmap/stage1_front64")
+    RESMAP_ROOTS = {"navtrain": RESMAP_ROOT, "navtest": RESMAP_ROOT / "navtest"}
+    RESMAP_SHA256 = "e67cc78d0da6afe00f0396d9940e98024826d7288117f346b9f85a7ade699858"
+    RESMAP_SHA_HEAD = RESMAP_SHA256[:16]
+    RESMAP_FIELDS = dict(RESMAP_FIELDS, bev=((256, 100, 100), "float16"), seg=((4, 200, 200), "float16"))
+    RESMAP_PC_RANGE = [0, -32, -3, 64, 32, 5]
+    RESMAP_ROI_SIZE = [64, 64]
+    S_H = 100
+    SEG_H = 200
+RESMAP_SPLIT = {"navtrain": "none", "navtest": "none"} if _BEV64 else {"navtrain": "train", "navtest": "none"}
+
 
 # ----------------------------------------------------------------------------------------------- transforms
 def resmap_to_s_grid(x):
@@ -148,7 +169,7 @@ class ResmapCache:
 
     @classmethod
     def for_subset(cls, subset: str) -> "ResmapCache":
-        return cls(RESMAP_ROOTS[subset], expect_split={"navtrain": "train", "navtest": "none"}[subset])
+        return cls(RESMAP_ROOTS[subset], expect_split=RESMAP_SPLIT[subset])
 
     # pickling (DataLoader workers): ship the index, never the memmaps
     def __getstate__(self):

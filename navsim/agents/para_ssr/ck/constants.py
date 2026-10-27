@@ -84,6 +84,11 @@ SPLITS = {
         "role": "report once with settings fixed on navtrain_val; MAP/DET teacher rows descriptive only"},
 }
 
+# CK_BEV64=1: the ReSMap front64 root covers navtrain_val too (2026-10-27), so the MAP teacher can be evaluated on it.
+from ..refiner.adapters import BEV64 as _BEV64  # noqa: E402
+if _BEV64:
+    SPLITS["navtrain_val"] = dict(SPLITS["navtrain_val"], map_teacher=True)
+
 # ----------------------------------------------------------------------------------------------- KD rules
 # score KD target per key: 'det' | 'map' | 'mean' (mean of the available teacher probabilities); no map -> det for all
 KD_SCORE_SOURCE = {"nc": "det", "dac": "map", "ep": "mean", "ttc": "det", "comfort": "mean"}

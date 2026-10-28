@@ -406,3 +406,150 @@ def test_teacher_store_pread_row_equals_the_memmap_row(tmp_path):
     for r in range(5):
         got = st._read_row("s", mm, r)
         assert got.dtype == a.dtype and got.shape == a.shape[1:] and np.array_equal(got, a[r])
+
+
+def test_rear_mask_ignores_points_behind_the_ego():
+    """10-28 review: CH._sample's in-range test has no x >= 0 side and its border padding repeats row 0, so a stopped
+    ego's rear corners (x = -REAR) read the first row.  rear_mask (student reads, L_corr hinges) drops them; the
+    default (scorer, T-E) is unchanged, and a path entirely ahead reads the same either way."""
+    from navsim.agents.para_ssr.modules import corridor_head as CH
+    from navsim.agents.para_ssr.modules.candidate_scorer import field_readout
+    from navsim.agents.para_ssr.refiner_v6c import losses as LS
+    sdf = torch.full((1, 200, 200), 3.0)
+    sdf[:, 0] = -1.0                                                                          # row 0 (x 0..0.32 m) off-road
+    occ = torch.zeros(1, 49, 200, 200)
+    occ[:, :, 0] = 1.0
+    stop = torch.zeros(1, 1, 41, 7)                                                           # stopped at the origin
+    old = field_readout(stop, sdf, occ)
+    assert torch.equal(old, field_readout(stop, sdf, occ, rear_mask=False))
+    assert float(old[0, 0, 5, 0]) == -1.0                                                     # rear corner read row 0
+    new = field_readout(stop, sdf, occ, rear_mask=True)
+    assert float(new[0, 0, 5, 0]) == 3.0 and float(new[0, 0, 5, 1]) > 0.9                    # front points still read row 0
+    ahead = stop.clone()
+    ahead[..., 0] = 10.0                                                                      # every point at x > 0
+    assert torch.equal(field_readout(ahead, sdf, occ), field_readout(ahead, sdf, occ, rear_mask=True))
+    S = stop[:, 0]
+    assert float(LS.road_hinge(S, sdf)) > 0 and float(LS.road_hinge(S, sdf, rear_mask=True)) == 0.0
+    S_back = S.clone()
+    S_back[..., 0] = -0.5
+    S_back[..., 2] = torch.pi                                                                 # behind, facing backwards
+    od = torch.full((1, 49, 200, 200), CH.CLIP)
+    od[:, :, 0] = -1.0
+    assert float(LS.front_hinge(S_back, od, "dist", 0.1).sum()) > 0
+    assert float(LS.front_hinge(S_back, od, "dist", 0.1, rear_mask=True).sum()) == 0.0
+
+
+def test_per_control_readout_separates_the_controls():
+    """10-28 review: one read-out per control.  Zero at init (Delta = 0), and a loss on the lateral controls gives no
+    gradient to the longitudinal read-out (with the shared Linear(hid, 1) it moved every control together)."""
+    from navsim.agents.para_ssr.refiner_v6c import nets as N
+    torch.manual_seed(0)
+    rc = N.Corrector(32, h_dim=32, heads=4, n_cmd=4)
+    E, M, S = torch.randn(3, 21, 12), torch.ones(3, 21, 5), _straight(8.0, n=3)[0]
+    ego, cmd = torch.randn(3, 4), torch.eye(4)[:3]
+    out = rc(E, M, S, ego, cmd)
+    assert out.shape == (3, 12) and torch.equal(out, torch.zeros(3, 12))
+    out.sum().backward()                                                                    # warm the read-out
+    with torch.no_grad():
+        rc.out.weight.normal_(0, 0.1)
+    rc.zero_grad()
+    rc(E, M, S, ego, cmd)[:, 6:].pow(2).sum().backward()
+    assert torch.equal(rc.out.weight.grad[:6], torch.zeros(6, 32)) and float(rc.out.weight.grad[6:].abs().sum()) > 0
+    assert torch.equal(rc.out.bias.grad[:6], torch.zeros(6))
+    shared = N.Corrector(32, h_dim=32, heads=4, n_cmd=4, out_mode="shared")
+    assert shared(E, M, S, ego, cmd).shape == (3, 12)
+    with pytest.raises(ValueError):
+        N.Corrector(32, out_mode="bad")
+
+
+@pytest.mark.parametrize("lead_x,expect", [(80.0, "pass"), (50.0, "fix"), (30.0, "unfix")])
+def test_official_decel_target(lead_x, expect):
+    """10-28 review: the longitudinal target comes from the official scorer.  Straight tau_base at 10 m/s (40 m in 4 s)
+    with a stopped car ahead: far (80 m) -> tau_base passes, target 0; 50 m -> TTC fails and only the -1.0 variant
+    passes (a_max = 1 m/s^2 shortens the 4 s path by at most ~6.5 m); 30 m -> no variant avoids it, left out"""
+    from types import SimpleNamespace
+    from navsim.agents.para_ssr.refiner_v6c import hook as H
+    t = _scene(lead_x=lead_x)
+    tt = torch.arange(1, 9, dtype=torch.float32) * 0.5
+    tau = torch.stack([10.0 * tt, torch.zeros_like(tt), torch.zeros_like(tt)], -1)[None]
+    init = torch.tensor([[10.0, 0, 0, 0, 0, 0, 0, 0]], dtype=torch.float64)
+    st9 = H._trk(tau.double()[:, None].reshape(1, 8, 3), init, full=True, angular=True).reshape(1, 1, 41, 9).float()
+    ex = ES.official_scores(st9, t, None)
+    base_fail = ((ex["nc1"][:, 0] < 1) | (ex["ttc1"][:, 0] < 1)) & torch.isfinite(ex["nc1"][:, 0])
+    cfg = SimpleNamespace(v6c_a_max=1.0, v6c_d_max=0.5, v6c_decoder_mode="A")
+    out = H.official_decel_target(tau, torch.tensor([10.0]), torch.zeros(1, 8), init, t, ex, base_fail, cfg)
+    if expect == "pass":
+        assert not bool(base_fail[0]) and float(out["z"][0]) == 0.0 and bool(out["use"][0])
+    elif expect == "fix":
+        assert bool(base_fail[0]) and bool(out["fixable"][0]) and float(out["z"][0]) == -1.0 and bool(out["use"][0])
+    else:
+        assert bool(base_fail[0]) and bool(out["unfixable"][0]) and not bool(out["use"][0])
+
+
+def test_fixing_term_on_lateral_only_states_leaves_lon_untouched():
+    """10-28 review: with S_fix (tau_base edited by the lateral controls only) the fixing part of the teacher term
+    gives the longitudinal controls no gradient; without it the time-mean hinge does (and asked for 'faster')"""
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from navsim.agents.para_ssr.refiner_v6c import hook as H
+    from navsim.agents.para_ssr.refiner_v6c import losses as LS
+    from navsim.agents.para_ssr.refiner_v6c import nets as N
+    tt = torch.arange(1, 9, dtype=torch.float32) * 0.5
+    tau = torch.stack([8.0 * tt, torch.zeros_like(tt), torch.zeros_like(tt)], -1)[None]
+    init = torch.tensor([[8.0, 0, 0, 0, 0, 0, 0]])
+    xs = (torch.arange(200) + 0.5) * 0.32
+    ys = 32.0 - (torch.arange(200) + 0.5) * 0.32
+    occ = ((xs - 20.0).abs()[:, None] < 2.3) & (ys.abs()[None] < 0.95)
+    occ = occ.float()[None, None].expand(1, 49, 200, 200).contiguous() * 0.95
+    tg = {"corridor_occ_dist": torch.full((1, 49, 200, 200), 8.0), "corridor_sdf": torch.full((1, 200, 200), 5.0),
+          "corridor_route_s": torch.zeros(1, 100, 100), "corridor_valid": torch.ones(1)}
+    w = {"teacher": 1.0, "gt": 0.0, "road": 0.0, "comfort": 0.0, "ec": 0.0, "prog": 0.0}
+    S_base = H._trk(tau, init, full=True).float()
+
+    def grads(use_fix):
+        ctrl = torch.zeros(1, 12, requires_grad=True)
+        Sg = H._trk(N.decode_v6(tau, ctrl, torch.tensor([8.0]), 1.0, 0.5, "A", 0.1, anchor_h=torch.zeros(1, 8))["traj"],
+                    init, full=True).float()
+        S_fix = None
+        if use_fix:
+            cl = torch.cat([torch.zeros_like(ctrl[:, :6]), ctrl[:, 6:]], -1)
+            S_fix = H._trk(N.decode_v6(tau, cl, torch.tensor([8.0]), 1.0, 0.5, "A", 0.0,
+                                       anchor_h=torch.zeros(1, 8))["traj"], init, full=True).float()
+        l, _ = LS.corr_loss(Sg, S_base, tg, occ, torch.ones(1), w, 0.1, 0.3, S_fix=S_fix)
+        return torch.autograd.grad(l, ctrl)[0][0]
+
+    g_old, g_new = grads(False), grads(True)
+    assert float(g_old[:6].abs().sum()) > 0
+    assert torch.equal(g_new[:6], torch.zeros(6))
+
+
+def test_rear_mask_rule_follows_the_checkpoint_generation():
+    """review 10-28: v6c_rear_mask None = the new rule, except for the 10-27 checkpoints (v6c_rc_out 'shared')"""
+    from types import SimpleNamespace
+    from navsim.agents.para_ssr.refiner_v6c.hook import rear_mask_of
+    assert rear_mask_of(SimpleNamespace()) is True
+    assert rear_mask_of(SimpleNamespace(v6c_rear_mask=None, v6c_rc_out="per_control")) is True
+    assert rear_mask_of(SimpleNamespace(v6c_rear_mask=None, v6c_rc_out="shared")) is False
+    assert rear_mask_of(SimpleNamespace(v6c_rear_mask=True, v6c_rc_out="shared")) is True
+    assert rear_mask_of(SimpleNamespace(v6c_rear_mask=False, v6c_rc_out="per_control")) is False
+
+
+def test_official_decel_target_scores_only_failing_rows_in_a_batch():
+    """the decel variants are scored only for failing tau_base rows; a 3-row batch (pass, fix, unfix) gives the same
+    targets as the rows one by one"""
+    from types import SimpleNamespace
+    from navsim.agents.para_ssr.refiner_v6c import hook as H
+    ts = [_scene(lead_x=x) for x in (80.0, 50.0, 30.0)]
+    t = {k: torch.cat([x[k] for x in ts], 0) for k in ts[0]}
+    tt = torch.arange(1, 9, dtype=torch.float32) * 0.5
+    tau = torch.stack([10.0 * tt, torch.zeros_like(tt), torch.zeros_like(tt)], -1)[None].repeat(3, 1, 1)
+    init = torch.tensor([[10.0, 0, 0, 0, 0, 0, 0, 0]], dtype=torch.float64).repeat(3, 1)
+    st9 = H._trk(tau.double(), init, full=True, angular=True).reshape(3, 1, 41, 9).float()
+    ex = ES.official_scores(st9, t, None)
+    base_fail = ((ex["nc1"][:, 0] < 1) | (ex["ttc1"][:, 0] < 1)) & torch.isfinite(ex["nc1"][:, 0])
+    cfg = SimpleNamespace(v6c_a_max=1.0, v6c_d_max=0.5, v6c_decoder_mode="A")
+    out = H.official_decel_target(tau, torch.full((3,), 10.0), torch.zeros(3, 8), init, t, ex, base_fail, cfg)
+    assert out["z"].tolist() == [0.0, -1.0, 0.0]
+    assert out["fixable"].tolist() == [False, True, False] and out["unfixable"].tolist() == [False, False, True]
+    assert out["use"].tolist() == [True, True, False]

@@ -420,7 +420,18 @@ class ParaSSRConfig:
     v6c_a_max: float = 1.0            # deceleration amplitude (m/s^2), V7
     v6c_d_max: float = 0.5            # lateral residual bound (m), V7
     v6c_decoder_mode: str = "A"       # A: deceleration only; B: the acceleration arm (V7)
-    v6c_lon_st_slope: float = 0.0     # straight-through slope of the mode-A clamp (0 = off; V7 rule)
+    v6c_lon_st_slope: float = 0.1     # straight-through slope of the mode-A clamp (10-28: 0.1 as refiner T / E / CK;
+                                      # the 10-27 run used 0 = off and every longitudinal control died)
+    v6c_lon_pos_penalty: float = 1.0  # mode A: weight of relu(z_lon) (z > 0 is clamped away); 0 = off (10-28 review)
+    v6c_reset_rc_adam: bool = True    # drop R-C / R-J AdamW state on the first micro-batch past the warm-up (10-28)
+    v6c_rc_out: str = "per_control"   # R-C read-out: per_control (10-28) | shared (the 10-27 checkpoints)
+    v6c_lon_target: str = "official"  # longitudinal controls: official decel target (10-28 review) | off (time-mean hinge)
+    v6c_lon_levels: Tuple[float, ...] = (-0.25, -0.5, -1.0, -2.0)   # z of the decel variants scored, mild -> strong
+    v6c_lon_target_weight: float = 1.0
+    v6c_lon_fix_weight: float = 4.0   # weight of a fixable failing sample vs a passing one (target 0)
+    v6c_rear_mask: Optional[bool] = None  # student reads / L_corr hinges: points behind the ego (x < 0) are out of range
+                                      # (10-28 review; CH._sample's border padding repeated row 0); None = True except
+                                      # v6c_rc_out 'shared' (the 10-27 checkpoints, old rule); T-E keeps the old rule
     v6c_h_arm: str = "E"              # R-C input: E (default) | EH (E + H detached) | H (H only)
     v6c_switch_delta: float = 0.0     # R-J switch margin on the expected PDMS (V9)
     v6c_switch_kappa: float = -1.0    # EC-proxy guard on the switch (< 0: off = kappa infinite)

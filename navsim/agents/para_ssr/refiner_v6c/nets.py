@@ -53,15 +53,17 @@ def footprint5(s: torch.Tensor) -> torch.Tensor:
 
 
 def path_reads(S: torch.Tensor, bev: torch.Tensor, sdf: torch.Tensor, occ_prob: torch.Tensor, bev_h: int,
-               bev_w: int, fwd_m: float) -> Dict[str, torch.Tensor]:
+               bev_w: int, fwd_m: float, rear_mask: bool = False) -> Dict[str, torch.Tensor]:
     """parameter-free reads along the paths.  S [B, R, 41, 7]; bev [B, H*W, C]; sdf [B, Hf, 200] (m);
     occ_prob [B, P, Hf, 200] PROBABILITIES (report 124 §3-1 exchange convention) ->
       ro [B, R, T, 3] field_readout at the 21 times (min corner SDF / CLIP, max occupancy, max TTC occupancy),
       road [B, R, T, 5] SDF at the 5 footprint points / CLIP, M [B, R, T, 5] in range (and not behind the ego),
-      smp [B, R, T, 5 C] BEV samples at the 5 points, kin [B, R, T, 6] kinematics"""
+      smp [B, R, T, 5 C] BEV samples at the 5 points, kin [B, R, T, 6] kinematics
+    rear_mask: ro also treats points behind the ego as out of range (as road / M already do).  The student R-E
+    reads with cfg.v6c_rear_mask (10-28 review); T-E keeps False, the rule it was trained with (teachers_te.pt)."""
     b, r = S.shape[:2]
     t = T21.to(S.device)
-    ro = field_readout(S, sdf, occ_prob)[:, :, t]                                          # [B, R, T, 3]
+    ro = field_readout(S, sdf, occ_prob, rear_mask=rear_mask)[:, :, t]                                          # [B, R, T, 3]
     ro = torch.cat([ro[..., :1] / CH.CLIP, ro[..., 1:]], -1)
     s21 = S[:, :, t]                                                                       # [B, R, T, 7]
     pts = footprint5(s21)                                                                  # [B, R, T, 5, 2]
@@ -152,15 +154,33 @@ def geom_features(S: torch.Tensor) -> torch.Tensor:
                         s[..., 0] / 32, s[..., 1] / 32], -1)
 
 
+class PerControlOut(nn.Module):
+    """one zero-initialised linear read-out per control query: [B, Q, hid] -> [B, Q] (10-28 review: the shared
+    Linear(hid, 1) read 12 near-identical query states, so one AdamW step moved every control of every sample together
+    and the lateral gradient dragged the longitudinal controls with it)"""
+
+    def __init__(self, q: int, hid: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(q, hid))
+        self.bias = nn.Parameter(torch.zeros(q))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x * self.weight.to(x.dtype)).sum(-1) + self.bias.to(x.dtype)
+
+
 class Corrector(nn.Module):
     """R-C: per-time tokens c_t = MLP([E_t features 12, M_t 5, geometry_t 7, Fourier(t)]); 6 longitudinal + 6 lateral
     control queries (+ ego status / command) read the 21 tokens by attention; the last layer is zero-initialised,
-    so Delta = 0 and tau_v6 == tau_base bitwise at the start.  use_h: the H ablation arms (E+H / H-only)."""
+    so Delta = 0 and tau_v6 == tau_base bitwise at the start.  use_h: the H ablation arms (E+H / H-only).
+    out_mode 'per_control' (default since 10-28): one read-out per control; 'shared': the single Linear(hid, 1) of the
+    10-27 runs (needed to load their checkpoints)."""
 
     def __init__(self, hid: int = 192, h_dim: int = 192, use_e: bool = True, use_h: bool = False, layers: int = 2,
-                 heads: int = 8, n_cmd: int = 4):
+                 heads: int = 8, n_cmd: int = 4, out_mode: str = "per_control"):
         super().__init__()
-        self.use_e, self.use_h = use_e, use_h
+        if out_mode not in ("per_control", "shared"):
+            raise ValueError(f"v6c_rc_out must be per_control | shared, got {out_mode!r}")
+        self.use_e, self.use_h, self.out_mode = use_e, use_h, out_mode
         nin = (12 + 5 + 7 if use_e else 7) + 8
         self.tok = _mlp(nin, hid)
         self.h_in = nn.Linear(h_dim, hid) if use_h else None
@@ -171,9 +191,12 @@ class Corrector(nn.Module):
         self.ffn = nn.ModuleList([_mlp(hid, hid, 2 * hid) for _ in range(layers)])
         self.n1 = nn.ModuleList([nn.LayerNorm(hid) for _ in range(layers)])
         self.n2 = nn.ModuleList([nn.LayerNorm(hid) for _ in range(layers)])
-        self.out = nn.Linear(hid, 1)
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
+        if out_mode == "shared":
+            self.out = nn.Linear(hid, 1)
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
+        else:
+            self.out = PerControlOut(12, hid)
 
     def forward(self, E: torch.Tensor, M: torch.Tensor, S: torch.Tensor, ego: torch.Tensor, cmd: torch.Tensor,
                 H: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -191,7 +214,8 @@ class Corrector(nn.Module):
         for at, ff, n1, n2 in zip(self.attn, self.ffn, self.n1, self.n2):
             q = n1(q + at(q, tok, tok, need_weights=False)[0])
             q = n2(q + ff(q))
-        return self.out(q)[..., 0].float()                                                 # [B, 12]
+        o = self.out(q)
+        return (o[..., 0] if self.out_mode == "shared" else o).float()                    # [B, 12]
 
 
 def decode_v6(tau_base: torch.Tensor, ctrl: torch.Tensor, v0: torch.Tensor, a_max: float = 1.0, d_max: float = 0.5,

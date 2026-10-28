@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from . import nets as N
+from ..modules import exact_score as ES
 
 AGENT_K = 32
 
@@ -38,13 +39,18 @@ class GradScale(torch.autograd.Function):
         return g * ctx.s, None
 
 
-def _trk(poses: torch.Tensor, init: torch.Tensor, full: bool = True, angular: bool = False) -> torch.Tensor:
+V6C_FIX_SLOT = 6                 # torch_tracker graph slot of the lateral-only fixing path (0: tau_v6, 1: cf planners)
+
+
+def _trk(poses: torch.Tensor, init: torch.Tensor, full: bool = True, angular: bool = False, slot: int = 0) -> torch.Tensor:
     """torch_tracker.track, but eager under inference_mode: a CUDA graph first captured inside Lightning's val
-    (inference tensors as static inputs) cannot be replayed later in a training step (report 125, risk list)"""
+    (inference tensors as static inputs) cannot be replayed later in a training step (report 125, risk list).
+    slot: a second GRAD call of the same shape in one forward needs its own graph (the backward reads the static
+    buffers; the 10-28 lateral-only path on slot 0 overwrote tau_v6's and the loss went NaN)"""
     from ..modules import torch_tracker as TT
     if torch.is_inference_mode_enabled():
         return TT._track(poses, init, full, angular)
-    return TT.track(poses, init, full=full, angular=angular)
+    return TT.track(poses, init, full=full, angular=angular, slot=slot)
 
 
 def _scaled(x: torch.Tensor, r: float) -> torch.Tensor:
@@ -65,7 +71,8 @@ class RefinerV6c(nn.Module):
         arm = str(getattr(cfg, "v6c_h_arm", "E"))
         if arm not in ("E", "EH", "H"):
             raise ValueError(f"v6c_h_arm must be E | EH | H, got {arm!r}")
-        self.rc = N.Corrector(hid, h_dim=hid, use_e=arm != "H", use_h=arm != "E", n_cmd=int(cfg.num_navi_cmd))
+        self.rc = N.Corrector(hid, h_dim=hid, use_e=arm != "H", use_h=arm != "E", n_cmd=int(cfg.num_navi_cmd),
+                              out_mode=str(getattr(cfg, "v6c_rc_out", "per_control")))
         self.rj = N.RowJudge(hid, n_cmd=int(cfg.num_navi_cmd))
 
     # ------------------------------------------------------------------ #
@@ -102,7 +109,8 @@ class RefinerV6c(nn.Module):
         occ = torch.sigmoid(_scaled(predictions["corridor_occ"].float(), r))             # PROBABILITIES (§3-1)
         agents = N.agent_features(det_out, AGENT_K) if det_out is not None else None
         # ---- R-E on tau_base
-        reads_b = N.path_reads(S_base[:, None], bev, sdf, occ, self.bev_h, self.bev_w, self.fwd_m)
+        rm = rear_mask_of(cfg)
+        reads_b = N.path_reads(S_base[:, None], bev, sdf, occ, self.bev_h, self.bev_w, self.fwd_m, rear_mask=rm)
         re_b = self.re(reads_b, agents)
         E_b, H_b, M_b = re_b["E"], re_b["H"], reads_b["M"]
         # ---- R-C (inputs detached) -> decoder -> tau_v6
@@ -116,7 +124,7 @@ class RefinerV6c(nn.Module):
         init = torch.cat([status, status.new_zeros(b, 3)], -1)
         S_v6_g = _trk(tau_v6, init, full=True).float()                                   # [B, 41, 7]
         S_v6_d = S_v6_g.detach()
-        reads_v = N.path_reads(S_v6_d[:, None], bev, sdf, occ, self.bev_h, self.bev_w, self.fwd_m)
+        reads_v = N.path_reads(S_v6_d[:, None], bev, sdf, occ, self.bev_h, self.bev_w, self.fwd_m, rear_mask=rm)
         re_v = self.re(reads_v, agents)
         E_v = re_v["E"]
         # ---- R-J on the two rows, every input detached
@@ -152,6 +160,15 @@ class RefinerV6c(nn.Module):
         return out
 
 
+def rear_mask_of(cfg) -> bool:
+    """v6c_rear_mask: True / False when set; None (default) = True, except for the 10-27 checkpoints (v6c_rc_out
+    'shared'), which were trained with the old rule (review 10-28: evaluating them must not shift R-E's inputs)"""
+    rm = getattr(cfg, "v6c_rear_mask", None)
+    if rm is None:
+        return str(getattr(cfg, "v6c_rc_out", "per_control")) != "shared"
+    return bool(rm)
+
+
 def zero_touch(mod: nn.Module) -> torch.Tensor:
     """0 * sum(p): every parameter gets a (zero) gradient on micro-batches without a v6c term (DDP,
     find_unused_parameters False)"""
@@ -173,6 +190,44 @@ def _area_flags(S: torch.Tensor, targets: Dict[str, torch.Tensor]) -> torch.Tens
         nd, mu, it = EV.ego_areas(S[i].float(), g["seg"][g["smask"]], g["lane"][g["lmask"]], g["int"][g["imask"]])
         out[i] = torch.stack([mu[:, t21], nd[:, t21], it[:, t21]], -1).float()
     return out
+
+
+LON_LEVELS = (-0.25, -0.5, -1.0, -2.0)        # z of the constant decel variants, mild -> strong (a_max tanh z m/s^2)
+
+
+@torch.no_grad()
+def official_decel_target(tau_b: torch.Tensor, v0: torch.Tensor, anchor_h: torch.Tensor, init: torch.Tensor,
+                          t_obs: Dict[str, torch.Tensor], ex: Dict[str, torch.Tensor], base_fail: torch.Tensor, cfg,
+                          levels=LON_LEVELS) -> Dict[str, torch.Tensor]:
+    """10-28 review: the longitudinal target from the official scorer instead of the time-mean occupancy hinge (which
+    asked a decel-only corrector to drive through a stopped object faster).  tau_base and L constant-decel variants
+    (z_lon = level on all 6 controls, lateral 0, the corrector's own decoder) are scored on the exact init:
+      tau_base fails (NC or TTC) and some variant passes NC and TTC without a worse DAC -> target = the mildest one
+      tau_base fails and none passes -> no target (decel cannot fix it)
+      tau_base passes -> target 0 (no edit)
+    -> {z [B] target, fixable [B], unfixable [B], use [B]}"""
+    b = tau_b.shape[0]
+    nl = len(levels)
+    valid = torch.isfinite(ex["nc1"][:, 0])
+    ok = torch.zeros(b, nl, dtype=torch.bool, device=tau_b.device)
+    rows = base_fail.nonzero(as_tuple=True)[0]                                           # only failing tau_base (~7 %)
+    if rows.numel():
+        m = rows.numel()
+        ctrl = tau_b.new_zeros(m * nl, 12)
+        ctrl[:, :6] = tau_b.new_tensor(levels).repeat(m)[:, None]
+        dec = N.decode_v6(tau_b[rows].repeat_interleave(nl, 0), ctrl, v0[rows].repeat_interleave(nl, 0),
+                          float(cfg.v6c_a_max), float(cfg.v6c_d_max), str(cfg.v6c_decoder_mode), 0.0,
+                          anchor_h=anchor_h[rows].repeat_interleave(nl, 0))
+        st9 = _trk(dec["traj"].double(), init[rows].repeat_interleave(nl, 0), full=True,
+                   angular=True).reshape(m, nl, 41, 9).float()
+        sub = {k: v[rows] for k, v in t_obs.items() if k.startswith("ex1_") and torch.is_tensor(v) and v.shape[:1] == (b,)}
+        exv = ES.official_scores(st9, sub, None)                                          # [m, L], v1 terms only
+        ok[rows] = (exv["nc1"] >= 1) & (exv["ttc1"] >= 1) & (exv["dac1"] >= ex["dac1"][rows, :1])
+    fixable = base_fail & ok.any(1)
+    unfixable = base_fail & ~ok.any(1)
+    first = torch.argmax(ok.float(), 1)                                                  # mildest passing level
+    z = torch.where(fixable, tau_b.new_tensor(levels)[first], torch.zeros_like(first, dtype=tau_b.dtype))
+    return {"z": z, "fixable": fixable, "unfixable": unfixable, "use": valid & ~unfixable}
 
 
 def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor],
@@ -205,6 +260,16 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
         ex = ES.official_scores(st9, t_obs, t_obs)                                     # [B, 2] per term
         lab = LB.stride2(LB.exact_step_masks(st9[..., :7], targets))                   # [B, 2, T]
         base_fail = ((ex["nc1"][:, 0] < 1) | (ex["ttc1"][:, 0] < 1)) & torch.isfinite(ex["nc1"][:, 0])
+        nc = int(cfg.num_navi_cmd)
+        status = features["status_feature"][:, nc:nc + 4].float()
+        lon_mode = str(getattr(cfg, "v6c_lon_target", "official"))
+        lon_t = None
+        warm_now = training and int(getattr(cfg, "v6c_warmup_steps", 0)) > 0 and \
+            int(predictions.get("_v6c_iteration", 0)) <= int(getattr(cfg, "v6c_warmup_steps", 0))
+        if lon_mode == "official" and training and not warm_now:
+            lv = tuple(float(x) for x in getattr(cfg, "v6c_lon_levels", LON_LEVELS))
+            lon_t = official_decel_target(tau_b, status[:, 0], predictions["v6c_anchor_h"], init, t_obs, ex,
+                                          base_fail, cfg, lv)
         # teachers (online, OOF copy of the other fold)
         kd = teacher_occ = None
         if teachers is not None and "kd_bev_0" in targets and "cf_fold" in targets:
@@ -263,16 +328,54 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
     w = {"teacher": float(cfg.v6c_corr_teacher), "gt": float(cfg.v6c_corr_gt), "road": float(cfg.v6c_corr_road),
          "comfort": float(cfg.v6c_corr_comfort), "ec": float(cfg.v6c_corr_ec), "prog": float(cfg.v6c_corr_prog)}
     if "corridor_occ_dist" in targets and training and predictions["v6c_S_v6_g"].requires_grad:
+        S_fix = None
+        if lon_t is not None:
+            # the fixing term (1[tau_base fails] h(S)) moves only the lateral controls; the longitudinal ones follow
+            # the official decel target below.  The path keeps the corrector's own (detached) longitudinal controls,
+            # so the lateral push fades once the decel clears the object (review 10-28: at lon = 0 it never did)
+            ctrl = predictions["v6c_ctrl"]
+            dec_l = N.decode_v6(tau_b, torch.cat([ctrl[:, :6].detach(), ctrl[:, 6:]], -1), status[:, 0],
+                                float(cfg.v6c_a_max), float(cfg.v6c_d_max), str(cfg.v6c_decoder_mode), 0.0,
+                                anchor_h=predictions["v6c_anchor_h"])
+            S_fix = _trk(dec_l["traj"].float(), torch.cat([status, status.new_zeros(b, 3)], -1), full=True,
+                         slot=V6C_FIX_SLOT).float()
         l_c, lg = LS.corr_loss(predictions["v6c_S_v6_g"], predictions["v6c_S_base"], targets, teacher_occ,
                                base_fail.float(), w, float(cfg.v6c_gt_margin), float(cfg.v6c_teacher_margin),
                                valid=targets["corridor_valid"].float(),
                                teacher_discount=float(getattr(cfg, "v6c_teacher_discount", 1.0)),
-                               fix_source=str(getattr(cfg, "v6c_fix_source", "teacher")))
+                               fix_source=str(getattr(cfg, "v6c_fix_source", "teacher")),
+                               rear_mask=rear_mask_of(cfg), S_fix=S_fix)
         logs.update(lg)
         loss = loss + float(cfg.v6c_w_corr) * l_c
+    if lon_t is not None:
+        zl = predictions["v6c_ctrl"][:, :6]
+        wt = torch.where(lon_t["fixable"], torch.full_like(lon_t["z"], float(getattr(cfg, "v6c_lon_fix_weight", 4.0))),
+                         torch.ones_like(lon_t["z"])) * lon_t["use"].float()
+        lt = torch.nn.functional.smooth_l1_loss(zl, lon_t["z"][:, None].expand_as(zl).to(zl.dtype), beta=0.1,
+                                                reduction="none").mean(-1)
+        l_t = (lt * wt).sum() / wt.sum().clamp(min=1.0)
+        loss = loss + float(getattr(cfg, "v6c_lon_target_weight", 1.0)) * l_t
+        with torch.no_grad():
+            logs["v6c/lon_tgt"] = l_t.detach()
+            logs["v6c/lon_fixable"] = lon_t["fixable"].float().mean()
+            logs["v6c/lon_unfixable"] = lon_t["unfixable"].float().mean()
+            zm = zl.mean(-1)
+            if bool(lon_t["fixable"].any()):
+                logs["v6c/z_lon_fix"] = zm[lon_t["fixable"]].mean()
+                logs["v6c/z_lon_fix_tgt"] = lon_t["z"][lon_t["fixable"]].mean()
+            pas = lon_t["use"] & ~lon_t["fixable"]
+            if bool(pas.any()):
+                logs["v6c/z_lon_pass"] = zm[pas].mean()
     # L_J: rows' official terms (NaN where the token has no v1 table)
     jl = {"nc": predictions["v6c_j_nc"], "dac": predictions["v6c_j_dac"], "ttc": predictions["v6c_j_ttc"],
           "prog": predictions["v6c_j_prog"], "eff": predictions["v6c_j_eff"]}
+    pen = float(getattr(cfg, "v6c_lon_pos_penalty", 0.0))
+    if pen > 0 and training and str(cfg.v6c_decoder_mode) == "A":
+        # 10-28 review: in mode A a longitudinal control above 0 is clamped away (no effect, no gradient without a
+        # straight-through slope); pull it back to the live boundary so the clamp is never an absorbing state
+        l_pen = torch.relu(predictions["v6c_ctrl"][:, :6]).sum(-1).mean()
+        loss = loss + pen * l_pen
+        logs["v6c/lon_pos_pen"] = l_pen.detach()
     l_j, lg = LS.judge_loss(jl, {k: ex[k] for k in ("nc1", "dac1", "ttc1", "prog1")}, ex["eff1"][:, 0])
     logs.update(lg)
     loss = loss + float(getattr(cfg, "v6c_w_J", 1.0)) * l_j
@@ -298,6 +401,7 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
         dz = predictions["v6c_ctrl"][:, :6]
         logs["v6c/z_lon_mean"] = dz.mean()
         logs["v6c/z_lon_zero"] = (dz == 0).float().mean()
+        logs["v6c/z_lon_std"] = dz.mean(-1).std() if dz.shape[0] > 1 else dz.new_zeros(())
         if "v6c_lon_dead" in predictions:
             logs["v6c/lon_dead"] = predictions["v6c_lon_dead"].float().mean()
         logs["v6c/lat_abs"] = predictions["v6c_ctrl"][:, 6:].abs().mean()
@@ -339,7 +443,8 @@ def warmup_risk_loss(v6c: RefinerV6c, cfg, features, targets, predictions, kd_te
     det = {k: predictions[k] for k in ("all_cls_scores", "all_bbox_preds", "traj_preds", "traj_cls_preds",
                                         "motion_hidden") if k in predictions}
     agents = N.agent_features(det, AGENT_K) if len(det) == 5 else None
-    reads = N.path_reads(S, bev, sdf, occ, v6c.bev_h, v6c.bev_w, v6c.fwd_m)
+    reads = N.path_reads(S, bev, sdf, occ, v6c.bev_h, v6c.bev_w, v6c.fwd_m,
+                         rear_mask=rear_mask_of(cfg))
     E = v6c.re(reads, agents)["E"]
     kd = None
     if kd_teachers is not None and "kd_bev_0" in targets and "cf_fold" in targets and bool(getattr(cfg, "v6c_kd", True)):

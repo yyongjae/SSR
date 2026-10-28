@@ -1241,6 +1241,7 @@ class ParaSSRAgent(AbstractAgent):
             logs["loss"] = loss.detach()
         if self.para_ssr_model.v6c is not None and "v6c_tau_v6" in predictions and "ex1_valid" in targets:
             predictions["_v6c_iteration"] = int(self._loss.iteration)
+            self._v6c_reset_adam_once()
             # refiner v6c (report 124), after the balancer and the scorer, before the distillation; never part of
             # ParaSSRLoss task_losses['plan'] (that would move g_plan and every distillation lambda)
             from .refiner_v6c.hook import v6c_loss
@@ -1293,6 +1294,36 @@ class ParaSSRAgent(AbstractAgent):
         if uses_teacher and not str(getattr(cfg, "v6c_teacher_ckpt", "") or ""):
             raise ValueError("v6c: v6c_kd=true or v6c_fix_source=teacher needs v6c_teacher_ckpt (the stage-T checkpoint); "
                              "the GT-only arm is v6c_fix_source=gt with v6c_kd=false")
+
+    def _v6c_reset_adam_once(self) -> None:
+        """v6c_reset_rc_adam (10-28 review): during the warm-up R-C and R-J get only zero_touch gradients, so AdamW
+        counts ~3,300 steps with m = v = 0; the first real gradient then moves them ~3x lr (bias correction of v only)
+        and momentum carries one event to ~30x lr, which pushed every longitudinal control of every sample past the
+        mode-A clamp at once.  On the first training micro-batch after the warm-up their STALE AdamW state (all-zero
+        second moments, or a shape changed by a checkpoint conversion) is dropped, so they start as a fresh optimizer
+        would; a later resume finds real moments and keeps them."""
+        cfg = self._config
+        if (not self.training or getattr(self, "_v6c_adam_reset_done", False)
+                or not bool(getattr(cfg, "v6c_reset_rc_adam", False))):
+            return
+        if int(self._loss.iteration) <= int(getattr(cfg, "v6c_warmup_steps", 0)):
+            return
+        opt = getattr(self, "_v6c_optimizer", None)
+        if opt is None:
+            return
+        v6c = self.para_ssr_model.v6c
+        n = 0
+        for p in list(v6c.rc.parameters()) + list(v6c.rj.parameters()):
+            st = opt.state.get(p)
+            if not st or "exp_avg_sq" not in st:
+                continue
+            # only STALE state: a shape that no longer fits (a converted read-out) or second moments that are all
+            # zero (only zero_touch gradients so far); a normal resume keeps its moments (review 10-28)
+            if tuple(st["exp_avg_sq"].shape) != tuple(p.shape) or not bool(st["exp_avg_sq"].any()):
+                opt.state.pop(p)
+                n += 1
+        self._v6c_adam_reset_done = True
+        logger.info("v6c: AdamW state of R-C / R-J dropped at loss iteration %d (%d tensors)", int(self._loss.iteration), n)
 
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
         self._check_v6c_training()
@@ -1403,6 +1434,7 @@ class ParaSSRAgent(AbstractAgent):
                 })
         optimizer_cls = getattr(torch.optim, cfg.optimizer_type)
         optimizer = optimizer_cls(groups, lr=self._lr, weight_decay=cfg.weight_decay)
+        self._v6c_optimizer = optimizer                    # v6c_reset_rc_adam (10-28 review)
 
         scheduler = WarmupCosLR(
             optimizer=optimizer,

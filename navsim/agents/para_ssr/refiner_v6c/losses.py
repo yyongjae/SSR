@@ -94,11 +94,13 @@ def _front_points(S: torch.Tensor):
     return q, c, s, spd
 
 
-def front_hinge(S: torch.Tensor, field: torch.Tensor, kind: str, margin: float, cap: float = 3.0) -> torch.Tensor:
+def front_hinge(S: torch.Tensor, field: torch.Tensor, kind: str, margin: float, cap: float = 3.0,
+                rear_mask: bool = False) -> torch.Tensor:
     """per-step hinge h(S, t) [B, 40] of the front-half footprint at steps 1..40 vs field planes (plane j = step j+1,
     0.1 s; TTC: shifted by speed * dt, dt 0.3 / 0.6 / 0.9 s, vs plane of step + dt, moving ego only) = overlap
     hinge + TTC hinge (max over the 3 shifts), as cf's plan loss adds its occupancy and TTC terms.  kind 'prob': field = occupancy PROBABILITY [B, P, Hf, 200], h = [p - margin]+;
-    kind 'dist': field = signed distance to agents (m) [B, P, Hf, 200], h = [margin - d]+.  Out of range -> 0."""
+    kind 'dist': field = signed distance to agents (m) [B, P, Hf, 200], h = [margin - d]+.  Out of range -> 0.
+    rear_mask: points behind the ego (x < 0) are out of range too (CH._sample's border padding repeats row 0)."""
     b = S.shape[0]
     q, c, s, spd = _front_points(S)
     npl = field.shape[1]
@@ -107,6 +109,8 @@ def front_hinge(S: torch.Tensor, field: torch.Tensor, kind: str, margin: float, 
         return ((vals - margin) if kind == "prob" else (margin - vals)).clamp(0, cap)
 
     v, inr = CH._sample(field[:, :40].float(), q.reshape(b, 40, 12, 2))
+    if rear_mask:
+        inr = inr & (q.reshape(b, 40, 12, 2)[..., 0] >= 0)
     h_occ = (hinge(v) * inr).amax(-1)                                                     # [B, 40]
     moving = (spd >= 5e-3).float()
     steps = torch.arange(40, device=S.device)
@@ -116,12 +120,16 @@ def front_hinge(S: torch.Tensor, field: torch.Tensor, kind: str, margin: float, 
         tq = torch.stack([q[..., 0] + c * sh, q[..., 1] + s * sh], -1)
         fld = field[:, (steps + d).clamp(max=npl - 1)].float()
         tv, ti = CH._sample(fld, tq.reshape(b, 40, 12, 2))
+        if rear_mask:
+            ti = ti & (tq.reshape(b, 40, 12, 2)[..., 0] >= 0)
         h_ttc = torch.maximum(h_ttc, (hinge(tv) * ti).amax(-1) * moving)
     return h_occ + h_ttc
 
 
-def road_hinge(S: torch.Tensor, sdf: torch.Tensor, margin: float = 0.1, cap: float = 3.0) -> torch.Tensor:
-    """cf static form: [B, 41, 7] states vs GT SDF [B, Hf, 200] -> [B] = mean_t max_corner [margin - SDF]+ (in range)"""
+def road_hinge(S: torch.Tensor, sdf: torch.Tensor, margin: float = 0.1, cap: float = 3.0,
+               rear_mask: bool = False) -> torch.Tensor:
+    """cf static form: [B, 41, 7] states vs GT SDF [B, Hf, 200] -> [B] = mean_t max_corner [margin - SDF]+ (in range;
+    rear_mask: a corner behind the ego, x < 0, is out of range)"""
     st = S[:, 1:]
     x, y, h = st[..., 0], st[..., 1], st[..., 2]
     c, s = torch.cos(h)[..., None], torch.sin(h)[..., None]
@@ -130,6 +138,8 @@ def road_hinge(S: torch.Tensor, sdf: torch.Tensor, margin: float = 0.1, cap: flo
     px, py = x[..., None] + c * cx - s * cy, y[..., None] + s * cx + c * cy
     b = S.shape[0]
     v, inr = CH._sample(sdf[:, None].float(), torch.stack([px, py], -1).reshape(b, 1, -1, 2))
+    if rear_mask:
+        inr = inr & (px.reshape(b, 1, -1) >= 0)
     return ((margin - v).clamp(0, cap) * inr).reshape(b, 40, 4).amax(-1).mean(-1)
 
 
@@ -168,7 +178,8 @@ def route_end(S: torch.Tensor, route_s: torch.Tensor) -> torch.Tensor:
 def corr_loss(S_g: torch.Tensor, S_base: torch.Tensor, targets: Dict[str, torch.Tensor],
               teacher_occ: Optional[torch.Tensor], base_fail: torch.Tensor, w: Dict[str, float],
               gt_margin: float = 0.1, teacher_margin: float = 0.3, valid: Optional[torch.Tensor] = None,
-              teacher_discount: float = 1.0, fix_source: str = "teacher") -> Tuple[torch.Tensor, Dict]:
+              teacher_discount: float = 1.0, fix_source: str = "teacher", rear_mask: bool = False,
+              S_fix: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
     """S_g [B, 41, 7] tau_v6 states WITH grad (status init); S_base [B, 41, 7] tau_base states (no grad, same init);
     targets: corridor_sdf [B, 200, 200], corridor_occ_dist [B, 49, 200, 200], corridor_route_s [B, 100, 100],
     corridor_valid [B]; teacher_occ [B, 49, 200, 200] OOF probabilities or None; base_fail [B] (0 / 1, tau_base's
@@ -179,6 +190,9 @@ def corr_loss(S_g: torch.Tensor, S_base: torch.Tensor, targets: Dict[str, torch.
     fix_source 'gt': the fixing part 1[tau_base fails] * mean_t h(S_v6) reads the GT occupancy distance instead of the
     teacher field (and the teacher term is off).  K-E / K-M are switched separately (cfg.v6c_kd, feedback 10-27), so
     the source of the fixing signal and the KD can be compared one at a time; report 124 control B = gt + no KD.
+    S_fix (10-28 review): states of tau_base edited by the LATERAL controls only (with grad); when given, the fixing
+    part 1[tau_base fails] * h(.) reads them, so the time-mean hinge no longer pushes the longitudinal controls (it asked
+    for 'faster' through a stopped object; the longitudinal target comes from the official scorer, hook.py).
     The GT guard [h_GT(v6) - h_GT(base)]+ only penalises an edit that RAISES the GT risk (a surrogate on 12 front
     points, not the official collision rule); at Delta = 0 it is 0 with zero gradient, so it never fixes a risky
     tau_base by itself: fixing comes only from the term gated by the official tau_base failure."""
@@ -188,23 +202,25 @@ def corr_loss(S_g: torch.Tensor, S_base: torch.Tensor, targets: Dict[str, torch.
     logs, terms = {}, {}
     if float(w.get("gt", 0.0)) > 0:
         od = targets["corridor_occ_dist"]
-        hv = front_hinge(S_g, od, "dist", gt_margin)
+        hv = front_hinge(S_g, od, "dist", gt_margin, rear_mask=rear_mask)
         with torch.no_grad():
-            hb = front_hinge(S_base, od, "dist", gt_margin)
+            hb = front_hinge(S_base, od, "dist", gt_margin, rear_mask=rear_mask)
         terms["gt"] = F.relu(hv - hb).mean(-1)
         if fix_source == "gt":
-            terms["gt"] = terms["gt"] + base_fail.float() * hv.mean(-1)
+            hf = hv if S_fix is None else front_hinge(S_fix, od, "dist", gt_margin, rear_mask=rear_mask)
+            terms["gt"] = terms["gt"] + base_fail.float() * hf.mean(-1)
         logs["v6c/frac_gt_worse"] = (((hv - hb) > 0).any(-1).float() * v).sum() / nv
     if float(w.get("teacher", 0.0)) > 0 and teacher_occ is not None and fix_source == "teacher":
-        hv = front_hinge(S_g, teacher_occ, "prob", teacher_margin)
+        hv = front_hinge(S_g, teacher_occ, "prob", teacher_margin, rear_mask=rear_mask)
         with torch.no_grad():
-            hb = front_hinge(S_base, teacher_occ, "prob", teacher_margin)
+            hb = front_hinge(S_base, teacher_occ, "prob", teacher_margin, rear_mask=rear_mask)
         tw = teacher_discount ** torch.arange(hv.shape[-1], device=hv.device, dtype=hv.dtype)
         tw = tw / tw.sum()
-        terms["teacher"] = (F.relu(hv - hb) * tw).sum(-1) + base_fail.float() * (hv * tw).sum(-1)
+        hf = hv if S_fix is None else front_hinge(S_fix, teacher_occ, "prob", teacher_margin, rear_mask=rear_mask)
+        terms["teacher"] = (F.relu(hv - hb) * tw).sum(-1) + base_fail.float() * (hf * tw).sum(-1)
         logs["v6c/frac_teacher_worse"] = (((hv - hb) > 0).any(-1).float() * v).sum() / nv
     if float(w.get("road", 0.0)) > 0:
-        terms["road"] = road_hinge(S_g, targets["corridor_sdf"])
+        terms["road"] = road_hinge(S_g, targets["corridor_sdf"], rear_mask=rear_mask)
     if float(w.get("comfort", 0.0)) > 0:
         terms["comfort"] = comfort_hinge(S_g)
     if float(w.get("ec", 0.0)) > 0:

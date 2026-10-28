@@ -252,6 +252,18 @@ def train_fields(ts: TeacherSet, data_by_fold, args, dev, log):
             train_field_copy(ts, kind, f, data_by_fold[f], args, dev, log)
 
 
+PLATT_SEED = 17
+
+
+def _platt_loader(ds, args, f: int):
+    """the Platt fits read the first platt_batches batches of a SHUFFLED loader (fixed seed per copy).  The packed token
+    list is sorted by city (Las Vegas first, 62,875 of 85,109), so the unshuffled loader of the 10-28 run fitted every
+    Platt map on Las Vegas tokens of 21-25 logs only (10-28 review)"""
+    g = torch.Generator().manual_seed(PLATT_SEED + f)
+    return torch.utils.data.DataLoader(ds, batch_size=args.batch, shuffle=True, generator=g, num_workers=args.workers,
+                                       worker_init_fn=_worker_init)
+
+
 @torch.no_grad()
 def fit_platt_occ(ts: TeacherSet, data_by_fold, args, dev, log, n_px: int = 4096):
     """OOF: copy f on fold 1 - f tokens; logistic regression of GT occupancy on the logit, per time bin.
@@ -267,7 +279,7 @@ def fit_platt_occ(ts: TeacherSet, data_by_fold, args, dev, log, n_px: int = 4096
     npos_all = [0.0] * nb
     nall = [0.0] * nb
     for f in range(2):
-        dl = torch.utils.data.DataLoader(data_by_fold[1 - f], batch_size=args.batch, num_workers=args.workers)
+        dl = _platt_loader(data_by_fold[1 - f], args, f)
         for n, bt in enumerate(dl):
             if n >= args.platt_batches:
                 break
@@ -428,7 +440,7 @@ def fit_platt_te_off(ts: TeacherSet, data_by_fold, anchors, args, dev, log):
     t21 = N.T21.to(dev)
     kb = ts.platt_ovl.bins(t21)
     for f in range(2):
-        dl = torch.utils.data.DataLoader(data_by_fold[1 - f], batch_size=args.batch, num_workers=args.workers)
+        dl = _platt_loader(data_by_fold[1 - f], args, f)
         for n, bt in enumerate(dl):
             if n >= args.platt_batches:
                 break

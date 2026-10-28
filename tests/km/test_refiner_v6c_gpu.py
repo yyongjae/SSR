@@ -102,3 +102,34 @@ def test_gpu_training_step_val_then_train(stage):
         a.eval()
         pe2 = a.forward({k: v.clone() for k, v in f.items()})
     assert torch.equal(pe2["trajectory"], pe2["v6c_out"].to(pe2["trajectory"].dtype))
+
+
+def test_two_grad_tracks_in_one_forward_match_eager():
+    """10-28: v6c_loss tracks tau_v6 (slot 0, in the forward) and the lateral-only fixing path (V6C_FIX_SLOT) with
+    grad in the same step.  A graphed callable's backward reads its static buffers, so the second call must not share
+    the first one's graph; the gradients have to equal the eager tracker's (the smoke with both on slot 0 went NaN)."""
+    from navsim.agents.para_ssr.modules import torch_tracker as TT
+    from navsim.agents.para_ssr.refiner_v6c import hook as H
+    from navsim.agents.para_ssr.refiner_v6c import nets as N
+    dev = _dev()
+    tt = torch.arange(1, 9, dtype=torch.float32, device=dev) * 0.5
+    tau = torch.stack([10 * tt, 0.05 * tt ** 2, 0.01 * tt], -1)[None].repeat(4, 1, 1)
+    init = torch.cat([torch.full((4, 1), 10.0, device=dev), torch.zeros(4, 6, device=dev)], -1)
+
+    def run(graph: bool):
+        ctrl = torch.zeros(4, 12, device=dev)
+        ctrl[:, :6] = -0.4
+        ctrl[:, 6:] = 0.3
+        ctrl.requires_grad_()
+        lat = torch.cat([torch.zeros_like(ctrl[:, :6]), ctrl[:, 6:]], -1)
+        p_full = N.decode_v6(tau, ctrl, init[:, 0])["traj"]
+        p_lat = N.decode_v6(tau, lat, init[:, 0])["traj"]
+        if graph:
+            S_g, S_f = H._trk(p_full, init), H._trk(p_lat, init, slot=H.V6C_FIX_SLOT)
+        else:
+            S_g, S_f = TT._track(p_full, init, True, False), TT._track(p_lat, init, True, False)
+        (S_g[..., :2].sum() + 3.0 * S_f[..., 1].pow(2).sum()).backward()
+        return ctrl.grad
+    g_graph, g_eager = run(True), run(False)
+    assert torch.isfinite(g_graph).all()
+    assert torch.allclose(g_graph, g_eager, rtol=1e-3, atol=1e-4), (g_graph - g_eager).abs().max()

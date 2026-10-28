@@ -337,3 +337,41 @@ def test_warmup_length_is_exact(batch):
         a.compute_loss(f, t, p)
         seen.append(float(a.latest_logs["v6c/warmup"]))
     assert seen == [1.0, 0.0]
+
+
+def test_rc_adam_reset_and_lon_penalty(batch):
+    """10-28 review: v6c_reset_rc_adam drops the R-C / R-J AdamW state once, on the first micro-batch past the warm-up
+    (the stale step count of the zero_touch warm-up amplified the first real update); v6c_lon_pos_penalty adds
+    relu(z_lon) in mode A and its gradient reaches the corrector"""
+    a = build_agent(0, v6c=True, v6c_stage="D", v6c_warmup_steps=1, v6c_reset_rc_adam=True, v6c_lon_pos_penalty=1.0,
+                    v6c_teacher_ckpt="", v6c_fix_source="gt", v6c_kd=False)
+    a.train()
+    opt = a.get_optimizers()["optimizer"]
+    rc_rj = list(a.para_ssr_model.v6c.rc.parameters()) + list(a.para_ssr_model.v6c.rj.parameters())
+    other = next(p for p in a.para_ssr_model.v6c.re.parameters())
+    for p in rc_rj + [other]:
+        opt.state[p] = {"step": torch.tensor(3325.0), "exp_avg": torch.zeros_like(p), "exp_avg_sq": torch.zeros_like(p)}
+    f, t = _fresh(batch)
+    a.compute_loss(f, t, a.forward(f, t))                                             # warm-up micro-batch: kept
+    assert all(p in opt.state for p in rc_rj)
+    with torch.no_grad():
+        a.para_ssr_model.v6c.rc.out.bias.fill_(0.05)                                  # every control above 0
+    f, t = _fresh(batch)
+    p = a.forward(f, t)
+    loss = a.compute_loss(f, t, p)
+    assert not any(q in opt.state for q in rc_rj) and other in opt.state
+    assert float(a.latest_logs["v6c/lon_pos_pen"]) > 0
+    loss.backward()
+    assert bool((a.para_ssr_model.v6c.rc.out.bias.grad[:6] > 0).all())                 # descent lowers every z_lon
+    opt.state[rc_rj[0]] = {"step": torch.tensor(1.0)}
+    f, t = _fresh(batch)
+    a.compute_loss(f, t, a.forward(f, t))                                             # only once per process
+    assert rc_rj[0] in opt.state
+    # a later resume (new process: flag unset) keeps real moments, drops only stale ones (review 10-28)
+    a._v6c_adam_reset_done = False
+    real = {"step": torch.tensor(9.0), "exp_avg": torch.ones_like(rc_rj[1]), "exp_avg_sq": torch.ones_like(rc_rj[1])}
+    opt.state[rc_rj[1]] = real
+    opt.state[rc_rj[2]] = {"step": torch.tensor(9.0), "exp_avg": torch.zeros(3), "exp_avg_sq": torch.ones(3)}
+    f, t = _fresh(batch)
+    a.compute_loss(f, t, a.forward(f, t))
+    assert opt.state[rc_rj[1]] is real and rc_rj[2] not in opt.state                  # wrong shape -> dropped

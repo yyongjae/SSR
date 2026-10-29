@@ -38,8 +38,9 @@
 #            extra v6c knobs: V6C_FIX=gt (GT fixing term), V6C_KD=false (no K-E / K-M), V6C_MODE=A, V6C_HARM=EH|H,
 #            V6C_DISCOUNT=0.93 (arms, report 124 §4-3).  Control B of report 124 = V6C_FIX=gt V6C_KD=false.
 #   LR / MAXEP (km 10/25): agent.lr and the cosine schedule length (default 1e-4 / 30)
-#   EXACT2_DIR (10/29): the v2 (EPDMS) tables of the scorer labels, default $KM_ROOT/exact2 (agent rows = the v1 ones);
-#                  $KM_ROOT/exact2_v22 = the v2.2 agent rows (tools build_exact2_v22.py, rebuilt 10-28)
+#   EXACT2_DIR (10/29): the v2 (EPDMS) tables of the scorer labels, default $KM_ROOT/exact2.  Since 10-29 03:30 KST
+#                  exact2 holds the v2.2 agent rows (old v1 rows: exact2_v1_backup; exact2_v22 = symlink to exact2)
+#   pc_range z (10/29): c64/cf variants place the camera pillars at z [-1, 3] (was [-2, 2], report 129; same as km cf_v15_fix)
 #   smoke: EPOCHS=1 LIMIT_TRAIN=40 LIMIT_VAL=5 VAL_EVERY=1 WANDB=false
 #   SELECT_RULE (km 10/17): trajectory the agent submits at inference, default pred_multiply_t0.25 (corridor); v2 = no corridor
 set -uo pipefail
@@ -98,7 +99,7 @@ case $VAR in
   c64|c64_traj|pert|mix|cf|cf_seg|cf_v15|cf_seg_v15|cf_vec_v15|cf_seg_v15_v6c|cf_seg_v6cP) V31C=(); for x in "${V31[@]}"; do [[ $x == *corridor_verdict_weight* ]] || V31C+=("$x"); done
            EXTRA=("${V31C[@]}" ++agent.config.corridor_format=c64
            ++agent.config.corridor_dir=$KM_ROOT/corridor64
-           "++agent.config.pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]" "++agent.config.map_pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]"
+           "++agent.config.pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]" "++agent.config.map_pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]"
            ++agent.config.bev_h=100 ++agent.config.cand_scorer_weight=1.0 ++agent.config.exact_dir=$KM_ROOT/exact
            ++agent.config.cand_official=true ++agent.config.exact2_dir=${EXACT2_DIR:-$KM_ROOT/exact2}
            ++agent.config.cand_scorer_fields=$([ "$VAR" = c64_traj ] && echo false || echo true))

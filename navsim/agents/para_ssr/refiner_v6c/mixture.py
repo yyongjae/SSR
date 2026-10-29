@@ -8,13 +8,15 @@ def path_mixture(anchors: torch.Tensor, hum: torch.Tensor, hvalid: torch.Tensor,
                  n_anchor: int = 32, n_rule: int = 32, n_gt: int = 16) -> torch.Tensor:
     """report 124 §3-2 / 122 §11: per token 32 anchors (8 nearest the human path, 8 mid, 16 random), 32 rule speed
     variants of the 8 nearest (time scaling 0.6 / 0.8 / 1.2 / and a 1 m/s^2-like late brake), 16 GT variants (lateral
-    +-0.5 / +-1.0 m, speed 0.8 / 1.2).  anchors [K, 8, 3]; hum [B, 8, 3] -> [B, 80, 8, 3] (ego frame)"""
+    +-0.5 / +-1.0 m, speed 0.8 / 1.2).  anchors [K, 8, 3]; hum [B, 8, 3] -> [B, 80, 8, 3] (ego frame).
+    gen: a private CPU generator (the global RNG is untouched); the 8 mid anchors (ranks 8..63) are drawn per token
+    (report 129 A40 / A73; one draw was shared by the batch)"""
     b = hum.shape[0]
     k = anchors.shape[0]
     d = torch.cdist(hum.reshape(b, -1), anchors.reshape(k, -1).to(hum))                    # [B, K]
     order = d.argsort(-1)
     near = order[:, :8]
-    mid = order[:, 8 + torch.randperm(56, generator=gen)[:8]]
+    mid = order[:, 8:64].gather(1, torch.rand(b, 56, generator=gen).argsort(1)[:, :8].to(order.device))
     rnd = torch.randint(0, k, (b, n_anchor - 16), generator=gen)
     sel = torch.cat([near, mid, rnd.to(near)], 1)
     A = anchors.to(hum)[sel]                                                               # [B, 32, 8, 3]

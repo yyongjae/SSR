@@ -54,22 +54,10 @@ def _bev_sample(bev: torch.Tensor, bev_h: int, bev_w: int, fwd_m: float, pts: to
     return F.grid_sample(img, g.to(img.dtype), mode="bilinear", padding_mode="zeros", align_corners=False)[..., 0].transpose(1, 2)
 
 
-def _behind_in_band(pts: torch.Tensor) -> torch.Tensor:
-    """points behind the ego (x < 0) inside the lateral band, which CH._sample's pre-10-29 mask (v <= 1) & (|u| <= 1)
-    counted as in range; u as in CH._sample"""
-    u = (-pts[..., 1] + 32.0) / 64.0 * 2 - 1
-    return (pts[..., 0] < 0) & (u.abs() <= 1)
-
-
-def field_readout(st: torch.Tensor, sdf: torch.Tensor, occ: torch.Tensor, rear_mask: bool = False,
-                  legacy_rear: bool = False) -> torch.Tensor:
+def field_readout(st: torch.Tensor, sdf: torch.Tensor, occ: torch.Tensor) -> torch.Tensor:
     """predicted corridor along the tracked footprints, per 0.1 s step -> [B, K, 41, 3]: (min corner SDF (m),
     max occupancy under the box (15 points), max occupancy under the box shifted by speed * dt, dt 0.3/0.6/0.9 s,
-    vs the plane of t + dt); step 0 = 0 occupancy.  sdf [B, H, 200], occ [B, P, H, 200] probabilities.
-    rear_mask (refiner v6c, 10-28): points behind the ego (x < 0, outside the front-only field) count as out of range;
-    CH._sample only checked x <= H * 0.32 m before km's 10-29 fix (cf_v15_fix) and its border padding repeats row 0 there.
-    legacy_rear (refiner v6c T-E / T-M only): the pre-fix rule, points behind the ego count as in range (the rule
-    teachers_te.pt was trained and Platt-fitted with)."""
+    vs the plane of t + dt); step 0 = 0 occupancy.  sdf [B, H, 200], occ [B, P, H, 200] probabilities."""
     b, k = st.shape[:2]
     dev = st.device
     x, y, h, spd = st[..., 0], st[..., 1], st[..., 2], torch.hypot(st[..., 3], st[..., 4])
@@ -78,10 +66,6 @@ def field_readout(st: torch.Tensor, sdf: torch.Tensor, occ: torch.Tensor, rear_m
     cy = dconst((CH.HALF_W, -CH.HALF_W, -CH.HALF_W, CH.HALF_W), dev)
     pc = torch.stack([x[..., None] + c * cx - s * cy, y[..., None] + s * cx + c * cy], -1)       # [B, K, 41, 4, 2]
     v, inr = CH._sample(sdf.float()[:, None], pc.reshape(b, 1, -1, 2))
-    if legacy_rear:
-        inr = inr | _behind_in_band(pc.reshape(b, 1, -1, 2))
-    if rear_mask:
-        inr = inr & (pc.reshape(b, 1, -1, 2)[..., 0] >= 0)
     sdf_min = torch.where(inr, v, torch.full_like(v, CH.CLIP)).reshape(b, k, 41, 4).amin(-1)
     fx, fy = torch.meshgrid(torch.linspace(-CH.REAR, CH.FRONT, 5, device=dev),
                             torch.linspace(-CH.HALF_W, CH.HALF_W, 3, device=dev), indexing="ij")
@@ -96,10 +80,6 @@ def field_readout(st: torch.Tensor, sdf: torch.Tensor, occ: torch.Tensor, rear_m
         q = q.permute(0, 2, 1, 3, 4).reshape(b, 40, -1, 2)
         pl = (steps + dd - 1).clamp(max=npl - 1) if npl >= 40 else ((steps + dd).clamp(max=40) - 1) // (40 // npl)
         val, ti = CH._sample(occ.float()[:, pl], q)
-        if legacy_rear:
-            ti = ti | _behind_in_band(q)
-        if rear_mask:
-            ti = ti & (q[..., 0] >= 0)
         val = torch.where(ti, val, torch.zeros_like(val)).reshape(b, 40, k, 15).amax(-1).permute(0, 2, 1)
         if dd == 0:
             occ1 = val

@@ -14,7 +14,8 @@
   by max class sigmoid: det_box f16 [N, 64, 10] (metric x right / y fwd, logW, logL, z, logH, sin, cos, vx, vy),
   det_cls f16 [N, 64, 7] sigmoid, det_traj f16 [N, 64, 6, 8, 2] per-step offsets (SSR axes, 0.5 s),
   det_tcls f16 [N, 64, 6] mode logits; done file detdone_<i>.npy
-Rows = <root>/packed/<split>/tokens.parquet.  Resumable; --part i/n shards the rows.
+Rows = <root>/packed/<split>/tokens.parquet.  Resumable; --part i/n shards the rows.  A resume that has to create a
+new output file (other flags than the first dump, e.g. --v6 added) while rows are already done is refused (fresh --out).
 
   CUDA_VISIBLE_DEVICES=0 $PY tools/corridor/dump_corr_model.py --run-dir <km_runs/corr30/RUN> --ckpt <ckpt> \
       --split navtrain_val --out <dir> [--part 0/2] [--limit N]
@@ -38,6 +39,14 @@ ROOT = os.environ.get("KM_CORR_ROOT", "/home/external-user/ssd/kyungmin_ck/km_ru
 SPEC = {"traj": (np.float16, (256, 8, 3)), "sim": (np.float16, (5, 256)), "im": (np.float16, (256,)),
         "final": (np.float32, (256,)), "v2traj": (np.float32, (8, 3)), "status": (np.float32, (4,)),
         "csdf": (np.float16, (100, 200)), "cocc": (np.uint8, (8, 100, 200))}
+
+
+def _resume_guard(created, done) -> None:
+    """refiner v6c (A36): rows already marked done were dumped without the files that had to be created now (their
+    rows would stay zero, e.g. v6_base / v6_traj of an old non --v6 dump, and select_npz would submit them)"""
+    if created and np.asarray(done).any():
+        raise SystemExit(f"dump_corr_model: OUT already holds finished rows ({int(np.asarray(done).sum())}) but "
+                         f"{', '.join(created)} had to be created (a dump with other flags?): use a fresh --out")
 
 
 def main(argv=None) -> int:
@@ -68,6 +77,10 @@ def main(argv=None) -> int:
     ap.add_argument("--select-rule", default=None,
                     help="override corridor_select_rule of the run config (km 10/17; default: the run's own)")
     a = ap.parse_args(argv)
+    if a.v6 and a.select_rule not in (None, "cand_official"):    # refiner v6c (A51): tau_base = the cand_official pick
+        print(f"dump_corr_model: --v6 needs the run's cand_official selection, not --select-rule {a.select_rule}",
+              file=sys.stderr)
+        return 2
     global SPEC
     if a.traj32:
         SPEC["traj"] = (np.float32, (256, 8, 3))
@@ -106,15 +119,21 @@ def main(argv=None) -> int:
     n = len(tdf)
     d = Path(a.out) / a.split
     d.mkdir(parents=True, exist_ok=True)
+    pi, pn = map(int, a.part.split("/"))
+    kind = "detdone" if a.det else "done"
+    fd = d / f"{kind}_{pi}.npy"
+    done = np.load(fd) if fd.exists() else np.zeros(n, bool)
+    done_any = done.copy()                       # every part's rows: the readers take the union of done_*.npy
+    for f in d.glob(f"{kind}_*.npy"):
+        done_any |= np.load(f)
+    created = [k for k in SPEC if not (d / f"{k}.npy").exists()]
+    _resume_guard(created, done_any)             # before creating anything: a refused resume leaves OUT unchanged
     arr = {}
     for k, (dt, sh) in SPEC.items():
         f = d / f"{k}.npy"
-        if not f.exists():
+        if k in created:
             np.lib.format.open_memmap(f, "w+", dt, (n,) + sh).flush()
         arr[k] = np.load(f, mmap_mode="r+")
-    pi, pn = map(int, a.part.split("/"))
-    fd = d / f"{'detdone' if a.det else 'done'}_{pi}.npy"
-    done = np.load(fd) if fd.exists() else np.zeros(n, bool)
     pos = np.arange(n)[np.arange(n) % pn == pi]
     if a.subset:
         pos = np.intersect1d(pos, np.random.default_rng(0).choice(np.arange(n), a.subset, replace=False))
@@ -188,6 +207,8 @@ def main(argv=None) -> int:
         out = {"traj": traj, "sim": pr["sim_rewards"], "im": pr["im_rewards"], "final": pr["plan_final_rewards"],
                "v2traj": pr.get("trajectory_v2", pr["trajectory"]), "status": fg["status_feature"][:, ncmd:ncmd + 4],
                "msel": pr.get("plan_select_index", pr["plan_final_rewards"].argmax(1))}
+        if a.v6 and "v6c_idx" in pr:   # refiner v6c (A51): tau_base's index (= plan_select_index, cand_official)
+            out["msel"] = pr["v6c_idx"]
         if not a.no_fields:
             out.update({"csdf": pr["corridor_sdf"], "cocc": torch.sigmoid(pr["corridor_occ"].float()) * 255})
         if a.cand:

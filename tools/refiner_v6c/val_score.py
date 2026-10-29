@@ -7,8 +7,9 @@ Per token it scores three trajectories with the official simulator + scorer (too
   v6    tau_v6    (v6_traj.npy)
   out   the submitted one (mode B: v6_switch ? v6 : base; the dump records the forward's switch)
 and reports the pre-registered endpoints of report 124 §5: mean PDMS of each, the paired difference v6 - base and
-out - base with a token bootstrap CI, the safety layer (tokens where base passes NC, DAC and TTC) difference, the EP
-change on the safety layer (2nd endpoint), and the switch rate.  Also the official v1 driving direction compliance
+out - base with a log-cluster bootstrap CI (tokens of one log are correlated: val_epdms.log_bootstrap resamples logs;
+the i.i.d. token CI is kept as ci95_token), the safety layer (tokens where base passes NC, DAC and TTC) difference, the
+EP change on the safety layer (2nd endpoint), and the switch rate.  Also the official v1 driving direction compliance
 (DDC, a multiplicative PDMS term) of each trajectory and how many tokens change DDC between base and v6 / out: R-J's
 expected PDMS assumes DDC = 1 (report 126 §2-7), so this measures that assumption.  EPDMS / EC: val_epdms.py.
 
@@ -28,6 +29,8 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
+
+from tools.refiner_v6c.val_epdms import log_bootstrap  # noqa: E402  (numpy / pandas only)
 
 TERMS = ("pdms", "nc", "dac", "ep", "ttc", "comfort", "ddc")       # ddc appended: the indices 0..5 above are kept
 
@@ -52,6 +55,16 @@ def boot_ci(x: np.ndarray, n: int = 2000, seed: int = 0):
         return float("nan"), float("nan")
     m = np.array([x[rng.integers(0, len(x), len(x))].mean() for _ in range(n)])
     return float(np.percentile(m, 2.5)), float(np.percentile(m, 97.5))
+
+
+def paired_ci(diff: np.ndarray, logs: np.ndarray, n: int = 2000, seed: int = 0) -> dict:
+    """mean and 95 % CI of a paired difference, x 100 (A52): ci95 = log-cluster bootstrap over the tokens' logs
+    (val_epdms.log_bootstrap), ci95_token = the i.i.d. token bootstrap (too narrow: tokens of a log are correlated)"""
+    b = log_bootstrap(diff, logs, n, seed)
+    lo, hi = boot_ci(np.asarray(diff, np.float64), n, seed)
+    return {"mean": round(100 * b["mean"], 3), "ci95": [round(100 * b["lo"], 3), round(100 * b["hi"], 3)],
+            "ci_method": "log-cluster bootstrap", "n_logs": b["n_logs"],
+            "ci95_token": [round(100 * lo, 3), round(100 * hi, 3)]}
 
 
 def main(argv=None) -> int:
@@ -86,13 +99,13 @@ def main(argv=None) -> int:
     ok = np.array([not isinstance(x, str) for x in res])
     R = np.array([x for x in res if not isinstance(x, str)], np.float64)                 # [n_ok, 2, 7]
     swo = sw[ok]
+    lg = logs[rows][ok]                                                                  # the clusters of paired_ci
     out = np.where(swo[:, None], R[:, 1], R[:, 0])
     summ = {"split": a.split, "tokens": int(len(rows)), "scored": int(ok.sum()), "switch_rate": float(swo.mean())}
     for nm, M in (("base", R[:, 0]), ("v6", R[:, 1]), ("out", out)):
         summ[nm] = dict(zip(TERMS, np.round(100 * M.mean(0), 3).tolist()))
     for nm, M in (("v6_minus_base", R[:, 1, 0] - R[:, 0, 0]), ("out_minus_base", out[:, 0] - R[:, 0, 0])):
-        lo, hi = boot_ci(M)
-        summ[nm] = {"mean": round(100 * float(M.mean()), 3), "ci95": [round(100 * lo, 3), round(100 * hi, 3)]}
+        summ[nm] = paired_ci(M, lg)
     safe = (R[:, 0, 1] == 1) & (R[:, 0, 2] == 1) & (R[:, 0, 4] == 1)                     # base passes NC, DAC, TTC
     dsafe = out[safe, 0] - R[safe, 0, 0]
     summ["safety_layer"] = {"frac": float(safe.mean()), "out_minus_base_pdms": round(100 * float(dsafe.mean()), 3)
@@ -104,14 +117,15 @@ def main(argv=None) -> int:
                    "out_lt1_frac": float((out[:, di] < 1).mean())}
     for nm, M in (("v6", R[:, 1, di]), ("out", out[:, di])):
         dd = M - R[:, 0, di]
-        lo, hi = boot_ci(dd)
-        summ["ddc"][f"{nm}_minus_base"] = {"mean": round(100 * float(dd.mean()), 3), "ci95": [round(100 * lo, 3),
-                                           round(100 * hi, 3)], "n_differ": int((dd != 0).sum()),
+        summ["ddc"][f"{nm}_minus_base"] = {**paired_ci(dd, lg), "n_differ": int((dd != 0).sum()),
                                            "n_lower": int((dd < 0).sum()), "n_higher": int((dd > 0).sum())}
     if (~ok).any():
         summ["first_error"] = [x for x in res if isinstance(x, str)][0]
     print(json.dumps(summ, indent=1))
     json.dump(summ, open(d / f"v6_val_{a.n}.json", "w"), indent=1)
+    if (~ok).any():                                                                      # like score_npz.py: a mean
+        print(f"ERROR: {int((~ok).sum())} tokens failed to score", file=sys.stderr)       # over a subset fails loudly
+        return 1
     return 0
 
 

@@ -410,6 +410,8 @@ class ParaSSRConfig:
     # ------------------------------------------------------------------ #
     # refiner v6c (SSR/report/124_refiner_v6c_design_on_corridor_cf.md; navsim/agents/para_ssr/refiner_v6c/).
     # Off by default: no module is built and the forward / loss are bit-identical to the baseline.
+    # The v6c parameters train in the base AdamW param group (lr, weight_decay, WarmupCosLR); there is no separate
+    # group (corrects report 124 D9 #6; report 129 A48).
     # ------------------------------------------------------------------ #
     v6c: bool = False
     v6c_stage: str = "D"              # P: the baseline is frozen (no_grad, BN / dropout / GridMask in eval, cf copy
@@ -430,8 +432,8 @@ class ParaSSRConfig:
     v6c_lon_target_weight: float = 1.0
     v6c_lon_fix_weight: float = 4.0   # weight of a fixable failing sample vs a passing one (target 0)
     v6c_rear_mask: Optional[bool] = None  # student reads / L_corr hinges: points behind the ego (x < 0) are out of range
-                                      # (10-28 review; CH._sample's border padding repeated row 0); None = True except
-                                      # v6c_rc_out 'shared' (the 10-27 checkpoints, old rule); T-E keeps the old rule
+                                      # (10-28 review); redundant since 2e674b4 (CH._sample masks x < 0 itself, so
+                                      # every value reads the same); kept so old run configs load (report 129)
     v6c_h_arm: str = "E"              # R-C input: E (default) | EH (E + H detached) | H (H only)
     v6c_switch_delta: float = 0.0     # R-J switch margin on the expected PDMS (V9)
     v6c_switch_kappa: float = -1.0    # EC-proxy guard on the switch (< 0: off = kappa infinite)
@@ -457,7 +459,9 @@ class ParaSSRConfig:
     v6c_teacher_ckpt: str = ""        # stage-T teacher checkpoint (T-D / T-M / T-E fold copies + Platt); "" = none
     v6c_seed: int = 6                 # v6c init under fork_rng (the baseline init / RNG stream stay unchanged)
     v6c_warmup_steps: int = 0         # stage D: micro-batches of R-E-only warm-up on the path mixture (0 = off;
-                                      # report 124 §4-3: epochs 0-4 = 5 * 85109 / (4 * NG) micro-batches per rank)
+                                      # report 124 §4-3: exactly epochs 0-4 = 5 * ceil(ceil(85109 / NG) / 4)
+                                      # micro-batches per rank, 26600 at NG = 4; the R-C / R-J AdamW reset then
+                                      # fires on the first micro-batch of an accumulation window, report 129 A48)
     # gt | teacher.  "teacher" supervises the map head with the ReSMap vector
     # head (arm 3: teacher knowledge through the label path).  Map *evaluation*
     # always uses GT.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""Official NAVSIM v2.2 one-stage EPDMS (with the two-frame extended comfort EC) of refiner v6c on navtrain_val.
+"""Official NAVSIM v2.2 one-stage EPDMS (with the two-frame extended comfort EC) of refiner v6c on navtrain_val or
+navtest (--split, table SPLITS).
 
 The scorer path is the one of report 76 / 119 (read-only reuse): NAVSIM v2.2 at /workspace/navsim_workspace/navsim
 (@0a380a9, post-fix pdm_score.py), non-reactive, `run_pdm_score_one_stage.py` with the precomputed agent of
@@ -18,6 +19,13 @@ Submissions (the four outputs of the 10-27 feedback; report 126 §9):
 EC compares the current frame's simulated plan with the previous adjacent frame's (same log, start-time gap <= 0.55 s
 among the evaluated tokens, run_pdm_score_one_stage.infer_start_adjacent_mapping); frames without one get EC weight 0.
 
+navtest (A49): the same scorer call as km's corr30_cf_v15_fix/eval_ep5/run_eval_ep5.sh (its navtest EPDMS 86.81 is
+comparable): metric cache perception_eval/epdms/metric_cache_v22_navtest, the stock split navtest (data_split test,
+navsim_logs/test/test, no A_epdms config on the search path) and the start times of A_epdms/sel/adjacent_navtest.parquet
+(all 12,146 tokens); a subset gets a quoted split with data_split test.  The split is written into pkl_info.json by
+`pkl` and read back by `run` / `analyze`; navtest outputs are named epdms_navtest_* (navtrain_val keeps epdms_val_*,
+so its old csvs are reused).  tools/corridor/score_npz.py builds its scorer call with scorer_cmd().
+
   # 1. pickles from a dump of every navtrain_val token (dump_corr_model.py --v6 --cand --no-fields --traj32)
   $PY tools/refiner_v6c/val_epdms.py pkl --dump <dump> --out <out> [--c0-dump <c0 dump>]
   # 2. official scorer, one run per submission (CPU, ray, nice); a dump with fewer tokens gets its own quoted split
@@ -26,6 +34,8 @@ among the evaluated tokens, run_pdm_score_one_stage.infer_start_adjacent_mapping
   $PY tools/refiner_v6c/val_epdms.py analyze --out <out>
   # or all three
   $PY tools/refiner_v6c/val_epdms.py all --dump <dump> --out <out> [--c0-dump ...] [--threads 16]
+  # navtest (eval.sh, a v6c run): the submission out + base / v6 + the same model's v2 (select_npz rule v2)
+  $PY tools/refiner_v6c/val_epdms.py all --split navtest --dump <navtest dump> --out <out> --npz v2=<sel_v2.npz>
 """
 from __future__ import annotations
 
@@ -38,7 +48,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -55,6 +65,16 @@ MET = ["no_at_fault_collisions", "drivable_area_compliance", "driving_direction_
        "ego_progress", "time_to_collision_within_bound", "lane_keeping", "history_comfort", "two_frame_extended_comfort"]
 SHORT = dict(zip(MET, ["NC", "DAC", "DDC", "TLC", "EP", "TTC", "LK", "HC", "EC"]))
 PAIRS = (("out", "base"), ("v6", "base"), ("out", "c0"), ("base", "c0"), ("v6", "c0"))
+# per evaluation split (A49): metric cache, full split (navtrain_val: the quoted FULL_SPLIT; navtest: the stock split),
+# navsim logs, adjacency table (its tokens = the full split), scene data_split of a subset, extra hydra search path
+SPLITS = {
+    "navtrain_val": dict(metric_cache=METRIC_CACHE, full_split=FULL_SPLIT,
+                         logs=NAVSIM_DATA / "navsim_logs/trainval/trainval", adj=ADJ_FULL, data_split="trainval",
+                         searchpath=[f"file://{A_EPDMS}/config"]),
+    "navtest": dict(metric_cache=PE_EPDMS / "metric_cache_v22_navtest", full_split="navtest",
+                    logs=NAVSIM_DATA / "navsim_logs/test/test", adj=A_EPDMS / "sel" / "adjacent_navtest.parquet",
+                    data_split="test", searchpath=[]),
+}
 
 
 def kst() -> str:
@@ -62,6 +82,21 @@ def kst() -> str:
 
 
 # ------------------------------------------------------------------------------------------------------ helpers
+def table(split: str) -> dict:
+    """SPLITS[split]; the navtrain_val paths are read from the module constants at call time (tests patch ADJ_FULL)"""
+    if split not in SPLITS:
+        raise KeyError(f"no EPDMS table for split {split!r}; known {sorted(SPLITS)}")
+    t = dict(SPLITS[split])
+    if split == "navtrain_val":
+        t.update(metric_cache=METRIC_CACHE, full_split=FULL_SPLIT, adj=ADJ_FULL)
+    return t
+
+
+def prefix(split: str) -> str:
+    """output name prefix: epdms_val for navtrain_val (unchanged, old csvs are reused), epdms_<split> otherwise"""
+    return "epdms_val" if split == "navtrain_val" else f"epdms_{split}"
+
+
 def log_bootstrap(diff: np.ndarray, logs: np.ndarray, n_boot: int = 2000, seed: int = 0, alpha: float = 0.05) -> dict:
     """Paired log-cluster bootstrap of mean(diff) (= tools/ck/eval_ck.log_bootstrap, copied to avoid its imports):
     resample logs with replacement, ratio estimator over tokens; NaN rows dropped."""
@@ -83,7 +118,8 @@ def log_bootstrap(diff: np.ndarray, logs: np.ndarray, n_boot: int = 2000, seed: 
 
 def adjacency(tokens: List[str], adj_full: Optional[Path] = None) -> pd.DataFrame:
     """previous adjacent token among `tokens` (official infer_start_adjacent_mapping: same log, sorted by start time,
-    consecutive gap <= 0.55 s), from the start times of the report-76 adjacency table (all 18,179 val tokens)."""
+    consecutive gap <= 0.55 s), from the start times of the report-76 adjacency table (all 18,179 val tokens; navtest:
+    pass SPLITS['navtest']['adj'])."""
     adj_full = Path(adj_full or ADJ_FULL)
     full = pd.read_parquet(adj_full)[["token", "log_name", "t"]]
     full["token"] = full.token.astype(str)
@@ -176,25 +212,28 @@ def cmd_pkl(a) -> int:
 
 
 # ------------------------------------------------------------------------------------------------------ 2. run
-def split_for(out: Path, toks: List[str], logs: List[str]) -> str:
-    """the full quoted split when the dump covers every val token, else a quoted subset split under <out>/config
-    (tokens and log names single-quoted: OmegaConf parses tokens like 3315880386e45927 as floats otherwise)."""
-    full = pd.read_parquet(ADJ_FULL).token.astype(str)                           # the 18,179 tokens of FULL_SPLIT
+def split_for(out: Path, toks: List[str], logs: List[str], split: str = "navtrain_val") -> str:
+    """the full split of `split` (table SPLITS) when the dump covers every token of its adjacency table, else a quoted
+    subset split under <out>/config with the table's data_split (tokens and log names single-quoted: OmegaConf parses
+    tokens like 3315880386e45927 as floats otherwise)."""
+    T = table(split)
+    full = pd.read_parquet(T["adj"]).token.astype(str)                           # navtrain_val: 18,179 = FULL_SPLIT
     if set(toks) == set(full):
-        return FULL_SPLIT
+        return T["full_split"]
     from omegaconf import OmegaConf
     h = hashlib.md5("\n".join(sorted(toks)).encode()).hexdigest()[:8]
-    name = f"v6c_val_{len(toks)}_{h}_q"
+    tag = "val" if split == "navtrain_val" else split
+    name = f"v6c_{tag}_{len(toks)}_{h}_q"
     C = out / "config" / "train_test_split"
     (C / "scene_filter").mkdir(parents=True, exist_ok=True)
     ul = sorted(set(logs))
-    lines = [f"# refiner v6c val EPDMS subset ({len(toks)} tokens, {len(ul)} logs), quoted",
+    lines = [f"# refiner v6c {tag} EPDMS subset ({len(toks)} tokens, {len(ul)} logs), quoted",
              "_target_: navsim.common.dataclasses.SceneFilter", "_convert_: 'all'",
              "num_history_frames: 4", "num_future_frames: 10", "frame_interval: 1", "has_route: true", "max_scenes: null",
              "log_names:"] + [f"  - '{x}'" for x in ul] + ["tokens:"] + [f"  - '{x}'" for x in toks]
     p = C / "scene_filter" / f"{name}.yaml"
     p.write_text("\n".join(lines) + "\n")
-    (C / f"{name}.yaml").write_text(f"defaults:\n  - scene_filter: {name}\n\ndata_split: trainval\n")
+    (C / f"{name}.yaml").write_text(f"defaults:\n  - scene_filter: {name}\n\ndata_split: {T['data_split']}\n")
     cfg = OmegaConf.load(p)
     assert list(cfg.tokens) == list(toks) and all(isinstance(t, str) for t in cfg.tokens), "token round-trip failed"
     assert list(cfg.log_names) == ul, "log round-trip failed"
@@ -207,9 +246,15 @@ def current_subs(out: Path) -> Dict[str, str]:
     return {k: v["md5"] for k, v in info["subs"].items()}
 
 
-def run_dir(out: Path, sub: str, md5: str) -> Path:
+def split_of(out: Path) -> str:
+    """the split of the LAST `pkl` call (pkl_info.json; navtrain_val when absent: outputs older than SPLITS)"""
+    p = out / "pkl_info.json"
+    return str(json.load(open(p)).get("split", "navtrain_val")) if p.exists() else "navtrain_val"
+
+
+def run_dir(out: Path, sub: str, md5: str, split: str = "navtrain_val") -> Path:
     """scorer output dir of one submission, keyed by its pickle's md5: a csv is reused only for the same pickle"""
-    return out / "exp" / f"epdms_val_{sub}_{md5[:12]}"
+    return out / "exp" / f"{prefix(split)}_{sub}_{md5[:12]}"
 
 
 def csv_of(out: Path, sub: str) -> Optional[Path]:
@@ -217,44 +262,57 @@ def csv_of(out: Path, sub: str) -> Optional[Path]:
     md5 = current_subs(out).get(sub)
     if md5 is None:
         return None
-    base = run_dir(out, sub, md5)
+    base = run_dir(out, sub, md5, split_of(out))
     c = [x for d in sorted(base.parent.glob(base.name + "*")) for x in d.rglob("*.csv")]
     return max(c, key=lambda x: x.stat().st_mtime) if c else None
+
+
+def scorer_cmd(split: str, pkl, exp_root, exp_name: str, output_dir, threads: int, nice: int,
+               extra_searchpath: Sequence[str] = (), tts: Optional[str] = None) -> Tuple[List[str], dict, Path]:
+    """(cmd, env, cwd) of one official v2.2 one-stage scorer run of a {token: f32 [8, 3]} pickle on SPLITS[split]
+    (precomputed agent, ray); tts = the train_test_split to score (default: the split's full one; a subset adds its
+    <out>/config through extra_searchpath).  navtest = km's run_eval_ep5.sh call."""
+    T = table(split)
+    env = {**os.environ, "NAVSIM_DEVKIT_ROOT": str(NAVSIM22), "OPENSCENE_DATA_ROOT": str(NAVSIM_DATA),
+           "NUPLAN_MAPS_ROOT": str(NAVSIM_DATA / "maps"), "NUPLAN_MAP_VERSION": "nuplan-maps-v1.0",
+           "NAVSIM_EXP_ROOT": str(exp_root), "PYTHONPATH": f"{NAVSIM22}:{PE_EPDMS}", "PYTHONDONTWRITEBYTECODE": "1",
+           "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+    sp = ["pkg://navsim.planning.script.config.common", f"file://{PE_EPDMS}/config"] + list(T["searchpath"]) \
+        + list(extra_searchpath)
+    cmd = ["nice", "-n", str(nice), sys.executable, "navsim/planning/script/run_pdm_score_one_stage.py",
+           f"train_test_split={tts or T['full_split']}", f"navsim_log_path={T['logs']}",
+           f"metric_cache_path={T['metric_cache']}", "agent=precomputed_agent", f"agent.traj_pkl={pkl}",
+           f"experiment_name={exp_name}", f"output_dir={output_dir}",
+           "worker=ray_distributed", f"worker.threads_per_node={threads}",
+           "hydra.searchpath=[" + ",".join(sp) + "]"]
+    return cmd, env, NAVSIM22
 
 
 def cmd_run(a) -> int:
     out = Path(a.out).resolve()
     tk = pd.read_parquet(out / "tokens.parquet")
-    split = split_for(out, tk.token.astype(str).tolist(), tk.log.astype(str).tolist())
+    sp_name = split_of(out)
+    split = split_for(out, tk.token.astype(str).tolist(), tk.log.astype(str).tolist(), sp_name)
     cur = current_subs(out)
     subs = [s for s in a.subs.split(",") if s in cur]
     (out / "logs").mkdir(exist_ok=True)
-    env = {**os.environ, "NAVSIM_DEVKIT_ROOT": str(NAVSIM22), "OPENSCENE_DATA_ROOT": str(NAVSIM_DATA),
-           "NUPLAN_MAPS_ROOT": str(NAVSIM_DATA / "maps"), "NUPLAN_MAP_VERSION": "nuplan-maps-v1.0",
-           "NAVSIM_EXP_ROOT": str(out / "exp"), "PYTHONPATH": f"{NAVSIM22}:{PE_EPDMS}", "PYTHONDONTWRITEBYTECODE": "1",
-           "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
-    sp = ["pkg://navsim.planning.script.config.common", f"file://{PE_EPDMS}/config", f"file://{A_EPDMS}/config"]
-    if split != FULL_SPLIT:
-        sp.append(f"file://{out}/config")
-    rec = {"split": split, "runs": {}}
+    extra = [] if split == table(sp_name)["full_split"] else [f"file://{out}/config"]
+    pre = prefix(sp_name)
+    rec = {"split": split, "eval_split": sp_name, "runs": {}}
     for s in subs:
         old = csv_of(out, s)
         if old is not None and not a.force:
             print(f"[{kst()}] skip {s}: csv of this pickle exists ({old})", flush=True)
             continue
-        rd = run_dir(out, s, cur[s])
+        rd = run_dir(out, s, cur[s], sp_name)
         if old is not None:                                   # --force: a new dated dir, the old csv is kept
             rd = rd.with_name(rd.name + "_" + time.strftime("%Y%m%d%H%M%S"))
-        cmd = ["nice", "-n", str(a.nice), sys.executable, "navsim/planning/script/run_pdm_score_one_stage.py",
-               f"train_test_split={split}", f"navsim_log_path={NAVSIM_DATA}/navsim_logs/trainval/trainval",
-               f"metric_cache_path={METRIC_CACHE}", "agent=precomputed_agent", f"agent.traj_pkl={out}/traj/{s}.pkl",
-               f"experiment_name=epdms_val_v6c_{s}", f"output_dir={rd}",
-               "worker=ray_distributed", f"worker.threads_per_node={a.threads}",
-               "hydra.searchpath=[" + ",".join(sp) + "]"]
+        cmd, env, cwd = scorer_cmd(sp_name, f"{out}/traj/{s}.pkl", out / "exp", f"{pre}_v6c_{s}", rd, a.threads,
+                                   a.nice, extra, tts=split)
         t0 = time.time()
         print(f"[{kst()}] start {s} ({split}, {a.threads} threads)", flush=True)
-        with open(out / "logs" / f"epdms_val_{s}.log", "w") as lf:
-            rc = subprocess.run(cmd, cwd=NAVSIM22, env=env, stdout=lf, stderr=subprocess.STDOUT).returncode
+        with open(out / "logs" / f"{pre}_{s}.log", "w") as lf:
+            rc = subprocess.run(cmd, cwd=cwd, env=env, stdout=lf, stderr=subprocess.STDOUT).returncode
         c = csv_of(out, s)
         rec["runs"][s] = {"rc": rc, "csv": str(c) if c else None, "sec": round(time.time() - t0, 1), "end": kst(),
                           "cmd": " ".join(cmd)}
@@ -290,11 +348,12 @@ def analyze(out: Path, n_boot: int = 2000) -> dict:
         D[s] = load_csv(csv_of(out, s))
         P[s] = pickle.load(open(out / "traj" / f"{s}.pkl", "rb"))
     assert "base" in D, "no base csv: run first"
-    adj = adjacency(toks).set_index("token").loc[toks]
+    adj = adjacency(toks, table(split_of(out))["adj"]).set_index("token").loc[toks]
     has_prev = adj.prev.notna().to_numpy()
     pos = {t: i for i, t in enumerate(toks)}
     prev_idx = np.array([pos[p] if isinstance(p, str) else -1 for p in adj.prev])
-    res = {"created": kst(), "out": str(out), "n_tokens": len(toks), "n_logs": int(len(np.unique(logs))),
+    res = {"created": kst(), "out": str(out), "split": split_of(out), "n_tokens": len(toks),
+           "n_logs": int(len(np.unique(logs))),
            "n_with_prev": int(has_prev.sum()), "switch_rate": float(sw.mean()), "abs": {}, "checks": {},
            "paired": {}, "change": {}, "ddc_flips": {}}
     for s, (df, avg) in D.items():

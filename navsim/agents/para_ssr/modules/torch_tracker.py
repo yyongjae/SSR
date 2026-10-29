@@ -55,17 +55,20 @@ def _consts(m: int, dtype, device):
     tensors are not allowed inside a CUDA-graph capture): A's mask, the jerk difference matrix R, tri, the curvature Q"""
     key = (m, dtype, device)
     if key not in _CONSTS:
-        rows = torch.arange(2 * m, device=device) // 2
-        mask = torch.arange(m, device=device)[None, :] > rows[:, None]                # upper triangle (k = 1), x2 rows
-        mask[:, 0] = False
-        band = torch.zeros(m - 2, m - 1, dtype=dtype, device=device)
-        idx = torch.arange(m - 2, device=device)
-        band[idx, idx] = -1.0
-        band[m - 3, m - 2] = 1.0
-        R = torch.cat([torch.zeros(m - 2, 1, dtype=dtype, device=device), band], 1)    # [m-2, m]
-        tri = torch.tril(torch.ones(m, m, dtype=dtype, device=device))
-        Q = CURV_RATE * torch.eye(m, dtype=dtype, device=device)
-        Q[0, 0] = CURV0
+        # report 129 A28: never inference tensors (a first call inside val's inference_mode would cache them, and the
+        # next training call with grad cannot save them for backward); same values in every mode
+        with torch.inference_mode(False):
+            rows = torch.arange(2 * m, device=device) // 2
+            mask = torch.arange(m, device=device)[None, :] > rows[:, None]            # upper triangle (k = 1), x2 rows
+            mask[:, 0] = False
+            band = torch.zeros(m - 2, m - 1, dtype=dtype, device=device)
+            idx = torch.arange(m - 2, device=device)
+            band[idx, idx] = -1.0
+            band[m - 3, m - 2] = 1.0
+            R = torch.cat([torch.zeros(m - 2, 1, dtype=dtype, device=device), band], 1)    # [m-2, m]
+            tri = torch.tril(torch.ones(m, m, dtype=dtype, device=device))
+            Q = CURV_RATE * torch.eye(m, dtype=dtype, device=device)
+            Q[0, 0] = CURV0
         _CONSTS[key] = (mask, R, tri, Q)
     return _CONSTS[key]
 
@@ -118,7 +121,8 @@ def _loop(ref: torch.Tensor, vprof: torch.Tensor, kprof: torch.Tensor, init: tor
     vx, ax, steer = init[:, 0], init[:, 2], init[:, 4]
     key = ("q_lat", ref.device)
     if key not in _CONSTS:                                                              # (built before any capture)
-        _CONSTS[key] = torch.tensor(Q_LAT, dtype=dt64, device=ref.device)
+        with torch.inference_mode(False):                                               # not an inference tensor (A28)
+            _CONSTS[key] = torch.tensor(Q_LAT, dtype=dt64, device=ref.device)
     q = _CONSTS[key]
     out = [torch.stack([x, y, h], -1)]
     dyn = [torch.stack([vx, init[:, 1], ax, init[:, 3]], -1)]
@@ -250,7 +254,11 @@ def track(poses: torch.Tensor, init: torch.Tensor, full: bool = False, angular: 
           slot: int = 0) -> torch.Tensor:
     """slot (km 10/25): a graphed callable's backward reads its static buffers, so two grad calls of the same shape in
     one forward (the cross-fit planners' plan loss next to the main one) need separate graphs: distinct slots."""
-    if not poses.is_cuda or os.environ.get("KM_TRACK_GRAPH", "1") == "0" or torch.cuda.is_current_stream_capturing():
+    # report 129 A28: eager under inference_mode (Lightning's val / eval): a graph first captured there holds inference
+    # tensors as static inputs and the next training replay of that key crashes; eager is bitwise the graph's result
+    # and val adds no graph memory (refiner_v6c.hook._trk did this already).  Training never runs in inference_mode.
+    if (not poses.is_cuda or os.environ.get("KM_TRACK_GRAPH", "1") == "0" or torch.cuda.is_current_stream_capturing()
+            or torch.is_inference_mode_enabled()):
         return _track(poses, init, full, angular)
     ref = interpolate(poses.to(torch.float64))
     vprof, kprof = _profiles(ref)

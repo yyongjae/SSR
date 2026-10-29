@@ -7,6 +7,9 @@
 Each is cross-fitted: copy f is trained on the tokens of fold f (cf_fold = crc32(log) % 2) and is used for the OTHER
 fold, so every training token gets an out-of-fold (OOF) teacher.  Platt maps (per time bin) calibrate the occupancy
 probabilities, the E_T logit channels and the T-M off-road probability; they are fitted on OOF outputs in stage T.
+Out-of-fold holds for the T-D / T-M / T-E heads and the Platt maps only: the backbones behind kd_bev_0 (BEVFusion 64 m,
+trained on navtrain_train + navtrain_val) and kd_bev_1 (ReSMap front64) saw every navtrain token; navtest is held out
+(report 129 A05).
 
 Baseline facts this relies on (report 125):
   * the dataloader already streams kd_bev_0 / kd_bev_1 [256, 100, 100] f16 on the student grid (row = forward 0..64 m,
@@ -32,6 +35,9 @@ from . import nets as N
 logger = logging.getLogger(__name__)
 TIME_BINS = (0, 10, 25, 41)                 # 0-1, 1-2.5, 2.5-4 s on the 41-step axis (report 124 D4 'Platt')
 TTC_LAST_DT = 0.9                 # the TTC rule's largest projection (dt 0, 0.3, 0.6, 0.9 s; labels.py)
+# teachers of report 129 and later: km's read rule x >= 0 (CH._sample), T-D target raster_min1, Platt fitted on the
+# KD-gated steps.  load_teachers refuses any other value (the 10-28 / 10-29 teachers read with the legacy rear rule)
+READ_RULE = "r129"
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 
 
@@ -129,26 +135,11 @@ class TeacherSet(nn.Module):
         prob = self.platt_occ(occ.permute(0, 2, 3, 1), planes).permute(0, 3, 1, 2)
         return {"occ_prob": prob, "sdf_m": sdf, "tok_det": tok_d}
 
-    @torch.no_grad()
-    def path_outputs(self, S: torch.Tensor, flds: Dict[str, torch.Tensor], area: torch.Tensor, copy: torch.Tensor,
-                     cin: int = 256) -> Dict[str, torch.Tensor]:
-        """S [B, R, 41, 7] paths; area [B, R, T, 3] GT area flags along them ->
-        p [B, R, T, 7] KD targets in E's units (probabilities on the 3 logit channels) and three gates [B, R, T]:
-          g_obj  the overlap channel: all 4 corners of the box inside the teacher window 0 <= x <= 64, |y| <= 32
-          g_ttc  the TTC-based channels (ttc, gap, vapp, px, py): g_obj AND the box shifted by speed * 0.9 s along the
-                 heading (the TTC rule's farthest projection, labels.py) also inside the window (report 124 D2 /
-                 report 127 §3.4: beyond 64 m the teacher sees nothing, so its 'no approach' there is not evidence)
-          g_off  the off-road channel (= g_obj)"""
-        reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], self.bev_h, self.bev_w, 64.0,
-                             legacy_rear=True)
-        E = self._per_copy(self.te, copy, lambda m, s: {"E": m({k: v[s] for k, v in reads.items()}, area=area[s])["E"]})["E"]
-        t21 = N.T21.to(S.device)
-        p_ovl = self.platt_ovl(E[..., 0], t21)
-        p_ttc = self.platt_ttc(E[..., 1], t21)
-        # T-M off-road probability from the min corner SDF (field_readout channel 0, already / CLIP in reads['ro'])
-        p_off = self.platt_off(reads["ro"][..., 0] * CLIP, t21)
-        p = torch.cat([p_ovl[..., None], p_ttc[..., None], E[..., 2:6], p_off[..., None]], -1)
-        s21 = S[:, :, t21]
+    @staticmethod
+    def kd_windows(S: torch.Tensor):
+        """S [B, R, 41, 7] -> (inwin, inproj) bool [B, R, T] at the 21 times: all 4 corners of the box inside the
+        teacher window 0 <= x <= 64, |y| <= 32; inproj also the box shifted by speed * TTC_LAST_DT along the heading"""
+        s21 = S[:, :, N.T21.to(S.device)]
         corners = N.footprint5(s21)[..., 1:, :]                                         # [B, R, T, 4, 2]
 
         def win(c):
@@ -159,7 +150,48 @@ class TeacherSet(nn.Module):
         shift = (torch.hypot(s21[..., 3], s21[..., 4]) * TTC_LAST_DT)[..., None]
         u = torch.stack([torch.cos(s21[..., 2]), torch.sin(s21[..., 2])], -1)
         inproj = inwin & win(corners + (u * shift)[..., None, :])
+        return inwin, inproj
+
+    @torch.no_grad()
+    def path_outputs(self, S: torch.Tensor, flds: Dict[str, torch.Tensor], area: torch.Tensor, copy: torch.Tensor,
+                     cin: int = 256) -> Dict[str, torch.Tensor]:
+        """S [B, R, 41, 7] paths; area [B, R, T, 3] GT area flags along them ->
+        p [B, R, T, 7] KD targets in E's units (probabilities on the 3 logit channels) and three gates [B, R, T]:
+          g_obj  the overlap channel: all 4 corners of the box inside the teacher window 0 <= x <= 64, |y| <= 32
+          g_ttc  the TTC-based channels (ttc, gap, vapp, px, py): g_obj AND the box shifted by speed * 0.9 s along the
+                 heading (the TTC rule's farthest projection, labels.py) also inside the window (report 124 D2 /
+                 report 127 §3.4: beyond 64 m the teacher sees nothing, so its 'no approach' there is not evidence)
+          g_off  the off-road channel (= g_obj)"""
+        reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], self.bev_h, self.bev_w, 64.0)
+        E = self._per_copy(self.te, copy, lambda m, s: {"E": m({k: v[s] for k, v in reads.items()}, area=area[s])["E"]})["E"]
+        t21 = N.T21.to(S.device)
+        p_ovl = self.platt_ovl(E[..., 0], t21)
+        p_ttc = self.platt_ttc(E[..., 1], t21)
+        # T-M off-road probability from the min corner SDF (field_readout channel 0, already / CLIP in reads['ro'])
+        p_off = self.platt_off(reads["ro"][..., 0] * CLIP, t21)
+        p = torch.cat([p_ovl[..., None], p_ttc[..., None], E[..., 2:6], p_off[..., None]], -1)
+        inwin, inproj = self.kd_windows(S)
         return {"p": p, "g_obj": inwin.float(), "g_ttc": inproj.float(), "g_off": inwin.float()}
+
+
+# meta['data'] key -> the student cfg attribute naming the same table (report 129 F02)
+DATA_KEYS = (("corridor_dir", "corridor_dir"), ("exact_dir", "exact_dir"), ("exact2_dir", "exact2_dir"),
+             ("teacher_root", "distill_feature_root"))
+
+
+def _warn_tables(path: str, meta: dict, cfg) -> None:
+    """one warning naming every table the teacher was trained on that differs from the student cfg's (no error; a cfg
+    without these attributes, e.g. the v6c_pipeline.sh probe, is not checked)"""
+    data = meta.get("data")
+    if not data:
+        return
+    bad = []
+    for mk, ck in DATA_KEYS:
+        v = getattr(cfg, ck, None)
+        if v and mk in data and os.path.realpath(str(v)) != data[mk]:
+            bad.append(f"{ck}: teacher {data[mk]} vs student {os.path.realpath(str(v))}")
+    if bad:
+        logger.warning("teacher checkpoint %s was trained on other tables: %s", path, "; ".join(bad))
 
 
 def load_teachers(path: str, cfg) -> TeacherSet:
@@ -176,9 +208,12 @@ def load_teachers(path: str, cfg) -> TeacherSet:
         raise RuntimeError(f"teacher checkpoint {path} is incomplete (phase_done={meta.get('phase_done')!r}, "
                            f"phases={phases}); use the checkpoint written after train_teachers.py --phase te "
                            f"(teachers_te.pt) of a run that went through {need}")
-    if phases is None:
-        logger.warning("teacher checkpoint %s has no phase record (written before 10-28): only phase_done='te' checked",
-                       path)
+    if meta.get("read_rule") != READ_RULE:
+        raise RuntimeError(f"teacher checkpoint {path} has read_rule={meta.get('read_rule')!r}, this code needs "
+                           f"{READ_RULE!r}: the 10-28 / 10-29 teachers (v6cT_main, v6cT_platt2, v6cT_platt3, v6cT_smoke) "
+                           f"read with the legacy rear rule; retrain with 'bash scripts/km_corridor/v6c_pipeline.sh "
+                           f"<new name>' (report 129 F01)")
+    _warn_tables(path, meta, cfg)
     missing, unexpected = ts.load_state_dict(ck["state_dict"], strict=False)
     if unexpected or [k for k in missing if not k.startswith(("te.", "platt_"))]:
         raise RuntimeError(f"teacher checkpoint {path}: missing {missing[:8]}, unexpected {unexpected[:8]}")

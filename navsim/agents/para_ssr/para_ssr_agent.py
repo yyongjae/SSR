@@ -114,6 +114,9 @@ class ParaSSRLoggingCallback(pl.Callback):
     sums that, so the breakdown has to reach the logger by another route.
     ``gshare/*`` in particular is the number to watch: it says which task is
     actually steering the shared BEV feature, which the loss curves do not.
+    It covers the ParaSSRLoss plan / det / map only: the corridor,
+    corridor_plan, scorer and v6c terms join after the balancer and are not in
+    it (``gnorm/distill_v8`` is the BEV distillation's own norm; report 129 A41).
 
     Wall-clock time goes out as ``time/*`` scalars (elapsed, ETA, per-epoch and
     per-validation hours) and, at the end of the session, as
@@ -121,6 +124,12 @@ class ParaSSRLoggingCallback(pl.Callback):
     a new session to that file, so ``total_hours`` is the whole training time
     across resumes; a crash or interrupt still writes the session with
     ``status: "interrupted"``.
+
+    Right before each optimizer step (after DDP's all-reduce and before
+    Lightning's gradient clip) it logs the global gradient norm
+    ``train/grad_norm_preclip``, ``train/grad_clip_active`` (its epoch mean is
+    the fraction of clipped optimizer steps) and ``lr/pg<i>`` of every param
+    group; read-only, the gradients are never touched (report 129 A47).
     """
 
     TIME_FILE = "train_time.json"
@@ -161,6 +170,26 @@ class ParaSSRLoggingCallback(pl.Callback):
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         self._log(pl_module, "val")
+
+    # ---- optimizer step (report 129 A47) --------------------------------- #
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer) -> None:
+        """Pre-clip global grad norm, clip-active flag and LR per param group.  PL 2.2.1 calls this hook before
+        _clip_gradients, on already all-reduced gradients (every rank agrees): rank_zero_only, no sync_dist,
+        batch_size=1 (epoch means are per optimizer step).  The norm is the one clip_grad_norm_ compares to
+        gradient_clip_val (get_total_norm); .grad is only read."""
+        grads = [p.grad for g in optimizer.param_groups for p in g["params"] if p.grad is not None]
+        opts = dict(on_step=True, prog_bar=False, sync_dist=False, rank_zero_only=True, batch_size=1)
+        if grads:
+            with torch.no_grad():
+                total = getattr(torch.nn.utils, "get_total_norm", None)
+                n = (total(grads) if total is not None else
+                     torch.linalg.vector_norm(torch.stack([x.to(grads[0].device) for x in torch._foreach_norm(grads)])))
+            norm = float(n)
+            clip = float(getattr(trainer, "gradient_clip_val", None) or 0.0)
+            pl_module.log("train/grad_norm_preclip", norm, on_epoch=True, **opts)
+            pl_module.log("train/grad_clip_active", float(clip > 0 and norm > clip), on_epoch=True, **opts)
+        for i, group in enumerate(optimizer.param_groups):
+            pl_module.log(f"lr/pg{i}", float(group["lr"]), on_epoch=False, **opts)
 
     # ---- wall-clock time ------------------------------------------------- #
     @staticmethod
@@ -303,6 +332,95 @@ class ParaSSRLoggingCallback(pl.Callback):
             logger.warning("could not write %s: %s", path, exc)
 
 
+def _anchor_distill(agent):
+    """the v9..v16 TrajectoryAnchorDistillation that owns the KD schedule clock (micro_step), or None"""
+    ad = getattr(getattr(agent, "_distill", None), "anchor_distill", None)
+    if ad is None or "micro_step" not in dict(ad.named_buffers(recurse=False)):
+        return None
+    return ad
+
+
+class DistillScheduleCallback(pl.Callback):
+    """Checkpoints the v15 distillation schedule (report 129 A30 / A42).
+
+    ``anchor_distill.micro_step`` (the only clock of the KD warm-up, ramp and
+    bev_scale), the TeacherRatioControllers ``ratio_ctrl`` / ``probe_ratio_ctrl``
+    (plain objects) and each probe's ``ema_step`` + ``ema__*`` shadows are
+    non-persistent, so a Lightning resume restored ``ParaSSRLoss.iteration``
+    but replayed the BEV-KD warm-up.  They travel here, in the checkpoint's
+    callback state: anchor_distill.py / planning_probe.py stay as km's and the
+    model state_dict keys are unchanged.  A checkpoint written before this
+    callback falls back to ``loss.iteration`` (equal to micro_step on a fresh
+    run: both advance once per training micro-batch), the live probe weights
+    as EMA shadows and fresh controllers.  Registered only when the agent has
+    an anchor distillation with a micro_step buffer.
+    """
+
+    def __init__(self, agent) -> None:
+        super().__init__()
+        self._agent = agent
+
+    def state_dict(self) -> Dict[str, Any]:
+        ad = _anchor_distill(self._agent)
+        if ad is None:
+            return {}                                       # Lightning then stores nothing
+        state: Dict[str, Any] = {"micro_step": int(ad.micro_step)}
+        for name in ("ratio_ctrl", "probe_ratio_ctrl"):
+            c = getattr(ad, name, None)
+            state[name] = None if c is None else c.state_dict()
+        state["probes"] = [{"ema_step": int(p.ema_step),
+                            "ema": {n: b.detach().cpu().clone() for n, b in p.named_buffers(recurse=False)
+                                    if n.startswith("ema__")}}
+                           for p in (ad.probes or [])]
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        ad = _anchor_distill(self._agent)
+        if not state_dict or ad is None:
+            return
+        probes = list(ad.probes or [])
+        saved = list(state_dict.get("probes") or [])
+        if len(saved) != len(probes):
+            raise ValueError(f"distillation schedule state has {len(saved)} probes, the model {len(probes)}")
+        with torch.no_grad():
+            ad.micro_step.fill_(int(state_dict["micro_step"]))
+            for name in ("ratio_ctrl", "probe_ratio_ctrl"):
+                c, sd = getattr(ad, name, None), state_dict.get(name)
+                if c is not None and sd is not None:
+                    c.load_state_dict(sd)
+            for p, st in zip(probes, saved):
+                p.ema_step.fill_(int(st["ema_step"]))
+                bufs = {n: b for n, b in p.named_buffers(recurse=False) if n.startswith("ema__")}
+                if set(bufs) != set(st["ema"]):
+                    raise ValueError(f"probe EMA buffers {sorted(set(bufs) ^ set(st['ema']))} != the checkpoint's")
+                for n, b in bufs.items():
+                    b.copy_(st["ema"][n].to(device=b.device, dtype=b.dtype))
+        it = int(getattr(self._agent._loss, "iteration", -1))
+        if int(state_dict["micro_step"]) != it:
+            logger.warning("distillation micro_step %d != loss iteration %d after the restore",
+                           int(state_dict["micro_step"]), it)
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint: Dict[str, Any]) -> None:
+        if self.state_key in (checkpoint.get("callbacks") or {}):
+            return                                          # load_state_dict restores it
+        ad = _anchor_distill(self._agent)
+        if ad is None:
+            return
+        # a checkpoint from before this callback: PL 2.2.1 restores the model (ParaSSRLoss.iteration in its extra
+        # state) before the callbacks, so loss.iteration is the resumed micro-batch count
+        it = int(self._agent._loss.iteration)
+        with torch.no_grad():
+            ad.micro_step.fill_(it)
+            for p in ad.probes or []:
+                p.ema_step.fill_(it)
+                live = {"ema__" + n.replace(".", "__"): q for n, q in p.named_parameters()}
+                for n, b in p.named_buffers(recurse=False):
+                    if n.startswith("ema__") and n in live:
+                        b.copy_(live[n].detach().to(device=b.device, dtype=b.dtype))
+        logger.warning("checkpoint has no distillation schedule state: micro_step / probe ema_step set to the loss "
+                       "iteration %d, probe EMA shadows = the restored weights, ratio controllers start fresh", it)
+
+
 class ParaSSRAgent(AbstractAgent):
     # CK Phase 2 helper (plain object, set in __init__ when config.ck_e2e is on).  Class-level default so agents built
     # without __init__ (tests use ParaSSRAgent.__new__) still read "CK off".
@@ -427,8 +545,10 @@ class ParaSSRAgent(AbstractAgent):
         """refiner v6c needs the corridor-cf candidate path it is built on (report 124 / 125)"""
         if not getattr(config, "v6c", False):
             return
+        # report 129 A51: tau_base is the scorer's cand_official pick (plan_select_index); another rule leaves no index
+        # and v6c would re-select with its own eps / lam
         need = {"cand_official": True, "cand_scorer_fields": True, "corridor_format": "c64", "bev_h": 100,
-                "bev_w": 100, "corridor_occ_planes": 49}
+                "bev_w": 100, "corridor_occ_planes": 49, "corridor_select_rule": "cand_official"}
         bad = {k: getattr(config, k, None) for k, v in need.items() if getattr(config, k, None) != v}
         if float(getattr(config, "cand_scorer_weight", 0.0)) <= 0 or float(getattr(config, "corridor_weight", 0.0)) <= 0:
             bad["cand_scorer_weight / corridor_weight"] = "must be > 0"
@@ -1277,6 +1397,9 @@ class ParaSSRAgent(AbstractAgent):
             from .ck.online2 import make_ck2_callback
 
             callbacks.append(make_ck2_callback(self))
+        if _anchor_distill(self) is not None:
+            # report 129 A30 / A42: micro_step, ratio controllers and probe EMA in the checkpoint's callback state
+            callbacks.append(DistillScheduleCallback(self))
         return callbacks
 
     # ------------------------------------------------------------------ #

@@ -12,6 +12,10 @@ Forward (train and eval share the code path):
   R-J       rows (tau_base, tau_v6), every input detached -> expected PDMS -> switch (mode B) | always tau_v6 (mode A)
 Loss (compute_loss, needs the exact tables): official terms of the 2 rows (float64 exact-init track, official_scores),
 per-step labels (labels.exact_step_masks), teacher outputs (teacher.py, optional), then L_E + L_E_re + L_corr + L_J.
+The R-E warm-up computes only its own mixture loss (report 129 A72).
+Logs: a conditional key (written only when its mask is non-empty, e.g. v6c/z_lon_fix) keeps its conditional epoch mean,
+but its *_step series repeats the last written value (Lightning); read step-level values from key_sum / denominator,
+both written on every call (report 129 A70; _cond).
 """
 from __future__ import annotations
 
@@ -77,7 +81,10 @@ class RefinerV6c(nn.Module):
 
     # ------------------------------------------------------------------ #
     def pick(self, predictions: Dict[str, torch.Tensor], training: bool) -> torch.Tensor:
-        if not training and "plan_select_index" in predictions:
+        if not training:
+            # report 129 A51: eval refines exactly the scorer's cand_official pick; no silent re-selection
+            if "plan_select_index" not in predictions:
+                raise ValueError("refiner v6c at eval needs corridor_select_rule=cand_official (plan_select_index)")
             return predictions["plan_select_index"].long()
         from ..modules.candidate_scorer import ec_roughness, expected_official, select_official
         with torch.no_grad():
@@ -157,16 +164,53 @@ class RefinerV6c(nn.Module):
                "v6c_switch": switch, "v6c_out": out_traj, "v6c_anchor_h": anchor_h, "v6c_c_rows": comf}
         if dec.get("lon_dead") is not None:
             out["v6c_lon_dead"] = dec["lon_dead"]
+        out["v6c_lon_noop"] = lon_noop(dec)
         return out
+
+
+@torch.no_grad()
+def lon_noop(dec: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """[B] 1 where the decoder's longitudinal edit has no effect (s == s0 on all 41 states: z = 0, a decel on a stopped
+    draft, or a clamped speed-up), report 129 A64; lon_dead keeps its meaning (the mode-A dead-zone flag)"""
+    return (dec["s"] == dec["s0"]).all(-1).float()
 
 
 def rear_mask_of(cfg) -> bool:
     """v6c_rear_mask: True / False when set; None (default) = True, except for the 10-27 checkpoints (v6c_rc_out
-    'shared'), which were trained with the old rule (review 10-28: evaluating them must not shift R-E's inputs)"""
+    'shared').  Since 2e674b4 CH._sample masks x < 0 itself, so the flag no longer changes any read or hinge; it is
+    kept so old run configs load (report 129 N-rear-mask-noop-docs)"""
     rm = getattr(cfg, "v6c_rear_mask", None)
     if rm is None:
         return str(getattr(cfg, "v6c_rc_out", "per_control")) != "shared"
     return bool(rm)
+
+
+def _world_rank():
+    """(world size, rank) of the initialised torch.distributed group, else (1, 0)"""
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size(), dist.get_rank()
+    return 1, 0
+
+
+def _cond(logs: Dict[str, torch.Tensor], key: str, x: torch.Tensor, mask: torch.Tensor) -> None:
+    """report 129 A70: key + '_sum' = sum(x * mask) / numel on every call; key = mean(x[mask]) only when the mask is
+    non-empty (its epoch mean stays the conditional mean).  key_sum / mean(mask), both always logged, reproduces key
+    at step and epoch level"""
+    logs[key + "_sum"] = (x * mask).sum() / mask.numel()
+    if bool(mask.any()):
+        logs[key] = x[mask].mean()
+
+
+@torch.no_grad()
+def overlabel_logs(logs: Dict[str, torch.Tensor], lab: Dict[str, torch.Tensor], ex: Dict[str, torch.Tensor]) -> None:
+    """step-label over-labelling (labels.py: no track memory; report 129 A69) on the on-policy rows: among the rows
+    with a TTC (overlap) step positive, the fraction whose official TTC (NC) passes anyway.  lab [B, R, T] (stride2);
+    ex official terms [B, R] (NaN without a table) -> v6c/{ttc,ovl}_overlabel (+ _sum) and v6c/{ttc,ovl}_steppos"""
+    for nm, term in (("ttc", "ttc1"), ("ovl", "nc1")):
+        pos = (lab[nm].amax(-1) > 0) & torch.isfinite(ex[term])                             # [B, R]
+        logs[f"v6c/{nm}_steppos"] = pos.float().mean()
+        _cond(logs, f"v6c/{nm}_overlabel", (ex[term] >= 1).float(), pos)
 
 
 def zero_touch(mod: nn.Module) -> torch.Tensor:
@@ -246,6 +290,32 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
         z = zero_touch(v6c)
         logs["v6c/rows_valid"] = z.detach()
         return z, logs
+    # ParaSSRLoss.iteration is already incremented for this micro-batch (1 on the first one), so <= gives exactly
+    # v6c_warmup_steps warm-up micro-batches
+    warm = training and int(getattr(cfg, "v6c_warmup_steps", 0)) > 0 and \
+        int(predictions.get("_v6c_iteration", 0)) <= int(getattr(cfg, "v6c_warmup_steps", 0))
+    if warm:
+        # report 124 §4-3 (D epochs 0-4): the scorer is untrained, so the pick is meaningless; R-E alone learns on
+        # the stage-T path mixture (anchors near / mid / random, rule speed variants, GT variants) of every token.
+        # report 129 A72: the 2-row track, official scores, step labels and teacher outputs of the on-policy rows
+        # are not computed here (none reaches this loss); only the cheap logs and the track_human side effect stay
+        with torch.no_grad():
+            init = ES.ego_init(targets["ex_ego"].double())
+            if "ex2_hum_st" not in targets:
+                ES.track_human(targets, init)
+            t_obs = LB.with_observed_horizon(targets)
+            logs["v6c/nobs_raised"] = (t_obs["ex1_nobs"].reshape(-1) != targets["ex1_nobs"].reshape(-1)).float().mean()
+            if teachers is not None and "kd_bev_0" in targets and "cf_fold" in targets:
+                ok0 = targets.get("kd_ok_0", torch.ones(b, dtype=torch.bool, device=dev)).bool()
+                ok1 = targets.get("kd_ok_1", torch.ones(b, dtype=torch.bool, device=dev)).bool()
+                logs["v6c/teacher_ok_frac_det"] = ok0.float().mean()
+                logs["v6c/teacher_ok_frac_map"] = ok1.float().mean()
+        logs["v6c/warmup"] = torch.tensor(1.0, device=dev)
+        lw, lgw = warmup_risk_loss(v6c, cfg, features, targets, predictions, kd_teachers=teachers)
+        logs.update({k + "_warm": v for k, v in lgw.items()})
+        loss = lw + zero_touch(v6c)
+        logs["v6c/loss"] = loss.detach()
+        return loss, logs
     with torch.no_grad():
         init = ES.ego_init(targets["ex_ego"].double())
         rows2 = torch.stack([tau_b, tau_v.detach()], 1).double()                       # [B, 2, 8, 3]
@@ -264,9 +334,7 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
         status = features["status_feature"][:, nc:nc + 4].float()
         lon_mode = str(getattr(cfg, "v6c_lon_target", "official"))
         lon_t = None
-        warm_now = training and int(getattr(cfg, "v6c_warmup_steps", 0)) > 0 and \
-            int(predictions.get("_v6c_iteration", 0)) <= int(getattr(cfg, "v6c_warmup_steps", 0))
-        if lon_mode == "official" and training and not warm_now:
+        if lon_mode == "official" and training:
             lv = tuple(float(x) for x in getattr(cfg, "v6c_lon_levels", LON_LEVELS))
             lon_t = official_decel_target(tau_b, status[:, 0], predictions["v6c_anchor_h"], init, t_obs, ex,
                                           base_fail, cfg, lv)
@@ -303,19 +371,7 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
     def sl(d, j):
         return None if d is None else {k: v[:, j:j + 1] for k, v in d.items()}
 
-    # ParaSSRLoss.iteration is already incremented for this micro-batch (1 on the first one), so <= gives exactly
-    # v6c_warmup_steps warm-up micro-batches
-    warm = training and int(getattr(cfg, "v6c_warmup_steps", 0)) > 0 and \
-        int(predictions.get("_v6c_iteration", 0)) <= int(getattr(cfg, "v6c_warmup_steps", 0))
-    logs["v6c/warmup"] = torch.tensor(float(warm), device=dev)
-    if warm:
-        # report 124 §4-3 (D epochs 0-4): the scorer is untrained, so the pick is meaningless; R-E alone learns on
-        # the stage-T path mixture (anchors near / mid / random, rule speed variants, GT variants) of every token
-        lw, lgw = warmup_risk_loss(v6c, cfg, features, targets, predictions, kd_teachers=teachers)
-        logs.update({k + "_warm": v for k, v in lgw.items()})
-        loss = lw + zero_touch(v6c)
-        logs["v6c/loss"] = loss.detach()
-        return loss, logs
+    logs["v6c/warmup"] = torch.tensor(0.0, device=dev)
     l_e, lg = LS.risk_loss(predictions["v6c_E_base"], sl(lab, 0), sl(kd, 0), lam, pw)
     logs.update({k + "_base": v for k, v in lg.items()})
     loss = float(getattr(cfg, "v6c_w_E", 1.0)) * l_e
@@ -360,12 +416,11 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
             logs["v6c/lon_fixable"] = lon_t["fixable"].float().mean()
             logs["v6c/lon_unfixable"] = lon_t["unfixable"].float().mean()
             zm = zl.mean(-1)
-            if bool(lon_t["fixable"].any()):
-                logs["v6c/z_lon_fix"] = zm[lon_t["fixable"]].mean()
-                logs["v6c/z_lon_fix_tgt"] = lon_t["z"][lon_t["fixable"]].mean()
+            _cond(logs, "v6c/z_lon_fix", zm, lon_t["fixable"])                            # denominator lon_fixable
+            _cond(logs, "v6c/z_lon_fix_tgt", lon_t["z"], lon_t["fixable"])
             pas = lon_t["use"] & ~lon_t["fixable"]
-            if bool(pas.any()):
-                logs["v6c/z_lon_pass"] = zm[pas].mean()
+            logs["v6c/lon_pass_frac"] = pas.float().mean()
+            _cond(logs, "v6c/z_lon_pass", zm, pas)
     # L_J: rows' official terms (NaN where the token has no v1 table)
     jl = {"nc": predictions["v6c_j_nc"], "dac": predictions["v6c_j_dac"], "ttc": predictions["v6c_j_ttc"],
           "prog": predictions["v6c_j_prog"], "eff": predictions["v6c_j_eff"]}
@@ -394,20 +449,40 @@ def v6c_loss(v6c: RefinerV6c, teachers, cfg, features: Dict[str, torch.Tensor], 
             logs["v6c/base_fail"] = base_fail[v].float().mean()
             pred_better = predictions["v6c_pdms_hat"][v, 1] > predictions["v6c_pdms_hat"][v, 0]
             flip = d.abs() > 1e-6
-            if bool(flip.any()):
-                logs["v6c/J_pair_acc"] = ((pred_better == (d > 0)) & flip).float().sum() / flip.float().sum()
+            logs["v6c/J_flip_frac"] = flip.float().mean()
+            _cond(logs, "v6c/J_pair_acc", (pred_better == (d > 0)).float(), flip)
             # R-J's comfort C is computed on the status-init states; the label c1 on the exact init (report 124 §2-5a)
             logs["v6c/c1_mismatch"] = (ex["c1"][v] != predictions["v6c_c_rows"][v]).float().mean()
+        overlabel_logs(logs, lab, ex)
         dz = predictions["v6c_ctrl"][:, :6]
         logs["v6c/z_lon_mean"] = dz.mean()
         logs["v6c/z_lon_zero"] = (dz == 0).float().mean()
         logs["v6c/z_lon_std"] = dz.mean(-1).std() if dz.shape[0] > 1 else dz.new_zeros(())
         if "v6c_lon_dead" in predictions:
             logs["v6c/lon_dead"] = predictions["v6c_lon_dead"].float().mean()
+        if "v6c_lon_noop" in predictions:
+            logs["v6c/lon_noop"] = predictions["v6c_lon_noop"].float().mean()
         logs["v6c/lat_abs"] = predictions["v6c_ctrl"][:, 6:].abs().mean()
         logs["v6c/rows_valid"] = has.float().mean()
     logs["v6c/loss"] = loss.detach()
     return loss, logs
+
+
+@torch.no_grad()
+def warmup_paths(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor],
+                 n_paths: int = 24) -> torch.Tensor:
+    """the warm-up's paths [B, n_paths, 8, 3] (CPU): path_mixture's 80 per token, n_paths of them drawn per token.
+    report 129 A40 / A73: the private CPU generator is seeded with iteration * world + rank (every DDP rank drew the
+    same choices) and the subset is drawn per sample (one subset was shared by the batch); the global RNG is
+    untouched"""
+    from .mixture import path_mixture
+    world, rank = _world_rank()
+    gen = torch.Generator().manual_seed(int(predictions.get("_v6c_iteration", 0)) * world + rank)
+    paths = path_mixture(predictions["trajectory_anchors"].float().cpu(), targets["ex2_hum"].float().cpu(),
+                         targets["ex2_hvalid"].cpu(), gen)
+    b, p = paths.shape[:2]
+    sel = torch.rand(b, p, generator=gen).argsort(1)[:, :n_paths]
+    return paths.gather(1, sel[:, :, None, None].expand(-1, -1, paths.shape[2], paths.shape[3]))
 
 
 def warmup_risk_loss(v6c: RefinerV6c, cfg, features, targets, predictions, kd_teachers=None, n_paths: int = 24):
@@ -416,18 +491,13 @@ def warmup_risk_loss(v6c: RefinerV6c, cfg, features, targets, predictions, kd_te
     from ..modules import exact_score as ES
     from . import labels as LB
     from . import losses as LS
-    from .mixture import path_mixture
     dev = predictions["bev_embed"].device
     nc = int(cfg.num_navi_cmd)
     status = features["status_feature"][:, nc:nc + 4].float()
     b = status.shape[0]
     has = targets["ex1_valid"].float() > 0.5
-    gen = torch.Generator().manual_seed(int(predictions.get("_v6c_iteration", 0)))
     with torch.no_grad():
-        paths = path_mixture(predictions["trajectory_anchors"].float().cpu(), targets["ex2_hum"].float().cpu(),
-                             targets["ex2_hvalid"].cpu(), gen)
-        sel = torch.randperm(paths.shape[1], generator=gen)[:n_paths]
-        paths = paths[:, sel].to(dev)
+        paths = warmup_paths(predictions, targets, n_paths).to(dev)
         r = paths.shape[1]
         st9 = _trk(paths.reshape(b * r, 8, 3).double(), ES.ego_init(targets["ex_ego"].double()).repeat_interleave(r, 0),
                    full=True, angular=True).reshape(b, r, 41, 9).float()

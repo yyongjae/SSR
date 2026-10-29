@@ -28,7 +28,8 @@ E_NAMES = ("ovl", "ttc", "gap", "vapp", "px", "py", "offroad")
 LOGIT_CH = (0, 1, 6)
 CONT_CH = (2, 3, 4, 5)
 CONT_NORM = (10.0, 5.0, 10.0, 10.0)               # gap, px, py in 10 m units, vapp in 5 m/s units (report 124 §2-3)
-CONT_CLIP = 4.0                                   # normalised continuous values are clipped to +-4 (loss and input)
+CONT_CLIP = 4.0                                   # the L_E targets and the R-C / R-J inputs (e_features) are clipped to
+                                                  # +-4; the L_E prediction side is not (losses.risk_loss, report 129 A39)
 
 
 def cont_norm(x: torch.Tensor) -> torch.Tensor:
@@ -53,19 +54,18 @@ def footprint5(s: torch.Tensor) -> torch.Tensor:
 
 
 def path_reads(S: torch.Tensor, bev: torch.Tensor, sdf: torch.Tensor, occ_prob: torch.Tensor, bev_h: int,
-               bev_w: int, fwd_m: float, rear_mask: bool = False, legacy_rear: bool = False) -> Dict[str, torch.Tensor]:
+               bev_w: int, fwd_m: float, rear_mask: bool = False) -> Dict[str, torch.Tensor]:
     """parameter-free reads along the paths.  S [B, R, 41, 7]; bev [B, H*W, C]; sdf [B, Hf, 200] (m);
     occ_prob [B, P, Hf, 200] PROBABILITIES (report 124 §3-1 exchange convention) ->
       ro [B, R, T, 3] field_readout at the 21 times (min corner SDF / CLIP, max occupancy, max TTC occupancy),
       road [B, R, T, 5] SDF at the 5 footprint points / CLIP, M [B, R, T, 5] in range (and not behind the ego),
       smp [B, R, T, 5 C] BEV samples at the 5 points, kin [B, R, T, 6] kinematics
-    rear_mask: ro also treats points behind the ego as out of range (as road / M already do).  The student R-E
-    reads with cfg.v6c_rear_mask (10-28 review); T-E keeps False, the rule it was trained with (teachers_te.pt).
-    legacy_rear (T-E / T-M): ro with CH._sample's pre-10-29 range rule (km's fix now masks x < 0 in the base), so
-    the teachers read exactly what they were trained and calibrated on; road / M mask x < 0 under both rules."""
+    Every caller (student R-E, T-E / T-M) reads with km's CH._sample rule, so points behind the ego are out of range
+    (report 129 F01).  rear_mask is accepted for call compatibility and has no effect; road / M keep the explicit
+    x >= 0, which equals CH._sample's bound."""
     b, r = S.shape[:2]
     t = T21.to(S.device)
-    ro = field_readout(S, sdf, occ_prob, rear_mask=rear_mask, legacy_rear=legacy_rear)[:, :, t]                                          # [B, R, T, 3]
+    ro = field_readout(S, sdf, occ_prob)[:, :, t]                                          # [B, R, T, 3]
     ro = torch.cat([ro[..., :1] / CH.CLIP, ro[..., 1:]], -1)
     s21 = S[:, :, t]                                                                       # [B, R, T, 7]
     pts = footprint5(s21)                                                                  # [B, R, T, 5, 2]
@@ -220,6 +220,20 @@ class Corrector(nn.Module):
         return (o[..., 0] if self.out_mode == "shared" else o).float()                    # [B, 12]
 
 
+def _bezier_moving(xy: torch.Tensor, min_speed: float = 1e-3) -> torch.Tensor:
+    """xy [..., T, 2] -> bool [..., T]: bezier_xyyaw's 'moving' test (Bezier through the origin and the T points,
+    |derivative| > min_speed); a copy, so modules/kinematics.py stays km's file"""
+    n = xy.shape[-2]
+    ctrl = torch.cat([torch.zeros_like(xy[..., :1, :]), xy], dim=-2)
+    delta = ctrl[..., 1:, :] - ctrl[..., :-1, :]
+    binom = torch.tensor([math.comb(n - 1, i) for i in range(n)], device=xy.device, dtype=xy.dtype)
+    t = torch.arange(1, n + 1, device=xy.device, dtype=xy.dtype) / n
+    powers = torch.arange(0, n, device=xy.device, dtype=xy.dtype)
+    basis = binom * t.view(-1, 1) ** powers * (1 - t).view(-1, 1) ** powers.flip(0)
+    deriv = n * torch.einsum("ki,...ic->...kc", basis, delta)
+    return deriv.norm(dim=-1) > min_speed
+
+
 def decode_v6(tau_base: torch.Tensor, ctrl: torch.Tensor, v0: torch.Tensor, a_max: float = 1.0, d_max: float = 0.5,
               mode: str = "A", lon_st_slope: float = 0.0, anchor_h: Optional[torch.Tensor] = None
               ) -> Dict[str, torch.Tensor]:
@@ -230,7 +244,9 @@ def decode_v6(tau_base: torch.Tensor, ctrl: torch.Tensor, v0: torch.Tensor, a_ma
     Heading (anchor_h [B, 8] given, report 124 D6): cf's candidates take the heading from the Bezier tangent of their
     xy (anchor_planner heading_from_xy, train.sh plan_heading_from_xy=true, fallback = the anchor heading), and
     tau_base = anchors + (bezier - anchors) in float32 is not bitwise a re-run of bezier_xyyaw.  So the edit is added:
-    h_v6 = h_base + wrap(bezier(xy_v6) - bezier(xy_base)), which is h_base bitwise at Delta = 0."""
+    h_v6 = h_base + wrap(bezier(xy_v6) - bezier(xy_base)), which is h_base bitwise at Delta = 0.  A pose the edit
+    stops (stationary in tau_v6, moving in tau_base) would take bezier_xyyaw's fallback, the anchor's later heading;
+    it holds the previous pose's v6 heading instead (pose 0: the t0 heading 0; report 129 A61)."""
     from ..refiner import decoder as DEC
     from ..modules.kinematics import bezier_xyyaw
     z, w = ctrl[:, :6], ctrl[:, 6:]
@@ -245,7 +261,13 @@ def decode_v6(tau_base: torch.Tensor, ctrl: torch.Tensor, v0: torch.Tensor, a_ma
         fb = anchor_h.to(tau_base.dtype)
         dh = bezier_xyyaw(xy, fb)[..., 2] - bezier_xyyaw(tau_base[..., :2], fb)[..., 2]
         dh = torch.atan2(torch.sin(dh), torch.cos(dh))
-        out["traj"] = torch.cat([xy, (tau_base[..., 2] + dh)[..., None]], -1)
+        h = tau_base[..., 2] + dh
+        hold = ~_bezier_moving(xy) & _bezier_moving(tau_base[..., :2])                    # stopped by the edit
+        hs = []                                                                            # out of place, sequential
+        for k in range(h.shape[-1]):
+            prev = hs[-1] if hs else torch.zeros_like(h[..., 0])
+            hs.append(torch.where(hold[..., k], prev, h[..., k]))
+        out["traj"] = torch.cat([xy, torch.stack(hs, -1)[..., None]], -1)
         out["heading_mode"] = "bezier_delta"
     out["lon_dead"] = None
     if mode == "A":                                                                        # mode-A dead zone (report 124 §4-4)

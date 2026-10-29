@@ -7,7 +7,8 @@ L_corr R-C, read on S_v6_g (the ONLY consumer of the grad states; report 124 §4
                      h = front-half footprint (cf GT hinge's 4 x 3 points) occupancy + TTC-shifted occupancy hinge;
                      teacher: probability field, margin 0.3; GT: occupancy distance field, margin eps (small)
       road           mean_t max_corner [0.1 - SDF_GT]+ (cap 3, in range)              (cf static form)
-      comfort        max_t lon accel / lat accel hinges (lat masked below 1 m/s)
+      comfort        max_t hinges of the official ego_is_comfortable features (lon / lat accel, jerk magnitude, lon
+                     jerk, yaw rate / accel; yaw masked below 1 m/s) on exact_verdict's filters (report 129 A19)
       EC             [rms jerk(v6) - max(rms jerk(base), 0.25)]+ / 0.5 + [rms yaw acc(v6, masked) - max(.., 0.05)]+ / 0.1
       progress       relu((s_end(base) - s_end(v6)) / 10)   (F.relu: 0 gradient at the Delta = 0 kink)
 L_J   R-J per row: CE(NC 3-class) + BCE(DAC fail) + BCE(TTC fail) + SmoothL1(prog / 10), + SmoothL1(eff / 10)
@@ -20,8 +21,9 @@ import torch
 import torch.nn.functional as F
 
 from ..modules import corridor_head as CH
+from ..modules import exact_verdict as EV
 from ..modules.candidate_scorer import _ec_ops
-from .nets import cont_norm
+from .nets import CONT_NORM, cont_norm
 
 LOGIT_LABELS = {"ovl": 0, "ttc": 1, "offroad": 6}
 
@@ -36,21 +38,35 @@ def risk_loss(E: torch.Tensor, lab: Dict[str, torch.Tensor], kd: Optional[Dict[s
     """E [B, R, T, 12] raw R-E output; lab = labels.stride2(exact_step_masks(...)) on the same rows' exact states
     ([B, R, T]; pos [B, R, T, 2]); kd (optional): {'p' [B, R, T, 7] teacher targets in E's raw units for the
     continuous channels and PROBABILITIES for the 3 logit channels, 'g' [B, R, T, 7] gates (0 / 1)};
-    lam: per-channel KD weights (names of nets.E_NAMES).  -> (loss, logs)"""
+    lam: per-channel KD weights (names of nets.E_NAMES).  -> (loss, logs)
+    Masks (report 129 N-stride2-odd-valid): ovl / ttc use lab['valid_bin'] (validity pooled over the same two steps as
+    the labels; 'valid' when absent), offroad valid_off, the continuous channels 'valid' (their even step).
+    The continuous prediction is normalised without a clip, the target with it (report 129 A39): an output beyond
+    +-4 units is pulled back instead of getting no gradient; |o| <= 4 is unchanged bitwise.
+    Eskill_{nm} (report 129 A66) = 1 - BCE / the BCE of the best constant logit on the same masked steps (same
+    pos_weight); Eprior_{nm} is that constant's BCE.  A batch without positives has a prior ~ 0 and a large negative
+    Eskill, so the pooled skill over many batches is 1 - mean(E_{nm}) / mean(Eprior_{nm})."""
     v = lab["valid"]
     nv = v.sum().clamp(min=1.0)
+    vb = lab.get("valid_bin", v)
     logs, loss = {}, E.new_zeros(())
     for nm, ch in LOGIT_LABELS.items():
-        vm = lab["valid_off"] if nm == "offroad" else v                  # DAC does not depend on the object horizon
+        vm = lab["valid_off"] if nm == "offroad" else vb                 # DAC does not depend on the object horizon
         nvm = vm.sum().clamp(min=1.0)
         l = (_bce_pw(E[..., ch], lab[nm], pos_weight) * vm).sum() / nvm
         loss = loss + l
         logs[f"v6c/E_{nm}"] = l.detach()
         with torch.no_grad():
-            logs[f"v6c/pos_{nm}"] = (lab[nm] * vm).sum() / nvm
+            pr = (lab[nm] * vm).sum() / nvm
+            logs[f"v6c/pos_{nm}"] = pr
+            q = (pos_weight * pr / (pos_weight * pr + 1 - pr)).clamp(1e-6, 1 - 1e-6)     # argmin of the constant BCE
+            prior = -(pos_weight * pr * torch.log(q) + (1 - pr) * torch.log(1 - q))
+            logs[f"v6c/Eprior_{nm}"] = prior
+            logs[f"v6c/Eskill_{nm}"] = 1 - l.detach() / prior.clamp(min=1e-6)
     # continuous 4 (gap, vapp, px, py): fixed values where there is no object, so every valid step is supervised
     y = torch.stack([lab["gap"], lab["vapp"], lab["pos"][..., 0], lab["pos"][..., 1]], -1)
-    lc = F.smooth_l1_loss(cont_norm(E[..., 2:6]), cont_norm(y), beta=0.5, reduction="none")       # [B, R, T, 4]
+    o = E[..., 2:6] / E.new_tensor(CONT_NORM)                                                      # not clipped (A39)
+    lc = F.smooth_l1_loss(o, cont_norm(y), beta=0.5, reduction="none")                            # [B, R, T, 4]
     for j, nm in enumerate(("gap", "vapp", "px", "py")):
         l = (lc[..., j] * v).sum() / nv
         loss = loss + l
@@ -63,6 +79,7 @@ def risk_loss(E: torch.Tensor, lab: Dict[str, torch.Tensor], kd: Optional[Dict[s
         for ch, nm in enumerate(("ovl", "ttc", "gap", "vapp", "px", "py", "offroad")):
             w = float(lam.get(nm, 0.0))
             gc = g[..., ch]
+            logs[f"v6c/KDcov_{nm}"] = (gc.float().mean()).detach()                # every call (report 129 A70)
             if w <= 0 or not bool(gc.any()):
                 continue
             ng = gc.sum().clamp(min=1.0)
@@ -70,11 +87,10 @@ def risk_loss(E: torch.Tensor, lab: Dict[str, torch.Tensor], kd: Optional[Dict[s
                 l = (F.binary_cross_entropy_with_logits(E[..., ch], p[..., ch].clamp(0, 1), reduction="none") * gc).sum() / ng
             else:
                 j = ch - 2
-                l = (F.smooth_l1_loss(cont_norm(E[..., 2:6])[..., j], cont_norm(p[..., 2:6])[..., j], beta=0.5,
-                                      reduction="none") * gc).sum() / ng
+                l = (F.smooth_l1_loss((E[..., 2:6] / E.new_tensor(CONT_NORM))[..., j], cont_norm(p[..., 2:6])[..., j],
+                                      beta=0.5, reduction="none") * gc).sum() / ng
             loss = loss + w * l
             logs[f"v6c/KD_{nm}"] = l.detach()
-            logs[f"v6c/KDcov_{nm}"] = (gc.float().mean()).detach()
     return loss, logs
 
 
@@ -88,19 +104,21 @@ def _front_points(S: torch.Tensor):
                             torch.linspace(-CH.HALF_W, CH.HALF_W, 3, device=S.device), indexing="ij")
     fx, fy = fx.reshape(-1), fy.reshape(-1)
     q = torch.stack([x[..., None] + c * fx - s * fy, y[..., None] + s * fx + c * fy], -1)
-    p0x = torch.cat([torch.zeros_like(x[:, :1]), x], -1)
-    p0y = torch.cat([torch.zeros_like(y[:, :1]), y], -1)
-    spd = (torch.hypot(p0x.diff(dim=-1), p0y.diff(dim=-1)) / 0.1).detach()             # cf plan loss: detached
+    # the state's own speed (state j + 1 for step index j), detached, as the official TTC, field_readout and the T-E
+    # shift; cf's plan loss keeps its lagged displacement speed (base, left as km; report 129 A20)
+    spd = torch.hypot(st[..., 3], st[..., 4]).detach()
     return q, c, s, spd
 
 
 def front_hinge(S: torch.Tensor, field: torch.Tensor, kind: str, margin: float, cap: float = 3.0,
                 rear_mask: bool = False) -> torch.Tensor:
     """per-step hinge h(S, t) [B, 40] of the front-half footprint at steps 1..40 vs field planes (plane j = step j+1,
-    0.1 s; TTC: shifted by speed * dt, dt 0.3 / 0.6 / 0.9 s, vs plane of step + dt, moving ego only) = overlap
-    hinge + TTC hinge (max over the 3 shifts), as cf's plan loss adds its occupancy and TTC terms.  kind 'prob': field = occupancy PROBABILITY [B, P, Hf, 200], h = [p - margin]+;
+    0.1 s; TTC: shifted by the state's own speed * dt, dt 0.3 / 0.6 / 0.9 s, vs plane of step + dt, moving ego only:
+    own speed >= 5e-3 m/s, report 129 A20) = overlap hinge + TTC hinge (max over the 3 shifts), as cf's plan loss adds
+    its occupancy and TTC terms.  kind 'prob': field = occupancy PROBABILITY [B, P, Hf, 200], h = [p - margin]+;
     kind 'dist': field = signed distance to agents (m) [B, P, Hf, 200], h = [margin - d]+.  Out of range -> 0.
-    rear_mask: points behind the ego (x < 0) are out of range too (CH._sample's border padding repeats row 0)."""
+    rear_mask: points behind the ego (x < 0) out of range; redundant with CH._sample's own x >= 0 bound since 2e674b4,
+    kept for call compatibility (report 129 N-rear-mask-noop-docs)."""
     b = S.shape[0]
     q, c, s, spd = _front_points(S)
     npl = field.shape[1]
@@ -129,7 +147,8 @@ def front_hinge(S: torch.Tensor, field: torch.Tensor, kind: str, margin: float, 
 def road_hinge(S: torch.Tensor, sdf: torch.Tensor, margin: float = 0.1, cap: float = 3.0,
                rear_mask: bool = False) -> torch.Tensor:
     """cf static form: [B, 41, 7] states vs GT SDF [B, Hf, 200] -> [B] = mean_t max_corner [margin - SDF]+ (in range;
-    rear_mask: a corner behind the ego, x < 0, is out of range)"""
+    rear_mask: a corner behind the ego, x < 0, is out of range; redundant with CH._sample's own x >= 0 bound since
+    2e674b4, kept for call compatibility)"""
     st = S[:, 1:]
     x, y, h = st[..., 0], st[..., 1], st[..., 2]
     c, s = torch.cos(h)[..., None], torch.sin(h)[..., None]
@@ -143,13 +162,28 @@ def road_hinge(S: torch.Tensor, sdf: torch.Tensor, margin: float = 0.1, cap: flo
     return ((margin - v).clamp(0, cap) * inr).reshape(b, 40, 4).amax(-1).mean(-1)
 
 
-def comfort_hinge(S: torch.Tensor) -> torch.Tensor:
-    st = S[:, 1:]
-    vx, ax, h = st[..., 3], st[..., 5], st[..., 2]
-    yr = torch.atan2(torch.sin(torch.diff(S[..., 2], dim=-1)), torch.cos(torch.diff(S[..., 2], dim=-1))) / 0.1
-    lat = vx * yr
-    mask = (torch.hypot(st[..., 3], st[..., 4]) >= 1.0).float()
-    return (F.relu(ax - 2.40) + F.relu(-4.05 - ax) + mask * F.relu(lat.abs() - 4.89)).amax(-1)
+def comfort_hinge(S: torch.Tensor, yaw_mask_speed: float = 1.0) -> torch.Tensor:
+    """[B, 41, 7] -> [B] max over the 41 states of hinges on the official ego_is_comfortable features, built from the
+    official filters as exact_verdict.exact_comfort (report 129 A19): lon / lat accel (Savitzky-Golay window 41),
+    jerk magnitude and lon jerk (accel window 8, then the derivative), yaw rate / yaw accel (window 5).
+    h = [lon - 2.40]+ + [-4.05 - lon]+ + [|lat| - 4.89]+ (m/s^2, the scale of the old term) + [|jm| - 8.37]+ / 8.37
+    + [|jx| - 4.13]+ / 4.13 + m ([|ya| - 1.93]+ / 1.93 + [|yr| - 0.95]+ / 0.95), m = own speed >= yaw_mask_speed.
+    DESIGN (not official): the low-speed yaw mask as in ec_rms (the decoder's heading is noise at a stop); 0 = the
+    official rule (h == 0 <=> exact_comfort == 1).  jm uses sqrt(ax^2 + ay^2 + 1e-12) (hypot's gradient is NaN at 0).
+    The base corridor_plan_loss comfort hinge is left as km has it."""
+    ops = EV._dev_ops(EV._comfort_ops(S.shape[-2]), S.device)
+    s = S.double()
+    ax, ay = s[..., 5], s[..., 6]
+    h = s[..., 2]
+    unwrap = 2 * torch.pi * torch.cumsum(torch.round(torch.diff(h, dim=-1) / (2 * torch.pi)), -1).detach()
+    hu = torch.cat([h[..., :1], h[..., 1:] - unwrap], -1)
+    lon, lat = ax @ ops["acc"], ay @ ops["acc"]
+    jm, jx = (ax.pow(2) + ay.pow(2) + 1e-12).sqrt() @ ops["jerk"], ax @ ops["jerk"]
+    yr, ya = hu @ ops["yaw_rate"], hu @ ops["yaw_acc"]
+    m = (torch.hypot(s[..., 3], s[..., 4]) >= yaw_mask_speed).double()
+    hh = F.relu(lon - 2.40) + F.relu(-4.05 - lon) + F.relu(lat.abs() - 4.89) + F.relu(jm.abs() - 8.37) / 8.37 \
+        + F.relu(jx.abs() - 4.13) / 4.13 + m * (F.relu(ya.abs() - 1.93) / 1.93 + F.relu(yr.abs() - 0.95) / 0.95)
+    return hh.amax(-1).float()
 
 
 def ec_rms(S: torch.Tensor):
@@ -195,7 +229,10 @@ def corr_loss(S_g: torch.Tensor, S_base: torch.Tensor, targets: Dict[str, torch.
     for 'faster' through a stopped object; the longitudinal target comes from the official scorer, hook.py).
     The GT guard [h_GT(v6) - h_GT(base)]+ only penalises an edit that RAISES the GT risk (a surrogate on 12 front
     points, not the official collision rule); at Delta = 0 it is 0 with zero gradient, so it never fixes a risky
-    tau_base by itself: fixing comes only from the term gated by the official tau_base failure."""
+    tau_base by itself: fixing comes only from the term gated by the official tau_base failure.
+    The GT guard and the fix_source='gt' arm read the BASE cell-centre corridor_occ_dist on purpose (a refiner-only
+    distance field would cost 49 distance transforms per token in the loader); the T-D teacher target uses
+    train_teachers.raster_agents_min1 (every object covers at least one cell, report 129 A04)."""
     S_base = S_base.detach()
     v = targets["corridor_valid"].float() if valid is None else valid.float()
     nv = v.sum().clamp(min=1.0)

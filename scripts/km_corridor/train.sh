@@ -30,7 +30,8 @@
 #                  jointly from scratch; V6C_TEACHER=<stage-T teachers_te.pt> (the checkpoint written after --phase te)
 #                  feeds the OOF teachers (K-E / K-M, teacher object term).  Without V6C_TEACHER training is refused
 #                  unless the GT-only arm is chosen explicitly: V6C_FIX=gt V6C_KD=false (= report 124 control B).
-#                  V6C_WARMUP (micro-batches of R-E-only warm-up, default 5 epochs).
+#                  V6C_WARMUP (micro-batches of R-E-only warm-up, default exactly epochs 0-4 = 5 * ceil(ceil(85109 / NG) / 4)
+#                  per rank: 26600 at 4 GPUs, 13300 at 8; report 129 A48).
 #                  cand_select eps / lam 0.05 / 0.05 in training, val and navtest (report 124 V8)
 #            cf_seg_v6cP : refiner v6c stage P: C0_CKPT=<a cf_seg_v15 checkpoint> frozen (BN / dropout / GridMask in
 #                  eval, the cf copy candidates kept), only v6c learns; v15 distillation OFF (it would keep training its
@@ -54,6 +55,10 @@ case $VAR in c64|c64_traj|pert|mix|cf|cf_seg|cf_v15|cf_seg_v15|cf_vec_v15|cf_seg
 V31=(++agent.config.corridor_plan_weight=20.0 ++agent.config.corridor_plan_ttc_weight=1.0 ++agent.config.plan_ep_feasible_only=true
      ++agent.config.corridor_occ_planes=${PLANES:-40} ++agent.config.corridor_route_weight=1.0
      ++agent.config.corridor_plan_prog_weight=0.2 ++agent.config.corridor_plan_comfort_weight=1.0 ++agent.config.corridor_verdict_weight=1.0)
+# report 129 A32: under distill_selector_v15, distill_resmap_scale only scales the logged loss_attn_resmap metric;
+# distill_lambda_gt/cov/risk and distill_tau_gt/risk are replaced per bank by the hard-coded DET 0.45/0.20/0.35 and
+# MAP 0.35/0.20/0.45, tau 4.5/8.0 (anchor_distill._compute_anchor_weights); the spatial bias is the fixed v15 4-head
+# horizon bias (distill_spatial_sigmas unused).  The keys stay so the composed config is identical to km's.
 V15_DISTILL=(
   ++agent.config.use_distill=true
   ++agent.config.distill_feature_root=${TEACHER_CACHE_ROOT:-/workspace/teacher_cache}
@@ -112,7 +117,7 @@ case $VAR in
        [ "$VAR" = cf_vec_v15 ] && EXTRA+=(++agent.config.map_repr=vector "${V15_DISTILL[@]}")
        if [ "$VAR" = cf_seg_v15_v6c ]; then
          EXTRA+=(++agent.config.map_repr=seg "${V15_DISTILL[@]}" "${V6C[@]}" ++agent.config.v6c_stage=D
-                 ++agent.config.v6c_warmup_steps=${V6C_WARMUP:-$((5 * 85109 / (4 * NG)))})
+                 ++agent.config.v6c_warmup_steps=${V6C_WARMUP:-$((5 * (((85109 + NG - 1) / NG + 3) / 4)))})
        fi
        if [ "$VAR" = cf_seg_v6cP ]; then
          [ -n "${C0_CKPT:-}" ] || { echo "cf_seg_v6cP needs C0_CKPT=<cf_seg_v15 checkpoint>"; exit 2; }

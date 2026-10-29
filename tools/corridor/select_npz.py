@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 """km 10/16: write the trajectory a pre-declared corridor selection rule picks (corr_select.py rules) for every
-dumped token as {tokens, trajectory} npz, for the official PDMS / EPDMS scorers (SSR-v2/data/logs/score_npz.sh).
+dumped token as {tokens, trajectory} npz, for the official PDMS / EPDMS scorers (tools/corridor/score_npz.py; a v6c
+dump: tools/refiner_v6c/val_epdms.py --npz).
 
   $PY tools/corridor/select_npz.py --dump <dir> --split navtest --rule pred_multiply_t0.25 --out <npz>
   rules: v2 | model (the forward's corridor_select_rule) | pred_{replace,multiply}_t{0.25,0.5} | v3_veto_ttc* / v3_dacveto_ncsoft_ttc* (pred only)
          refiner v6c (dump --v6): v6 (mode B: R-J's switch ? tau_v6 : tau_base) | v6A (always tau_v6) | v6base (tau_base,
-         read from the f32 dump, = model up to the f16 rounding of traj.npy)
+         read from the f32 dump, = model up to the f16 rounding of traj.npy).  On a --v6 dump 'model' is tau_base, not
+         the submitted trajectory (that is v6): a WARNING is printed
 """
 from __future__ import annotations
 
@@ -31,6 +33,9 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     import pandas as pd
     d = Path(a.dump) / a.split
+    if a.rule == "model" and (d / "v6_switch.npy").exists():     # refiner v6c (A49): msel = tau_base's index
+        print(f"WARNING: {d} is a refiner v6c dump: rule 'model' is tau_base, not the submitted trajectory "
+              f"(use rule v6)", flush=True)
     D = {k: np.load(d / f"{k}.npy", mmap_mode="r") for k in ("traj", "sim", "im", "final")}
     if (d / "verdict.npz").exists():
         V = dict(np.load(d / "verdict.npz"))

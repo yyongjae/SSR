@@ -23,8 +23,11 @@ ego is in multiple lanes / non-drivable / an intersection) and were inside the i
 |y| <= 32 m, ego frame at t0) at their first observed step; the same set for the GT labels and for T-E.
 
 The step labels ignore the scorer's track memory (the first overlap of a track decides whether it counts), so a step
-label can be positive where the aggregated official NC / TTC is 1 (over-labelling, logged by the caller).  The
-direction test that matters is "step positive -> candidate failed" for overlaps that are a track's first.
+label can be positive where the aggregated official NC / TTC is 1 (over-labelling).  hook.v6c_loss logs its size on
+the two on-policy rows after the warm-up (report 129 A69): v6c/ttc_overlabel (ttc1 >= 1 among the rows with a TTC step
+positive; denominator v6c/ttc_steppos) and v6c/ovl_overlabel (nc1 >= 1 among the rows with an overlap step positive;
+v6c/ovl_steppos), each with its step-exact *_sum.  The direction test that matters is "step positive -> candidate
+failed" for overlaps that are a track's first.
 
 DESIGN (not official): gap is the separating-axis distance of two oriented boxes (exact 0 when they overlap, a lower
 bound of the Euclidean distance otherwise); vapp uses the object's displacement to the next observed step of the same
@@ -218,15 +221,21 @@ def with_observed_horizon(t: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
 def stride2(lab: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """41 steps (0.1 s) -> the 21 refiner times (0, 0.2, .., 4.0 s), max-pooled over the odd step that the
     subsampling would drop (a 0.1 s positive at an odd step stays visible: bin max over (t - 0.1, t]), continuous
-    channels at the even step"""
+    channels at the even step.  With 'valid' in lab, also valid_bin = 'valid' pooled exactly like ovl / ttc / offroad
+    (report 129 N-stride2-odd-valid): with an odd last observed step 2j - 1, slot j carries that step's positive but
+    'valid' (step 2j) is 0; risk_loss weights ovl / ttc by valid_bin, the continuous channels by 'valid'"""
+    def pool(v):
+        od = torch.cat([torch.zeros_like(v[..., :1]), v[..., 1::2]], -1)                     # step 2j - 1 -> slot j
+        return torch.maximum(v[..., 0::2], od)
+
     out = {}
     for kk, v in lab.items():
         if kk in ("ovl", "ttc", "offroad"):
-            ev = v[..., 0::2]
-            od = torch.cat([torch.zeros_like(v[..., :1]), v[..., 1::2]], -1)                 # step 2j - 1 -> slot j
-            out[kk] = torch.maximum(ev, od)
+            out[kk] = pool(v)
         elif kk == "pos":
             out[kk] = v[..., 0::2, :]
         else:
             out[kk] = v[..., 0::2]
+    if "valid" in lab:
+        out["valid_bin"] = pool(lab["valid"])
     return out

@@ -34,9 +34,16 @@ navtest (12,146, official, 4th look), `corr30_v2` epoch 30, rule `pred_multiply_
      the 32 m `v31` needs it, so build 64 first)
 4. `train.sh v31 corr30_v31 0,1` (or `v31_64`).  Smoke: `EPOCHS=1 LIMIT_TRAIN=40 LIMIT_VAL=5 VAL_EVERY=1 WANDB=false`.
 5. Evaluation (`eval.sh`): `val` = navtrain_val all 18,179 tokens, every pre-declared rule, official PDMS;
-   `navtest` = the rule fixed on val + the same model's v2 selection, official PDMS and EPDMS
-   (needs the SSR-v2 checkout's `data/logs/score_npz.sh`, `V2_REPO`).
-   Arguments for `v31`: planes 40, route 1; for `v31_64` also fwd rows 200.
+   `navtest` = the rule fixed on val + the same model's v2 selection, official PDMS and EPDMS through
+   `tools/corridor/score_npz.py` (v1 PDMS via `corr_select.work`, v2.2 one-stage EPDMS on `metric_cache_v22_navtest`: the
+   calls of km's `corr30_cf_v15_fix/eval_ep5/run_eval_ep5.sh`).  `score_npz.py --check --split navtest` runs before the
+   dump; a missing input or a failed scoring exits 1.
+   Planes / fwd rows default to the archived run config (`corridor_occ_planes`; 200 rows for `corridor_format=c64`, else
+   100); arguments 6 / 8 override them.  Route for `v31`: argument 7 = 1.  `EVAL_DRY=1` only prints the commands.
+   Refiner v6c runs (`agent.config.v6c` in the archived config, detected by `eval.sh`) take their own route: one dump
+   `--v6 --traj32 --cand --no-fields`; the navtest submission is rule `v6` (R-J's switch ? tau_v6 : tau_base; rule `model`
+   is tau_base); PDMS via `tools/refiner_v6c/val_score.py`, EPDMS via `tools/refiner_v6c/val_epdms.py` (`--split navtest`
+   on navtest, with the same model's `v2` pick).
 
 ## Known gaps
 

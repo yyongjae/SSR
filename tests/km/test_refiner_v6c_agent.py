@@ -226,12 +226,12 @@ def test_training_without_teacher_is_refused_unless_gt_only():
 def test_kd_and_fix_source_switch_independently(batch, tmp_path):
     """feedback 10-27 #5: K-E / K-M (v6c_kd) and the source of the fixing term (v6c_fix_source) are separate switches;
     before, fix_source=gt also turned KD off, so 'KD on + GT fixing' could not be built"""
-    from navsim.agents.para_ssr.refiner_v6c.teacher import TeacherSet
+    from navsim.agents.para_ssr.refiner_v6c.teacher import READ_RULE, TeacherSet
     torch.manual_seed(0)
     ck = tmp_path / "teachers_te.pt"
     torch.save({"state_dict": TeacherSet().state_dict(),
                 "meta": {"folds": 2, "hid_e": 192, "planes": 49, "phase_done": "te",
-                         "phases": ["fields", "platt_occ", "te"]}}, ck)
+                         "phases": ["fields", "platt_occ", "te"], "read_rule": READ_RULE}}, ck)
     seen = {}
     for fix, kd in (("gt", True), ("gt", False), ("teacher", False)):
         a = build_agent(0, v6c=True, v6c_stage="D", v6c_fix_source=fix, v6c_kd=kd, v6c_teacher_ckpt=str(ck))

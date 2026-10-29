@@ -399,7 +399,7 @@ def train_te_copy(ts: TeacherSet, f: int, ds, anchors, args, dev, log, ckpt: Pat
                           torch.cat([status, status.new_zeros(b, 3)], -1).repeat_interleave(r, 0),
                           full=True).reshape(b, r, 41, 7).float()
                 area = _area_flags(S, bt)
-                reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], 100, 100, 64.0)
+                reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], 100, 100, 64.0, legacy_rear=True)
             E = model(reads, area=area)["E"]
             loss, lg = LS.risk_loss(E, lab, None, None, 4.0)
             opt.zero_grad(set_to_none=True)
@@ -461,7 +461,7 @@ def fit_platt_te_off(ts: TeacherSet, data_by_fold, anchors, args, dev, log):
             S = track(paths.reshape(b * r, 8, 3).float(), torch.cat([status, status.new_zeros(b, 3)], -1)
                       .repeat_interleave(r, 0), full=True).reshape(b, r, 41, 7).float()
             area = _area_flags(S, bt)
-            reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], 100, 100, 64.0)
+            reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], 100, 100, 64.0, legacy_rear=True)
             E = ts.te[f](reads, area=area)["E"]
             corners = N.footprint5(S[:, :, t21])[..., 1:, :]
             gm = ((corners[..., 0] >= 0) & (corners[..., 0] <= 64.0) & (corners[..., 1].abs() <= 32.0)).all(-1)

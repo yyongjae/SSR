@@ -409,9 +409,10 @@ def test_teacher_store_pread_row_equals_the_memmap_row(tmp_path):
 
 
 def test_rear_mask_ignores_points_behind_the_ego():
-    """10-28 review: CH._sample's in-range test has no x >= 0 side and its border padding repeats row 0, so a stopped
-    ego's rear corners (x = -REAR) read the first row.  rear_mask (student reads, L_corr hinges) drops them; the
-    default (scorer, T-E) is unchanged, and a path entirely ahead reads the same either way."""
+    """10-28 review: CH._sample's in-range test had no x >= 0 side and its border padding repeats row 0, so a stopped
+    ego's rear corners (x = -REAR) read the first row.  km's 10-29 fix (cf_v15_fix, |v| <= 1) masks them in the base
+    (scorer, corridor loss) too, so the default now equals rear_mask; legacy_rear reproduces the pre-fix rule for T-E /
+    T-M (teachers_te.pt), and a path entirely ahead reads the same under every rule."""
     from navsim.agents.para_ssr.modules import corridor_head as CH
     from navsim.agents.para_ssr.modules.candidate_scorer import field_readout
     from navsim.agents.para_ssr.refiner_v6c import losses as LS
@@ -420,22 +421,23 @@ def test_rear_mask_ignores_points_behind_the_ego():
     occ = torch.zeros(1, 49, 200, 200)
     occ[:, :, 0] = 1.0
     stop = torch.zeros(1, 1, 41, 7)                                                           # stopped at the origin
-    old = field_readout(stop, sdf, occ)
-    assert torch.equal(old, field_readout(stop, sdf, occ, rear_mask=False))
-    assert float(old[0, 0, 5, 0]) == -1.0                                                     # rear corner read row 0
-    new = field_readout(stop, sdf, occ, rear_mask=True)
+    legacy = field_readout(stop, sdf, occ, legacy_rear=True)
+    assert float(legacy[0, 0, 5, 0]) == -1.0                                                  # rear corner read row 0
+    new = field_readout(stop, sdf, occ)
+    assert torch.equal(new, field_readout(stop, sdf, occ, rear_mask=True))
     assert float(new[0, 0, 5, 0]) == 3.0 and float(new[0, 0, 5, 1]) > 0.9                    # front points still read row 0
     ahead = stop.clone()
     ahead[..., 0] = 10.0                                                                      # every point at x > 0
     assert torch.equal(field_readout(ahead, sdf, occ), field_readout(ahead, sdf, occ, rear_mask=True))
+    assert torch.equal(field_readout(ahead, sdf, occ), field_readout(ahead, sdf, occ, legacy_rear=True))
     S = stop[:, 0]
-    assert float(LS.road_hinge(S, sdf)) > 0 and float(LS.road_hinge(S, sdf, rear_mask=True)) == 0.0
+    assert float(LS.road_hinge(S, sdf)) == 0.0 and float(LS.road_hinge(S, sdf, rear_mask=True)) == 0.0
     S_back = S.clone()
     S_back[..., 0] = -0.5
     S_back[..., 2] = torch.pi                                                                 # behind, facing backwards
     od = torch.full((1, 49, 200, 200), CH.CLIP)
     od[:, :, 0] = -1.0
-    assert float(LS.front_hinge(S_back, od, "dist", 0.1).sum()) > 0
+    assert float(LS.front_hinge(S_back, od, "dist", 0.1).sum()) == 0.0
     assert float(LS.front_hinge(S_back, od, "dist", 0.1, rear_mask=True).sum()) == 0.0
 
 

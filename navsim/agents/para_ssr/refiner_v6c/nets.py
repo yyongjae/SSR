@@ -53,17 +53,19 @@ def footprint5(s: torch.Tensor) -> torch.Tensor:
 
 
 def path_reads(S: torch.Tensor, bev: torch.Tensor, sdf: torch.Tensor, occ_prob: torch.Tensor, bev_h: int,
-               bev_w: int, fwd_m: float, rear_mask: bool = False) -> Dict[str, torch.Tensor]:
+               bev_w: int, fwd_m: float, rear_mask: bool = False, legacy_rear: bool = False) -> Dict[str, torch.Tensor]:
     """parameter-free reads along the paths.  S [B, R, 41, 7]; bev [B, H*W, C]; sdf [B, Hf, 200] (m);
     occ_prob [B, P, Hf, 200] PROBABILITIES (report 124 §3-1 exchange convention) ->
       ro [B, R, T, 3] field_readout at the 21 times (min corner SDF / CLIP, max occupancy, max TTC occupancy),
       road [B, R, T, 5] SDF at the 5 footprint points / CLIP, M [B, R, T, 5] in range (and not behind the ego),
       smp [B, R, T, 5 C] BEV samples at the 5 points, kin [B, R, T, 6] kinematics
     rear_mask: ro also treats points behind the ego as out of range (as road / M already do).  The student R-E
-    reads with cfg.v6c_rear_mask (10-28 review); T-E keeps False, the rule it was trained with (teachers_te.pt)."""
+    reads with cfg.v6c_rear_mask (10-28 review); T-E keeps False, the rule it was trained with (teachers_te.pt).
+    legacy_rear (T-E / T-M): ro with CH._sample's pre-10-29 range rule (km's fix now masks x < 0 in the base), so
+    the teachers read exactly what they were trained and calibrated on; road / M mask x < 0 under both rules."""
     b, r = S.shape[:2]
     t = T21.to(S.device)
-    ro = field_readout(S, sdf, occ_prob, rear_mask=rear_mask)[:, :, t]                                          # [B, R, T, 3]
+    ro = field_readout(S, sdf, occ_prob, rear_mask=rear_mask, legacy_rear=legacy_rear)[:, :, t]                                          # [B, R, T, 3]
     ro = torch.cat([ro[..., :1] / CH.CLIP, ro[..., 1:]], -1)
     s21 = S[:, :, t]                                                                       # [B, R, T, 7]
     pts = footprint5(s21)                                                                  # [B, R, T, 5, 2]

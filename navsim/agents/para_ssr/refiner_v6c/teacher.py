@@ -139,7 +139,8 @@ class TeacherSet(nn.Module):
                  heading (the TTC rule's farthest projection, labels.py) also inside the window (report 124 D2 /
                  report 127 §3.4: beyond 64 m the teacher sees nothing, so its 'no approach' there is not evidence)
           g_off  the off-road channel (= g_obj)"""
-        reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], self.bev_h, self.bev_w, 64.0)
+        reads = N.path_reads(S, flds["tok_det"], flds["sdf_m"], flds["occ_prob"], self.bev_h, self.bev_w, 64.0,
+                             legacy_rear=True)
         E = self._per_copy(self.te, copy, lambda m, s: {"E": m({k: v[s] for k, v in reads.items()}, area=area[s])["E"]})["E"]
         t21 = N.T21.to(S.device)
         p_ovl = self.platt_ovl(E[..., 0], t21)

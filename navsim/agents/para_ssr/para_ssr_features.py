@@ -30,6 +30,7 @@ consecutive frames is read straight off those poses -- no angle round-trip.
 """
 from __future__ import annotations
 
+import functools
 from typing import Dict, List, Sequence, Tuple, Union
 
 import cv2
@@ -42,6 +43,26 @@ from navsim.common.dataclasses import AgentInput
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder
 
 from .cache_key import cache_key
+
+
+@functools.lru_cache(maxsize=64)
+def _undistort_maps(w: int, h: int, intr_bytes: bytes, dist_bytes: bytes):
+    intr = np.frombuffer(intr_bytes, dtype=np.float64).reshape(3, 3)
+    dist = np.frombuffer(dist_bytes, dtype=np.float64)
+    return cv2.initUndistortRectifyMap(intr, dist, None, intr, (w, h), cv2.CV_32FC1)
+
+
+def undistort_image(
+    img: np.ndarray,
+    cam_intrinsics: np.ndarray,
+    cam_distortion: np.ndarray,
+) -> np.ndarray:
+    """Lens distortion correction matching SafeDrive (initUndistortRectifyMap + remap)."""
+    h, w = img.shape[:2]
+    intr = np.asarray(cam_intrinsics, dtype=np.float64)
+    dist = np.asarray(cam_distortion, dtype=np.float64).reshape(-1)
+    map1, map2 = _undistort_maps(w, h, intr.tobytes(), dist.tobytes())
+    return cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
 
 # SSR-BEV (x right, y forward, z up) -> nuPlan lidar (x forward, y left, z up)
 T_LIDAR_FROM_SSR = np.array(
@@ -116,6 +137,7 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
             ("frame_indices", cfg.frame_indices),
             ("image_scale", cfg.image_scale),
             ("pc_range", cfg.pc_range),
+            ("undistort", True),
             ("use_lidar", cfg.use_lidar),
         ]
         if cfg.use_lidar:
@@ -238,6 +260,8 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
                     f"check ParaSSRConfig.camera_names against get_sensor_config()"
                 )
             img = cam.image
+            if getattr(cam, "intrinsics", None) is not None and getattr(cam, "distortion", None) is not None:
+                img = undistort_image(img, cam.intrinsics, cam.distortion)
             h, w = img.shape[:2]
             new_w = int(round(w * cfg.image_scale))
             new_h = int(round(h * cfg.image_scale))

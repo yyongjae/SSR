@@ -71,7 +71,7 @@ case $VAR in
   v2)  EXTRA=(++agent.config.corridor_dir=$KM_ROOT/corridor_dt01) ;;
   v31) EXTRA=("${V31[@]}" ++agent.config.corridor_dir=$KM_ROOT/corridor_dt01 ++agent.config.corridor_route_dir=$KM_ROOT/route32) ;;
   v31_64) EXTRA=("${V31[@]}" ++agent.config.corridor_format=c64 ++agent.config.corridor_dir=$KM_ROOT/corridor64
-           "++agent.config.pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]" "++agent.config.map_pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]"
+           "++agent.config.pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]" "++agent.config.map_pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]"
            ++agent.config.bev_h=100) ;;
   v32b) EXTRA=("${V31[@]}" ++agent.config.corridor_dir=$KM_ROOT/corridor32_p49 ++agent.config.corridor_route_dir=$KM_ROOT/route32
          ++agent.config.corridor_occ_pos_weight=8.0 ++agent.config.corridor_occ_time_weight=1.0
@@ -79,7 +79,7 @@ case $VAR in
   c64|c64_traj|pert|mix|cf|cf_seg|cf_v15|cf_seg_v15|cf_vec_v15) V31C=(); for x in "${V31[@]}"; do [[ $x == *corridor_verdict_weight* ]] || V31C+=("$x"); done
            EXTRA=("${V31C[@]}" ++agent.config.corridor_format=c64
            ++agent.config.corridor_dir=$KM_ROOT/corridor64
-           "++agent.config.pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]" "++agent.config.map_pc_range=[-32.0,0.0,-2.0,32.0,64.0,2.0]"
+           "++agent.config.pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]" "++agent.config.map_pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]"
            ++agent.config.bev_h=100 ++agent.config.cand_scorer_weight=1.0 ++agent.config.exact_dir=$KM_ROOT/exact
            ++agent.config.cand_official=true ++agent.config.exact2_dir=$KM_ROOT/exact2
            ++agent.config.cand_scorer_fields=$([ "$VAR" = c64_traj ] && echo false || echo true))

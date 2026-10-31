@@ -49,7 +49,7 @@ class AgentCrossAttn(nn.Module):
         self.tok = nn.Sequential(nn.Linear(cin + 10 + 7 + 9 * 4 * nf + 1, hid), nn.ReLU(inplace=True),
                                  nn.Linear(hid, hid))
         self.pix = nn.Linear(4 * nf, hid)
-        cell = 32.0 / bev_h                                                             # 0.64 m
+        cell = 64.0 / bev_w                                                             # 0.64 m (32 m for bev_h=50, 64 m for bev_h=100)
         fwd = (torch.arange(bev_h) + 0.5) * cell
         ssr_x = -32.0 + (torch.arange(bev_w) + 0.5) * (64.0 / bev_w)
         gy, gx = torch.meshgrid(fwd, ssr_x, indexing="ij")
@@ -274,7 +274,7 @@ def _sample(field: torch.Tensor, pts: torch.Tensor) -> tuple:
     g = torch.stack([u, v], -1).reshape(b * p, n, 1, 2)
     val = F.grid_sample(field.reshape(b * p, 1, *field.shape[2:]).float(), g.float(), mode="bilinear",
                         padding_mode="border", align_corners=False).reshape(b, p, n)
-    return val, (v <= 1) & (u.abs() <= 1)
+    return val, (v.abs() <= 1) & (u.abs() <= 1)
 
 
 def corridor_plan_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor],

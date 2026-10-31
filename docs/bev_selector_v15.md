@@ -292,4 +292,179 @@ CK2 Refiner (`ck_e2e2.enabled=false`)를 완전히 제거하고 **오직 순수 
   2. **최종 에폭(`Epoch 29`, `last.ckpt`)에서도 `89.16%` (`+1.02%p`) 기록**:
      - CK2 Refiner의 보조 그래디언트 없이도 순수 `BEV Selector v15` 자체가 카메라 BEV 표현을 강력하게 개선하여, Refiner와 함께 학습된 `no_kd`(`88.62%`), `bevkd`(`88.96%`), `v13`(`89.09%`), `v14`(`89.10%`), `v15`(`89.02%`)의 최종 에폭 `v2` 점수를 모두 상회했습니다.
 
+---
+
+## 7. 신규 Student 통합 (`corr30_cf_v15`): 64m `km/corridor-cf` (`map_repr=seg`) + `BEV Selector v15`
+
+기존 32m(`50×100`) `PARA-SSR v2` Student에서 **64m(`100×100`) `km/corridor-cf` + Raster Map Segmentation Head (`map_repr=seg`)**로 Student 아키텍처가 변경됨에 따라, 64m $100 \times 100$ 격자 위에서 `BEV Selector v15`를 결합한 **`corr30_cf_v15`** 사양과 `Epoch 0 ~ 19` 학습·검증 및 **`10 Epoch` (`epoch=9`) / `15 Epoch` (`epoch=14`) / `20 Epoch` (`epoch=19`) `navtest` ($N=12,146$) 공식 PDMS / EPDMS 평가 결과**를 정리합니다.
+
+### 7.1 Student 아키텍처 변경점 및 64m `BEV Selector v15` 연동 사양
+
+| 항목 | 기존 Student (`fusion_v15_main` / `noref`) | **신규 Student (`corr30_cf_v15`: `km/corridor-cf` + `v15`)** |
+| :--- | :--- | :--- |
+| **BEV 격자 및 공간 범위** | $50 \times 100$ ($HW = 5,000$), 전방 $0\text{--}32\text{m}$ (`0.64m`/cell) | **$100 \times 100$ ($HW = 10,000$), 전방 $0\text{--}64\text{m}$ (`pc_range=[-32,0,-2,32,64,2]`)** |
+| **Map Head 표현 (`map_repr`)** | Vector Map (`100×20` polylines) | **Raster BEV Segmentation (`map_repr=seg`: road / walkway / centerline / crosswalk)** |
+| **Corridor Field Head** | 없음 (후단 CK2 Refiner 사용) | **64m Corridor Field Head (`c64`: Static SDF + `49 × 0.1s` Occupancy Planes + Route)** |
+| **Candidate Scorer & 선택 규칙** | `v2` Base 또는 CK2 Refiner | **Cross-Fit (`cand_cf_folds=2`) Official Candidate Scorer (`corridor_select_rule=cand_official`)** |
+| **궤적 제약 손실 (`corridor_plan`)** | `v2` regression + reward loss | **`corridor_plan_weight=20.0` (Static / Occ / TTC / Comfort / Progress + `0.1x` EC Smoothness Hinge)** |
+| **Teacher BEV 캐시 (`100×100`)** | 32m $50\times 100$ (`bevfusion`, `resmap`) | **64m $100\times 100$ (`bevfusion/cache_{train,val}_100x100`, `resmap/stage1_front64`)** |
+| **채널별 Z-Score 정규화 통계** | 32m `norm.npz` / `norm_map.npz` | **64m 전용 [`norm_bevfusion_100x100.npz`](file:///workspace/byounggun/SSR/resources/km_corridor/norm_bevfusion_100x100.npz) & [`norm_resmap_100x100.npz`](file:///workspace/byounggun/SSR/resources/km_corridor/norm_resmap_100x100.npz)** |
+| **Probe Warmup / Ramp 스케줄** | `5,300` micro-steps (1 Ep) / `2,650` (0.5 Ep) | **`5,300` micro-steps (1 Ep) / `2,650` (0.5 Ep) 동일 (`4 GPU × bs 4 × accum 8`)** |
+
+```bash
+# 실행 명령어 (scripts/km_corridor/train.sh)
+bash scripts/km_corridor/train.sh cf_v15 corr30_cf_v15 0,1,2,3
+```
+
+---
+
+### 7.2 `corr30_cf_v15` (64m) vs `fusion_v15_noref` (32m) 학습 텔레메트리 대조 (`Epoch 0 → 4 → 9 → 14 → 19`)
+
+| 구분 | 텔레메트리 지표 | `corr30_cf_v15` (`Ep 0 → Ep 4 → Ep 9 → Ep 14 → Ep 19`) | `fusion_v15_noref` (`Ep 0 → Ep 4 → Ep 10`) | 진단 및 해석 |
+| :--- | :--- | :---: | :---: | :--- |
+| **Stream 1**<br>(Grid KD:<br>$100\times 100$) | `distill_cell_mse/bevfusion` ↓ | `1.3721 → 1.1282 → 1.0677 → 1.0342 → 1.0169` | `1.1517 → 0.9782 → 0.9217` | $32\text{--}64\text{m}$ 원거리 영역 포함으로 초기 오프셋만 높고 수렴 기울기 동일 (`-25.9%`) |
+| | `distill_cell_mse/resmap` ↓ | `1.0585 → 0.9078 → 0.8294 → 0.7805 → 0.7537` | `0.9761 → 0.7665 → 0.6495` | **`-28.8%` 단조 감소** |
+| | `distill_uniform_mse/bevfusion` ↓ | `0.9513 → 0.8406 → 0.8084 → 0.7880 → 0.7783` | `0.9651 → 0.8319 → 0.7891` | 전역 $100\times 100$ 격자 MSE가 32m 모델의 Ep 10 수준(`0.789`) 하회 |
+| | `distill_uniform_mse/resmap` ↓ | `0.9525 → 0.8230 → 0.7581 → 0.7163 → 0.6946` | `0.9450 → 0.7486 → 0.6373` | 매 에폭 일정한 폭으로 지속 감소 |
+| | `distill_global_5x5_cos/bevfusion` ↑ | `0.2872 → 0.5487 → 0.5838 → 0.6040 → 0.6134` | `0.3012 → 0.5610 → 0.6015` | $5\times 5$ 전역 문맥 코사인 유사도가 `0.613`까지 상승 |
+| | `distill_global_5x5_cos/resmap` ↑ | `0.2907 → 0.5391 → 0.6009 → 0.6358 → 0.6538` | `0.3105 → 0.5740 → 0.6480` | 64m 맵 전역 문맥 정렬 원활 (`0.654` 달성) |
+| | `distill_edge_3x3/bevfusion` ↓ | `1.1466 → 1.1716 → 1.1270 → 1.0993 → 1.0831` | `1.1120 → 1.0890 → 1.0450` | Ramp 직후 피크 이후 지속 감소 |
+| | `distill_edge_3x3/resmap` ↓ | `0.3576 → 0.3631 → 0.3409 → 0.3298 → 0.3252` | `0.3410 → 0.2980 → 0.2640` | 차선/도로 경계 1차 공간 미분 오차 안정적 감소 |
+| **Stream 2**<br>(Probe KD) | **`distill_cos/bevfusion`** ↑ | `0.8076 → 0.8539 → 0.8289 → 0.8089 → 0.7944` | `0.8061 → 0.8767 → 0.8561` | Subspace Drift 없이 **`0.79+` 고수준 유지** (`winner_cos: 0.8097`) |
+| | **`distill_cos/resmap`** ↑ | `0.7636 → 0.8657 → 0.8820 → 0.8851 → 0.8831` | `0.7477 → 0.8737 → 0.8984` | **`0.883+` 고수준 유지** (`winner_cos: 0.8883`) |
+| | **`distill_sibling_cos/bevfusion`** ↑ | `0.5915 → 0.6628 → 0.6514 → 0.6423 → 0.6338` | `0.5826 → 0.7057 → 0.7005` | 속도 형제(`Mid+Far`) 차분 방향 정렬 안정적 유지 |
+| | **`distill_sibling_cos/resmap`** ↑ | `0.4895 → 0.6932 → 0.7351 → 0.7530 → 0.7603` | `0.4728 → 0.7243 → 0.7875` | `sibling_diff` 오차 `0.3333 → 0.1808` (**-45.8% 감소**) |
+| | **`probe/student_gap/bevfusion`** ↓ | `0.0865 → 0.0726 → 0.0707 → 0.0730 → 0.0752` | `0.0920 → 0.0660 → 0.0645` | `L_score_kd` 작동으로 `0.075` 수준 유지 |
+| | **`probe/student_gap/resmap`** ↓ | `0.0866 → 0.0620 → 0.0544 → 0.0508 → 0.0489` | `0.1030 → 0.0645 → 0.0525` | 32m 모델보다 더 낮은 **`0.0489`** 수준으로 축소 |
+| **Teacher Probe**<br>& 공간 집중도 | **`probe/det/loss_epoch`** ↓ | **`3.5215 → 2.8279 → 2.6684 → 2.6026 → 2.5231`** | `3.5886 → 2.8790 → 2.7172` | **64m 확장의 이점으로 32m(`2.717`)보다 훨씬 낮게 수렴!** (`nc_err 0.124`, `ttc_err 0.141`) |
+| | **`probe/map/loss_epoch`** ↓ | **`4.7050 → 4.0450 → 3.9671 → 3.9326 → 3.9070`** | `4.7222 → 4.0358 → 3.9620` | `map_repr=seg`에서도 `gt_map_pts` 기반 EPDMS 타깃 정상 작동 (`dac_err 0.020`, `ddc_err 0.018`, `lk_err 0.045`) |
+| | **`probe/head_entropy/bevfusion`** ↓ | `5.7712 → 5.2901 → 5.2755 → 5.3205 → 5.3710` | `5.5309 → 5.1860 → 5.1975` | **10,000셀 중 유효 ~215셀(2.15%)만 집중** (초고해상도 코리도 포커싱) |
+| | **`probe/head_entropy/resmap`** ↓ | `5.9016 → 5.6770 → 5.6359 → 5.6324 → 5.6427` | `5.6598 → 5.4711 → 5.4334` | **10,000셀 중 유효 ~282셀(2.82%)만 집중** |
+| **Grad Balance** | `gnorm/distill_v8` vs `gnorm/plan` | `0.0065 → 0.0086 → 0.0111 → 0.0129` vs `0.046~0.096` | `0.0123~0.0154` vs `0.092~0.121` | `corridor_plan_loss` 스케일에 맞춰 `gnorm/plan` 대비 **~13.4% 비율** 자동 유지 |
+
+---
+
+### 7.3 5ep (`epoch=4`) vs 10ep (`epoch=9`) vs 15ep (`epoch=14`) vs 20ep (`epoch=19`) In-Training Validation 결과 (`limit_val_batches=250`)
+
+| 구분 | 지표 (Metric) | 5ep (`ep=4`, step 3324) | 10ep (`ep=9`, step 6649) | 15ep (`ep=14`, step 9974) | **20ep (`ep=19`, step 13299)** | 5ep → 20ep 변화 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **Total / Plan Loss** | **`val/traj_loss_epoch`** | **4.4165** | **3.5788** | **3.2211** | **2.8794** | **-1.5371 (개선)** |
+| | `val/loss_v2_epoch` (`loss_plan_reg_weighted`) | 7.9513 | 7.7871 | 7.7500 | **7.6917** | -0.2596 |
+| | `val/loss_plan_reg_epoch` | 0.0314 | 0.0294 | 0.0284 | **0.0272** | -0.0042 |
+| | `val/plan_v2/sim_reward_loss_epoch` | 1.1802 | 1.0952 | 1.0667 | **1.0397** | -0.1405 |
+| | `val/plan_v2/traj_offset_loss_epoch` | 0.2101 | 0.2027 | **0.1929** | 0.1975 | -0.0126 |
+| **Corridor 예측** | `val/corr/sdf_epoch` | 1.7376 | 1.4154 | 1.3208 | **1.2345** | **-0.5031** |
+| | `val/corr/route_d_epoch` | 1.5508 | 1.3141 | 1.2575 | **1.2080** | **-0.3428** |
+| | `val/corr/occ_epoch` | 0.1559 | 0.1416 | 0.1391 | **0.1364** | -0.0195 |
+| | `val/corr/sign_band1m_epoch` (↑) | 62.49% | 65.61% | 66.70% | **67.85%** | **+5.36%p** |
+| **Corridor Plan 위반율** | `val/corr_plan/frac_static_viol_epoch` (↓) | 18.92% | 16.88% | 14.81% | **11.98%** | **-6.94%p** |
+| | `val/corr_plan/frac_ttc_viol_epoch` (↓) | 18.59% | 17.56% | 15.88% | **15.12%** | **-3.47%p** |
+| | `val/corr_plan/frac_occ_viol_epoch` (↓) | 6.25% | 6.02% | 5.11% | **5.03%** | **-1.22%p** |
+| **Candidate Scorer Acc (↑)** | `val/cand/acc_nc1_epoch` / `nc2` | 95.98% / 96.01% | 96.48% / 96.50% | 96.55% / 96.53% | **96.69% / 96.68%** | **+0.71%p** |
+| | `val/cand/acc_dac1_epoch` / `dac2` | 88.76% / 88.76% | 91.54% / 91.50% | 91.74% / 91.75% | **93.70% / 93.69%** | **+4.94%p** |
+| | `val/cand/acc_ttc1_epoch` / `ttc2` | 86.89% / 94.68% | 88.85% / 95.17% | 89.16% / **95.42%** | **89.71%** / 95.38% | **+2.82%p / +0.70%p** |
+| | `val/cand/acc_ddc2_epoch` | 92.30% | 93.91% | 94.99% | **95.05%** | **+2.75%p** |
+| | `val/cand/acc_lk2_epoch` | 89.22% | 89.32% | 89.98% | **90.83%** | **+1.61%p** |
+| | `val/cand/prog_epoch` (Loss ↓) | 0.1817 | 0.1544 | 0.1515 | **0.1492** | -0.0325 |
+| | `val/cand/gt_best_pdms1_epoch` / `epdms2` (↑) | 96.81% / 96.16% | 96.67% / 96.11% | 97.79% / **97.73%** | **97.95%** / 97.50% | **+1.14%p / +1.34%p** |
+
+---
+
+### 7.4 `10 Epoch` (`epoch=9`), `15 Epoch` (`epoch=14`) & `20 Epoch` (`epoch=19`) `navtest` ($N=12,146$) 공식 PDMS & EPDMS 평가 결과
+
+학습 1/3 지점인 **10 Epoch** ([`epoch=9-step=6650.ckpt`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15/train/lightning_logs/version_1/checkpoints/epoch=9-step=6650.ckpt)), 1/2 지점인 **15 Epoch** ([`epoch=14-step=9975.ckpt`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15/train/lightning_logs/version_1/checkpoints/epoch=14-step=9975.ckpt)), 그리고 2/3 지점인 **20 Epoch** ([`epoch=19-step=13300.ckpt`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15/train/lightning_logs/version_1/checkpoints/epoch=19-step=13300.ckpt)) 체크포인트에 대해 `navtest` 전수($N=12,146$) 덤프 및 공식 **PDMS (v1)** / **EPDMS (v2.2 One-Stage)** 평가를 수행한 결과입니다 ([`eval_ep10`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15/eval_ep10/pdms_navtest.json), [`eval_ep15`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15/eval_ep15/pdms_navtest.json), [`eval_ep20`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15/eval_ep20/pdms_navtest.json)).
+
+#### (1) Official PDMS (v1, $N=12,146$)
+
+| 모델 / 선택 규칙 (`navtest`, $N=12,146$) | 에폭 | **★ PDMS** | `NC` | `DAC` | `EP` | `TTC` | `Comfort` | `v2`와 동일 선택 비율 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `corr30_v31` (`v2` 선택) | Ep 10 | `86.91` | `98.41` | `95.24` | `81.14` | `94.38` | `100.00` | `100.0%` |
+| `corr30_v31` (`pred_multiply_t0.25`) | Ep 10 | `88.34` | `98.52` | `96.67` | `82.47` | `94.54` | `99.97` | `84.1%` |
+| `corr30_v31` (`pred_multiply_t0.25`) | Ep 30 (완주) | `89.19` | `98.50` | `97.06` | `83.74` | `94.85` | `99.98` | `89.0%` |
+| `corr30_v2` (`pred_multiply_t0.25`) | Ep 30 (완주) | `89.30` | — | — | — | — | — | — |
+| `corr30_cf_64m_seg_cand3_eps05` (`cand_official`, No KD) | Ep 30 (완주) | `90.82` | — | — | — | — | — | — |
+| **`corr30_cf_v15` (`v2` Anchor-Label 선택)** | **Ep 10** | `85.73` | `98.06` | `94.06` | `79.96` | `94.27` | `100.00` | `100.0%` |
+| **★ `corr30_cf_v15` (`cand_official`, $\varepsilon=0.05, \lambda=0.05$)** | **Ep 10** | **`90.45`** | `98.26` | `97.26` | `87.91` | `93.51` | `100.00` | `9.2%` |
+| **`corr30_cf_v15` (`v2` Anchor-Label 선택)** | **Ep 15** | `86.18` (`+0.45`) | **`98.64`** | `94.05` | `79.58` | **`95.70`** | `99.99` | `100.0%` |
+| **★★ `corr30_cf_v15` (`cand_official`, $\varepsilon=0.05, \lambda=0.05$)** | **Ep 15** | **`90.94`** 🏆 (`+0.49`) | **`98.29`** | **`97.71`** 🏆 | `88.15` | **`93.87`** | **`100.00`** | `7.7%` |
+| **`corr30_cf_v15` (`v2` Anchor-Label 선택)** | **Ep 20** | **`87.95`** (`+1.77`) | `98.60` | **`95.76`** (`+1.71`) | **`81.82`** (`+2.24`) | `95.51` | **`100.00`** | `100.0%` |
+| **★★ `corr30_cf_v15` (`cand_official`, $\varepsilon=0.05, \lambda=0.05$)** | **Ep 20** | **`90.78`** | `98.03` | `97.69` | **`89.10`** 🏆 (`+0.95`) | `92.58` | **`100.00`** | `7.8%` |
+
+#### (2) Official EPDMS (v2.2 One-Stage, $N=12,146$)
+
+| 모델 / 선택 규칙 (`navtest`, $N=12,146$) | 에폭 | **★ EPDMS** | `NC` | `DAC` | `DDC` | `TLC` | `EP` | `TTC` | `LK` | `HC` | `EC` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `corr30_v31` (`v2` 선택) | Ep 10 | `85.35` | — | — | — | — | — | — | — | — | — |
+| `corr30_v31` (`pred_multiply_t0.25`) | Ep 10 | `86.26` | — | — | — | — | — | — | — | — | — |
+| `corr30_v31` (`pred_multiply_t0.25`) | Ep 30 (완주) | `87.77` | — | — | — | — | — | — | — | — | — |
+| `corr30_v2` (`pred_multiply_t0.25`) | Ep 30 (완주) | `88.57` | — | — | — | — | — | — | — | — | — |
+| `corr30_cf_64m_seg_cand3_eps05` (`cand_official`, No KD) | Ep 30 (완주) | `89.32` | — | — | — | — | — | — | — | — | — |
+| **`corr30_cf_v15` (`v2` Anchor-Label 선택)** | **Ep 10** | `85.53` | `98.07` | `94.06` | `99.36` | `99.71` | `86.87` | `97.77` | `95.61` | `98.26` | `84.67` |
+| **★ `corr30_cf_v15` (`cand_official`, $\varepsilon=0.05, \lambda=0.05$)** | **Ep 10** | **`89.04`** | `98.26` | `97.26` | `98.96` | `99.62` | `92.05` | **`97.91`** 🏆 | `95.24` | `98.23` | `79.12` |
+| **`corr30_cf_v15` (`v2` Anchor-Label 선택)** | **Ep 15** | `85.73` (`+0.20`) | **`98.64`** | `94.05` | `99.39` | **`99.78`** | `86.01` | **`98.37`** | `96.16` | **`98.34`** | `83.71` |
+| **★★ `corr30_cf_v15` (`cand_official`, $\varepsilon=0.05, \lambda=0.05$)** | **Ep 15** | **`89.43`** (`+0.39`) | **`98.29`** | **`97.71`** 🏆 | **`99.01`** | **`99.63`** | `91.89` | `97.77` | **`95.57`** | `98.16` | `79.17` |
+| **`corr30_cf_v15` (`v2` Anchor-Label 선택)** | **Ep 20** | **`87.54`** (`+1.81`) | `98.60` | **`95.76`** (`+1.71`) | **`99.42`** | `99.74` | **`86.89`** | **`98.37`** | **`96.51`** | **`98.34`** | **`83.89`** |
+| **★★★ `corr30_cf_v15` (`cand_official`, $\varepsilon=0.05, \lambda=0.05$)** | **Ep 20** | **`89.72`** 🏆 (`+0.29`) | `98.03` | `97.69` | `98.87` | `99.56` | **`93.04`** 🏆 (`+1.15`) | `97.46` | `95.35` | `98.16` | **`82.12`** 🏆 (`+2.95`) |
+
+- **10 Epoch → 15 Epoch → 20 Epoch 평가 핵심 요약**:
+  1. **20 Epoch에서 공식 EPDMS 최고점 경신 (`89.04% → 89.43% → 89.72%`, 30ep Baseline `89.32%` 대비 `+0.40%p`)**:
+     - `cand_official` 기준 **`EPDMS 89.72%`**를 달성했으며, 특히 15ep 대비 **`EP (91.89% → 93.04%, +1.15%p)`**와 **`EC (79.17% → 82.12%, +2.95%p)`**가 크게 도약했습니다.
+     - `v2` 기본 플래너 역시 15ep → 20ep 구간에서 **`PDMS 86.18% → 87.95% (+1.77%p)`**, **`EPDMS 85.73% → 87.54% (+1.81%p)`**, **`DAC 94.05% → 95.76% (+1.71%p)`**, **`LK 96.16% → 96.51% (+0.35%p)`**로 Base 궤적 품질 자체가 대폭 향상되었습니다.
+  2. **PDMS (v1) vs EPDMS (v2.2) 추이**:
+     - **PDMS (v1)**는 15ep에서 **`90.94%`**로 최고점을 기록한 뒤 20ep에서 **`90.78%`**(`EP 88.15% → 89.10%` 상승, `TTC 93.87% → 92.58%` 트레이드오프)를 유지했고, **EPDMS (v2.2)**는 20ep에서 **`89.72%`**로 지속 상승했습니다.
+     - 20에폭 완료 시점 이후 본 학습(`corr30_cf_v15`)을 종료하고, [`docs/tofix.md`](file:///workspace/byounggun/SSR/docs/tofix.md)에 정리된 5가지 수정 사항(`exact2_v22` 정식 v2.2 정답 테이블, `corridor_head.py:_sample` 후방 범위 검사, `pc_range` $z \in [-1.0, 3.0]$ 기둥 높이 보정, `AgentCrossAttn`/`rasterize_agent_mask` 코드 수정, 카메라 왜곡 보정 `undistort`)을 모두 반영한 재학습(`corr30_cf_v15_fix`)을 진행했습니다.
+
+---
+
+### 7.5 5대 수정 반영 본 학습 `corr30_cf_v15_fix` (30 Epochs 완주: `Ep 5, 10, 15, 20, 25, 30`) `navtest` ($N=12,146$) 공식 PDMS & EPDMS 평가 결과
+
+[`docs/tofix.md`](file:///workspace/byounggun/SSR/docs/tofix.md)의 5가지 수정 사항을 모두 적용하여 30 에폭 완주한 [`corr30_cf_v15_fix`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15_fix/train)의 전 구간(`Ep 5, 10, 15, 20, 25, 30`) 체크포인트에 대한 `navtest` ($N=12,146$) 공식 **PDMS (v1)** 및 **EPDMS (v2.2 One-Stage)** 평가 결과입니다 ([`eval_ep5`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15_fix/eval_ep5/pdms_navtest.json), [`eval_ep10`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15_fix/eval_ep10/pdms_navtest.json), [`eval_ep15`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15_fix/eval_ep15/pdms_navtest.json), [`eval_ep20`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15_fix/eval_ep20/pdms_navtest.json), [`eval_ep25`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15_fix/eval_ep25/pdms_navtest.json), [`eval_ep30`](file:///workspace/byounggun/SSR/work_dirs/km_runs/corr30/corr30_cf_v15_fix/eval_ep30/pdms_navtest.json)).
+
+#### (1) Official PDMS (v1, $N=12,146$) — `corr30_cf_v15_fix` 전 구간 추이
+
+| 모델 / 선택 규칙 (`navtest`, $N=12,146$) | 에폭 | **★ PDMS** | `NC` | `DAC` | `EP` | `TTC` | `Comfort` | `v2`와 동일 선택 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `corr30_cf_64m_seg_cand3_eps05` (`cand_official`, No KD) | Ep 30 | `90.82` | — | — | — | — | — | — |
+| `corr30_cf_v15` (수정 전, `cand_official`) | Ep 15 / Ep 20 | `90.94` / `90.78` | `98.29` / `98.03` | `97.71` / `97.69` | `88.15` / `89.10` | `93.87` / `92.58` | `100.00` | `7.7%` / `7.8%` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 5** | `81.45` | `97.36` | `90.33` | `76.25` | `92.98` | `100.00` | `100.0%` |
+| **★ `corr30_cf_v15_fix` (`cand_official`)** | **Ep 5** | `88.88` | `98.25` | `96.50` | `85.19` | `93.51` | `100.00` | `8.9%` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 10** | `86.20` (`+0.47` vs 구 10ep) | `98.11` | `94.39` | `80.76` | `94.29` | `100.00` | `100.0%` |
+| **★ `corr30_cf_v15_fix` (`cand_official`)** | **Ep 10** | `90.35` | `98.28` | `97.19` | `88.16` | `93.20` | `100.00` | `9.6%` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 15** | `87.71` (`+1.53` vs 구 15ep) | **`98.81`** | `95.59` | `80.58` | **`96.31`** | `100.00` | `100.0%` |
+| **★★★ `corr30_cf_v15_fix` (`cand_official`)** | **Ep 15** | **`91.25`** 🏆 (`+0.31` vs 구 15ep) | **`98.48`** 🏆 | `97.80` | `88.37` | **`94.17`** 🏆 | **`100.00`** | `7.2%` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 20** | `88.17` (`+0.22` vs 구 20ep) | `98.54` | `96.18` | `81.87` | `95.49` | `100.00` | `100.0%` |
+| **★★ `corr30_cf_v15_fix` (`cand_official`)** | **Ep 20** | **`90.88`** (`+0.10` vs 구 20ep) | `97.78` | **`97.99`** 🏆 | `89.24` | `92.36` | **`100.00`** | `7.5%` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 25** | **`88.39`** 🏆 | `98.37` | **`96.47`** | **`82.69`** | `94.88` | `100.00` | `100.0%` |
+| **`corr30_cf_v15_fix` (`cand_official`)** | **Ep 25** | `89.83` | `97.16` | `97.80` | **`89.28`** | `90.21` | `100.00` | `7.9%` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 30** | `88.25` | `98.29` | `96.34` | `82.49` | `94.90` | `100.00` | `100.0%` |
+| **`corr30_cf_v15_fix` (`cand_official`)** | **Ep 30** | `89.39` | `96.92` | `97.52` | `88.94` | `90.01` | `100.00` | `7.2%` |
+
+#### (2) Official EPDMS (v2.2 One-Stage, $N=12,146$) — `corr30_cf_v15_fix` 전 구간 추이
+
+| 모델 / 선택 규칙 (`navtest`, $N=12,146$) | 에폭 | **★ EPDMS** | `NC` | `DAC` | `DDC` | `TLC` | `EP` | `TTC` | `LK` | `HC` | `EC` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `corr30_cf_64m_seg_cand3_eps05` (`cand_official`, No KD) | Ep 30 | `89.32` | — | — | — | — | — | — | — | — | — |
+| `corr30_cf_v15` (수정 전, `cand_official`) | Ep 15 / Ep 20 | `89.43` / `89.72` | `98.29` / `98.03` | `97.71` / `97.69` | `99.01` / `98.87` | `99.63` / `99.56` | `91.89` / `93.04` | `97.77` / `97.46` | `95.57` / `95.35` | `98.16` / `98.16` | `79.17` / `82.12` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 5** | `80.50` | `97.37` | `90.33` | `98.25` | `99.61` | `87.11` | `96.99` | `94.19` | `98.25` | `82.39` |
+| **★ `corr30_cf_v15_fix` (`cand_official`)** | **Ep 5** | `86.81` | `98.25` | `96.50` | `98.49` | `99.56` | `90.00` | `97.74` | `94.18` | `98.18` | `74.14` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 10** | `85.74` (`+0.21` vs 구 10ep) | `98.11` | `94.39` | `99.19` | `99.67` | `87.36` | `97.68` | `95.38` | `98.32` | `84.61` |
+| **★ `corr30_cf_v15_fix` (`cand_official`)** | **Ep 10** | `88.70` | `98.28` | `97.19` | `98.71` | `99.56` | `92.40` | `97.85` | `94.92` | `98.21` | `78.17` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 15** | `87.19` (`+1.46` vs 구 15ep) | **`98.81`** | `95.59` | **`99.48`** | `99.78` | `85.50` | **`98.44`** | `96.01` | `98.31` | `84.32` |
+| **★★ `corr30_cf_v15_fix` (`cand_official`)** | **Ep 15** | **`89.73`** (`+0.30` vs 구 15ep) | **`98.49`** 🏆 | `97.80` | **`98.92`** 🏆 | **`99.56`** | `91.89` | **`97.91`** 🏆 | **`95.76`** 🏆 | `98.28` | `79.86` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 20** | `87.73` (`+0.19` vs 구 20ep) | `98.53` | `96.18` | `99.36` | `99.79` | `86.62` | `98.27` | **`96.43`** | `98.35` | `83.93` |
+| **★★★ `corr30_cf_v15_fix` (`cand_official`)** | **Ep 20** | **`89.86`** 🏆 (`+0.14` vs 구 20ep) | `97.78` | **`97.99`** 🏆 | `98.88` | `99.54` | `93.28` | `97.18` | `95.46` | **`98.32`** 🏆 | `82.61` |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 25** | **`87.96`** 🏆 | `98.37` | **`96.47`** | `99.30` | `99.75` | **`87.39`** | `97.94` | `96.20` | `98.33` | `84.50` |
+| **`corr30_cf_v15_fix` (`cand_official`)** | **Ep 25** | `89.14` | `97.17` | `97.80` | `98.84` | `99.44` | `94.07` | `96.27` | `95.17` | `98.17` | **`82.84`** 🏆 |
+| **`corr30_cf_v15_fix` (`v2` Anchor-Label 선택)** | **Ep 30** | `87.89` | `98.28` | `96.34` | `99.36` | `99.78` | `87.35` | `97.92` | `96.36` | `98.32` | `84.52` |
+| **`corr30_cf_v15_fix` (`cand_official`)** | **Ep 30** | `88.57` | `96.92` | `97.52` | `98.70` | `99.46` | **`94.28`** 🏆 | `96.03` | `95.00` | `98.12` | `82.60` |
+
+- **30 Epoch 전 구간(`Ep 5 ~ Ep 30`) 핵심 요약**:
+  1. **최고점(Sweet-spot) 경신 — Ep 15 (`PDMS 91.25%` 🏆) & Ep 20 (`EPDMS 89.86%` 🏆)**:
+     - **Ep 15 (`epoch=14`)**: 공식 **PDMS (v1) `91.25%`** (수정 전 15ep `90.94%` 대비 **`+0.31%p`**, 30ep No-KD Baseline `90.82%` 대비 **`+0.43%p`**), 공식 **EPDMS (v2.2) `89.73%`** (수정 전 15ep `89.43%` 대비 **`+0.30%p`**) 달성.
+     - **Ep 20 (`epoch=19`)**: 공식 **EPDMS (v2.2) `89.86%`** (수정 전 20ep `89.72%` 대비 **`+0.14%p`**, 30ep No-KD Baseline `89.32%` 대비 **`+0.54%p`**), 공식 **PDMS (v1) `90.88%`** (수정 전 20ep `90.78%` 대비 **`+0.10%p`**) 달성.
+  2. **기본 플래너(`v2`) 및 `CorridorHead`는 25~30 에폭까지 지속 향상 (`PDMS 88.39%`, `EPDMS 87.96%`)**:
+     - `v2` 기본 플래너는 Ep 5 (`81.45% / 80.50%`) → Ep 15 (`87.71% / 87.19%`) → Ep 25 (`88.39% / 87.96%`)까지 꾸준히 상승했으며, `CorridorHead` SDF 정밀도(`val/corr/sdf_epoch = 1.2045`, `sign_band1m = 68.11%`)와 `CandidateScorer`의 `DDC2` 정확도(`val/cand/acc_ddc2_epoch = 94.14%`) 역시 후반부까지 향상되었습니다.
+  3. **후반부(Ep 25~30) `CandidateScorer`의 `NC/TTC` 과적합 및 `BEVFusion` Probe KD 드리프트 영향**:
+     - 20 에폭 이후 Cross-fit fold 플래너들의 충돌 실패 빈도(`train/cand/pos_nc1_epoch`)가 `~1.0%`까지 줄어들면서 `CandidateScorer`의 `NC` 검증 정확도가 `96.70% (Ep 15) → 95.62% (Ep 25/30)`로 하락했고, 앞서 분석한 `BEVFusion` $t=0$ 정적 Probe KD의 후반부 역할 괴리(`distill_cos/bevfusion: 0.858 → 0.782`)와 맞물려 `cand_official` 선택기의 `NC`/`TTC` 방어력이 Ep 15~20에서 정점을 찍은 뒤 Ep 25~30에서는 `EP`/`EC` 공격성 위주로 이동했습니다.
+
 

@@ -123,6 +123,10 @@ def build_wandb_logger(
                 self._handle_failure("finalize", exc)
 
     try:
+        import os
+        api_key = os.environ.get("WANDB_API_KEY")
+        if api_key and mode != "disabled":
+            wandb.login(key=api_key, relogin=True)
         wandb_logger = SafeWandbLogger(
             project=project,
             name=name,

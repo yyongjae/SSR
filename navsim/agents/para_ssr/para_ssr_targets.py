@@ -250,6 +250,10 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
                 ("use_det_motion_head", cfg.use_det_motion_head),
                 ("use_map_head", cfg.use_map_head),
                 ("traj", (ts.time_horizon, ts.interval_length, ts.num_poses)),
+                # aux_distill BEV distillation addresses its teacher caches by the
+                # frame token; the field is only present when it is on, so the
+                # distillation-off cache name is unchanged.
+                *((("scene_token", True),) if getattr(cfg, "needs_scene_token", False) else ()),
             ),
         )
 
@@ -283,7 +287,27 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
             targets.update(self._compute_agent_targets(scene, cur_idx))
         if cfg.use_map_head:
             targets.update(self._compute_map_targets(scene, cur_idx))
+        if getattr(cfg, "refiner_mode", "off") != "off":
+            targets.update(self._stage_e_targets(scene))
+        if getattr(cfg, "needs_scene_token", False):
+            # aux_distill teacher-cache key (= scene_metadata.initial_token)
+            targets["scene_token"] = cur_frame.token
         return targets
+
+    def _stage_e_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
+        """Stage E per-token GT (surrogate) and teacher BEVs (E2); refiner/e2e.py GTLoader.
+        Opened lazily so each dataloader worker holds its own file handles."""
+        loader = getattr(self, "_stage_e_gt", None)
+        if loader is None:
+            from .refiner.e2e import GTLoader
+
+            cfg = self._config
+            runs = tuple(cfg.kd_teacher_runs) if cfg.refiner_mode == "E2" else ()
+            loader = GTLoader(cfg.ref_data_root, runs,
+                              human_path=(getattr(cfg, "kd_draft_source", "tau0") == "human_mix"
+                                          or getattr(cfg, "ref_human_only_until", None) is not None))
+            self._stage_e_gt = loader
+        return loader.load(str(scene.scene_metadata.initial_token))
 
     # ------------------------------------------------------------------ #
     def _compute_agent_targets(self, scene: Scene, cur_idx: int) -> Dict[str, torch.Tensor]:

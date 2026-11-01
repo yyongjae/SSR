@@ -1,0 +1,41 @@
+{
+ "stageT": {
+  "dl": 52528,
+  "per_arc_min": 29,
+  "per_arc_med": 228.5,
+  "per_arc_max": 939,
+  "arcs_with_zero": 0,
+  "frac_min": 0.008415990381725278,
+  "frac_med": 0.07147357998019624,
+  "frac_max": 0.13530778164924506,
+  "max_arc_needed_GB_min_inputs": 1.899597,
+  "max_arc_needed_GB_all9": 2.9259239999999997,
+  "overall_frac": 0.07265092618589553
+ },
+ "e2e": {
+  "dl": 78543,
+  "per_arc_min": 58,
+  "per_arc_med": 344.5,
+  "per_arc_max": 1431,
+  "arcs_with_zero": 0,
+  "frac_min": 0.012022843402464683,
+  "frac_med": 0.10696392392443899,
+  "frac_max": 0.19192799070847852,
+  "max_arc_needed_GB_min_inputs": 2.8949130000000003,
+  "max_arc_needed_GB_all9": 4.458996,
+  "overall_frac": 0.10863199998893529
+ },
+ "navtrain": {
+  "dl": 93670,
+  "per_arc_min": 58,
+  "per_arc_med": 418.0,
+  "per_arc_max": 1588,
+  "arcs_with_zero": 0,
+  "frac_min": 0.03176341730558598,
+  "frac_med": 0.13359372433771544,
+  "frac_max": 0.22192513368983957,
+  "max_arc_needed_GB_min_inputs": 3.212524,
+  "max_arc_needed_GB_all9": 4.948208,
+  "overall_frac": 0.12955399512322635
+ }
+}

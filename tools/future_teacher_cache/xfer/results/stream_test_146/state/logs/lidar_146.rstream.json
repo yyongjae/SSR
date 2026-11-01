@@ -1,0 +1,1 @@
+{"ok": true, "rc": 0, "bytes": 1228436113, "total": 1228436113, "sec": 1834.406, "MBps": 0.67, "retries": 1, "error": null, "url": "https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/a76f840b65e972bc45e56c2adced897498e9a026/openscene-v1.1/openscene_sensor_trainval_lidar/openscene_sensor_trainval_lidar_146.tgz"}

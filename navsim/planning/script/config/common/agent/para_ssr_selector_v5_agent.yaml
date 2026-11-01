@@ -1,0 +1,27 @@
+# Advanced BEV-register distillation (v5).
+# Incorporates:
+#   1. Linear projection adapter (student_proj) for channel basis alignment.
+#   2. Loss scale un-dilution (tok_scale=25.0) to match det/map gradient norms naturally.
+#   3. Hybrid Normalized L2 + Cosine distance loss for robust feature distillation.
+#   4. Spatially boosted masks (agent mask for BEVFusion, road boundary for ReSMap) to resolve bank conflicts.
+defaults:
+  - para_ssr_selector_agent
+  - _self_
+
+config:
+  image_architecture: resnet34.tv_in1k
+  distill_selector: true
+  distill_selector_registers: 16
+  distill_selector_div_sigma: 4.0
+  distill_selector_tok_warmup_steps: 53195
+  distill_selector_anchor_sigma: 6.0
+  distill_selector_anchor_sigma_end: 2.0
+  distill_selector_plan_tau: 0.25
+  distill_selector_struct_mix: 0.6
+  # Advanced Distillation Options:
+  distill_selector_proj: true
+  distill_selector_tok_scale: 25.0
+  distill_selector_loss_type: hybrid
+  distill_selector_struct_mask_boost: 2.0
+  # Natural gradient scaling makes artificial task throttling unnecessary
+  grad_balance_target: null

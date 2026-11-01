@@ -1,0 +1,33 @@
+{
+  "n": 64,
+  "perturbed": 62,
+  "invalid": 2,
+  "lat_opposite_sign_frac": 0.375,
+  "lat_grad_zero_frac_at_student_identity": 0.375,
+  "lon_grad_zero_frac_at_student_identity": 0.8984375,
+  "loss_at_identity": 0.0922921746969223,
+  "T": {
+    "live": 0.1875,
+    "mean_abs_lon": 0.10582483559846878,
+    "mean_abs_lat": 0.08992596715688705,
+    "z_quantiles": [
+      -2.9006876945495605,
+      8.04960823059082,
+      12.960624694824219,
+      24.30666732788086
+    ],
+    "frac_z_saturated_above_5": 0.6953125
+  },
+  "M": {
+    "live": 0.09375,
+    "mean_abs_lon": 0.06257300823926926,
+    "mean_abs_lat": 0.11084491014480591,
+    "z_quantiles": [
+      -3.8906357288360596,
+      10.093639373779297,
+      15.314502716064453,
+      28.656583786010742
+    ],
+    "frac_z_saturated_above_5": 0.7057291865348816
+  }
+}

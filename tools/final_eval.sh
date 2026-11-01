@@ -47,12 +47,14 @@ if [ ! -e "$CKPT" ]; then
   echo "checkpoint not found: $CKPT" >&2
   exit 1
 fi
-case "$CKPT" in
-  *_ema.pth) ;;
-  *) echo "NOTE: $CKPT is not an *_ema.pth. The in-training validation already" >&2
-     echo "      scored the raw weights; the EMA copy is the one that has not" >&2
-     echo "      been measured. Continuing anyway." >&2 ;;
-esac
+if [ "${EXPECT_RAW:-0}" != 1 ]; then
+  case "$CKPT" in
+    *_ema.pth) ;;
+    *) echo "NOTE: $CKPT is not an *_ema.pth. The in-training validation already" >&2
+       echo "      scored the raw weights; the EMA copy is the one that has not" >&2
+       echo "      been measured. Continuing anyway." >&2 ;;
+  esac
+fi
 
 # run.sh exports a working PATH/NUMBA before calling this; standalone use falls
 # back to whatever env is active, or SSR_PYTHON.
@@ -72,4 +74,4 @@ echo "gpu    : $GPU  (single, sequential)"
 echo "out    : $OUT"
 
 exec python tools/test.py "$CONFIG" "$CKPT" \
-    --eval bbox --jsonfile_prefix "$OUT" "${@:4}" 2>&1 | tee "$OUT/eval.log"
+    --eval bbox --jsonfile-prefix "$OUT" "${@:4}" 2>&1 | tee "$OUT/eval.log"

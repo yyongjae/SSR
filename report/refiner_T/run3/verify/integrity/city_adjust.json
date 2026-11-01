@@ -1,0 +1,57 @@
+{
+ "city_x_sibling": [
+  {
+   "map_location": "sg-one-north",
+   "sib": true,
+   "n_logs": 22,
+   "P1": 1.117854621024028,
+   "P2": -0.2319986251933322
+  },
+  {
+   "map_location": "us-ma-boston",
+   "sib": true,
+   "n_logs": 59,
+   "P1": 1.0890140618563002,
+   "P2": 0.4678650578675203
+  },
+  {
+   "map_location": "us-nv-las-vegas-strip",
+   "sib": false,
+   "n_logs": 7,
+   "P1": 0.5020183081190576,
+   "P2": -0.12556504269211452
+  },
+  {
+   "map_location": "us-nv-las-vegas-strip",
+   "sib": true,
+   "n_logs": 180,
+   "P1": 1.5761753596169779,
+   "P2": 1.3092153176498484
+  },
+  {
+   "map_location": "us-pa-pittsburgh-hazelwood",
+   "sib": false,
+   "n_logs": 3,
+   "P1": 1.2211877323660276,
+   "P2": -0.5572755417956656
+  },
+  {
+   "map_location": "us-pa-pittsburgh-hazelwood",
+   "sib": true,
+   "n_logs": 24,
+   "P1": 1.8823187770035803,
+   "P2": -0.21288515406162464
+  }
+ ],
+ "navtest_cols": [
+  "token",
+  "log"
+ ],
+ "navtest_city_share": null,
+ "dev_city_share": {
+  "us-nv-las-vegas-strip": 0.6567465321563682,
+  "us-ma-boston": 0.1244640605296343,
+  "sg-one-north": 0.11349306431273644,
+  "us-pa-pittsburgh-hazelwood": 0.10529634300126103
+ }
+}

@@ -1,0 +1,747 @@
+{
+ "stageT_4s": {
+  "run_frames": 62629,
+  "run_logs": 972,
+  "run_archives": 200,
+  "npz_drop_bev_GB": 5.504212294,
+  "npz_bev_GB": 165.842468806,
+  "gpu_h_1gpu_11p6": 1.4997365900383142,
+  "gpu_h_1gpu_5p8": 2.9994731800766283,
+  "gpu_h_4gpu_11p6": 0.37493414750957854,
+  "S1": {
+   "n_cam_frames": 52528,
+   "n_lid_frames": 52528,
+   "n_sweep_only_lidar": 0,
+   "total_GB": 106.569541792,
+   "total_GB_arcscaled": 106.2154245562129,
+   "g1": {
+    "peak_serial_GB": 1.905056346,
+    "peak_overlap2_GB": 3.01278879,
+    "peak_serial_GB_arcscaled": 1.9209160176421065,
+    "peak_overlap2_GB_arcscaled": 2.97564003400708
+   },
+   "g2": {
+    "peak_serial_GB": 3.01278879,
+    "peak_overlap2_GB": 4.54454336,
+    "peak_serial_GB_arcscaled": 2.97564003400708,
+    "peak_overlap2_GB_arcscaled": 4.486188592796781
+   },
+   "g5": {
+    "peak_serial_GB": 5.230282492,
+    "peak_overlap2_GB": 9.75859534,
+    "peak_serial_GB_arcscaled": 5.2252660457645215,
+    "peak_overlap2_GB_arcscaled": 9.733034336246385
+   },
+   "g10": {
+    "peak_serial_GB": 7.569505034,
+    "peak_overlap2_GB": 13.550448706,
+    "peak_serial_GB_arcscaled": 7.551272428124153,
+    "peak_overlap2_GB_arcscaled": 13.507534898427858
+   },
+   "g20": {
+    "peak_serial_GB": 13.164974046,
+    "peak_overlap2_GB": 24.108396762,
+    "peak_serial_GB_arcscaled": 13.10968775276025,
+    "peak_overlap2_GB_arcscaled": 24.037728609382683
+   },
+   "g40": {
+    "peak_serial_GB": 24.108396762,
+    "peak_overlap2_GB": 46.068279498,
+    "peak_serial_GB_arcscaled": 24.037728609382683,
+    "peak_overlap2_GB_arcscaled": 45.84640098390155
+   },
+   "g100": {
+    "peak_serial_GB": 54.664364416,
+    "peak_overlap2_GB": 106.569541792,
+    "peak_serial_GB_arcscaled": 54.40833776795425,
+    "peak_overlap2_GB_arcscaled": 106.21542455621291
+   },
+   "g200": {
+    "peak_serial_GB": 106.569541792,
+    "peak_overlap2_GB": 106.569541792,
+    "peak_serial_GB_arcscaled": 106.2154245562129,
+    "peak_overlap2_GB_arcscaled": 106.2154245562129
+   }
+  },
+  "S2": {
+   "n_cam_frames": 62629,
+   "n_lid_frames": 85637,
+   "n_sweep_only_lidar": 23008,
+   "total_GB": 159.34484071,
+   "total_GB_arcscaled": 158.4936537009683,
+   "g1": {
+    "peak_serial_GB": 2.81663146,
+    "peak_overlap2_GB": 4.317362818,
+    "peak_serial_GB_arcscaled": 2.7966842184641325,
+    "peak_overlap2_GB_arcscaled": 4.260617674768053
+   },
+   "g2": {
+    "peak_serial_GB": 4.317362818,
+    "peak_overlap2_GB": 6.69867254,
+    "peak_serial_GB_arcscaled": 4.260617674768053,
+    "peak_overlap2_GB_arcscaled": 6.604340467408473
+   },
+   "g5": {
+    "peak_serial_GB": 7.48166047,
+    "peak_overlap2_GB": 14.448173002,
+    "peak_serial_GB_arcscaled": 7.456685717750376,
+    "peak_overlap2_GB_arcscaled": 14.395645004188838
+   },
+   "g10": {
+    "peak_serial_GB": 10.994040858,
+    "peak_overlap2_GB": 20.114996762,
+    "peak_serial_GB_arcscaled": 10.940245997371475,
+    "peak_overlap2_GB_arcscaled": 20.016994977127283
+   },
+   "g20": {
+    "peak_serial_GB": 19.213239624,
+    "peak_overlap2_GB": 35.674768016,
+    "peak_serial_GB_arcscaled": 19.103641288142853,
+    "peak_overlap2_GB_arcscaled": 35.51819175597613
+   },
+   "g40": {
+    "peak_serial_GB": 35.674768016,
+    "peak_overlap2_GB": 68.302113048,
+    "peak_serial_GB_arcscaled": 35.51819175597613,
+    "peak_overlap2_GB_arcscaled": 67.84147898825094
+   },
+   "g100": {
+    "peak_serial_GB": 82.025431272,
+    "peak_overlap2_GB": 159.34484071,
+    "peak_serial_GB_arcscaled": 81.47429705425107,
+    "peak_overlap2_GB_arcscaled": 158.4936537009683
+   },
+   "g200": {
+    "peak_serial_GB": 159.34484071,
+    "peak_overlap2_GB": 159.34484071,
+    "peak_serial_GB_arcscaled": 158.4936537009683,
+    "peak_overlap2_GB_arcscaled": 158.4936537009683
+   }
+  }
+ },
+ "e2e_4s": {
+  "run_frames": 93606,
+  "run_logs": 978,
+  "run_archives": 200,
+  "npz_drop_bev_GB": 8.226656916,
+  "npz_bev_GB": 247.869998484,
+  "gpu_h_1gpu_11p6": 2.2415229885057473,
+  "gpu_h_1gpu_5p8": 4.4830459770114945,
+  "gpu_h_4gpu_11p6": 0.5603807471264368,
+  "S1": {
+   "n_cam_frames": 78543,
+   "n_lid_frames": 78543,
+   "n_sweep_only_lidar": 0,
+   "total_GB": 159.349138002,
+   "total_GB_arcscaled": 158.8409092403142,
+   "g1": {
+    "peak_serial_GB": 2.903232834,
+    "peak_overlap2_GB": 4.495851824,
+    "peak_serial_GB_arcscaled": 2.927402365544061,
+    "peak_overlap2_GB_arcscaled": 4.440440174846409
+   },
+   "g2": {
+    "peak_serial_GB": 4.495851824,
+    "peak_overlap2_GB": 6.794498086,
+    "peak_serial_GB_arcscaled": 4.440440174846409,
+    "peak_overlap2_GB_arcscaled": 6.707018019834741
+   },
+   "g5": {
+    "peak_serial_GB": 7.599937244,
+    "peak_overlap2_GB": 14.499933658,
+    "peak_serial_GB_arcscaled": 7.5957458714345,
+    "peak_overlap2_GB_arcscaled": 14.464627513094925
+   },
+   "g10": {
+    "peak_serial_GB": 11.034719346,
+    "peak_overlap2_GB": 20.150180648,
+    "peak_serial_GB_arcscaled": 11.01070617872786,
+    "peak_overlap2_GB_arcscaled": 20.089951531866742
+   },
+   "g20": {
+    "peak_serial_GB": 19.066793972,
+    "peak_overlap2_GB": 35.711184028,
+    "peak_serial_GB_arcscaled": 18.993789941685275,
+    "peak_overlap2_GB_arcscaled": 35.614729692314796
+   },
+   "g40": {
+    "peak_serial_GB": 35.711184028,
+    "peak_overlap2_GB": 68.109314794,
+    "peak_serial_GB_arcscaled": 35.6147296923148,
+    "peak_overlap2_GB_arcscaled": 67.79637212483482
+   },
+   "g100": {
+    "peak_serial_GB": 81.775405898,
+    "peak_overlap2_GB": 159.349138002,
+    "peak_serial_GB_arcscaled": 81.40086878029024,
+    "peak_overlap2_GB_arcscaled": 158.8409092403142
+   },
+   "g200": {
+    "peak_serial_GB": 159.349138002,
+    "peak_overlap2_GB": 159.349138002,
+    "peak_serial_GB_arcscaled": 158.8409092403142,
+    "peak_overlap2_GB_arcscaled": 158.8409092403142
+   }
+  },
+  "S2": {
+   "n_cam_frames": 93606,
+   "n_lid_frames": 122229,
+   "n_sweep_only_lidar": 28623,
+   "total_GB": 230.069751108,
+   "total_GB_arcscaled": 228.924230913985,
+   "g1": {
+    "peak_serial_GB": 4.22352674,
+    "peak_overlap2_GB": 6.342192278,
+    "peak_serial_GB_arcscaled": 4.241891507183348,
+    "peak_overlap2_GB_arcscaled": 6.259752440342486
+   },
+   "g2": {
+    "peak_serial_GB": 6.342192278,
+    "peak_overlap2_GB": 9.70112362,
+    "peak_serial_GB_arcscaled": 6.259752440342486,
+    "peak_overlap2_GB_arcscaled": 9.566460978553211
+   },
+   "g5": {
+    "peak_serial_GB": 10.69694702,
+    "peak_overlap2_GB": 20.950361136,
+    "peak_serial_GB_arcscaled": 10.668228902535636,
+    "peak_overlap2_GB_arcscaled": 20.881107344151335
+   },
+   "g10": {
+    "peak_serial_GB": 15.7249821,
+    "peak_overlap2_GB": 29.154621026,
+    "peak_serial_GB_arcscaled": 15.656758982041243,
+    "peak_overlap2_GB_arcscaled": 29.024780027909195
+   },
+   "g20": {
+    "peak_serial_GB": 27.214567848,
+    "peak_overlap2_GB": 51.130972864,
+    "peak_serial_GB_arcscaled": 27.075272175270165,
+    "peak_overlap2_GB_arcscaled": 50.92968324941563
+   },
+   "g40": {
+    "peak_serial_GB": 51.130972864,
+    "peak_overlap2_GB": 97.715743472,
+    "peak_serial_GB_arcscaled": 50.929683249415625,
+    "peak_overlap2_GB_arcscaled": 97.10111480380512
+   },
+   "g100": {
+    "peak_serial_GB": 118.348358172,
+    "peak_overlap2_GB": 230.069751108,
+    "peak_serial_GB_arcscaled": 117.58931869662504,
+    "peak_overlap2_GB_arcscaled": 228.92423091398499
+   },
+   "g200": {
+    "peak_serial_GB": 230.069751108,
+    "peak_overlap2_GB": 230.069751108,
+    "peak_serial_GB_arcscaled": 228.924230913985,
+    "peak_overlap2_GB_arcscaled": 228.924230913985
+   }
+  }
+ },
+ "navtrain_4s": {
+  "run_frames": 112152,
+  "run_logs": 1192,
+  "run_archives": 200,
+  "npz_drop_bev_GB": 9.856590672,
+  "npz_bev_GB": 296.980066128,
+  "gpu_h_1gpu_11p6": 2.685632183908046,
+  "gpu_h_1gpu_5p8": 5.371264367816092,
+  "gpu_h_4gpu_11p6": 0.6714080459770115,
+  "S1": {
+   "n_cam_frames": 93670,
+   "n_lid_frames": 93670,
+   "n_sweep_only_lidar": 0,
+   "total_GB": 190.03900738,
+   "total_GB_arcscaled": 189.52838006253376,
+   "g1": {
+    "peak_serial_GB": 3.221756632,
+    "peak_overlap2_GB": 4.63583999,
+    "peak_serial_GB_arcscaled": 3.1950730801870435,
+    "peak_overlap2_GB_arcscaled": 4.578654585461741
+   },
+   "g2": {
+    "peak_serial_GB": 4.63583999,
+    "peak_overlap2_GB": 7.15156935,
+    "peak_serial_GB_arcscaled": 4.578654585461741,
+    "peak_overlap2_GB_arcscaled": 7.060919636215887
+   },
+   "g5": {
+    "peak_serial_GB": 7.920489856,
+    "peak_overlap2_GB": 15.711135616,
+    "peak_serial_GB_arcscaled": 7.879824339655161,
+    "peak_overlap2_GB_arcscaled": 15.665539170025617
+   },
+   "g10": {
+    "peak_serial_GB": 12.688202756,
+    "peak_overlap2_GB": 22.38796249,
+    "peak_serial_GB_arcscaled": 12.612382827527423,
+    "peak_overlap2_GB_arcscaled": 22.310853631770858
+   },
+   "g20": {
+    "peak_serial_GB": 21.02865711,
+    "peak_overlap2_GB": 40.294274854,
+    "peak_serial_GB_arcscaled": 20.950321623541097,
+    "peak_overlap2_GB_arcscaled": 40.023061426861375
+   },
+   "g40": {
+    "peak_serial_GB": 39.811417122,
+    "peak_overlap2_GB": 78.529303498,
+    "peak_serial_GB_arcscaled": 39.73401591738136,
+    "peak_overlap2_GB_arcscaled": 78.2262653235473
+   },
+   "g100": {
+    "peak_serial_GB": 96.488365026,
+    "peak_overlap2_GB": 190.03900738,
+    "peak_serial_GB_arcscaled": 96.11930004991076,
+    "peak_overlap2_GB_arcscaled": 189.52838006253376
+   },
+   "g200": {
+    "peak_serial_GB": 190.03900738,
+    "peak_overlap2_GB": 190.03900738,
+    "peak_serial_GB_arcscaled": 189.52838006253376,
+    "peak_overlap2_GB_arcscaled": 189.52838006253376
+   }
+  },
+  "S2": {
+   "n_cam_frames": 112152,
+   "n_lid_frames": 146599,
+   "n_sweep_only_lidar": 34447,
+   "total_GB": 275.867720064,
+   "total_GB_arcscaled": 274.65173043425966,
+   "g1": {
+    "peak_serial_GB": 4.700808664,
+    "peak_overlap2_GB": 6.58310869,
+    "peak_serial_GB_arcscaled": 4.6667995771754915,
+    "peak_overlap2_GB_arcscaled": 6.497298900684494
+   },
+   "g2": {
+    "peak_serial_GB": 6.58310869,
+    "peak_overlap2_GB": 10.269398902,
+    "peak_serial_GB_arcscaled": 6.497298900684494,
+    "peak_overlap2_GB_arcscaled": 10.12911747854692
+   },
+   "g5": {
+    "peak_serial_GB": 11.758354738,
+    "peak_overlap2_GB": 22.717132036,
+    "peak_serial_GB_arcscaled": 11.70433021572216,
+    "peak_overlap2_GB_arcscaled": 22.633918108966498
+   },
+   "g10": {
+    "peak_serial_GB": 18.343037334,
+    "peak_overlap2_GB": 32.597321104,
+    "peak_serial_GB_arcscaled": 18.206133264245416,
+    "peak_overlap2_GB_arcscaled": 32.50634331721583
+   },
+   "g20": {
+    "peak_serial_GB": 30.072800496,
+    "peak_overlap2_GB": 58.315234404,
+    "peak_serial_GB_arcscaled": 29.927499587132168,
+    "peak_overlap2_GB_arcscaled": 57.82055559199799
+   },
+   "g40": {
+    "peak_serial_GB": 57.19404108,
+    "peak_overlap2_GB": 113.325081354,
+    "peak_serial_GB_arcscaled": 56.939746698231566,
+    "peak_overlap2_GB_arcscaled": 112.62298443139883
+   },
+   "g100": {
+    "peak_serial_GB": 140.367768192,
+    "peak_overlap2_GB": 275.867720064,
+    "peak_serial_GB_arcscaled": 139.57866162107243,
+    "peak_overlap2_GB_arcscaled": 274.65173043425966
+   },
+   "g200": {
+    "peak_serial_GB": 275.867720064,
+    "peak_overlap2_GB": 275.867720064,
+    "peak_serial_GB_arcscaled": 274.65173043425966,
+    "peak_overlap2_GB_arcscaled": 274.65173043425966
+   }
+  }
+ },
+ "navtrain_5s": {
+  "run_frames": 133113,
+  "run_logs": 1192,
+  "run_archives": 200,
+  "npz_drop_bev_GB": 11.698769118,
+  "npz_bev_GB": 352.485087582,
+  "gpu_h_1gpu_11p6": 3.18757183908046,
+  "gpu_h_1gpu_5p8": 6.37514367816092,
+  "gpu_h_4gpu_11p6": 0.796892959770115,
+  "S1": {
+   "n_cam_frames": 112007,
+   "n_lid_frames": 112007,
+   "n_sweep_only_lidar": 0,
+   "total_GB": 227.241369698,
+   "total_GB_arcscaled": 226.62330959521384,
+   "g1": {
+    "peak_serial_GB": 3.870977112,
+    "peak_overlap2_GB": 5.53866222,
+    "peak_serial_GB_arcscaled": 3.838916522038297,
+    "peak_overlap2_GB_arcscaled": 5.470337943200913
+   },
+   "g2": {
+    "peak_serial_GB": 5.53866222,
+    "peak_overlap2_GB": 8.53116287,
+    "peak_serial_GB_arcscaled": 5.470337943200913,
+    "peak_overlap2_GB_arcscaled": 8.422998145120921
+   },
+   "g5": {
+    "peak_serial_GB": 9.470503752,
+    "peak_overlap2_GB": 18.831451548,
+    "peak_serial_GB_arcscaled": 9.421936863792878,
+    "peak_overlap2_GB_arcscaled": 18.776474381060996
+   },
+   "g10": {
+    "peak_serial_GB": 15.169442278,
+    "peak_overlap2_GB": 26.784402428,
+    "peak_serial_GB_arcscaled": 15.07826521516132,
+    "peak_overlap2_GB_arcscaled": 26.691911130563224
+   },
+   "g20": {
+    "peak_serial_GB": 25.21815802,
+    "peak_overlap2_GB": 48.162015546,
+    "peak_serial_GB_arcscaled": 25.122977981436048,
+    "peak_overlap2_GB_arcscaled": 47.836999585710856
+   },
+   "g40": {
+    "peak_serial_GB": 47.735964606,
+    "peak_overlap2_GB": 93.972635666,
+    "peak_serial_GB_arcscaled": 47.63948381527537,
+    "peak_overlap2_GB_arcscaled": 93.6065166863748
+   },
+   "g100": {
+    "peak_serial_GB": 115.265038596,
+    "peak_overlap2_GB": 227.241369698,
+    "peak_serial_GB_arcscaled": 114.81924554952494,
+    "peak_overlap2_GB_arcscaled": 226.62330959521384
+   },
+   "g200": {
+    "peak_serial_GB": 227.241369698,
+    "peak_overlap2_GB": 227.241369698,
+    "peak_serial_GB_arcscaled": 226.62330959521384,
+    "peak_overlap2_GB_arcscaled": 226.62330959521384
+   }
+  },
+  "S2": {
+   "n_cam_frames": 133113,
+   "n_lid_frames": 167413,
+   "n_sweep_only_lidar": 34300,
+   "total_GB": 318.187436382,
+   "total_GB_arcscaled": 316.85635937279125,
+   "g1": {
+    "peak_serial_GB": 5.42962698,
+    "peak_overlap2_GB": 7.612817204,
+    "peak_serial_GB_arcscaled": 5.389548935836519,
+    "peak_overlap2_GB_arcscaled": 7.514316669476653
+   },
+   "g2": {
+    "peak_serial_GB": 7.612817204,
+    "peak_overlap2_GB": 11.852196276,
+    "peak_serial_GB_arcscaled": 7.514316669476653,
+    "peak_overlap2_GB_arcscaled": 11.691850358171815
+   },
+   "g5": {
+    "peak_serial_GB": 13.492687436,
+    "peak_overlap2_GB": 26.219035818,
+    "peak_serial_GB_arcscaled": 13.42941005001828,
+    "peak_overlap2_GB_arcscaled": 26.125277600889017
+   },
+   "g10": {
+    "peak_serial_GB": 21.174503498,
+    "peak_overlap2_GB": 37.42093098,
+    "peak_serial_GB_arcscaled": 21.02071600851977,
+    "peak_overlap2_GB_arcscaled": 37.32249230917354
+   },
+   "g20": {
+    "peak_serial_GB": 34.774833168,
+    "peak_overlap2_GB": 67.22927494,
+    "peak_serial_GB_arcscaled": 34.61191081085723,
+    "peak_overlap2_GB_arcscaled": 66.67525126280039
+   },
+   "g40": {
+    "peak_serial_GB": 66.065249978,
+    "peak_overlap2_GB": 130.789455722,
+    "peak_serial_GB_arcscaled": 65.87046651892211,
+    "peak_overlap2_GB_arcscaled": 130.09765999701193
+   },
+   "g100": {
+    "peak_serial_GB": 161.78700168,
+    "peak_overlap2_GB": 318.187436382,
+    "peak_serial_GB_arcscaled": 160.9147187773833,
+    "peak_overlap2_GB_arcscaled": 316.8563593727912
+   },
+   "g200": {
+    "peak_serial_GB": 318.187436382,
+    "peak_overlap2_GB": 318.187436382,
+    "peak_serial_GB_arcscaled": 316.85635937279125,
+    "peak_overlap2_GB_arcscaled": 316.85635937279125
+   }
+  }
+ },
+ "navtrain_logs_all_frames": {
+  "run_frames": 566300,
+  "run_logs": 1192,
+  "run_archives": 200,
+  "npz_drop_bev_GB": 49.7698418,
+  "npz_bev_GB": 1499.5703282,
+  "gpu_h_1gpu_11p6": 13.560823754789274,
+  "gpu_h_1gpu_5p8": 27.121647509578548,
+  "gpu_h_4gpu_11p6": 3.3902059386973185,
+  "S1": {
+   "n_cam_frames": 517093,
+   "n_lid_frames": 517093,
+   "n_sweep_only_lidar": 0,
+   "total_GB": 1049.085517702,
+   "total_GB_arcscaled": 1045.6335683104435,
+   "g1": {
+    "peak_serial_GB": 18.516985378,
+    "peak_overlap2_GB": 23.871025524,
+    "peak_serial_GB_arcscaled": 18.36362216805336,
+    "peak_overlap2_GB_arcscaled": 23.57554715574245
+   },
+   "g2": {
+    "peak_serial_GB": 23.871025524,
+    "peak_overlap2_GB": 40.533674906,
+    "peak_serial_GB_arcscaled": 23.57554715574245,
+    "peak_overlap2_GB_arcscaled": 40.54994453742624
+   },
+   "g5": {
+    "peak_serial_GB": 45.155313198,
+    "peak_overlap2_GB": 84.808482828,
+    "peak_serial_GB_arcscaled": 45.11172485299743,
+    "peak_overlap2_GB_arcscaled": 84.54072620399039
+   },
+   "g10": {
+    "peak_serial_GB": 69.681645644,
+    "peak_overlap2_GB": 123.684616696,
+    "peak_serial_GB_arcscaled": 69.26774372012429,
+    "peak_overlap2_GB_arcscaled": 123.12126506666748
+   },
+   "g20": {
+    "peak_serial_GB": 122.940041958,
+    "peak_overlap2_GB": 229.740868546,
+    "peak_serial_GB_arcscaled": 122.30388952046576,
+    "peak_overlap2_GB_arcscaled": 228.57235964638036
+   },
+   "g40": {
+    "peak_serial_GB": 226.07074402,
+    "peak_overlap2_GB": 436.740760966,
+    "peak_serial_GB_arcscaled": 225.27867305978944,
+    "peak_overlap2_GB_arcscaled": 434.6474818166077
+   },
+   "g100": {
+    "peak_serial_GB": 527.44091965,
+    "peak_overlap2_GB": 1049.085517702,
+    "peak_serial_GB_arcscaled": 525.1206823095204,
+    "peak_overlap2_GB_arcscaled": 1045.6335683104437
+   },
+   "g200": {
+    "peak_serial_GB": 1049.085517702,
+    "peak_overlap2_GB": 1049.085517702,
+    "peak_serial_GB_arcscaled": 1045.6335683104435,
+    "peak_overlap2_GB_arcscaled": 1045.6335683104435
+   }
+  },
+  "S2": {
+   "n_cam_frames": 566300,
+   "n_lid_frames": 599463,
+   "n_sweep_only_lidar": 33163,
+   "total_GB": 1195.447975544,
+   "total_GB_arcscaled": 1191.1411543569889,
+   "g1": {
+    "peak_serial_GB": 21.02390711,
+    "peak_overlap2_GB": 27.29360282,
+    "peak_serial_GB_arcscaled": 20.854476578053436,
+    "peak_overlap2_GB_arcscaled": 26.95145702216396
+   },
+   "g2": {
+    "peak_serial_GB": 27.29360282,
+    "peak_overlap2_GB": 45.528045956,
+    "peak_serial_GB_arcscaled": 26.95145702216396,
+    "peak_overlap2_GB_arcscaled": 45.52950349976147
+   },
+   "g5": {
+    "peak_serial_GB": 50.863899864,
+    "peak_overlap2_GB": 96.830164184,
+    "peak_serial_GB_arcscaled": 50.794958967315885,
+    "peak_overlap2_GB_arcscaled": 96.51040738028287
+   },
+   "g10": {
+    "peak_serial_GB": 79.381747158,
+    "peak_overlap2_GB": 140.663543906,
+    "peak_serial_GB_arcscaled": 78.883093694274,
+    "peak_overlap2_GB_arcscaled": 140.00878784593647
+   },
+   "g20": {
+    "peak_serial_GB": 138.73611852,
+    "peak_overlap2_GB": 259.998161608,
+    "peak_serial_GB_arcscaled": 138.00841481486333,
+    "peak_overlap2_GB_arcscaled": 258.63647233738413
+   },
+   "g40": {
+    "peak_serial_GB": 256.215713314,
+    "peak_overlap2_GB": 496.593861456,
+    "peak_serial_GB_arcscaled": 255.30001844691745,
+    "peak_overlap2_GB_arcscaled": 494.0878586370232
+   },
+   "g100": {
+    "peak_serial_GB": 601.95214487,
+    "peak_overlap2_GB": 1195.447975544,
+    "peak_serial_GB_arcscaled": 599.1009944856988,
+    "peak_overlap2_GB_arcscaled": 1191.1411543569889
+   },
+   "g200": {
+    "peak_serial_GB": 1195.447975544,
+    "peak_overlap2_GB": 1195.447975544,
+    "peak_serial_GB_arcscaled": 1191.1411543569889,
+    "peak_overlap2_GB_arcscaled": 1191.1411543569889
+   }
+  }
+ },
+ "trainval_all_frames": {
+  "run_frames": 619731,
+  "run_logs": 1310,
+  "run_archives": 200,
+  "npz_drop_bev_GB": 54.465678666,
+  "npz_bev_GB": 1641.056364234,
+  "gpu_h_1gpu_11p6": 14.84030172413793,
+  "gpu_h_1gpu_5p8": 29.68060344827586,
+  "gpu_h_4gpu_11p6": 3.7100754310344826,
+  "S1": {
+   "n_cam_frames": 570524,
+   "n_lid_frames": 570524,
+   "n_sweep_only_lidar": 0,
+   "total_GB": 1157.487078536,
+   "total_GB_arcscaled": 1153.548492961328,
+   "g1": {
+    "peak_serial_GB": 18.516985378,
+    "peak_overlap2_GB": 30.927240616,
+    "peak_serial_GB_arcscaled": 18.36362216805336,
+    "peak_overlap2_GB_arcscaled": 30.595805454432305
+   },
+   "g2": {
+    "peak_serial_GB": 25.425097048,
+    "peak_overlap2_GB": 41.665753118,
+    "peak_serial_GB_arcscaled": 25.11108437162117,
+    "peak_overlap2_GB_arcscaled": 41.66783910223367
+   },
+   "g5": {
+    "peak_serial_GB": 50.596592346,
+    "peak_overlap2_GB": 96.883983756,
+    "peak_serial_GB_arcscaled": 50.240838238284844,
+    "peak_overlap2_GB_arcscaled": 96.47045765608972
+   },
+   "g10": {
+    "peak_serial_GB": 72.568647966,
+    "peak_overlap2_GB": 139.54182692,
+    "peak_serial_GB_arcscaled": 72.08087066641266,
+    "peak_overlap2_GB_arcscaled": 138.95416666684554
+   },
+   "g20": {
+    "peak_serial_GB": 129.846124814,
+    "peak_overlap2_GB": 253.544943208,
+    "peak_serial_GB_arcscaled": 129.14814259454974,
+    "peak_overlap2_GB_arcscaled": 252.21648596350684
+   },
+   "g40": {
+    "peak_serial_GB": 241.674352494,
+    "peak_overlap2_GB": 475.095489636,
+    "peak_serial_GB_arcscaled": 240.70324452193879,
+    "peak_overlap2_GB_arcscaled": 472.6892697689498
+   },
+   "g100": {
+    "peak_serial_GB": 585.01866097,
+    "peak_overlap2_GB": 1157.487078536,
+    "peak_serial_GB_arcscaled": 582.4471843888174,
+    "peak_overlap2_GB_arcscaled": 1153.5484929613283
+   },
+   "g200": {
+    "peak_serial_GB": 1157.487078536,
+    "peak_overlap2_GB": 1157.487078536,
+    "peak_serial_GB_arcscaled": 1153.548492961328,
+    "peak_overlap2_GB_arcscaled": 1153.548492961328
+   }
+  },
+  "S2": {
+   "n_cam_frames": 619731,
+   "n_lid_frames": 652894,
+   "n_sweep_only_lidar": 33163,
+   "total_GB": 1303.849536378,
+   "total_GB_arcscaled": 1299.0560790078732,
+   "g1": {
+    "peak_serial_GB": 21.02390711,
+    "peak_overlap2_GB": 33.935732494,
+    "peak_serial_GB_arcscaled": 20.854476578053436,
+    "peak_overlap2_GB_arcscaled": 33.58117624911398
+   },
+   "g2": {
+    "peak_serial_GB": 28.847674344,
+    "peak_overlap2_GB": 46.660124168,
+    "peak_serial_GB_arcscaled": 28.48699423804274,
+    "peak_overlap2_GB_arcscaled": 46.647398064568904
+   },
+   "g5": {
+    "peak_serial_GB": 56.909687036,
+    "peak_overlap2_GB": 108.905665112,
+    "peak_serial_GB_arcscaled": 56.52728530025885,
+    "peak_overlap2_GB_arcscaled": 108.44013883238217
+   },
+   "g10": {
+    "peak_serial_GB": 82.220057944,
+    "peak_overlap2_GB": 156.695629496,
+    "peak_serial_GB_arcscaled": 81.6962206405625,
+    "peak_overlap2_GB_arcscaled": 156.0049993242381
+   },
+   "g20": {
+    "peak_serial_GB": 145.642201376,
+    "peak_overlap2_GB": 283.80223627,
+    "peak_serial_GB_arcscaled": 144.8526678889473,
+    "peak_overlap2_GB_arcscaled": 282.28059865451064
+   },
+   "g40": {
+    "peak_serial_GB": 272.128553786,
+    "peak_overlap2_GB": 535.257822124,
+    "peak_serial_GB_arcscaled": 270.94770517209906,
+    "peak_overlap2_GB_arcscaled": 532.3527618523979
+   },
+   "g100": {
+    "peak_serial_GB": 659.52988619,
+    "peak_overlap2_GB": 1303.849536378,
+    "peak_serial_GB_arcscaled": 656.4274965649957,
+    "peak_overlap2_GB_arcscaled": 1299.056079007873
+   },
+   "g200": {
+    "peak_serial_GB": 1303.849536378,
+    "peak_overlap2_GB": 1303.849536378,
+    "peak_serial_GB_arcscaled": 1299.0560790078732,
+    "peak_overlap2_GB_arcscaled": 1299.0560790078732
+   }
+  }
+ },
+ "meta": {
+  "trainval_frames": 723019,
+  "trainval_logs": 1310,
+  "navtrain_logs": 1192,
+  "navtrain_logs_frames": 669588,
+  "cached_current_npz_train": 103288,
+  "ondisk_frames_navtrain_pkg": 152495,
+  "ondisk_8cam_lidar_GB_est": 471.362045,
+  "frames_not_on_disk": 570524,
+  "keep_front3_all_trainval_not_on_disk_GB": 356.991700424,
+  "keep_front3_navtrain_logs_not_on_disk_GB": 323.558534518,
+  "P_full_extracted_GB": 2246.288070798166,
+  "P_full_largest_tgz_GB": 19.295805663,
+  "tgz_total_GB": 2124.354505708,
+  "group_tgz_GB": {
+   "g1": 33.756219084,
+   "g2": 46.308583161,
+   "g5": 91.128136324,
+   "g10": 134.334856793,
+   "g20": 235.357170442,
+   "g40": 441.902967529,
+   "g100": 1074.299713457,
+   "g200": 2124.354505708
+  }
+ }
+}

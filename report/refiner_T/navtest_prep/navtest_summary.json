@@ -1,0 +1,28 @@
+{
+ "n_mc": 12146,
+ "n_mc_csv": 12146,
+ "mc_dup_tokens": 0,
+ "n_teacher": 12146,
+ "teacher_manifest_written": 12146,
+ "teacher_sha": "cddf943ffec8d6a8",
+ "scenario_types": {
+  "unknown": 12146
+ },
+ "n_teacher_and_mc": 12146,
+ "missing_logs": [],
+ "n_not_in_log": 0,
+ "n_in_head_ablation_table": 12146,
+ "table_n": 12146,
+ "log_mismatch_vs_table": 0,
+ "city_mismatch_vs_table": 0,
+ "table_tokens_not_kept": 0,
+ "n": 12146,
+ "n_logs": 136,
+ "city": {
+  "us-nv-las-vegas-strip": 4064,
+  "us-ma-boston": 3731,
+  "us-pa-pittsburgh-hazelwood": 2437,
+  "sg-one-north": 1914
+ },
+ "created": "2026-09-29 13:54:29"
+}

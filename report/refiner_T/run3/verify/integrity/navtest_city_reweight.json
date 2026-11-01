@@ -1,0 +1,19 @@
+{
+ "navtest_city_share": {
+  "us-nv-las-vegas-strip": 0.3345957516877984,
+  "us-ma-boston": 0.30717931829408857,
+  "us-pa-pittsburgh-hazelwood": 0.20064218672814096,
+  "sg-one-north": 0.15758274328997202
+ },
+ "navtest_drive_in_navtrain_frac": 0.0,
+ "P1_city_reweighted": [
+  1.3726979262864734,
+  1.0884558226295136,
+  1.6703523260362072
+ ],
+ "P2_city_reweighted": [
+  0.46158431831534635,
+  0.21817235920643,
+  0.7091239340388131
+ ]
+}

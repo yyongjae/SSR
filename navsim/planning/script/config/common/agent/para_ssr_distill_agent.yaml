@@ -1,0 +1,41 @@
+# Stage 2 of planning distillation: the ordinary PARA-SSR agent plus frozen
+# stage-1 adapters pulling the student BEV towards the cached teacher BEV.
+#
+# Requires a stage-1 checkpoint; PlanningDistillation refuses to build without
+# one, because distilling towards a randomly initialised adapter is not the
+# experiment.
+#
+#   DISTILL_FEATURE_ROOT=/path/to/teacher_cache \
+#   BEVFUSION_ADAPTER_CKPT=/path/to/stage1.ckpt \
+#     ./scripts/training/train_para_ssr.sh agent=para_ssr_distill_agent
+defaults:
+  - para_ssr_agent
+  - _self_
+
+config:
+  use_distill: true
+  distill_feature_root: ${oc.env:DISTILL_FEATURE_ROOT,''}
+  # Only BEVFusion is cached today.  Add a maptrv2 entry here and in
+  # distill_branches once that cache exists.
+  distill_adapter_checkpoints:
+    bevfusion: ${oc.env:BEVFUSION_ADAPTER_CKPT,''}
+    resmap: ${oc.env:RESMAP_ADAPTER_CKPT,''}
+  distill_loss_weight: 1.0
+  use_corridor_mask: true
+  distill_trajectory_frame: navsim
+  distill_use_role_masks: true
+  distill_walkway_suppress: 0.0
+  distill_boundary_kernel: 3
+  distill_mse_weight: 1.0
+  distill_cwd_weight: 0.0
+  distill_relation_weight: 0.0
+  distill_attn_weight: 0.0
+  distill_adaptive_branch: false
+  distill_plan_look_weight: 0.0
+  distill_plan_look_tau: 0.5
+  distill_head_kd_weight: 0.0
+  distill_head_kd_det: false
+  distill_head_kd_det_geom: false
+  corridor_sigma_along: 4.0
+  corridor_sigma_cross: 2.5
+  corridor_base_weight: 0.1

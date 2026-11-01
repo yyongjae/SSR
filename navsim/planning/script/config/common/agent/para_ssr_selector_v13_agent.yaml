@@ -1,0 +1,79 @@
+# BEV Selector v13: PARA-SSR v2 Student Multi-Task + CK2-Aligned Wide-Corridor Multi-Scale & Soft-Capped Dual-Consumer KD
+# - Student: km/para-ssr-v2 full multi-task architecture (ResNet-34) + optional CK2 Refiner v2 E2E
+# - Distill v13 (docs/bev_selector_v13.md):
+#     * Fix 1 (Wide Corridor Coverage & Soft-Capped Ribbon w_pgp):
+#       Restores wide anchor coverage for both BEVFusion (DET: tau_gt=4.5, tau_risk=8.0, N_eff~125) and ReSMap
+#       (MAP: tau_gt=4.5, tau_risk=8.0, N_eff~130), and applies soft tanh capping m_cap = 4*tanh(m_norm/4) with
+#       w_pgp = 0.75 + 0.25*m_cap_norm so background retains 75% uniform supervision while the +-4.8m CK2 ribbon
+#       receives a flat 1.2x~2.0x plateau (eliminating v12's 41.8x centerline spike).
+#     * Fix 2 (Non-Penalizing Far-Field Boost & 10-Point Look-Ahead):
+#       Retains 10-point (T+2, +1.0s braking look-ahead) spatial bias and replaces v12's near-field-penalizing
+#       row_gain with g_v13(y) = 1.0 + 0.50 * clamp((y - 10.0)/22.0, 0, 1) in [1.0, 1.5], never penalizing 0~10m.
+#     * Fix 3 (CK2-Matched Multi-Scale Structural Grid KD):
+#       Directly aligns the exact spatial scales consumed by CK2 Refiner:
+#       - M3b 5x5 Global Context Pool KD (15%): F.avg_pool2d(5x5) ([B, 200, C]) hybrid MSE + LayerNorm Cosine.
+#       - M3a Corridor Spatial-Derivative (3x3 Edge) KD (10%): w_pgp-weighted row/col finite-difference MSE.
+#     * Fix 4 (Balanced Dual-Consumer Allocation & Zero-Init student_proj):
+#       Restores zero-init (0.0) on student_proj and combines 55% 1x1 cell MSE + 15% 5x5 pool + 10% 3x3 edge +
+#       10% anchor feature + 10% velocity-sibling differential feature + 0.20x confidence-weighted attention KL.
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Student architecture (ResNet-34 camera backbone)
+  image_architecture: resnet34.tv_in1k
+
+  # km/para-ssr-v2 Student Multi-Task Configuration
+  use_task_interaction: true
+  use_det_motion_head: true
+  use_map_head: true
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+  plan_heading_from_xy: true
+
+  # Task Gradient Balancing (Closed-loop balancer across Plan, Det, Map)
+  grad_balance_target:
+    plan: 0.4
+    det: 0.3
+    map: 0.3
+  grad_balance_warmup_iters: 10600
+  grad_balance_interval: 200
+
+  # v13 CK2-Aligned Wide-Corridor Multi-Scale & Soft-Capped Dual-Consumer KD
+  distill_selector: false
+  distill_selector_v6: false
+  distill_selector_v7: false
+  distill_selector_v8: false
+  distill_selector_v9: false
+  distill_selector_v10: false
+  distill_selector_v11: false
+  distill_selector_v12: false
+  distill_selector_v13: true
+  distill_spatial_sigmas: [2.0, 4.0, 8.0, 16.0]
+  distill_lambda_gt: 0.45
+  distill_lambda_cov: 0.20
+  distill_lambda_risk: 0.35
+  distill_tau_gt: 4.5
+  distill_tau_risk: 8.0
+  distill_attn_loss_scale: 5.0
+  distill_resmap_scale: 3.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  distill_anchor_mode: cross_attn
+  distill_probe_warmup_steps: 1000
+  distill_probe_ramp_steps: 2000
+  distill_probe_loss_weight: 0.5
+  distill_probe_lr_mult: 3.0
+  distill_proj_lr_mult: 2.0
+  distill_probe_use_ema: true
+  distill_probe_ema_decay: 0.99
+
+  # Legacy distill options turned off
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0

@@ -1,0 +1,496 @@
+{
+ "camera": {
+  "n_files": 22360,
+  "n_dirs": 56,
+  "prefixes": {
+   "openscene-v1.1/sensor_blobs/trainval": 22360
+  },
+  "owners": {
+   "litianyu/litianyu": 22416
+  },
+  "logs": [
+   "2021.06.09.17.23.18_veh-38_04782_05228",
+   "2021.06.14.14.25.15_veh-26_05108_05312",
+   "2021.06.14.18.13.35_veh-26_03853_03946",
+   "2021.07.09.01.37.16_veh-26_02856_02932",
+   "2021.08.17.15.02.08_veh-45_02003_02086",
+   "2021.08.17.17.17.01_veh-45_00207_00594",
+   "2021.08.24.18.30.46_veh-08_01985_02093"
+  ],
+  "uncompressed_total": 4718985807,
+  "compressed": 4704972041,
+  "ratio_uncomp_over_comp": 1.0029785014401533,
+  "logs_match_map": true,
+  "completeness": {
+   "2021.08.17.15.02.08_veh-45_02003_02086": {
+    "CAM_F0": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L0": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R0": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L1": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R1": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L2": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R2": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_B0": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    }
+   },
+   "2021.08.17.17.17.01_veh-45_00207_00594": {
+    "CAM_F0": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L0": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R0": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L1": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R1": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L2": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R2": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_B0": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    }
+   },
+   "2021.07.09.01.37.16_veh-26_02856_02932": {
+    "CAM_F0": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L0": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R0": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L1": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R1": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L2": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R2": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_B0": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    }
+   },
+   "2021.06.14.14.25.15_veh-26_05108_05312": {
+    "CAM_F0": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L0": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R0": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L1": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R1": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L2": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R2": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_B0": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    }
+   },
+   "2021.06.09.17.23.18_veh-38_04782_05228": {
+    "CAM_F0": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L0": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R0": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L1": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R1": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L2": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R2": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_B0": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    }
+   },
+   "2021.08.24.18.30.46_veh-08_01985_02093": {
+    "CAM_F0": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L0": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R0": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L1": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R1": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L2": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R2": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_B0": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    }
+   },
+   "2021.06.14.18.13.35_veh-26_03853_03946": {
+    "CAM_F0": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L0": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R0": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L1": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R1": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_L2": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_R2": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    },
+    "CAM_B0": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    }
+   }
+  },
+  "mean_member_bytes": {
+   "CAM_F0": 220577.97602862254,
+   "CAM_L0": 201295.66368515205,
+   "CAM_R0": 203851.75635062612,
+   "CAM_L1": 219299.01180679785,
+   "CAM_R1": 226500.6196779964,
+   "CAM_L2": 208160.78568872987,
+   "CAM_R2": 210730.49946332737,
+   "CAM_B0": 197950.7023255814
+  }
+ },
+ "lidar": {
+  "n_files": 2795,
+  "n_dirs": 7,
+  "prefixes": {
+   "openscene-v1.1/sensor_blobs/trainval": 2795
+  },
+  "owners": {
+   "daniel/daniel": 2802
+  },
+  "logs": [
+   "2021.06.09.17.23.18_veh-38_04782_05228",
+   "2021.06.14.14.25.15_veh-26_05108_05312",
+   "2021.06.14.18.13.35_veh-26_03853_03946",
+   "2021.07.09.01.37.16_veh-26_02856_02932",
+   "2021.08.17.15.02.08_veh-45_02003_02086",
+   "2021.08.17.17.17.01_veh-45_00207_00594",
+   "2021.08.24.18.30.46_veh-08_01985_02093"
+  ],
+  "uncompressed_total": 3921630467,
+  "compressed": 3456836376,
+  "ratio_uncomp_over_comp": 1.134456491555966,
+  "logs_match_map": true,
+  "completeness": {
+   "2021.08.17.15.02.08_veh-45_02003_02086": {
+    "MergedPointCloud": {
+     "exp": 166,
+     "have": 166,
+     "missing": 0,
+     "extra": 0
+    },
+    "subdirs": [
+     "MergedPointCloud"
+    ]
+   },
+   "2021.08.17.17.17.01_veh-45_00207_00594": {
+    "MergedPointCloud": {
+     "exp": 774,
+     "have": 774,
+     "missing": 0,
+     "extra": 0
+    },
+    "subdirs": [
+     "MergedPointCloud"
+    ]
+   },
+   "2021.07.09.01.37.16_veh-26_02856_02932": {
+    "MergedPointCloud": {
+     "exp": 152,
+     "have": 152,
+     "missing": 0,
+     "extra": 0
+    },
+    "subdirs": [
+     "MergedPointCloud"
+    ]
+   },
+   "2021.06.14.14.25.15_veh-26_05108_05312": {
+    "MergedPointCloud": {
+     "exp": 408,
+     "have": 408,
+     "missing": 0,
+     "extra": 0
+    },
+    "subdirs": [
+     "MergedPointCloud"
+    ]
+   },
+   "2021.06.09.17.23.18_veh-38_04782_05228": {
+    "MergedPointCloud": {
+     "exp": 892,
+     "have": 892,
+     "missing": 0,
+     "extra": 0
+    },
+    "subdirs": [
+     "MergedPointCloud"
+    ]
+   },
+   "2021.08.24.18.30.46_veh-08_01985_02093": {
+    "MergedPointCloud": {
+     "exp": 216,
+     "have": 216,
+     "missing": 0,
+     "extra": 0
+    },
+    "subdirs": [
+     "MergedPointCloud"
+    ]
+   },
+   "2021.06.14.18.13.35_veh-26_03853_03946": {
+    "MergedPointCloud": {
+     "exp": 187,
+     "have": 187,
+     "missing": 0,
+     "extra": 0
+    },
+    "subdirs": [
+     "MergedPointCloud"
+    ]
+   }
+  },
+  "mean_member_bytes": {
+   "MergedPointCloud": 1403087.8236135957
+  }
+ },
+ "same_logs_cam_lidar": true,
+ "per_frame_bytes_F0L0R0_lidar": 2028813.2196779964,
+ "per_frame_bytes_8cam_lidar": 3091454.838640429,
+ "per_frame_bytes_F0L0R0": 625725.3960644007
+}

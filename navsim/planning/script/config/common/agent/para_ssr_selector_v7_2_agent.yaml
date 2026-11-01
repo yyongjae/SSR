@@ -1,0 +1,59 @@
+# BEV Selector v7_2: PARA-SSR v2 Student Architecture (Aux Det + Motion + Map + Task Interaction)
+# combined with v7 Trajectory-Anchor-Guided Distillation (Spatial Bias & Attention Alignment).
+# - Student: km/para-ssr-v2 full multi-task architecture (ResNet-34)
+#     * use_task_interaction: true
+#     * use_det_motion_head: true
+#     * use_map_head: true
+#     * plan_anchor: true (256 trajectory anchors + PDM score simulation reward)
+#     * grad_balance_target: {plan: 0.4, det: 0.3, map: 0.3}
+# - Distill v7:
+#     * 2D Positional Encoding on BEV Keys (Spatial coordinate awareness)
+#     * Soft Gaussian Relative Spatial Distance Bias per Trajectory Anchor
+#     * Teacher Attention Map Alignment (KL Divergence on Teacher's Cross-Attention weights)
+#     * Attended Feature Distillation (Hybrid L2 + Cosine on Teacher & Student features)
+#     * ReSMap Domain Loss Scaling (3.0x multiplier to resolve DAC gradient starvation)
+#     * Sharpened Winner & Softmax Importance Weighting (tau=1.0, winner_boost=2.0)
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Student architecture (ResNet-34 camera backbone)
+  image_architecture: resnet34.tv_in1k
+
+  # km/para-ssr-v2 Student Multi-Task Configuration
+  use_task_interaction: true
+  use_det_motion_head: true
+  use_map_head: true
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+
+  # Task Gradient Balancing (Closed-loop balancer across Plan, Det, Map)
+  grad_balance_target:
+    plan: 0.4
+    det: 0.3
+    map: 0.3
+  grad_balance_warmup_iters: 10600
+  grad_balance_interval: 200
+
+  # v7 Trajectory-Anchor-Guided Distillation
+  distill_selector: false
+  distill_selector_v6: false
+  distill_selector_v7: true
+  distill_spatial_sigma: 4.0
+  distill_attn_loss_scale: 5.0
+  distill_resmap_scale: 3.0
+  distill_anchor_winner_boost: 2.0
+  distill_anchor_tau: 1.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  distill_anchor_mode: cross_attn
+
+  # Legacy distill options turned off
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0

@@ -30,8 +30,10 @@ class AgentLightningModule(pl.LightningModule):
             loss_dict = {"traj_loss": loss_dict}
             
         total_loss = 0.0
+        # agent.config.log_sync_dist = False drops the per-micro-batch all-reduce (default True = unchanged)
+        sync_dist = bool(getattr(getattr(self.agent, "config", None), "log_sync_dist", True))
         for loss_key, loss_value in loss_dict.items():
-            self.log(f"{logging_prefix}/{loss_key}", loss_value, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log(f"{logging_prefix}/{loss_key}", loss_value, on_step=True, on_epoch=True, prog_bar=True, sync_dist=sync_dist)
             if 'acc' in loss_key:
                 continue
             total_loss = total_loss + loss_value

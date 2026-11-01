@@ -1,0 +1,28 @@
+{
+ "created": "2026-09-28",
+ "n": 301,
+ "seed": 20260928,
+ "strata": {
+  "stopped": 48,
+  "decel": 151,
+  "turn": 105,
+  "fast": 11,
+  "short_path": 35,
+  "any": 301
+ },
+ "sources": {
+  "path_long (human poses t=0.5..8 s from navtest raw logs, NaN beyond n_valid)": [
+   "/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/navtest_paths.npz",
+   "81361a747a979d49328cb756e9ef3887f8491610b563f767325617a5bf93f158"
+  ],
+  "tau_h (human 8 poses)": [
+   "report/navsim_version_audit/adversarial_verify/human_navtest_trajectories.pkl",
+   "f395019ca0150f7f28b32b4e8cacd4e8ad001047eec501cad5d679b2319838ad"
+  ],
+  "tau_student (interaction_final seed 0)": [
+   "work_dirs/eval/para_ssr_interaction_final_navtest_trajectories.pkl",
+   "c520714bba80803c536dfb77c676c8989a8b61e984ade04e0570174fe94de912"
+  ]
+ },
+ "note": "path_long produced by scratchpad d_navtest_paths.py (report refiner_kd_design/fact_drafts.md (d)); v0/a0 = ego_dynamic_state of the log frame."
+}

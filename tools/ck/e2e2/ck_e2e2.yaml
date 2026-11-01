@@ -1,0 +1,94 @@
+# CK2 e2e (v2 + CK2 student from scratch, 30 epochs, 2 GPUs) -- ParaSSRConfig.ck_e2e2 for the main run
+# (SPEC ck2e2e s7-1 = CKE2E2Config defaults).  launch_util2.py turns every leaf into '++agent.config.ck_e2e2.<key>=<value>'
+# (nested dicts as dotted leaves).  io_dir is filled at launch with <RUN>/ck_e2e2.  The BEV-KD arm = this file +
+# bevkd_arm.set; smoke overrides live in smoke_e2e2.sh (E2E_CK_SET), never here.
+# user = USER DECISIONS of the CK2 e2e task; NUxx = non-user choice (SPEC s9, listed with the reason there).
+enabled: true
+io_dir: ""
+topk: 16                                     # user (v2 top-16; generation layout)
+variants:                                    # user: speeds -1.0,-0.5,+0.5 m/s^2, lateral +-0.5 m, 'separate', ext straight
+  speeds: [-1.0, -0.5, 0.5]
+  lats: [-0.5, 0.5]
+  combine: separate
+  s_on_frac: 0.2                             # = the variant label files (build.json)
+  ext: straight
+  compute_dtype: float64                     # NU22
+n_var_step: 32                               # user "student 32"
+var_sampling: type_balanced                  # NU10
+teacher_det_run: /home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10       # user 2026-10-09 00:30 KST (DET, BEVFusion t0; official EP)
+teacher_map_run: /home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2M10       # user 2026-10-09 00:30 KST (MAP, ReSMap; official EP)
+teacher_which: last                          # NU05 / user 2026-10-08 (KD uses the last ckpt; no best selection)
+teacher_require_done: true                   # NU05
+teacher_ep_check: true                       # report 48: TeacherPair2 refuses teachers whose config.json ep_target != ep_target
+teacher_amp: true                            # user (fp16 no_grad, as the old e2e)
+amp: false                                   # NU38 (student fp32, old)
+bev_grad_scale: 1.0                          # NU19 (old)
+seed: 0
+ep_target: official                          # user 2026-10-09 00:30 KST: official EP (decoupled = official EP without
+                                             # NC*DAC*DDC was worse on navtest); the teachers' config.json ep_target must match
+score_prior: ck2_warmup                      # NU20
+score_prior_rows: 4000
+loss_weight: 1.0
+lambda_score: 1.0                            # user (label BCE 1.0)
+lambda_kd_score: 0.5                         # user (score KD 0.5)
+kd_score_keys: [nc, dac, ep, ttc]            # user 2026-10-08: comfort NOT distilled (kinematic, no privileged info; labels only)
+kd_calib:                                    # user 2026-10-08 ~22:35 KST: Platt calibration of each teacher's KD logits
+  enabled: true                              # (per key, a z + b, NLL fit on navtrain_train r34 top-16; fit_kd_calib.py);
+  det: /home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/ck2T10__last.json      # DET keys nc / ep / ttc
+  map: /home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/ck2M10__last.json      # MAP keys dac / ep
+lambda_sur: 1.0                              # NU15 (old)
+lat_kd:                                      # lateral KD: ONE L1 on the mean of DET / MAP e_lat (user)
+  balance: ema                               # NU17 (old EMA balancer)
+  ratio: 0.5                                 # user 2026-10-08 (lateral KD 0.5 x surrogate)
+  m: 0.99
+  floor: 0.0001
+  cap: 10.0
+  start_mb: 1000                             # user (doubled vs the 4-GPU run)
+  fixed: 1.0
+lon_st_slope: 0.1
+lr_mult: 3.0                                 # NU38 (old)
+weight_decay: 0.01
+clip: 1.0
+warmup:
+  packed: /home/external-user/ssd/yongjae_refiner/ck/packed/navtrain_train
+  raw_labels: /home/external-user/ssd/yongjae_refiner/ck/labels/navtrain_train/raw256    # user
+  var_dir: /home/external-user/ssd/yongjae_refiner/ck/ck2/labels/navtrain_train/var_separate_sampler16_accstraight  # user
+  sampler_seed: 0                            # NU45
+  n_var: 32                                  # NU07
+  sur_groups: near_mid                       # NU15
+  lat_kd_groups: near_mid                    # NU16
+record_from_epoch: 4                         # NU21 (old; epoch 4 recorded so epoch 5 has gen 4)
+record_until_epoch: null                     # -> max_epochs - 2 (28)
+onpolicy_from_epoch: 5                       # user (5 warm-up epochs 0-4)
+kd_ramp_epochs: 0.0                          # NU18
+label_lag: 1                                 # user (option B, one-epoch lag)
+label_refresh_every_mb: 1000                 # user (doubled)
+onpolicy_label:
+  n_orig: 16                                 # NU11
+  n_var: 32                                  # NU11
+  fallback: warmup                           # NU12
+rec_chunk_tokens: 64                         # NU21
+grad_share_every: 100                        # user (doubled)
+log_every: 1
+infer_outputs: true
+infer_select: null                           # NU30 (selection happens in eval_ck2)
+strict_rows: 0.999                           # NU38
+bev_kd:                                      # off in the main run; bevkd_arm.set switches the arm on (teachers [det, map])
+  enabled: false
+  teachers: [det]                            # main run: unused (arm off); the arm sets [det, map] (user 2026-10-08 ~20:40 KST)
+  distance: mse                              # NU35
+  init: zero                                 # NU35 (one zero-init 1x1 adapter per teacher)
+  ln: true
+  target_clip: null
+  ratio: 0.1                                 # PER TEACHER: lam_t |dL_t/dBEV| ~ 0.1 x |g_plan| (user 2026-10-08), NU31
+  cap: 0.25                                  # per teacher, cap 0.25 x at the measurement, NU31
+  m: 0.9                                     # NU31
+  w_max: null
+  start_mb: 10600                            # NU33
+  adapter_weight: 1.0                        # NU32 (each adapter learns from its own teacher loss at this weight)
+  lr_mult: 3.0                               # NU34
+  weight_decay: 0.01                         # NU34
+  ratio_det: null                            # optional per-teacher override of ratio / cap (null = the shared value)
+  ratio_map: null
+  cap_det: null
+  cap_map: null

@@ -37,6 +37,10 @@ ARMS = {
     "nodet": "para_ssr_map_plan",
     "nomap": "para_ssr_det_motion_plan",
     "plan_only": "para_ssr_plan_only",
+    # v2 ablation series: shared camera-only base config, heads/interaction differ
+    "plan_only_final": "para_ssr_plan_only_final",
+    "parallel_final": "para_ssr_parallel_final",
+    "interaction_final": "para_ssr_interaction_final",
 }
 
 

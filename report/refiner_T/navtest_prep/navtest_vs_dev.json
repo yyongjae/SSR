@@ -1,0 +1,356 @@
+{
+ "dev": {
+  "n_split_tokens": 8000,
+  "n_drafted_tokens": 7930,
+  "n_scored_tokens": 7930,
+  "score_error_rows": 0,
+  "valid_rate": 94.47,
+  "bank_valid": {
+   "n": 97386,
+   "fail": 11.98,
+   "fail_ttc": 17.73,
+   "nc": 5.23,
+   "dac": 7.97,
+   "ttc": 11.39,
+   "ddc": 0.0,
+   "pdms": 0.8215
+  },
+  "human_k0": {
+   "n": 7930,
+   "pdms": 0.9504,
+   "nc_fail": 0.0,
+   "dac_fail": 0.0,
+   "ttc_fail": 0.0,
+   "ep": 0.8812
+  },
+  "tokens_per_city": {
+   "us-nv-las-vegas-strip": 5275,
+   "us-ma-boston": 990,
+   "sg-one-north": 900,
+   "us-pa-pittsburgh-hazelwood": 835
+  },
+  "city_frac": {
+   "us-nv-las-vegas-strip": 65.9,
+   "us-ma-boston": 12.4,
+   "sg-one-north": 11.2,
+   "us-pa-pittsburgh-hazelwood": 10.4
+  },
+  "by_family": {
+   "combined": {
+    "n": 6881,
+    "fail": 24.46,
+    "fail_ttc": 34.22,
+    "nc": 8.47,
+    "dac": 17.74,
+    "ttc": 20.46,
+    "ddc": 0.0,
+    "pdms": 0.6996
+   },
+   "creep": {
+    "n": 243,
+    "fail": 81.89,
+    "fail_ttc": 93.83,
+    "nc": 79.84,
+    "dac": 2.88,
+    "ttc": 92.18,
+    "ddc": 0.0,
+    "pdms": 0.1349
+   },
+   "cv": {
+    "n": 7928,
+    "fail": 64.32,
+    "fail_ttc": 80.44,
+    "nc": 36.64,
+    "dac": 39.09,
+    "ttc": 53.25,
+    "ddc": 0.04,
+    "pdms": 0.2305
+   },
+   "hdrift": {
+    "n": 2,
+    "fail": 0.0,
+    "fail_ttc": 0.0,
+    "nc": 0.0,
+    "dac": 0.0,
+    "ttc": 0.0,
+    "ddc": 0.0,
+    "pdms": 0.9754
+   },
+   "identity": {
+    "n": 7930,
+    "fail": 0.0,
+    "fail_ttc": 0.0,
+    "nc": 0.0,
+    "dac": 0.0,
+    "ttc": 0.0,
+    "ddc": 0.0,
+    "pdms": 0.9504
+   },
+   "ignore_brake": {
+    "n": 2097,
+    "fail": 4.48,
+    "fail_ttc": 21.41,
+    "nc": 3.58,
+    "dac": 0.91,
+    "ttc": 20.46,
+    "ddc": 0.0,
+    "pdms": 0.8568
+   },
+   "lat": {
+    "n": 14608,
+    "fail": 20.27,
+    "fail_ttc": 24.54,
+    "nc": 5.96,
+    "dac": 15.38,
+    "ttc": 11.22,
+    "ddc": 0.0,
+    "pdms": 0.7424
+   },
+   "lconst": {
+    "n": 33937,
+    "fail": 3.24,
+    "fail_ttc": 10.43,
+    "nc": 1.34,
+    "dac": 1.93,
+    "ttc": 8.69,
+    "ddc": 0.0,
+    "pdms": 0.9142
+   },
+   "small": {
+    "n": 23760,
+    "fail": 2.23,
+    "fail_ttc": 3.06,
+    "nc": 0.06,
+    "dac": 2.17,
+    "ttc": 0.93,
+    "ddc": 0.0,
+    "pdms": 0.9309
+   }
+  },
+  "by_city": {
+   "sg-one-north": {
+    "n": 11638,
+    "fail": 14.4,
+    "fail_ttc": 16.58,
+    "nc": 1.63,
+    "dac": 13.64,
+    "ttc": 4.32,
+    "ddc": 0.01,
+    "pdms": 0.7821
+   },
+   "us-ma-boston": {
+    "n": 12183,
+    "fail": 11.56,
+    "fail_ttc": 17.19,
+    "nc": 5.43,
+    "dac": 7.44,
+    "ttc": 11.25,
+    "ddc": 0.0,
+    "pdms": 0.8261
+   },
+   "us-nv-las-vegas-strip": {
+    "n": 63025,
+    "fail": 11.57,
+    "fail_ttc": 18.38,
+    "nc": 6.23,
+    "dac": 6.71,
+    "ttc": 13.47,
+    "ddc": 0.0,
+    "pdms": 0.8278
+   },
+   "us-pa-pittsburgh-hazelwood": {
+    "n": 10540,
+    "fail": 12.22,
+    "fail_ttc": 15.71,
+    "nc": 3.05,
+    "dac": 9.88,
+    "ttc": 6.88,
+    "ddc": 0.01,
+    "pdms": 0.8219
+   }
+  },
+  "human_pdms_by_city": {
+   "sg-one-north": 0.9077,
+   "us-ma-boston": 0.9517,
+   "us-nv-las-vegas-strip": 0.9588,
+   "us-pa-pittsburgh-hazelwood": 0.943
+  }
+ },
+ "navtest": {
+  "n_split_tokens": 12146,
+  "n_drafted_tokens": 12101,
+  "n_scored_tokens": 12101,
+  "score_error_rows": 0,
+  "valid_rate": 94.41,
+  "bank_valid": {
+   "n": 148517,
+   "fail": 12.81,
+   "fail_ttc": 18.59,
+   "nc": 5.03,
+   "dac": 8.77,
+   "ttc": 11.23,
+   "ddc": 0.01,
+   "pdms": 0.8096
+  },
+  "human_k0": {
+   "n": 12101,
+   "pdms": 0.9467,
+   "nc_fail": 0.0,
+   "dac_fail": 0.0,
+   "ttc_fail": 0.0,
+   "ep": 0.8723
+  },
+  "tokens_per_city": {
+   "us-nv-las-vegas-strip": 4064,
+   "us-ma-boston": 3731,
+   "us-pa-pittsburgh-hazelwood": 2437,
+   "sg-one-north": 1914
+  },
+  "city_frac": {
+   "us-nv-las-vegas-strip": 33.5,
+   "us-ma-boston": 30.7,
+   "us-pa-pittsburgh-hazelwood": 20.1,
+   "sg-one-north": 15.8
+  },
+  "by_family": {
+   "combined": {
+    "n": 10448,
+    "fail": 27.0,
+    "fail_ttc": 35.73,
+    "nc": 7.72,
+    "dac": 20.91,
+    "ttc": 18.68,
+    "ddc": 0.03,
+    "pdms": 0.6745
+   },
+   "creep": {
+    "n": 423,
+    "fail": 83.92,
+    "fail_ttc": 95.74,
+    "nc": 82.27,
+    "dac": 2.36,
+    "ttc": 94.09,
+    "ddc": 0.0,
+    "pdms": 0.1115
+   },
+   "cv": {
+    "n": 12098,
+    "fail": 68.0,
+    "fail_ttc": 82.63,
+    "nc": 34.68,
+    "dac": 42.07,
+    "ttc": 50.0,
+    "ddc": 0.07,
+    "pdms": 0.2068
+   },
+   "hdrift": {
+    "n": 3,
+    "fail": 0.0,
+    "fail_ttc": 0.0,
+    "nc": 0.0,
+    "dac": 0.0,
+    "ttc": 0.0,
+    "ddc": 0.0,
+    "pdms": 0.9196
+   },
+   "identity": {
+    "n": 12101,
+    "fail": 0.0,
+    "fail_ttc": 0.0,
+    "nc": 0.0,
+    "dac": 0.0,
+    "ttc": 0.0,
+    "ddc": 0.0,
+    "pdms": 0.9467
+   },
+   "ignore_brake": {
+    "n": 3142,
+    "fail": 4.42,
+    "fail_ttc": 23.49,
+    "nc": 3.66,
+    "dac": 0.76,
+    "ttc": 23.01,
+    "ddc": 0.0,
+    "pdms": 0.8452
+   },
+   "lat": {
+    "n": 22254,
+    "fail": 22.01,
+    "fail_ttc": 26.46,
+    "nc": 5.62,
+    "dac": 17.45,
+    "ttc": 11.0,
+    "ddc": 0.0,
+    "pdms": 0.7204
+   },
+   "lconst": {
+    "n": 51821,
+    "fail": 3.5,
+    "fail_ttc": 10.95,
+    "nc": 1.37,
+    "dac": 2.14,
+    "ttc": 9.0,
+    "ddc": 0.0,
+    "pdms": 0.9054
+   },
+   "small": {
+    "n": 36227,
+    "fail": 2.13,
+    "fail_ttc": 3.24,
+    "nc": 0.12,
+    "dac": 2.01,
+    "ttc": 1.24,
+    "ddc": 0.0,
+    "pdms": 0.927
+   }
+  },
+  "by_city": {
+   "sg-one-north": {
+    "n": 24726,
+    "fail": 15.26,
+    "fail_ttc": 16.61,
+    "nc": 1.28,
+    "dac": 14.42,
+    "ttc": 3.17,
+    "ddc": 0.0,
+    "pdms": 0.7649
+   },
+   "us-ma-boston": {
+    "n": 44760,
+    "fail": 13.89,
+    "fail_ttc": 21.59,
+    "nc": 6.66,
+    "dac": 8.42,
+    "ttc": 14.78,
+    "ddc": 0.0,
+    "pdms": 0.7959
+   },
+   "us-nv-las-vegas-strip": {
+    "n": 48468,
+    "fail": 10.98,
+    "fail_ttc": 17.89,
+    "nc": 6.13,
+    "dac": 6.24,
+    "ttc": 13.6,
+    "ddc": 0.0,
+    "pdms": 0.8363
+   },
+   "us-pa-pittsburgh-hazelwood": {
+    "n": 30563,
+    "fail": 12.16,
+    "fail_ttc": 16.92,
+    "nc": 3.92,
+    "dac": 8.75,
+    "ttc": 8.8,
+    "ddc": 0.04,
+    "pdms": 0.8236
+   }
+  },
+  "human_pdms_by_city": {
+   "sg-one-north": 0.8908,
+   "us-ma-boston": 0.9524,
+   "us-nv-las-vegas-strip": 0.9635,
+   "us-pa-pittsburgh-hazelwood": 0.9544
+  }
+ }
+}

@@ -641,6 +641,11 @@ def _load_training_agent_config(
         agent_config.config.plan_map_weight = 0.0
     if agent_config.config.get("plan_anchor", False):
         agent_config.config.plan_score_file = None  # labels are training-only
+    # aux_distill BEV distillation is training-only as well: built, it would open
+    # the teacher caches and add scene_token to the targets.  The loader skips
+    # its '_distill.' checkpoint keys when it is not built.
+    if "use_distill" in agent_config.config:
+        agent_config.config.use_distill = False
     return agent_config
 
 
@@ -818,12 +823,16 @@ def _run_missing_inference(
         sensor_config=agent.get_sensor_config(),
     )
     target_builders = agent.get_target_builders()
-    if len(target_builders) != 1 or not isinstance(
+    extra_builders = [
+        b for b in target_builders[1:]
+        if type(b).__name__ not in ("CKE2ETargetBuilder", "CK2E2ETargetBuilder")
+    ]
+    if not target_builders or not isinstance(
         target_builders[0], ParaSSRTargetBuilder
-    ):
+    ) or extra_builders:
         raise TypeError(
-            "PARA-SSR auxiliary evaluation requires exactly one "
-            "ParaSSRTargetBuilder"
+            "PARA-SSR auxiliary evaluation requires ParaSSRTargetBuilder as primary builder "
+            f"(got {[type(b).__name__ for b in target_builders]})"
         )
     dataset = _AuxiliaryTokenDataset(
         scene_loader,

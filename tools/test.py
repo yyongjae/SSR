@@ -40,6 +40,9 @@ def parse_args():
     parser.add_argument('config', help='test config file path')
     parser.add_argument('checkpoint', help='checkpoint file')
     parser.add_argument('--json_dir', help='json parent dir name file') # NOTE: json file parent folder name
+    parser.add_argument(
+        '--jsonfile-prefix',
+        help='directory prefix used by dataset evaluation outputs')
     parser.add_argument('--out', help='output result file in pickle format')
     parser.add_argument(
         '--fuse-conv-bn',
@@ -256,8 +259,9 @@ def main():
             else:
                 mmcv.dump(outputs['bbox_results'], args.out)
         kwargs = {} if args.eval_options is None else args.eval_options
-        kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
-            '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
+        kwargs['jsonfile_prefix'] = args.jsonfile_prefix or osp.join(
+            'test', args.config.split('/')[-1].split('.')[-2],
+            time.ctime().replace(' ', '_').replace(':', '_'))
         if args.format_only:
             dataset.format_results(outputs['bbox_results'], **kwargs)
 

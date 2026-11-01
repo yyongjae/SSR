@@ -1,0 +1,41 @@
+{
+ "E2": {
+  "det_mAP": 0.24915986640128387,
+  "map_mAP": 0.25389628124020663,
+  "det_AP": {
+   "vehicle": 0.5005941514495387,
+   "pedestrian": 0.21628954836726483,
+   "bicycle": 0.03533447264604479,
+   "traffic_cone": 0.22862496555968098,
+   "barrier": 0.2365820015947494,
+   "czone_sign": 0.001286532583702699,
+   "generic_object": 0.525407392608006
+  },
+  "map_AP": {
+   "road": 0.35463275546926787,
+   "walkway": 0.13913896511455026,
+   "centerline": 0.36528583547019594,
+   "crosswalk": 0.15652756890681238
+  }
+ },
+ "E0": {
+  "det_mAP": 0.27072588895138855,
+  "map_mAP": 0.2722674528336137,
+  "det_AP": {
+   "barrier": 0.260867072787913,
+   "bicycle": 0.0599811324780947,
+   "czone_sign": 0.004411791742021307,
+   "generic_object": 0.5415530521634602,
+   "pedestrian": 0.2434220164073077,
+   "traffic_cone": 0.24319338324433953,
+   "vehicle": 0.5416527738365833
+  },
+  "map_AP": {
+   "centerline": 0.3905826568738678,
+   "crosswalk": 0.16548631758684446,
+   "road": 0.3789702131756578,
+   "walkway": 0.1540306236980846
+  }
+ },
+ "note": "BEVFusion det mAP on the same V3 protocol 79.6 (report/28); ReSMap vector mAP 77.4 (its README, own eval)"
+}

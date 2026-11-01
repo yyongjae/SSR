@@ -1,0 +1,2 @@
+[rstream] retry 1 at 1087930077 (ConnectionError('premature end of body at 1087930077'))
+[rstream] done rc=0 bytes=1772587391/1772587391 sec=1316.6 MBps=1.346 retries=1 err=None

@@ -1,0 +1,60 @@
+{
+  "args": {
+    "tokens": [
+      "/home/external-user/ssd/yongjae_refiner/splits/e2e_train_trainlogs.parquet"
+    ],
+    "horizon_s": 5.0,
+    "logs_dir": "/home/external-user/navsim/download/trainval_navsim_logs/trainval",
+    "sensor_root": "/home/external-user/navsim/download/trainval_sensor_blobs",
+    "cache_dir": [
+      "/home/external-user/datasets/teacher_cache/bevfusion/cache_train_50x100"
+    ],
+    "map": "/home/external-user/yongjae/SSR/tools/future_teacher_cache/xfer/hf/map_trainval.json",
+    "tree_dir": "/home/external-user/yongjae/SSR/tools/future_teacher_cache/xfer/hf",
+    "cams": [
+      "CAM_F0",
+      "CAM_L0",
+      "CAM_R0"
+    ],
+    "max_sweeps": 2,
+    "no_sweeps": false,
+    "exact_listings": [],
+    "lf_cache": "/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/lf_cache.pkl",
+    "workers": 24,
+    "out": "/tmp/claude-1001/-home-external-user/9262a8d2-fa20-46d7-ba9a-92d7d13b8ceb/scratchpad/streamtest/lists/e2e_5s"
+  },
+  "frames_per_token": 10,
+  "input_tokens": 85109,
+  "input_tokens_not_in_logs": 0,
+  "input_tokens_without_current_npz": 0,
+  "future_frames_union": 187737,
+  "already_cached": 76501,
+  "run_frames": 111236,
+  "run_frames_on_disk": 17242,
+  "dl_frames": 93994,
+  "run_frames_on_disk_missing_some_sweep": 7997,
+  "sweep_only_lidar_frames_outside_run": 0,
+  "run_logs": 978,
+  "anomalies": {},
+  "logs_not_in_map": [],
+  "totals": {
+    "camera_files": 281982,
+    "camera_est_bytes": 58814489644,
+    "camera_est_bytes_arcscaled": 60020540486,
+    "camera_tgz_bytes": 1242213272326,
+    "lidar_files": 93994,
+    "lidar_est_bytes": 131881853472,
+    "lidar_est_bytes_arcscaled": 130097202577,
+    "lidar_tgz_bytes": 882141233382
+  },
+  "est_extracted_GB": 190.696343116,
+  "est_extracted_GB_arcscaled": 190.117743063,
+  "tgz_total_GB": 2124.354505708,
+  "discard_fraction_compressed_est": 0.9105056418068801,
+  "archives_with_nonempty_list": {
+    "camera": 200,
+    "lidar": 200
+  },
+  "archives": 200,
+  "seconds": 3.4561262130737305
+}

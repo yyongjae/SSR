@@ -1,0 +1,19 @@
+{
+ "n": 80,
+ "by_kind": {
+  "orig": 50,
+  "T": 15,
+  "none": 15
+ },
+ "maxabs": {
+  "d_nc": 0.0,
+  "d_dac": 0.0,
+  "d_ddc": 0.0,
+  "d_ep": 0.0,
+  "d_ttc": 0.0,
+  "d_comfort": 0.0,
+  "d_pdms": 0.0
+ },
+ "n_any_mismatch_gt_1e6": 0,
+ "n_failing_label": 27
+}

@@ -1,0 +1,11 @@
+# fusion_v1 arm: refiner v2 e2e main arm + aux_distill's v8 BEV anchor distillation (docs/bev_selector_v8.md).
+# Hydra overrides merged by key into the launcher recipe (E2E_EXTRA).  Teachers of the v8 term come from the CK2
+# targets kd_bev_0 (BEVFusion) / kd_bev_1 (ReSMap, transpose only), which the dataloader workers load for the CK2
+# teachers anyway; v8's own hyper-parameters stay at their defaults (lambda 0.6/0.2/0.2, sigmas 2/4/8/16 m,
+# feature 10 / attention 5, ReSMap x3, 0.5 per bank, distill_loss_weight 1.0).
+#   RUN=<name> CK2_E2E_APPROVED=1 E2E_EXTRA=tools/ck/e2e2/fusion_v8_arm.extra bash tools/ck/e2e2/train_e2e2.sh start --gpus 0,1,2,3
+#   (4 GPUs, user 2026-10-13: accumulate 8 and the per-rank counters halved by launch_util2.counters2 / scale_mb_counters)
+++agent.config.use_distill=true
+++agent.config.distill_selector_v8=true
+++agent.config.distill_teacher_source=targets
+++agent.config.distill_feature_root=/workspace/teacher_cache

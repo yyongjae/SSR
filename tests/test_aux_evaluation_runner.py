@@ -34,6 +34,30 @@ def _record(token: str = "token_a", identity: str = "a" * 64):
     }
 
 
+def test_aux_agent_config_drops_training_plan_scores(tmp_path):
+    config_path = tmp_path / "training.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "agent:",
+                "  checkpoint_path: null",
+                "  config:",
+                "    test_aux_heads: false",
+                "    backbone_pretrained: true",
+                "    plan_anchor: true",
+                "    plan_score_file: /tmp/pdm_score_256",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    loaded = runner._load_training_agent_config(config_path, tmp_path / "model.ckpt")
+    assert loaded.config.test_aux_heads is True
+    assert loaded.config.backbone_pretrained is False
+    assert loaded.config.plan_anchor is True
+    assert loaded.config.plan_score_file is None
+
+
 def test_record_schema_fixes_top100_and_twenty_raw_points():
     record = _record()
     runner._validate_record(record, "token_a", "a" * 64)
@@ -153,3 +177,30 @@ def test_existing_final_receipt_rejects_changed_record_digest(tmp_path):
         runner._publish_final_results(
             tmp_path, "a" * 64, identity, metrics, records_sha256="2" * 64
         )
+
+
+@pytest.mark.parametrize("helper", [
+    "modules/temporal_alignment.py", "modules/lidar_encoder.py", "modules/new_helper.py",
+])
+def test_model_helper_changes_invalidate_resumed_evaluation(tmp_path, monkeypatch, helper):
+    # Only the helper changes: checkpoint/config/token set remain the same.
+    # A future helper must be discovered without editing an evaluator file list.
+    source_root = tmp_path / "source"
+    for relative in runner.SOURCE_PATHS:
+        path = source_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original source\n")
+    helper_path = source_root / "navsim/agents/para_ssr" / helper
+    helper_path.parent.mkdir(parents=True, exist_ok=True)
+    helper_path.write_text("original helper\n")
+    monkeypatch.setattr(runner, "REPO_ROOT", source_root)
+    manifest = tmp_path / "manifest.json"
+    before = {"sources": runner._source_hashes()}
+    runner._write_or_validate_manifest(manifest, before)
+    assert runner._write_or_validate_manifest(manifest, before)
+
+    helper_path.write_text("changed inference behavior\n")
+    after = {"sources": runner._source_hashes()}
+    assert before != after
+    with pytest.raises(RuntimeError, match="another auxiliary evaluation"):
+        runner._write_or_validate_manifest(manifest, after)

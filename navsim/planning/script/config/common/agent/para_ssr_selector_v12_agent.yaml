@@ -1,0 +1,77 @@
+# BEV Selector v12: PARA-SSR v2 Student Multi-Task + Horizon-Balanced & Velocity-Sibling Contrastive Dual-Consumer KD
+# - Student: km/para-ssr-v2 full multi-task architecture (ResNet-34) + optional CK2 Refiner v2 E2E
+# - Distill v12 (docs/bev_selector_v12.md):
+#     * Fix 1 (Horizon-Balanced & Look-Ahead Extended Spatial Importance):
+#       Extends each trajectory anchor from T=8 (4.0s) to T=10 (5.0s, +1.0s TTC braking look-ahead up to 8~12m)
+#       and applies forward row gain g(y) = 0.65 + 0.90*(y/32.0) to eliminate the 18x anchor waypoint density decay
+#       in the 16m~32m horizon where id and a+0.5 diverge.
+#     * Fix 2 (Velocity-Sibling Contrastive Probe & Differential Feature KD):
+#       Constructs 406 same-geometry velocity-sibling pairs (i_slow, j_fast), adds a pairwise speed-cliff ranking loss
+#       to the teacher probe, and aligns student vs teacher differential features (f(j_fast) - f(i_slow)).
+#     * Fix 3 (Domain-Asymmetric Anchor Focus & Speed-Cliff Risk Boost):
+#       Tightens BEVFusion (DET) focus onto the ego corridor (tau_gt=2.0, tau_risk=2.8, lambda_gt=0.58, N_eff~54)
+#       while keeping ReSMap (MAP) wide (tau_gt=4.0, tau_risk=8.0, lambda_risk=0.50, N_eff~115), plus two-sided
+#       speed-cliff risk boost on both safe slow and crashing fast siblings.
+#     * Fix 4 (Dual-Consumer 80/20 Hybrid KD):
+#       Combines 80% PGP-weighted 1x1 cell MSE (for CK2 bilinear waypoint sampler), 10% anchor-pooled feature KD,
+#       10% velocity-sibling differential feature KD, and 0.25x confidence-weighted attention KL (for v2 Cross-Attn).
+defaults:
+  - para_ssr_distill_agent
+  - _self_
+
+config:
+  # Student architecture (ResNet-34 camera backbone)
+  image_architecture: resnet34.tv_in1k
+
+  # km/para-ssr-v2 Student Multi-Task Configuration
+  use_task_interaction: true
+  use_det_motion_head: true
+  use_map_head: true
+  plan_anchor: true
+  plan_anchor_file: /workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy
+  plan_score_file: /workspace/byounggun/SSR/data/planning_vb/pdm_score_256
+  plan_heading_from_xy: true
+
+  # Task Gradient Balancing (Closed-loop balancer across Plan, Det, Map)
+  grad_balance_target:
+    plan: 0.4
+    det: 0.3
+    map: 0.3
+  grad_balance_warmup_iters: 10600
+  grad_balance_interval: 200
+
+  # v12 Horizon-Balanced & Velocity-Sibling Contrastive Dual-Consumer KD
+  distill_selector: false
+  distill_selector_v6: false
+  distill_selector_v7: false
+  distill_selector_v8: false
+  distill_selector_v9: false
+  distill_selector_v10: false
+  distill_selector_v11: false
+  distill_selector_v12: true
+  distill_spatial_sigmas: [2.0, 4.0, 8.0, 16.0]
+  distill_lambda_gt: 0.58
+  distill_lambda_cov: 0.15
+  distill_lambda_risk: 0.27
+  distill_tau_gt: 2.0
+  distill_tau_risk: 2.8
+  distill_attn_loss_scale: 5.0
+  distill_resmap_scale: 3.0
+  distill_anchor_loss_scale: 10.0
+  distill_anchor_loss_type: hybrid
+  distill_anchor_proj: true
+  distill_anchor_mode: cross_attn
+  distill_probe_warmup_steps: 1000
+  distill_probe_ramp_steps: 2000
+  distill_probe_loss_weight: 0.5
+  distill_probe_lr_mult: 3.0
+  distill_proj_lr_mult: 2.0
+  distill_probe_use_ema: true
+  distill_probe_ema_decay: 0.99
+
+  # Legacy distill options turned off
+  use_corridor_mask: false
+  distill_use_role_masks: false
+  distill_mse_weight: 0.0
+  distill_plan_look_weight: 0.0
+  distill_head_kd_weight: 0.0

@@ -1,0 +1,21 @@
+{
+ "label": "POST-HOC diagnostic (not part of the pre-stated rule): the official NC failures of the train bank that the surrogate does not flag at the chosen setting (m_col 0.15, exact-SAT human mask), raw reference",
+ "script": "/home/external-user/ssd/yongjae_refiner/m8_recheck/a1_miss_diag_posthoc.py",
+ "rows": "/home/external-user/ssd/yongjae_refiner/m8_recheck/a1_miss_diag_m0.15_sat.csv",
+ "n_miss": 43,
+ "official collision object found in objects and OBS at nc_time_idx": 43,
+ "class A: tracking gap (LQR-tracked pose overlaps a counted, not-behind object; raw reference does not)": 21,
+ "class A raw SAT gap at nc_time [m] median / max": [
+  0.4583920806600576,
+  1.1565899887257998
+ ],
+ "class B: excluded by the not-behind mask (object centre < -1.3 m along ego heading; overlaps on tracked pose)": 22,
+ "class B by family": {
+  "7": 18,
+  "5": 2,
+  "6": 2
+ },
+ "class B with first-appearance object speed <= 0.05 m/s (official STOPPED_TRACK -> at fault; pdm_scorer uses unique_objects = first appearance)": 17,
+ "class B with |lateral offset| > 1 m (side collision, lane change)": 5,
+ "nc_time_idx median": 38.0
+}

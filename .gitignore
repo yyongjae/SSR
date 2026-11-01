@@ -7,7 +7,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
-
+.env
 # 가상환경 / 에디터
 .venv/
 venv/
@@ -38,3 +38,4 @@ tf_logs/
 
 # --work-dir 인자를 literal 로 넘겨서 잘못 생긴 디렉터리
 path/
+!tools/ck/data/

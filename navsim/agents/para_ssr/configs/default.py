@@ -8,7 +8,7 @@ Values fall into three groups:
 * **optimisation** -- the WoTE/SeerDrive-derived recipe (see report #09 §4).
 """
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
@@ -495,6 +495,203 @@ class ParaSSRConfig:
     # backbone learns at 0.1x, as in WoTE and in the original SSR config
     backbone_lr_mult: float = 0.1
     grad_clip_norm: float = 35.0
+
+    # ------------------------------------------------------------------ #
+    # Stage E: student refiner (+ correction KD).  'off' = E0, nothing is
+    # built, loaded or computed (bit-identical, tools/refiner/stageE_parity.py).
+    # See navsim/agents/para_ssr/refiner/e2e.py and
+    # report/refiner_T/stageE_impl_plan.md.
+    # ------------------------------------------------------------------ #
+    refiner_mode: str = "off"            # off | E1 (surrogate) | E2 (surrogate + KD)
+    ref_bev_grad_scale: float = 0.1      # gradient scale student BEV <- refiner
+    ref_w: float = 1.0                   # weight of the surrogate loss
+    ref_term_weights: Dict[str, float] = field(
+        default_factory=lambda: dict(col=1.0, ttc=1.0, dac=1.0, prog=2.0, cmf=0.1, mod=0.1)
+    )
+    ref_m_col: float = 0.15
+    ref_m_dac: float = 0.05
+    ref_m_ttc: float = 0.15
+    ref_lon_st_slope: float = 0.1        # mode-A straight-through slope (training only)
+    ref_perturb_frac: float = 0.5        # share of samples fed a perturbed sg(tau0)
+    ref_seed: int = 0                    # refiner init + perturbation rng
+    ref_lr_mult: float = 3.0             # refiner lr = lr * 3 (stage-T 3e-4 peak)
+    ref_weight_decay: float = 0.01
+    ref_clip: float = 1.0                # refiner-only grad-norm clip (before the global 35)
+    ref_data_root: str = "/home/external-user/ssd/yongjae_refiner"
+    kd_teacher_runs: Tuple[str, ...] = ()
+    kd_lambda: float = 0.0               # lambda_KD constant (from the pilot rule)
+    kd_space: str = ""                   # KD control space raw | tanh | decoded; E2 training refuses "" (user choice)
+    kd_ramp: Tuple[float, float] = (5.0, 10.0)   # 0 before epoch a, linear to 1 at epoch b (REVISION 1: 5-9)
+    ref_eval_traj: str = "final"         # eval output: final (tau_final) | tau0
+    # KD balance / draft options (defaults = the behaviour before these options existed; refiner/e2e.py docstring)
+    kd_balance: str = "fixed"            # fixed: kd_lambda x ramp | ema: w = kd_ratio * EMA(L_sur_w) / EMA(L_KD)
+    kd_ratio: float = 1.0                # ema: target weighted-KD / weighted-surrogate magnitude ratio
+    kd_ema_m: float = 0.99               # ema momentum (bias-corrected)
+    kd_ema_floor: float = 1e-4           # ema: floor on EMA(L_KD) in the denominator
+    kd_start_epoch: Optional[float] = None   # ema: KD on from this epoch (no ramp); None -> kd_ramp[0]
+    kd_draft_source: str = "tau0"        # tau0: perturbed sg(tau0) | human_mix: perturbed GT human traj (else sg(tau0))
+    ref_human_only_until: Optional[float] = None  # epoch < this: every draft = perturbed GT human (invalid -> unperturbed
+                                         #   GT human); from then on kd_draft_source applies.  None = off
+    kd_ratio_ramp_epochs: Optional[float] = None  # ema: ratio 0 -> kd_ratio linearly over [kd_start, kd_start + this]; None = off
+    kd_weight_max: Optional[float] = None         # ema: cap on the KD weight (after the ratio); None = no cap
+    grad_share_every: int = 50           # E1/E2: log ||dL/d bev_embed|| of E0 / surrogate / KD every n micro-batches (0 = off)
+
+    # ------------------------------------------------------------------ #
+    # CK Phase 2 (report 45; navsim/agents/para_ssr/ck/online.py): v2 + CK
+    # end-to-end.  Empty dict / enabled false = off: nothing is built,
+    # loaded or computed (v2 bit-identical).  Parsed by CKE2EConfig.from_any.
+    # ------------------------------------------------------------------ #
+    ck_e2e: Dict[str, Any] = field(default_factory=dict)
+    # CK2 e2e (navsim/agents/para_ssr/ck/online2.py; SSR/report/47 s9): v2 + CK2 student
+    # from scratch.  Empty dict / enabled false = off (nothing built / loaded / computed).
+    # Parsed by CKE2E2Config.from_any; exclusive with ck_e2e.
+    ck_e2e2: Dict[str, Any] = field(default_factory=dict)
+    # self.log(..., sync_dist=...) of the per-micro-batch loss logs
+    # (ParaSSRLoggingCallback, AgentLightningModule).  True = previous
+    # behaviour; False removes the per-micro-batch all-reduce (DDP -14 %).
+    log_sync_dist: bool = True
+
+    # ------------------------------------------------------------------ #
+    # BEV planning distillation, merged from aux_distill (ba7640d;
+    # docs/bev_selector_v8.md, navsim/agents/para_ssr/distill/).  Off by
+    # default: nothing below is read, built or loaded when use_distill is
+    # false (refiner / v2 bit-identical).  On this kyungmin-v2 core only the
+    # trajectory-anchor path (distill_selector_v6 / v7 / v8) is supported; the
+    # stage-1 adapter, corridor and register-selector paths (v1-v5) depend on
+    # aux_distill's own v2 port (forward_from_bev, use_metric_planner) and are
+    # not wired here.
+    # ------------------------------------------------------------------ #
+    use_distill: bool = False
+    # Root holding BEVFusion ``cache_{train,val}_50x100`` and the ReSMap shards.
+    distill_feature_root: str = ""
+    # ``{branch: {cache_name, adapter: {...}, loss_weight[, flip_w, cache_subdirs, feature_key]}}``.
+    # The anchor path (v6-v8) needs both branches and ignores ``adapter``.
+    distill_branches: Dict[str, Dict] = field(
+        default_factory=lambda: {
+            "bevfusion": {
+                "cache_name": "bevfusion",
+                "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
+                "loss_weight": 1.0,
+            },
+            "resmap": {
+                "cache_name": "resmap",
+                "adapter": {"channels": 256, "hidden_channels": 256, "dropout": 0.0},
+                "loss_weight": 1.0,
+                # fusion_v1: transpose only.  ReSMap's lateral index 0 is y_left = +32 m, i.e.
+                # already student column 0; aux_distill's default flip_w=True mirrored the map
+                # teacher left/right (GT check, 187 navtrain tokens: road IoU 0.965 transpose-only
+                # vs 0.360 with the flip, better on 187/187; = refiner/resmap_cache.py, kd_bev_1).
+                "flip_w": False,
+            },
+        }
+    )
+    # ``{branch: /path/to/stage1_adapter.ckpt}`` (stage-1 paths only; unused by v6-v8)
+    distill_adapter_checkpoints: Dict[str, str] = field(default_factory=dict)
+    # BEVFusion directory ``cache_train_50x100``. ReSMap is sharded and already
+    # 50x100 after the lateral/forward transpose. Same shape as the student,
+    # so stage 2 does not resample either teacher.
+    distill_cache_size: Tuple[int, int] = (50, 100)
+    distill_loss_weight: float = 1.0
+    # Seed of the frozen random probe of the anchor path (anchor/cmd/status MLPs,
+    # q/k/v/out projections): built under torch.random.fork_rng, so turning the
+    # distillation on changes neither the v2 / refiner init nor the global RNG
+    # stream (data order).  aux_distill drew the probe from the global RNG.
+    distill_probe_seed: int = 0
+    # Where the anchor path gets its two teacher BEVs (bevfusion, resmap):
+    #   "store"   aux_distill's TeacherFeatureStore, read in the training process from
+    #             distill_feature_root by targets['scene_token'];
+    #   "targets" the refiner e2e targets kd_bev_0 (DET = BEVFusion) / kd_bev_1 (MAP = ReSMap,
+    #             transpose only), loaded by the ck_e2e2 dataloader workers for the CK2 teachers
+    #             anyway (no extra I/O); tokens with kd_ok False are left out of the term.
+    distill_teacher_source: str = "store"
+    # Legacy v1-v5 knobs (inert on the anchor path; kept because the
+    # aux_distill agent yamls set them).
+    use_corridor_mask: bool = True
+    # NAVSIM GT poses are (x_forward, y_left); BEV cells are SSR (x_right, y_forward).
+    distill_trajectory_frame: str = "navsim"
+    corridor_sigma_base: float = 2.5
+    corridor_sigma_growth: float = 0.1
+    corridor_base_weight: float = 0.1
+    corridor_sigma_along: float = 4.0
+    corridor_sigma_cross: float = 2.5
+    corridor_sigma_along_growth: float = 0.15
+    corridor_sigma_cross_growth: float = 0.1
+    distill_use_role_masks: bool = True
+    distill_agent_inflate: float = 1.5
+    distill_agent_future_sigma: float = 1.5
+    distill_map_sigma: float = 1.25
+    distill_walkway_suppress: float = 0.0
+    distill_boundary_kernel: int = 3
+    distill_mse_weight: float = 1.0
+    distill_cwd_weight: float = 0.0
+    distill_cwd_tau: float = 4.0
+    distill_relation_weight: float = 0.0
+    distill_relation_samples: int = 64
+    distill_attn_weight: float = 0.0
+    distill_attn_tau: float = 0.5
+    distill_adaptive_branch: bool = False
+    distill_plan_look_weight: float = 0.0
+    distill_plan_look_tau: float = 0.5
+    distill_head_kd_weight: float = 0.0
+    distill_head_kd_tau: float = 2.0
+    distill_head_kd_det: bool = False
+    distill_head_kd_det_geom: bool = False
+    distill_selector: bool = False
+    distill_selector_registers: int = 16
+    distill_selector_div_sigma: float = 4.0
+    distill_selector_tok_warmup_steps: int = 53195
+    distill_selector_anchor_sigma: float = 6.0
+    distill_selector_anchor_sigma_end: float = 2.0
+    distill_selector_plan_tau: float = 0.3
+    distill_selector_struct_mix: float = 0.5
+    distill_selector_proj: bool = False
+    distill_selector_tok_scale: float = 1.0
+    distill_selector_loss_type: str = "l2"
+    distill_selector_struct_mask_boost: float = 0.0
+    # v6: Trajectory-Anchor-Guided Distillation
+    distill_selector_v6: bool = False
+    distill_anchor_winner_boost: float = 1.0
+    distill_anchor_tau: float = 2.0
+    distill_anchor_loss_scale: float = 10.0
+    distill_anchor_loss_type: str = "hybrid"
+    distill_anchor_proj: bool = True
+    distill_anchor_mode: str = "cross_attn"
+    # v7: + spatial bias & attention alignment
+    distill_selector_v7: bool = False
+    distill_spatial_sigma: float = 4.0
+    distill_attn_loss_scale: float = 5.0
+    distill_resmap_scale: float = 3.0
+    # v8: hybrid anchor weighting & multi-scale spatial distance bias
+    distill_selector_v8: bool = False
+    distill_spatial_sigmas: Tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
+    distill_lambda_gt: float = 0.6
+    distill_lambda_cov: float = 0.2
+    distill_lambda_risk: float = 0.2
+    distill_tau_gt: float = 5.0
+    distill_tau_risk: float = 8.0
+    # v9/v10/v11/v12/v13/v14/v15/v16: Domain-Specific Planning-Grounded Probe (PGP) + structural fixes
+    distill_selector_v9: bool = False
+    distill_selector_v10: bool = False
+    distill_selector_v11: bool = False
+    distill_selector_v12: bool = False
+    distill_selector_v13: bool = False
+    distill_selector_v14: bool = False
+    distill_selector_v15: bool = False
+    distill_selector_v16: bool = False
+    distill_proj_lr_mult: float = 2.0
+    distill_probe_warmup_steps: int = 1000
+    distill_probe_ramp_steps: int = 2000
+    distill_probe_loss_weight: float = 1.0
+    distill_probe_lr_mult: float = 3.0
+    distill_probe_use_ema: bool = True
+    distill_probe_ema_decay: float = 0.99
+    # aux_distill stage-1 teacher adapter (not supported on this core)
+    teacher_adapter_branch: str = "bevfusion"
+
+    @property
+    def needs_scene_token(self) -> bool:
+        """Targets must carry the frame token for the cache-addressed distillation."""
+        return bool(self.use_distill)
 
     @property
     def bev_grid_length(self) -> Tuple[float, float]:

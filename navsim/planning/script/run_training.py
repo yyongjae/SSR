@@ -131,15 +131,26 @@ def main(cfg: DictConfig) -> None:
         logger.info("Building SceneLoader")
         train_data, val_data = build_datasets(cfg, agent)
 
+    if hasattr(agent, "filter_datasets_to_teacher_cache"):
+        # aux_distill BEV distillation: keep only training tokens every teacher
+        # cache has (ReSMap covers navtrain train_logs only).  No-op when it is off.
+        agent.filter_datasets_to_teacher_cache(train_data, val_data)
+
     logger.info("Building Datasets")
+    if len(train_data) == 0:
+        raise RuntimeError("training set is empty (after teacher-cache filtering, if the distillation is on)")
     train_dataloader = DataLoader(
         train_data, **cfg.dataloader.params, shuffle=True, worker_init_fn=_worker_init
     )
     logger.info("Num training samples: %d", len(train_data))
-    val_dataloader = DataLoader(
-        val_data, **cfg.dataloader.params, shuffle=False, worker_init_fn=_worker_init
-    )
-    logger.info("Num validation samples: %d", len(val_data))
+    if len(val_data) == 0:
+        val_dataloader = None
+        logger.warning("Validation set is empty (teacher-cache filtering); validation is skipped")
+    else:
+        val_dataloader = DataLoader(
+            val_data, **cfg.dataloader.params, shuffle=False, worker_init_fn=_worker_init
+        )
+        logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")
     trainer_params = cfg.trainer.params

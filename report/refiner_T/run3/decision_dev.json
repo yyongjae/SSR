@@ -1,0 +1,167 @@
+{
+ "outcome": "PASS",
+ "sanity": {
+  "ok": true,
+  "d_pdms_vs_orig_points_T": {
+   "mean": 7.408984671952316,
+   "lo": 7.090894408394037,
+   "hi": 7.7315082727504345,
+   "n_logs": 295,
+   "n": 97386
+  },
+  "d_pdms_vs_orig_points_none": {
+   "mean": 5.9702755933537865,
+   "lo": 5.723788000691736,
+   "hi": 6.214673675987569,
+   "n_logs": 295,
+   "n": 97386
+  }
+ },
+ "endpoints": {
+  "P1_d_pdms_points": {
+   "mean": 1.4387090785985288,
+   "lo": 1.1863711160618204,
+   "hi": 1.6940980569107915,
+   "n_logs": 295,
+   "n": 97386
+  },
+  "P2_ncttc_reduction_pp": {
+   "mean": 0.7906680631712978,
+   "lo": 0.5046717375188315,
+   "hi": 1.0912914889930627,
+   "n_logs": 295,
+   "n": 97386
+  },
+  "P2ni_dac_excess_pp": {
+   "mean": -1.0063048076725607,
+   "lo": -1.199550113182221,
+   "hi": -0.8135557618770068,
+   "n_logs": 295,
+   "n": 97386
+  },
+  "P2ni_ddc_excess_pp": {
+   "mean": 0.0,
+   "lo": 0.0,
+   "hi": 0.0,
+   "n_logs": 295,
+   "n": 97386
+  },
+  "P3_new_fail_excess_pp": {
+   "mean": -0.20536832809644098,
+   "lo": -0.3248299272906717,
+   "hi": -0.09278978675600022,
+   "n_logs": 295,
+   "n": 97386
+  }
+ },
+ "p3_non_inferior": true,
+ "dac_ddc_non_inferior": true,
+ "arms": {
+  "T": {
+   "theta": 0.0,
+   "wtag": "stageT3",
+   "n_drafts": 97386,
+   "budget_def": "passing",
+   "ep_loss_points": 0.08490253763953563,
+   "ep_loss_points_all": -6.274747862381826,
+   "ep_loss_points_passing": 0.08490253763953563,
+   "n_passing": 85600.0,
+   "d_pdms_points": 7.408984671952316,
+   "pdms": 0.8955624079219051,
+   "pdms_orig": 0.821472561202382,
+   "modified_frac": 1.0,
+   "within_budget": true
+  },
+  "none": {
+   "theta": 0.0,
+   "wtag": "stageT3",
+   "n_drafts": 97386,
+   "budget_def": "passing",
+   "ep_loss_points": 0.15376857177215741,
+   "ep_loss_points_all": -4.968144236849213,
+   "ep_loss_points_passing": 0.15376857177215741,
+   "n_passing": 85300.0,
+   "d_pdms_points": 5.9702755933537865,
+   "pdms": 0.8811753171359197,
+   "pdms_orig": 0.821472561202382,
+   "modified_frac": 1.0,
+   "within_budget": true
+  }
+ },
+ "n_paired_drafts": 97386,
+ "n_logs": 295,
+ "seeds": [
+  0
+ ],
+ "n_boot": 10000,
+ "margin_pp": 0.5,
+ "eq_points": 0.2,
+ "eq_pp": 0.5,
+ "budget_def": "passing",
+ "by_family": {
+  "identity": {
+   "n": 7930,
+   "d_pdms_points_T_minus_none": 0.259838453083159,
+   "d_pdms_points_T": -0.08871552983833302,
+   "d_pdms_points_none": -0.348553982921492,
+   "ncttc_reduction_pp": -0.025220680958385876
+  },
+  "small": {
+   "n": 23760,
+   "d_pdms_points_T_minus_none": 0.6244783698944302,
+   "d_pdms_points_T": 1.0536006225241707,
+   "d_pdms_points_none": 0.42912225262974046,
+   "ncttc_reduction_pp": 0.0
+  },
+  "lconst": {
+   "n": 33937,
+   "d_pdms_points_T_minus_none": 1.376940737415289,
+   "d_pdms_points_T": 1.6119398875229274,
+   "d_pdms_points_none": 0.2349991501076383,
+   "ncttc_reduction_pp": 1.6177033915785133
+  },
+  "ignore_brake": {
+   "n": 2097,
+   "d_pdms_points_T_minus_none": 2.550390522055391,
+   "d_pdms_points_T": 2.206382373581071,
+   "d_pdms_points_none": -0.34400814847431965,
+   "ncttc_reduction_pp": 2.193609918931807
+  },
+  "creep": {
+   "n": 243,
+   "d_pdms_points_T_minus_none": 18.021262002743484,
+   "d_pdms_points_T": 58.17901234567901,
+   "d_pdms_points_none": 40.15775034293553,
+   "ncttc_reduction_pp": 22.633744855967077
+  },
+  "lat": {
+   "n": 14608,
+   "d_pdms_points_T_minus_none": 1.1233017136062315,
+   "d_pdms_points_T": 14.1375884241595,
+   "d_pdms_points_none": 13.014286710553268,
+   "ncttc_reduction_pp": -1.0747535596933189
+  },
+  "combined": {
+   "n": 6881,
+   "d_pdms_points_T_minus_none": 2.9309136107709683,
+   "d_pdms_points_T": 15.549453479001595,
+   "d_pdms_points_none": 12.618539868230624,
+   "ncttc_reduction_pp": 0.6249091701787531
+  },
+  "cv": {
+   "n": 7928,
+   "d_pdms_points_T_minus_none": 3.8068964249957085,
+   "d_pdms_points_T": 39.12934326004539,
+   "d_pdms_points_none": 35.32244683504968,
+   "ncttc_reduction_pp": 2.976791120080726
+  },
+  "hdrift": {
+   "n": 2,
+   "d_pdms_points_T_minus_none": -1.2294578825508162,
+   "d_pdms_points_T": -1.2288159224322637,
+   "d_pdms_points_none": 0.0006419601185525536,
+   "ncttc_reduction_pp": 0.0
+  }
+ },
+ "selection_file": "report/refiner_T/run3/selection.json"
+}

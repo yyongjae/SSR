@@ -1,0 +1,50 @@
+M8 train-split re-check: CONFIRMATION on a disjoint pool (pre-stated).
+Written 2026-09-28 ~12:15 KST, BEFORE any number of the confirmation run was computed. Nothing in this file is changed
+after the run starts. Scripts: tools/refiner/m8_confirm.py (pool, analysis) + tools/refiner/m8_recheck.py (run, summarize;
+unchanged code, pointed at the confirmation directory with --out / --report).
+Dev tokens and navtest are never read.
+
+Setting under test
+  S* = (m_col 0.15 m, m_dac 0.10 m, human mask = exact SAT)   sid 14, chosen by SELECTION_RULE.txt on the sweep pool
+  D  = (m_col 0.30 m, m_dac 0.20 m, human mask = exact SAT)   sid 23, the current code default (SurrogateConfig())
+
+Pool (disjoint by LOG from the sweep pool)
+  Eligible = m8_recheck.eligible_tokens() (train split; 13 stored labels without error; objects; navtrain SDF;
+  human trajectory without frame gap; metric cache).
+  Excluded = every log of the sweep pool (/home/external-user/ssd/yongjae_refiner/m8_recheck/tokens.parquet, 800 logs).
+  Only 91 train logs are left (1,930 eligible tokens), so the pool takes several tokens per log:
+    cap c = the smallest integer with sum over logs of min(n_log, c) >= 800  (c = 12 -> 842 tokens);
+    per log (logs sorted), min(n_log, c) tokens drawn without replacement, numpy default_rng(seed 0).
+  The effective sample is 91 log clusters. Every CI is a log-cluster bootstrap (2,000 resamples) plus Clopper-Pearson.
+  Proof of disjointness: pool_disjointness.json + tokens_sweep.csv + tokens_confirm.csv (token and log intersections = 0).
+
+Computation
+  Identical to the sweep: all 48 grid settings, same code (m8_recheck.py run / summarize), same metric definitions
+  (SELECTION_RULE.txt), labels = snapshot of scores/train.parquet for the pool, official re-score with stored-label check.
+
+VERDICT (about S*)
+  CONFIRMED iff both hold on the confirmation pool:
+    (1) S* meets all four pre-stated criteria by point estimate (the form of the original M8 acceptance):
+          A1 >= 0.70, A2 <= 0.02, A3 >= 0.60, DAC human false alarm <= 0.02;
+    (2) safety guard vs D on the same source drafts: for NC and for DAC separately, the paired log-bootstrap 95% CI of
+          (new official failure rate under S*) - (new official failure rate under D)
+        does NOT lie entirely above 0.  (new failure = source passes that metric, the guided output fails it;
+        rate over all valid perturbed sources.)
+  Otherwise NOT CONFIRMED.
+
+Reported next to the verdict (not part of it)
+  - "fragile": any 95% CI (log bootstrap) of S*'s four criteria that contains its threshold;
+  - the selection rule re-applied to the confirmation grid alone, and to the settings feasible on BOTH pools;
+  - sweep vs confirmation difference per criterion for S* and D (independent log bootstrap of the difference);
+  - paired S* - D on the confirmation pool (log bootstrap): residual official NC failures after guided correction
+    (all sources), P(official NC fixed | source NC fail), P(official NC fail after | surrogate says fixed),
+    P(official NC fail after | modified), raw-invisible residual NC failures, TTC fixed / new, DAC fixed / new,
+    mean dPDMS. S* corrects less than D by construction, so more residual NC failures under S* are expected;
+    this is the safety cost of the smaller margin and is reported with its CI, not used to flip the verdict;
+  - the same flags on the official LQR-tracked states (ceiling of an ideal M7b tracker) for S* and D.
+
+Config to use for training
+  If CONFIRMED: S*'s values, passed as optional arguments (code defaults unchanged).
+  If NOT CONFIRMED: the rule order (largest m_col, then m_dac, then SAT mask) applied to the settings that are feasible
+  on BOTH pools and pass the safety guard vs D; if there is none, no raw-reference setting is confirmed and the code
+  default stays (decision back to the user, D1).

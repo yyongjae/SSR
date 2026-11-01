@@ -105,7 +105,7 @@ class ParaSSRLoss(torch.nn.Module):
         # BEV selector v7 distillation (distill/anchor_distill.py): training-only, owned by the loss
         # so its parameters reach the optimizer (agent.get_optimizers) and leave the eval path alone
         if bool(getattr(config, "distill_v7", False)):
-            from .distill import TrajectoryAnchorDistillation
+            from .distill_v7 import TrajectoryAnchorDistillation
             if not (getattr(config, "plan_anchor", False) and getattr(config, "plan_anchor_file", None)):
                 raise ValueError("distill_v7 needs the anchor planner (plan_anchor, plan_anchor_file)")
             self.v7_distill = TrajectoryAnchorDistillation(

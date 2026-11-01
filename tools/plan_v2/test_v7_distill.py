@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools/readout"))
 import _env  # noqa: F401,E402
 from navsim.agents.para_ssr.configs.default import ParaSSRConfig                          # noqa: E402
-from navsim.agents.para_ssr.distill import TrajectoryAnchorDistillation, v7_stores        # noqa: E402
+from navsim.agents.para_ssr.distill_v7 import TrajectoryAnchorDistillation, v7_stores        # noqa: E402
 
 OK = []
 ANCHORS = ROOT / "data/planning_vb/trajectory_anchors_256.npy"

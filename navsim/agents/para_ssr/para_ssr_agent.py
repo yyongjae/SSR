@@ -581,7 +581,7 @@ class ParaSSRAgent(AbstractAgent):
         # The one exception is the distillation adapter (readout/distill.py):
         # it is training-only, so a KD checkpoint must evaluate without it and
         # a KD fine-tune must start from a checkpoint that never had it.
-        kd_prefix = ("_loss.distiller.", "_loss.v7_distill.")      # + v7 distillation (distill/)
+        kd_prefix = ("_loss.distiller.", "_loss.v7_distill.")      # + v7 distillation (distill_v7/)
         own = self.state_dict()
         state_dict = {
             k: v for k, v in state_dict.items() if not k.startswith(kd_prefix) or k in own
@@ -669,7 +669,7 @@ class ParaSSRAgent(AbstractAgent):
         if getattr(cfg, "plan_anchor", False) and getattr(cfg, "plan_score_file", None):
             builders.append(AnchorScoreTargetBuilder(cfg))
         if bool(getattr(cfg, "distill_v7", False)):
-            from .distill.v7_targets import V7TeacherTargetBuilder
+            from .distill_v7.v7_targets import V7TeacherTargetBuilder
 
             builders.append(V7TeacherTargetBuilder(cfg))
         return builders

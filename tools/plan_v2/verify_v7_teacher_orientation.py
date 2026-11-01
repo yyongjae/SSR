@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     from navsim.agents.para_ssr.configs.default import ParaSSRConfig
-    from navsim.agents.para_ssr.distill.teacher_store import v7_stores
+    from navsim.agents.para_ssr.distill_v7.teacher_store import v7_stores
     from navsim.agents.para_ssr.readout.bev_cache import BevCache
     from navsim.common.dataloader import SceneLoader
 

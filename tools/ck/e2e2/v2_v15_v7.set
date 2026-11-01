@@ -1,0 +1,7 @@
+# ck_e2e2 sets of v2_v15_v7 (E2E_CK_SET): the 64 m refiner teachers (same recipe as ck2T10 / ck2M10, trained on the
+# BEVFusion 100x100 / ReSMap front64 caches with CK_BEV64=1, 2026-10-27) and their KD Platt calibration
+# (tools/ck/e2e2/fit_kd_calib.py with CK_BEV64=1; the launcher refuses missing / mismatched files).
+teacher_det_run=/home/external-user/ssd/yongjae_refiner/ck/ck2/train64/ck2T10_64m
+teacher_map_run=/home/external-user/ssd/yongjae_refiner/ck/ck2/train64/ck2M10_64m
+kd_calib.det=/home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/ck2T10_64m__last.json
+kd_calib.map=/home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/ck2M10_64m__last.json

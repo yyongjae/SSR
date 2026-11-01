@@ -58,7 +58,11 @@ while [ $# -gt 0 ]; do
 done
 RUN=${RUN:?RUN=<run name> is required}
 ARM=${ARM:-main}
-E2E_ROOT=${E2E_ROOT:-/workspace/byounggun/ssr_outputs/ck2_e2e}
+E2E_ROOT=${E2E_ROOT:-/home/external-user/ssd/yongjae_refiner/v7/e2e}
+# v2_v15_v7: never write into another user's tree (aux_distill defaulted to /workspace/byounggun/ssr_outputs/ck2_e2e)
+case "$(readlink -m "$E2E_ROOT")" in /workspace/byounggun*|/home/external-user/byounggun*)
+  echo "[train_e2e2] REFUSED: E2E_ROOT=$E2E_ROOT is under byounggun's directory (read-only for this branch)" >&2; exit 3;;
+esac
 R="$E2E_ROOT/$RUN"
 L="$R/launch"; LB="$R/labeler"; IO="$R/ck_e2e2"
 export PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1

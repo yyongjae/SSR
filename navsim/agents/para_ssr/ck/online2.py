@@ -331,9 +331,17 @@ class CKE2E2Config:
                 raise ValueError("ck_e2e and ck_e2e2 cannot both be enabled")
             if not getattr(parent, "plan_anchor", False):
                 raise ValueError("ck_e2e2 needs plan_anchor=true (top-16 of the anchor planner)")
-            if (int(parent.bev_h), int(parent.bev_w)) != (50, 100) or tuple(float(v) for v in parent.pc_range) != (
-                    -32.0, 0.0, -2.0, 32.0, 32.0, 2.0):
-                raise ValueError("ck_e2e2 reads the 50 x 100 S grid (0.64 m, front ROI)")
+            # the S grid of the refiner (refiner.adapters: 50 x 100 = 0..32 m, or 100 x 100 = 0..64 m with
+            # CK_BEV64=1, fixed at import) must be the v2 BEV grid itself: same rows / cols and x / y extent (0.64 m
+            # cells, front ROI); the pillar heights (pc_range z) are free (v2_v15_v7: z [-1, 3])
+            from ..refiner.adapters import BEV_H, BEV_W, CELL
+
+            pc = tuple(float(v) for v in parent.pc_range)
+            want = (-BEV_W * CELL / 2, 0.0, BEV_W * CELL / 2, BEV_H * CELL)
+            if (int(parent.bev_h), int(parent.bev_w)) != (BEV_H, BEV_W) or (pc[0], pc[1], pc[3], pc[4]) != want:
+                raise ValueError(f"ck_e2e2 reads the {BEV_H} x {BEV_W} S grid (0.64 m, x_right {want[0]}..{want[2]}, "
+                                 f"y_forward 0..{want[3]}); got bev {parent.bev_h} x {parent.bev_w}, pc_range {pc}.  "
+                                 "A 100 x 100 / 64 m BEV needs CK_BEV64=1 in the environment of every process.")
             if int(parent.embed_dims) != 256:
                 raise ValueError(f"ck_e2e2 needs embed_dims 256, got {parent.embed_dims}")
         if self.topk != K16:

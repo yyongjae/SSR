@@ -267,11 +267,16 @@ def student_topk(predictions: Dict[str, torch.Tensor], k: int) -> Dict[str, torc
 
 
 def bev_sgrid(bev_embed: torch.Tensor) -> torch.Tensor:
-    """bev_embed [B, 5000, 256] -> S grid [B, 256, 50, 100] (gradient kept; AdapterSGrid flattens it back)."""
+    """bev_embed [B, BEV_H * BEV_W, 256] -> S grid [B, 256, BEV_H, BEV_W] (gradient kept; AdapterSGrid flattens it
+    back).  BEV_H = 50 (0..32 m) or 100 with CK_BEV64=1 (0..64 m, v2_v15_v7); v2 row = forward bin from the ego, col 0 =
+    32 m left, the S-grid convention."""
+    from ..refiner.adapters import BEV_H, BEV_W
+
     B, HW, C = bev_embed.shape
-    if HW != 50 * 100:
-        raise ValueError(f"bev_embed {tuple(bev_embed.shape)} is not the 50 x 100 grid")
-    return bev_embed.transpose(1, 2).reshape(B, C, 50, 100)
+    if HW != BEV_H * BEV_W:
+        raise ValueError(f"bev_embed {tuple(bev_embed.shape)} is not the {BEV_H} x {BEV_W} grid (CK_BEV64="
+                         f"{'1' if BEV_H == 100 else '0'})")
+    return bev_embed.transpose(1, 2).reshape(B, C, BEV_H, BEV_W)
 
 
 def _sanitize_traj(traj: torch.Tensor, fallback: torch.Tensor, ok: Optional[torch.Tensor] = None

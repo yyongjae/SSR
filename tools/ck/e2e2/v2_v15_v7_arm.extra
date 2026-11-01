@@ -1,0 +1,44 @@
+# v2_v15_v7 arm (report 132): baseline v2-seg + BEV selector v15 (km 64 m port) + refiner v2 (ck_e2e2) on the front
+# 0-64 m, 100 x 100 BEV.  Hydra overrides merged by key into the e2e launcher recipe (E2E_EXTRA); launched through
+# scripts/training/train_v2_v15_v7.sh, which also exports CK_BEV64=1 (refiner S grid 100 x 100) and the ck_e2e2 sets
+# (64 m refiner teachers + their KD calibration, tools/ck/e2e2/v2_v15_v7.set).
+# Everything else (r34, anchors, plan heads, 4 GPU x batch 4 x acc 8, GradBalancer 5300 / 100, no in-training val,
+# ck_e2e2 defaults) is the recipe that fusion_v15_main ran.
+wandb.project=v2_v15_v7
+wandb.group=v2_v15_v7
+# ---- grid: front 0..64 m x +-32 m, 100 x 100 cells of 0.64 m, camera pillars z [-1, 3] (km cf_v15_fix values)
+++agent.config.pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]
+++agent.config.map_pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]
+++agent.config.bev_h=100
+++agent.config.bev_w=100
+++agent.config.distill_cache_size=[100,100]
+# ---- map head: v2-seg drivable-area segmentation head (scripts/training/train_v2_r34_seg.sh)
+++agent.config.map_head_type=seg
+++agent.config.bev_seg_weight=3.0
+# ---- lens undistortion (ParaSSRConfig default; explicit for the record)
+++agent.config.undistort=true
+# ---- BEV selector v15 (= tools/ck/e2e2/fusion_v15_arm.extra; teachers from the CK2 targets kd_bev_0 / kd_bev_1)
+++agent.config.use_distill=true
+++agent.config.distill_selector_v8=false
+++agent.config.distill_selector_v9=false
+++agent.config.distill_selector_v10=false
+++agent.config.distill_selector_v11=false
+++agent.config.distill_selector_v12=false
+++agent.config.distill_selector_v13=false
+++agent.config.distill_selector_v14=false
+++agent.config.distill_selector_v15=true
+++agent.config.distill_selector_v16=false
+++agent.config.distill_teacher_source=targets
+++agent.config.distill_feature_root=/workspace/teacher_cache
+++agent.config.distill_lambda_gt=0.45
+++agent.config.distill_lambda_cov=0.20
+++agent.config.distill_lambda_risk=0.35
+++agent.config.distill_tau_gt=4.5
+++agent.config.distill_tau_risk=8.0
+++agent.config.distill_probe_warmup_steps=5300
+++agent.config.distill_probe_ramp_steps=2650
+++agent.config.distill_probe_loss_weight=0.5
+++agent.config.distill_probe_lr_mult=3.0
+++agent.config.distill_proj_lr_mult=3.0
+++agent.config.distill_probe_use_ema=true
+++agent.config.distill_probe_ema_decay=0.99

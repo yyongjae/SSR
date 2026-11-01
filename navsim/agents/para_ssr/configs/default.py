@@ -40,6 +40,9 @@ class ParaSSRConfig:
     # navsim images are 1920x1080. 0.4 -> 768x432, then drop 16 rows of sky.
     image_scale: float = 0.4
     crop_top: int = 16
+    # lens distortion correction before resize / crop (1b3b00c, SafeDrive-style; km cf_v15).  False only to
+    # evaluate checkpoints trained on distorted images or for parity tests against the pre-fix base.
+    undistort: bool = True
 
     ego_motion_dims: int = 18
 
@@ -67,14 +70,14 @@ class ParaSSRConfig:
     # cell with a lateral flip and no resampling (teacher_cache/*_50x100).  The
     # earlier 100 x 100 variant had 0.32 x 0.64 m cells and needed the
     # longitudinal axis resampled against that teacher.
-    pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
+    pc_range: Tuple[float, ...] = (-32.0, 0.0, -1.0, 32.0, 32.0, 3.0)
     bev_h: int = 50     # y_forward: 32 m / 50 = 0.64 m per row
     bev_w: int = 100    # x_right:  64 m / 100 = 0.64 m per column
 
     # Deliberately identical to pc_range.  A different map range would make the
     # map decoder's normalized reference points address the wrong physical BEV
     # cells, even if both tensors happened to have compatible shapes.
-    map_pc_range: Tuple[float, ...] = (-32.0, 0.0, -2.0, 32.0, 32.0, 2.0)
+    map_pc_range: Tuple[float, ...] = (-32.0, 0.0, -1.0, 32.0, 32.0, 3.0)
     embed_dims: int = 256
     num_heads: int = 8
     ffn_channels: int = 512

@@ -288,6 +288,95 @@ class ParaSSRLoggingCallback(pl.Callback):
             logger.warning("could not write %s: %s", path, exc)
 
 
+def _anchor_distill(agent):
+    """the v9..v16 TrajectoryAnchorDistillation that owns the KD schedule clock (micro_step), or None"""
+    ad = getattr(getattr(agent, "_distill", None), "anchor_distill", None)
+    if ad is None or "micro_step" not in dict(ad.named_buffers(recurse=False)):
+        return None
+    return ad
+
+
+class DistillScheduleCallback(pl.Callback):
+    """Checkpoints the v15 distillation schedule (report 129 A30 / A42).
+
+    ``anchor_distill.micro_step`` (the only clock of the KD warm-up, ramp and
+    bev_scale), the TeacherRatioControllers ``ratio_ctrl`` / ``probe_ratio_ctrl``
+    (plain objects) and each probe's ``ema_step`` + ``ema__*`` shadows are
+    non-persistent, so a Lightning resume restored ``ParaSSRLoss.iteration``
+    but replayed the BEV-KD warm-up.  They travel here, in the checkpoint's
+    callback state: anchor_distill.py / planning_probe.py stay as km's and the
+    model state_dict keys are unchanged.  A checkpoint written before this
+    callback falls back to ``loss.iteration`` (equal to micro_step on a fresh
+    run: both advance once per training micro-batch), the live probe weights
+    as EMA shadows and fresh controllers.  Registered only when the agent has
+    an anchor distillation with a micro_step buffer.
+    """
+
+    def __init__(self, agent) -> None:
+        super().__init__()
+        self._agent = agent
+
+    def state_dict(self) -> Dict[str, Any]:
+        ad = _anchor_distill(self._agent)
+        if ad is None:
+            return {}                                       # Lightning then stores nothing
+        state: Dict[str, Any] = {"micro_step": int(ad.micro_step)}
+        for name in ("ratio_ctrl", "probe_ratio_ctrl"):
+            c = getattr(ad, name, None)
+            state[name] = None if c is None else c.state_dict()
+        state["probes"] = [{"ema_step": int(p.ema_step),
+                            "ema": {n: b.detach().cpu().clone() for n, b in p.named_buffers(recurse=False)
+                                    if n.startswith("ema__")}}
+                           for p in (ad.probes or [])]
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        ad = _anchor_distill(self._agent)
+        if not state_dict or ad is None:
+            return
+        probes = list(ad.probes or [])
+        saved = list(state_dict.get("probes") or [])
+        if len(saved) != len(probes):
+            raise ValueError(f"distillation schedule state has {len(saved)} probes, the model {len(probes)}")
+        with torch.no_grad():
+            ad.micro_step.fill_(int(state_dict["micro_step"]))
+            for name in ("ratio_ctrl", "probe_ratio_ctrl"):
+                c, sd = getattr(ad, name, None), state_dict.get(name)
+                if c is not None and sd is not None:
+                    c.load_state_dict(sd)
+            for p, st in zip(probes, saved):
+                p.ema_step.fill_(int(st["ema_step"]))
+                bufs = {n: b for n, b in p.named_buffers(recurse=False) if n.startswith("ema__")}
+                if set(bufs) != set(st["ema"]):
+                    raise ValueError(f"probe EMA buffers {sorted(set(bufs) ^ set(st['ema']))} != the checkpoint's")
+                for n, b in bufs.items():
+                    b.copy_(st["ema"][n].to(device=b.device, dtype=b.dtype))
+        it = int(getattr(self._agent._loss, "iteration", -1))
+        if int(state_dict["micro_step"]) != it:
+            logger.warning("distillation micro_step %d != loss iteration %d after the restore",
+                           int(state_dict["micro_step"]), it)
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint: Dict[str, Any]) -> None:
+        if self.state_key in (checkpoint.get("callbacks") or {}):
+            return                                          # load_state_dict restores it
+        ad = _anchor_distill(self._agent)
+        if ad is None:
+            return
+        # a checkpoint from before this callback: PL 2.2.1 restores the model (ParaSSRLoss.iteration in its extra
+        # state) before the callbacks, so loss.iteration is the resumed micro-batch count
+        it = int(self._agent._loss.iteration)
+        with torch.no_grad():
+            ad.micro_step.fill_(it)
+            for p in ad.probes or []:
+                p.ema_step.fill_(it)
+                live = {"ema__" + n.replace(".", "__"): q for n, q in p.named_parameters()}
+                for n, b in p.named_buffers(recurse=False):
+                    if n.startswith("ema__") and n in live:
+                        b.copy_(live[n].detach().to(device=b.device, dtype=b.dtype))
+        logger.warning("checkpoint has no distillation schedule state: micro_step / probe ema_step set to the loss "
+                       "iteration %d, probe EMA shadows = the restored weights, ratio controllers start fresh", it)
+
+
 class ParaSSRAgent(AbstractAgent):
     # CK Phase 2 helper (plain object, set in __init__ when config.ck_e2e is on).  Class-level default so agents built
     # without __init__ (tests use ParaSSRAgent.__new__) still read "CK off".
@@ -750,12 +839,13 @@ class ParaSSRAgent(AbstractAgent):
                            "it was built from, e.g. after a checkpoint restore)")
         frac, dead = 1.0, False
         if str(getattr(cfg, "distill_teacher_source", "store")) == "targets":
-            # fusion_v1: the CK2 targets (S grid, f16): kd_bev_0 = DET / BEVFusion, kd_bev_1 = MAP / ReSMap
-            from .ck.bev_kd import sgrid_to_tokens
+            # S-grid f16 targets from CK2E2ETargetBuilder (refiner on) or DistillTeacherTargetBuilder (refiner off):
+            # kd_bev_0 = DET / BEVFusion, kd_bev_1 = MAP / ReSMap; any grid size (km's 64 m port, 100 x 100)
+            from .distill.adapter import bev_map_to_tokens
 
             ok = targets["kd_ok_0"].bool() & targets["kd_ok_1"].bool()
-            inputs["teacher_tokens"] = (sgrid_to_tokens(targets["kd_bev_0"]).float(),
-                                        sgrid_to_tokens(targets["kd_bev_1"]).float())
+            inputs["teacher_tokens"] = (bev_map_to_tokens(targets["kd_bev_0"]).float(),
+                                        bev_map_to_tokens(targets["kd_bev_1"]).float())
             out["distill/teacher_ok_frac"] = ok.float().mean().detach()
             if not bool(ok.any()):
                 # no teacher at all on this rank: run the term on the student's own (detached) BEV with weight 0, so
@@ -994,13 +1084,16 @@ class ParaSSRAgent(AbstractAgent):
             from .ck.e2e_data import CKE2ETargetBuilder
 
             builders.append(CKE2ETargetBuilder(cfg))
-        if self._ck_e2e2 is not None or (
-            getattr(cfg, "use_distill", False)
-            and str(getattr(cfg, "distill_teacher_source", "store")) == "targets"
-        ):
+        if self._ck_e2e2 is not None:
+            # also emits kd_bev_{0,1} / kd_ok_{0,1} (refiner teachers and v15 read the same tensors)
             from .ck.e2e_data2 import CK2E2ETargetBuilder
 
             builders.append(CK2E2ETargetBuilder(cfg))
+        elif getattr(cfg, "use_distill", False) and str(getattr(cfg, "distill_teacher_source", "store")) == "targets":
+            # km's 64 m port (eba0524): teacher BEVs without the refiner
+            from .distill.teacher_store import DistillTeacherTargetBuilder
+
+            builders.append(DistillTeacherTargetBuilder(cfg))
         return builders
 
     # ------------------------------------------------------------------ #
@@ -1093,6 +1186,9 @@ class ParaSSRAgent(AbstractAgent):
             from .ck.online2 import make_ck2_callback
 
             callbacks.append(make_ck2_callback(self))
+        if _anchor_distill(self) is not None:
+            # report 129 A30 / A42: micro_step, ratio controllers and probe EMA in the checkpoint's callback state
+            callbacks.append(DistillScheduleCallback(self))
         return callbacks
 
     # ------------------------------------------------------------------ #

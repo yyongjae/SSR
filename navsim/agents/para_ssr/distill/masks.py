@@ -162,9 +162,9 @@ def rasterize_agent_mask(
         sin_y = torch.sin(yaw)
         dx = grid_x.unsqueeze(0) - cx
         dy = grid_y.unsqueeze(0) - cy
-        local_x = cos_y * dx + sin_y * dy
-        local_y = -sin_y * dx + cos_y * dy
-        inside = (local_x.abs() <= half_l) & (local_y.abs() <= half_w)
+        local_w = -cos_y * dx + sin_y * dy
+        local_l = -sin_y * dx - cos_y * dy
+        inside = (local_w.abs() <= half_w) & (local_l.abs() <= half_l)
         current = inside.any(dim=0).to(dtype)
         mask[b, 0] = current
 

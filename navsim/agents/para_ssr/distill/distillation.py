@@ -904,12 +904,17 @@ def build_planning_distillation(config):
     branches = {
         name: dict(spec) for name, spec in config.distill_branches.items()
     }
+    feature_root = str(getattr(config, "distill_feature_root", "") or "/workspace/teacher_cache")
+    student_bev_size = (int(config.bev_h), int(config.bev_w))
+    cache_size = tuple(int(v) for v in config.distill_cache_size)
+    if student_bev_size == (100, 100) and cache_size == (50, 100):
+        cache_size = (100, 100)
     module = PlanningDistillation(
-        feature_root=config.distill_feature_root,
+        feature_root=feature_root,
         branches=branches,
         adapter_checkpoint=dict(config.distill_adapter_checkpoints),
-        student_bev_size=(config.bev_h, config.bev_w),
-        cache_size=tuple(config.distill_cache_size),
+        student_bev_size=student_bev_size,
+        cache_size=cache_size,
         use_corridor_mask=getattr(config, "use_corridor_mask", True),
         pc_range=tuple(config.pc_range),
         corridor_sigma_base=float(getattr(config, "corridor_sigma_base", 2.5)),

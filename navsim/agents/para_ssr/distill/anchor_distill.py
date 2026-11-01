@@ -176,12 +176,28 @@ class TrajectoryAnchorDistillation(nn.Module):
         if self.version in ("v10", "v11", "v12", "v13", "v14", "v15", "v16"):
             import numpy as np
             from ..ck.bev_kd_arm import TeacherRatioControllers
-            default_norms = (
-                "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10/norm.npz",
-                "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2M10/norm_map.npz",
-            )
-            for bank_idx, norm_path in enumerate(default_norms):
-                if os.path.isfile(norm_path):
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
+            if (self.bev_h, self.bev_w) == (100, 100) or self.pc_range[4] > 40.0:
+                cand_norms = (
+                    (
+                        os.path.join(repo_root, "resources/km_corridor/norm_bevfusion_100x100.npz"),
+                        "/workspace/teacher_cache/bevfusion/norm_100x100.npz",
+                        "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10/norm.npz",
+                    ),
+                    (
+                        os.path.join(repo_root, "resources/km_corridor/norm_resmap_100x100.npz"),
+                        "/workspace/teacher_cache/resmap/stage1_front64/norm_map.npz",
+                        "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2M10/norm_map.npz",
+                    ),
+                )
+            else:
+                cand_norms = (
+                    ("/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10/norm.npz",),
+                    ("/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2M10/norm_map.npz",),
+                )
+            for bank_idx, norm_paths in enumerate(cand_norms):
+                norm_path = next((p for p in norm_paths if os.path.isfile(p)), None)
+                if norm_path is not None:
                     with np.load(norm_path, allow_pickle=False) as zf:
                         zm = torch.as_tensor(zf["mean"].astype(np.float32)).view(1, 1, self.channels)
                         zs = torch.as_tensor(zf["std"].astype(np.float32)).clamp_min(1e-6).view(1, 1, self.channels)
@@ -297,7 +313,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         y_min, y_max = self.pc_range[1], self.pc_range[4]
         grid_y = y_min + (r + 0.5) * ((y_max - y_min) / self.bev_h)
         if self.version in ("v13", "v14", "v15", "v16"):
-            gain_r = 1.0 + 0.50 * ((grid_y - 10.0) / max(y_max - 10.0, 1e-4)).clamp(0.0, 1.0)
+            gain_r = 1.0 + 0.50 * ((grid_y - 10.0) / 22.0).clamp(0.0, 1.0)
         else:
             gain_r = 0.65 + 0.90 * (grid_y / max(y_max, 1e-4)).clamp(0.0, 1.0)
         return gain_r.unsqueeze(1).expand(self.bev_h, self.bev_w).reshape(1, -1)

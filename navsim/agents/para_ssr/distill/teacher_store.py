@@ -71,7 +71,16 @@ class TeacherFeatureStore:
 
     # ------------------------------------------------------------------ #
     def teacher_root(self) -> str:
-        return os.path.join(self.root, self.teacher)
+        base = os.path.join(self.root, self.teacher)
+        s1_front64 = os.path.join(base, "stage1_front64")
+        wants_100 = any("100x100" in s for s in self.cache_subdirs) and not (
+            len(self.cache_subdirs) == 2 and all("50x100" in s for s in self.cache_subdirs)
+        )
+        if os.path.isfile(os.path.join(s1_front64, "index.json")) and (
+            wants_100 or not os.path.isfile(os.path.join(base, "index.json"))
+        ):
+            return s1_front64
+        return base
 
     def is_sharded(self) -> bool:
         return os.path.isfile(os.path.join(self.teacher_root(), "index.json"))
@@ -86,11 +95,20 @@ class TeacherFeatureStore:
 
     def _get_index(self) -> Dict[str, list]:
         if self._index is None:
-            path = os.path.join(self.teacher_root(), "index.json")
+            troot = self.teacher_root()
+            path = os.path.join(troot, "index.json")
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"{self.teacher}: index.json not found at {path}")
             with open(path, "r", encoding="utf-8") as handle:
-                self._index = json.load(handle)
+                idx = dict(json.load(handle))
+            navtest_path = os.path.join(troot, "navtest", "index.json")
+            if os.path.isfile(navtest_path):
+                with open(navtest_path, "r", encoding="utf-8") as handle:
+                    nt_idx = json.load(handle)
+                for tok, (sh, r) in nt_idx.items():
+                    if tok not in idx:
+                        idx[tok] = [f"navtest/{sh}", r]
+            self._index = idx
         return self._index
 
     def manifests(self) -> Dict[str, dict]:
@@ -137,19 +155,15 @@ class TeacherFeatureStore:
         bev_info = meta.get("tensors", {}).get("bev", {})
         bev_shape = bev_info.get("shape", [])
         if len(bev_shape) == 3:
-            # ReSMap raw axes: (C, lateral, forward) e.g. [256, 100, 50].
-            # load_batch transposes to (C, forward, lateral) when dim1 > dim2.
-            height, width = int(bev_shape[1]), int(bev_shape[2])
-            if height > width:
-                return (width, height)
-            return (height, width)
+            # ReSMap raw axes: (C, lateral, forward) e.g. [256, 100, 50] or [256, 100, 100].
+            # _load_sharded_one always transposes (0, 2, 1) -> (C, forward, lateral).
+            lat, fwd = int(bev_shape[1]), int(bev_shape[2])
+            return (fwd, lat)
         grid = meta.get("bev_grid", [])
         if len(grid) == 2:
-            # bev_grid is [lateral, forward] = [100, 50] for ReSMap.
+            # bev_grid is [lateral, forward] = [100, 50] or [100, 100] for ReSMap.
             lat, fwd = int(grid[0]), int(grid[1])
-            if lat > fwd:
-                return (fwd, lat)
-            return (lat, fwd)
+            return (fwd, lat)
         raise TeacherCacheMismatch("sharded meta has neither tensors.bev.shape nor bev_grid")
 
     def validate_manifest(self, config) -> None:
@@ -251,13 +265,19 @@ class TeacherFeatureStore:
             return token in self._get_index()
         return os.path.isfile(self.path_for(token))
 
+    def _shard_path(self, shard: str) -> str:
+        troot = self.teacher_root()
+        if str(shard).startswith("navtest/"):
+            return os.path.join(troot, "navtest", "bev", f"{shard[len('navtest/'):]}.npy")
+        return os.path.join(troot, "bev", f"{shard}.npy")
+
     def path_for(self, token: str) -> str:
         token = str(token)
         if self.is_sharded():
             idx = self._get_index()
             if token in idx:
                 shard, _ = idx[token]
-                return os.path.join(self.teacher_root(), "bev", f"{shard}.npy")
+                return self._shard_path(shard)
             return ""
         shard = token[:2]
         candidates = [
@@ -295,17 +315,17 @@ class TeacherFeatureStore:
             raise FileNotFoundError(f"{self.teacher}: token {token} not found in index.json")
         shard, row = idx[token]
         if shard not in self._mmap_cache:
-            shard_path = os.path.join(self.teacher_root(), "bev", f"{shard}.npy")
+            shard_path = self._shard_path(shard)
             if not os.path.isfile(shard_path):
                 raise FileNotFoundError(f"Missing shard file: {shard_path}")
             self._mmap_cache[shard] = np.load(shard_path, mmap_mode="r")
         raw = np.asarray(self._mmap_cache[shard][row])
-        # In ReSMap, axes are (C, lateral, forward) = (256, 100, 50)
-        # Transpose to (C, forward=50, lateral=100)
+        # In ReSMap, axes are (C, lateral, forward) = (256, 100, 50) for 32m or (256, 100, 100) for stage1_front64 64m.
+        # Always transpose (0, 2, 1) -> (C, forward, lateral) so both 50x100 and 100x100 align with student BEV.
         # fusion_v1: lateral index 0 is y_left = +32 m, i.e. already the student column 0,
         # so ReSMap needs the transpose only -- configure flip_w=False for this store
         # (configs/default.py distill_branches); flipping mirrors the map left/right.
-        if raw.ndim == 3 and raw.shape[1] > raw.shape[2]:
+        if raw.ndim == 3:
             raw = raw.transpose(0, 2, 1)
         if self.flip_w:
             raw = raw[:, :, ::-1].copy()
@@ -313,6 +333,19 @@ class TeacherFeatureStore:
             # fusion_v1: own the memory (a transposed memmap row is a read-only view)
             raw = np.array(raw)
         return raw
+
+    def load_one_token(self, token: str) -> Optional[np.ndarray]:
+        """Load one token's ``[C, H, W]`` teacher BEV map, or return ``None`` if absent."""
+        token_str = str(token)
+        if self.is_sharded():
+            try:
+                return self._load_sharded_one(token_str)
+            except FileNotFoundError:
+                return None
+        path = self.path_for(token_str)
+        if not os.path.isfile(path):
+            return None
+        return self._load_one(path)
 
     def load_batch(
         self, tokens: Sequence[str], device: torch.device, dtype: torch.dtype
@@ -392,3 +425,71 @@ def restrict_dataset_to_stores(dataset, stores: Sequence[TeacherFeatureStore], n
         ",".join(store.teacher for store in stores),
     )
     return dropped
+
+
+try:
+    from navsim.planning.training.abstract_feature_target_builder import AbstractTargetBuilder as _ATB
+except Exception:  # pragma: no cover
+    _ATB = object
+
+
+class DistillTeacherTargetBuilder(_ATB):
+    """Worker-parallel target builder for frozen teacher BEVs (``kd_bev_0`` = BEVFusion, ``kd_bev_1`` = ReSMap).
+
+    Follows the ``Corridor64TargetBuilder`` / ``ExactFullTargetBuilder`` dataloader pattern in ``km/corridor-cf``:
+    each worker process lazily opens its own ``TeacherFeatureStore`` handles/memmaps (checked via ``os.getpid()``)
+    and emits ``kd_bev_{0,1}`` ``[C, H, W]`` ``float16`` + ``kd_ok_{0,1}`` ``bool`` per frame token.
+    """
+
+    def __init__(self, config) -> None:
+        try:
+            super().__init__()
+        except TypeError:  # pragma: no cover
+            pass
+        root = str(getattr(config, "distill_feature_root", "") or "/workspace/teacher_cache")
+        self._root = os.path.abspath(os.path.expanduser(root))
+        self._c = int(getattr(config, "embed_dims", 256))
+        self._bev_h = int(getattr(config, "bev_h", 100))
+        self._bev_w = int(getattr(config, "bev_w", 100))
+        cs = tuple(int(v) for v in getattr(config, "distill_cache_size", (self._bev_h, self._bev_w)))
+        if (self._bev_h, self._bev_w) == (100, 100) and cs == (50, 100):
+            if os.path.isdir(os.path.join(self._root, "bevfusion", "cache_train_100x100")):
+                cs = (100, 100)
+        self._cache_size = cs
+        self._pid: Optional[int] = None
+        self._stores: Optional[Tuple[TeacherFeatureStore, TeacherFeatureStore]] = None
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        d["_pid"], d["_stores"] = None, None
+        return d
+
+    def get_unique_name(self) -> str:
+        return f"para_ssr_distill_teachers_{self._cache_size[0]}x{self._cache_size[1]}"
+
+    def _open(self) -> Tuple[TeacherFeatureStore, TeacherFeatureStore]:
+        if self._stores is None or self._pid != os.getpid():
+            h, w = self._cache_size
+            subdirs = (f"cache_train_{h}x{w}", f"cache_val_{h}x{w}")
+            self._stores = (
+                TeacherFeatureStore(self._root, "bevfusion", cache_subdirs=subdirs, flip_w=True),
+                TeacherFeatureStore(self._root, "resmap", cache_subdirs=subdirs, flip_w=False),
+            )
+            self._pid = os.getpid()
+        return self._stores
+
+    def compute_targets(self, scene) -> Dict[str, torch.Tensor]:
+        stores = self._open()
+        token = str(scene.frames[scene.scene_metadata.num_history_frames - 1].token)
+        h, w = self._cache_size
+        out: Dict[str, torch.Tensor] = {}
+        for i, store in enumerate(stores):
+            arr = store.load_one_token(token)
+            if arr is not None:
+                out[f"kd_bev_{i}"] = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float16))
+                out[f"kd_ok_{i}"] = torch.tensor(True, dtype=torch.bool)
+            else:
+                out[f"kd_bev_{i}"] = torch.zeros((self._c, h, w), dtype=torch.float16)
+                out[f"kd_ok_{i}"] = torch.tensor(False, dtype=torch.bool)
+        return out
+

@@ -17,7 +17,9 @@ wandb.group=v2_v15_v7
 ++agent.config.bev_seg_weight=3.0
 # ---- lens undistortion (ParaSSRConfig default; explicit for the record)
 ++agent.config.undistort=true
-# ---- BEV selector v15 (= tools/ck/e2e2/fusion_v15_arm.extra; teachers from the CK2 targets kd_bev_0 / kd_bev_1)
+# ---- BEV selector v15 (= tools/ck/e2e2/fusion_v15_arm.extra; teachers from the CK2 targets kd_bev_0 / kd_bev_1).
+# distill_probe_warmup_steps / _ramp_steps (per-rank micro-batches: 1.0 / 0.5 epoch, km 2ecd5b5; 5300 / 2650 on 4
+# GPUs as fusion_v15_main) are written by scripts/training/train_v2_v15_v7.sh for the GPU count of the run.
 ++agent.config.use_distill=true
 ++agent.config.distill_selector_v8=false
 ++agent.config.distill_selector_v9=false
@@ -35,8 +37,6 @@ wandb.group=v2_v15_v7
 ++agent.config.distill_lambda_risk=0.35
 ++agent.config.distill_tau_gt=4.5
 ++agent.config.distill_tau_risk=8.0
-++agent.config.distill_probe_warmup_steps=5300
-++agent.config.distill_probe_ramp_steps=2650
 ++agent.config.distill_probe_loss_weight=0.5
 ++agent.config.distill_probe_lr_mult=3.0
 ++agent.config.distill_proj_lr_mult=3.0

@@ -60,7 +60,8 @@ E2E_ROOT = f"{CK_DATA}/ck2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/ck2/e2e_smoke"
 IO_SUB = "ck_e2e2"
 NGPU = 2                          # user: 2 GPUs per run (devices 2)
-NGPU_ALLOWED = (2, 4)             # user 2026-10-13: 4 GPUs for the fusion_v1 / fusion_v10 runs
+NGPU_ALLOWED = (2, 4, 8)          # user 2026-10-13: 4 GPUs for the fusion_v1 / fusion_v10 runs; 2026-11-02:
+                                  # 8 GPUs (0-7, CK_ALLOW_GPU4567=1) for the v2_v15_v7 student (same global batch 128)
 EXTRA_GPUS = ("4", "5", "6", "7")  # only with CK_ALLOW_GPU45=1 (2,3,4,5 or 4,5,6,7)
 ACCUMULATE = 16                   # user: 2 x 4 x 16 = 128
 BALANCE_WARMUP = 10600            # user

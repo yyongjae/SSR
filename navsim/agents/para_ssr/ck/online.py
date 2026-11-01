@@ -178,8 +178,10 @@ class CKE2EConfig:
                 raise ValueError("ck_e2e needs refiner_mode off (Stage E and CK e2e are exclusive)")
             if not getattr(parent, "plan_anchor", False):
                 raise ValueError("ck_e2e needs plan_anchor=true (top-16 of the anchor planner)")
-            if (int(parent.bev_h), int(parent.bev_w)) != (50, 100) or tuple(float(v) for v in parent.pc_range) != (
-                    -32.0, 0.0, -2.0, 32.0, 32.0, 2.0):
+            pc = tuple(float(v) for v in parent.pc_range)
+            # x / y extent only: the pillar heights (pc_range z) do not change the S grid (v2_v15_v7 default z [-1, 3])
+            if (int(parent.bev_h), int(parent.bev_w)) != (50, 100) or (pc[0], pc[1], pc[3], pc[4]) != (
+                    -32.0, 0.0, 32.0, 32.0):
                 raise ValueError("ck_e2e reads the 50 x 100 S grid (0.64 m, front ROI)")
             if int(parent.embed_dims) != 256:
                 raise ValueError(f"ck_e2e needs embed_dims 256, got {parent.embed_dims}")

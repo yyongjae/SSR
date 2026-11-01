@@ -60,11 +60,15 @@ def gpu_guard(device: str) -> None:
         raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK jobs run on exactly one GPU of {allowed}")
 
 
-def gpu_guard_ddp(device: str, world_size: int, max_gpus: int = 2) -> None:
+def gpu_guard_ddp(device: str, world_size: int, max_gpus: int = 0) -> None:
     """DDP variant (train_ck2): CUDA_VISIBLE_DEVICES = 1 .. max_gpus distinct GPUs of ALLOWED_GPUS and exactly one
     process per visible GPU (world_size == number of visible GPUs).  gpu_guard above is unchanged (single-GPU jobs)."""
     if not str(device).startswith("cuda"):
         return
+    # v2_v15_v7 (user 2026-11-02 KST: "0123으로 det, 4567로 map"): CK_TEACHER_MAX_GPUS=4 lifts the 2-GPU cap of the
+    # teacher runs (default 2 = unchanged); the global batch (--tokens-per-batch) is split over the ranks as before
+    if not max_gpus:
+        max_gpus = int(os.environ.get("CK_TEACHER_MAX_GPUS", "2"))
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     ids = [x.strip() for x in vis.split(",") if x.strip()]
     allowed = _allowed_gpus()

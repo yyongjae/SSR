@@ -36,6 +36,13 @@ kd_calib:                                    # user 2026-10-08 ~22:35 KST: Platt
   enabled: true                              # (per key, a z + b, NLL fit on navtrain_train r34 top-16; fit_kd_calib.py);
   det: /home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/ck2T10__last.json      # DET keys nc / ep / ttc
   map: /home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/ck2M10__last.json      # MAP keys dac / ep
+  mode: file                                 # file (det / map above) | online (user 2026-11-02, option B: fitted inside
+  refits_per_epoch: 10                       #   the run on its own labelled candidates, det / map null; kd_calib.py
+  ema_epochs: 1.0                            #   OnlineKDCalib) -- these six keys are the online options
+  bins: 4096
+  zmax: 20.0
+  min_n: 2000.0
+  reset_onpolicy: true
 lambda_sur: 1.0                              # NU15 (old)
 lat_kd:                                      # lateral KD: ONE L1 on the mean of DET / MAP e_lat (user)
   balance: ema                               # NU17 (old EMA balancer)

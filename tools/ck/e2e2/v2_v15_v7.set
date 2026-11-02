@@ -1,10 +1,17 @@
 # ck_e2e2 sets of v2_v15_v7 (E2E_CK_SET): the refiner teachers of this branch (user 2026-11-02: "0123으로 det, 4567로 map",
 # trained on the cached BEVFusion 100x100 / ReSMap front64 teacher BEVs with CK_BEV64=1, recipe of ck2T10_64m /
 # ck2M10_64m on 4 GPUs each; runs in /home/external-user/ssd/yongjae_refiner/v7/teachers) and their KD Platt
-# calibration (tools/ck/e2e2/fit_kd_calib.py with CK_BEV64=1; the launcher refuses missing / mismatched files).
-# The 2026-10-27 teachers ck2T10_64m / ck2M10_64m (ssd/yongjae_refiner/ck/ck2/train64, calibration in ck/ck2/kd_calib)
-# are the same recipe on 2 GPUs and stay usable by swapping the four paths.
+# calibration.
+# KD calibration (user 2026-11-02, option B, branch v2_final): fitted INSIDE the student run on its own labelled
+# candidates (warm-up: GT-based anchors + variants; on-policy: the previous generation's top-16 + variants with labeler2
+# official labels) -- no calibration file, no other trained planner.  The first v2_v15_v7_main run used the file mode
+# instead (tools/ck/e2e2/fit_kd_calib.py on the OLD v2 r34 top-16 of navtrain_train):
+#   kd_calib.det=/home/external-user/ssd/yongjae_refiner/v7/kd_calib/ck2T10_64m_v7__last.json
+#   kd_calib.map=/home/external-user/ssd/yongjae_refiner/v7/kd_calib/ck2M10_64m_v7__last.json
+# The 2026-10-27 teachers ck2T10_64m / ck2M10_64m (ssd/yongjae_refiner/ck/ck2/train64) are the same recipe on 2 GPUs and
+# stay usable by swapping the two teacher paths.
 teacher_det_run=/home/external-user/ssd/yongjae_refiner/v7/teachers/ck2T10_64m_v7
 teacher_map_run=/home/external-user/ssd/yongjae_refiner/v7/teachers/ck2M10_64m_v7
-kd_calib.det=/home/external-user/ssd/yongjae_refiner/v7/kd_calib/ck2T10_64m_v7__last.json
-kd_calib.map=/home/external-user/ssd/yongjae_refiner/v7/kd_calib/ck2M10_64m_v7__last.json
+kd_calib.mode=online
+kd_calib.det=null
+kd_calib.map=null

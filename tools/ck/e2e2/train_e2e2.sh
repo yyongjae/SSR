@@ -29,6 +29,8 @@
 #   KD keys fitted); a missing file is REFUSED with the command to run after the teacher has finished:
 #     CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=$REPO /venv/ssr/bin/python tools/ck/e2e2/fit_kd_calib.py --run <teacher run>
 #       --which last      (-> .../ck/ck2/kd_calib/<run>__last.json; recorded with its sha16 in launch/teachers.json)
+#   kd_calib.mode=online (user 2026-11-02, option B; det / map null): no file, fitted inside the run on its own
+#   labelled candidates (navsim ck/kd_calib.OnlineKDCalib; refits in <run>/ck_e2e2/kd_calib_online.jsonl).
 # -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (min(16 x ngpu, 48) workers, --world-size ngpu, --max-epoch
 #   MAX_EPOCHS-2, --exit-when-done --train-pid-file) -> watchdog (restart a dead / hung labeler while training lives).
 # ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied

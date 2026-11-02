@@ -232,7 +232,15 @@ def kd_calib_record(kd_calib: Optional[Dict[str, Any]], teachers: Dict[str, Any]
     from navsim.agents.para_ssr.ck.kd_calib import load_teacher_calib
     if not kd_calib or not kd_calib.get("enabled"):
         return {"enabled": False}
-    out: Dict[str, Any] = {"enabled": True}
+    if kd_calib.get("mode", "file") == "online":
+        # user 2026-11-02 option B: fitted inside the run (kd_calib.OnlineKDCalib), no file to check
+        if kd_calib.get("det") or kd_calib.get("map"):
+            raise LaunchError("ck_e2e2.kd_calib.mode online: kd_calib.det / kd_calib.map must be null (no file is "
+                              f"read), got {kd_calib.get('det')!r} / {kd_calib.get('map')!r}")
+        return {"enabled": True, "mode": "online", "det": None, "map": None,
+                "online": {k: kd_calib.get(k) for k in ("refits_per_epoch", "ema_epochs", "bins", "zmax", "min_n",
+                                                        "reset_onpolicy")}}
+    out: Dict[str, Any] = {"enabled": True, "mode": "file"}
     for name, arm, run in (("det", "T", det_run), ("map", "M", map_run)):
         p = kd_calib.get(name)
         if not p:

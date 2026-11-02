@@ -29,6 +29,13 @@ KD calibration (kd_calib, user 2026-10-08 ~22:35 KST; ck/kd_calib.py): with kd_c
   (combine_teacher); fitted keys = the KD keys the teacher is a source of (DET nc / ep / ttc, MAP dac / ep), identity
   elsewhere.  TeacherPair2 refuses a calibration file whose run / which / ckpt sha16 / ep_target / arm differ from the
   loaded teacher or that leaves one of its KD keys unfitted.  Lateral KD is untouched.  enabled false = old path.
+  kd_calib.mode 'online' (user 2026-11-02, option B; default 'file' = the above): no file and no other trained planner;
+  kd_calib.OnlineKDCalib fits the same per-key Platt (a, b) INSIDE the run on (raw teacher logit, the student's own
+  label target) pairs: warm-up = the step's KD candidates (= its labelled set), on-policy = the label set G of rows with
+  a generation (the teachers score G in an extra no-grad trunk.candidates call; the KD outputs are unchanged by it).
+  Binned float64 sums, all-reduced and refitted refits_per_epoch times per epoch (EMA over ema_epochs, reset at the
+  first on-policy window), identity before the first refit; refits logged to io_dir/kd_calib_online.jsonl, the
+  parameters as ck2/cal_<teacher>_<key>_a / _b; state in the CKE2E2 checkpoint state ('kd_calib_online').
 Student CK loss (added after the v2 grad balancer, outside it; ParaSSRAgent.compute_loss)
   L_CK2 = loss_weight * [ lambda_score * BCE(s_lab, y_lab)                       (official labels, EP per ep_target, 1.0)
                           + lambda_sur * L_sur(decode(tau_sur, z_lon = 0, w_lat; slope lon_st_slope))
@@ -114,9 +121,15 @@ def _d_onpolicy_label() -> Dict[str, Any]:
 
 def _d_kd_calib() -> Dict[str, Any]:
     # user 2026-10-08 ~22:35 KST: Platt calibration of the teacher logits for KD (files of tools/ck/e2e2/fit_kd_calib.py;
-    # null = that teacher uncalibrated)
+    # null = that teacher uncalibrated).  mode 'online' (user 2026-11-02, option B): fitted inside the run on the run's
+    # own labelled candidates (kd_calib.OnlineKDCalib; det / map must be null), the remaining keys are its options.
     return {"enabled": True, "det": str(calib_path(TEACHER_DET_RUN, "last")),
-            "map": str(calib_path(TEACHER_MAP_RUN, "last"))}
+            "map": str(calib_path(TEACHER_MAP_RUN, "last")), "mode": "file", "refits_per_epoch": 10,
+            "ema_epochs": 1.0, "bins": 4096, "zmax": 20.0, "min_n": 2000.0, "reset_onpolicy": True}
+
+
+KD_CALIB_MODES = ("file", "online")
+KD_CALIB_ONLINE_KEYS = ("refits_per_epoch", "ema_epochs", "bins", "zmax", "min_n", "reset_onpolicy")
 
 
 def _d_bev_kd() -> Dict[str, Any]:
@@ -296,7 +309,10 @@ class CKE2E2Config:
                        "weight_decay": float(b["weight_decay"]),
                        **{k: _opt_float(b[k]) for k in BEV_KD_PER_TEACHER}}
         kc = dict(self.kd_calib)
-        self.kd_calib = {"enabled": _b(kc["enabled"]), **{t: _opt_str(kc[t]) for t in KD_CALIB_TEACHERS}}
+        self.kd_calib = {"enabled": _b(kc["enabled"]), **{t: _opt_str(kc[t]) for t in KD_CALIB_TEACHERS},
+                         "mode": str(kc["mode"]), "refits_per_epoch": int(kc["refits_per_epoch"]),
+                         "ema_epochs": float(kc["ema_epochs"]), "bins": int(kc["bins"]), "zmax": float(kc["zmax"]),
+                         "min_n": float(kc["min_n"]), "reset_onpolicy": _b(kc["reset_onpolicy"])}
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
@@ -407,7 +423,19 @@ class CKE2E2Config:
                     raise ValueError(f"ck_e2e2.bev_kd.{k} is set but teacher {k.split('_', 1)[1]!r} is not in "
                                      f"bev_kd.teachers {bk['teachers']}")
         kc = self.kd_calib
-        if kc["enabled"]:
+        if kc["mode"] not in KD_CALIB_MODES:
+            raise ValueError(f"ck_e2e2.kd_calib.mode must be one of {KD_CALIB_MODES}, got {kc['mode']!r}")
+        if kc["mode"] == "online":
+            if not kc["enabled"]:
+                raise ValueError("ck_e2e2.kd_calib.mode online needs kd_calib.enabled true")
+            if any(kc[t] is not None for t in KD_CALIB_TEACHERS):
+                raise ValueError("ck_e2e2.kd_calib.mode online fits the calibration inside the run: kd_calib.det and "
+                                 f"kd_calib.map must be null, got {kc['det']!r} / {kc['map']!r}")
+            if not (kc["refits_per_epoch"] >= 1 and kc["ema_epochs"] > 0 and kc["bins"] >= 16 and kc["zmax"] > 0
+                    and kc["min_n"] >= 2):
+                raise ValueError("ck_e2e2.kd_calib online options need refits_per_epoch >= 1, ema_epochs > 0, "
+                                 f"bins >= 16, zmax > 0, min_n >= 2; got {kc}")
+        elif kc["enabled"]:
             if all(kc[t] is None for t in KD_CALIB_TEACHERS):
                 raise ValueError("ck_e2e2.kd_calib.enabled needs a calibration file for det and / or map")
             for t in KD_CALIB_TEACHERS:
@@ -579,6 +607,12 @@ class TeacherPair2:
                 self.calib_info[name] = info
             self.calib = cal or None
 
+    def set_calib_arrays(self, params: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> None:
+        """online KD calibration (kd_calib.OnlineKDCalib.params): {'det' / 'map': (a [5], b [5])} -> the logits'
+        a z + b of run(); identity entries reproduce the uncalibrated logits exactly."""
+        self.calib = {k: (torch.as_tensor(np.asarray(a, np.float32), device=self.device),
+                          torch.as_tensor(np.asarray(b, np.float32), device=self.device)) for k, (a, b) in params.items()}
+
     def nets(self):
         return [self.det, self.map]
 
@@ -593,13 +627,18 @@ class TeacherPair2:
         return self
 
     @torch.no_grad()
-    def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None) -> Dict[str, torch.Tensor]:
+    def run(self, bev_det, ok_det, bev_map, ok_map, cand, status, cand_ok=None, extra=None
+            ) -> Dict[str, torch.Tensor]:
         """bev_* [B, 256, 50, 100] (f16 cache), ok_* [B], cand [B, K, 8, 3] (finite), status [B, 8], cand_ok [B, K]
         -> kd_score_prob f32 [B,K,5] (combine_teacher: nc/ttc DET, dac MAP, ep/comfort mean), kd_e_lat f32 [B,K,6]
         = 0.5 (e_DET + e_MAP) (decode z_lon = 0, slope 0), kd_ok bool [B,K] = DET ok & MAP ok (per token) & finite
-        logits / offsets of both & cand_ok; e_det / e_map [B,K,6], p_det / p_map [B,K,5] (logging).
+        logits / offsets of both & cand_ok; e_det / e_map [B,K,6], p_det / p_map [B,K,5] (logging); z_det / z_map
+        [B,K,5] the RAW (uncalibrated) logits and ok_det / ok_map [B,K] each teacher's own ok (online calibration).
         With calibration (self.calib) each teacher's logits are a_k z + b_k BEFORE the sigmoid / combination (p_det /
-        p_map are then the calibrated probabilities); the lateral outputs are unchanged."""
+        p_map are then the calibrated probabilities); the lateral outputs are unchanged.
+        extra [B, K2, 8, 3] (finite; online calibration's label set): scored in a SEPARATE trunk.candidates call on
+        the same scene features (the KD outputs above are exactly those of a call without extra) -> z_det_x / z_map_x
+        [B,K2,5] raw logits, ok_det_x / ok_map_x [B,K2] (token ok & finite logits)."""
         from ..refiner.e2e import ego_inputs
         from .kd import combine_teacher
 
@@ -609,14 +648,22 @@ class TeacherPair2:
         ego = ego_inputs(status.detach().float().to(dev))
         v0 = ego[0]
         ac = torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=self.amp and dev.type == "cuda")
-        logits, ws = [], []
+        logits, ws, raw_x = [], [], []
+        if extra is not None:
+            extra = extra.detach().float().to(dev)
+            K2 = extra.shape[1]
         for net, bev in ((self.det, bev_det), (self.map, bev_map)):
             with ac:
                 feat, mem = net.trunk.scene(bev.to(dev).float(), B)
                 o = net.trunk.candidates(feat, mem, cand, *ego)
                 s = net.score(o, B, K)
+                if extra is not None:
+                    sx = net.score(net.trunk.candidates(feat, mem, extra, *ego), B, K2)
             logits.append(s.float())
             ws.append(o["w_lat"].float())
+            if extra is not None:
+                raw_x.append(sx.float())
+        raw = list(logits)
         if self.calib is not None:            # KD calibration: Platt on the logits, per teacher and key
             for i, name in enumerate(("det", "map")):
                 ab = self.calib.get(name)
@@ -638,8 +685,15 @@ class TeacherPair2:
         if cand_ok is not None:
             kd_ok = kd_ok & cand_ok.bool().to(dev)
         e_mean = 0.5 * (e_det + e_map)
-        return {"kd_score_prob": comb["kd_score_prob"].float(), "kd_e_lat": e_mean, "kd_ok": kd_ok,
-                "e_det": e_det, "e_map": e_map, "p_det": torch.sigmoid(logits[0]), "p_map": torch.sigmoid(logits[1])}
+        res = {"kd_score_prob": comb["kd_score_prob"].float(), "kd_e_lat": e_mean, "kd_ok": kd_ok,
+               "e_det": e_det, "e_map": e_map, "p_det": torch.sigmoid(logits[0]), "p_map": torch.sigmoid(logits[1]),
+               "z_det": raw[0], "z_map": raw[1], "ok_det": det["ok"], "ok_map": mp["ok"]}
+        if extra is not None:
+            for i, (name, ok_tok) in enumerate((("det", ok_det), ("map", ok_map))):
+                o = ok_tok.reshape(-1).bool().to(dev)[:, None].expand(-1, K2)
+                res[f"z_{name}_x"] = raw_x[i]
+                res[f"ok_{name}_x"] = o & torch.isfinite(raw_x[i]).all(-1)
+        return res
 
 
 # ----------------------------------------------------------------------------------------------- student forward
@@ -725,6 +779,12 @@ class CKE2E2:
         if self.cfg.bev_kd["enabled"]:       # rank-local token counters of the arm (tokens seen / without teacher BEV)
             self.cum.update({"bevkd_tok": 0, **{f"bevkd_miss_{t}": 0 for t in self.cfg.bev_kd["teachers"]}})
         self._teachers: Optional[TeacherPair2] = None
+        self.calib_online = None             # kd_calib.OnlineKDCalib (kd_calib.mode 'online', user 2026-11-02)
+        self._calib_version_applied: Optional[int] = None
+        kc = self.cfg.kd_calib
+        if kc["enabled"] and kc["mode"] == "online":
+            from .kd_calib import OnlineKDCalib
+            self.calib_online = OnlineKDCalib(self.cfg.kd_score_keys, **{k: kc[k] for k in KD_CALIB_ONLINE_KEYS})
         self._labels = None
         self._labels_max_epoch: Optional[int] = None
         self._sampler = None
@@ -760,9 +820,12 @@ class CKE2E2:
 
     # -------------------------------------------------------------------------------------- state
     def state_dict(self) -> Dict[str, Any]:
-        return {"ema": self.ema.state_dict(), "mb": int(self.mb), "cum": dict(self.cum),
-                "skipped_steps": int(self.skipped_steps),
-                "bev_ctrl": None if self.bev_ctrl is None else self.bev_ctrl.state_dict()}
+        sd = {"ema": self.ema.state_dict(), "mb": int(self.mb), "cum": dict(self.cum),
+              "skipped_steps": int(self.skipped_steps),
+              "bev_ctrl": None if self.bev_ctrl is None else self.bev_ctrl.state_dict()}
+        if self.calib_online is not None:
+            sd["kd_calib_online"] = self.calib_online.state_dict()
+        return sd
 
     def load_state_dict(self, sd: Dict[str, Any]) -> None:
         if not sd:
@@ -773,22 +836,84 @@ class CKE2E2:
         self.skipped_steps = int(sd.get("skipped_steps", 0))
         if self.bev_ctrl is not None and sd.get("bev_ctrl"):
             self.bev_ctrl.load_state_dict(sd["bev_ctrl"])
+        if self.calib_online is not None:
+            if not sd.get("kd_calib_online"):
+                raise ValueError("ck_e2e2.kd_calib.mode online: the checkpoint has no online KD calibration state "
+                                 "(resume of a run that used another kd_calib mode)")
+            self.calib_online.load_state_dict(sd["kd_calib_online"])
+        elif sd.get("kd_calib_online"):
+            raise ValueError("the checkpoint carries an online KD calibration state but ck_e2e2.kd_calib.mode is not "
+                             "'online'")
 
     # -------------------------------------------------------------------------------------- lazy pieces
     def teachers(self, device) -> TeacherPair2:
         if self._teachers is None:
             c = self.cfg
             kc = c.kd_calib
+            file_mode = kc["enabled"] and kc["mode"] == "file"
             self._teachers = TeacherPair2(c.teacher_det_run, c.teacher_map_run, c.teacher_which, device,
                                           c.teacher_amp, c.teacher_require_done,
                                           ep_target=c.ep_target if c.teacher_ep_check else None,
-                                          calib=({"det": kc["det"], "map": kc["map"]} if kc["enabled"] else None),
+                                          calib=({"det": kc["det"], "map": kc["map"]} if file_mode else None),
                                           kd_keys=c.kd_score_keys)
+            self._calib_version_applied = None
             if self._teachers.calib_info:
                 print("[ck_e2e2] KD calibration: " + "; ".join(
                     f"{t} {i['path']} (sha16 {i['sha16']}, ckpt {i['ckpt_sha16']}, keys {i['fitted_keys']})"
                     for t, i in self._teachers.calib_info.items()), flush=True)
-        return self._teachers.to(device)
+        tp = self._teachers.to(device)
+        co = self.calib_online
+        if co is not None and self._calib_version_applied != co.version:
+            from .kd_calib import CALIB_TEACHERS
+            tp.set_calib_arrays({t: co.params(t) for t in CALIB_TEACHERS})
+            self._calib_version_applied = co.version
+        return tp
+
+    def _calib_online_step(self, dev, logs: Dict[str, float]) -> None:
+        """online KD calibration: refit at a new slot (every rank, before the teachers run; one all-reduce), record
+        the refit (rank 0: io_dir/kd_calib_online.jsonl + one line on stdout), log the current parameters."""
+        co = self.calib_online
+        rec = co.maybe_refit(self.epoch_frac, dev, self.phase)
+        if rec is not None and self.rank == 0:
+            rec = dict(rec, epoch=int(self.epoch), epoch_frac=round(float(self.epoch_frac), 6), mb=int(self.mb),
+                       gstep=int(self.gstep), time=time.time())
+            try:
+                p = Path(self.cfg.io_dir)
+                p.mkdir(parents=True, exist_ok=True)
+                with open(p / "kd_calib_online.jsonl", "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except OSError as e:          # logging only: never stop training for it
+                print(f"[ck_e2e2] kd_calib_online.jsonl not written: {e}", flush=True)
+            if "keys" in rec:
+                print("[ck_e2e2] online KD calibration refit " + str(rec["refit"]) + f" (window {rec['window_phase']}"
+                      + (", EMA reset" if rec.get("reset") else "") + "): " + "; ".join(
+                          f"{k} a {r.get('a', r['a_prev']):.3f} b {r.get('b', r['b_prev']):.3f} n {r['n_win']:.0f}"
+                          for k, r in rec["keys"].items()), flush=True)
+        for t, ks in co.fit.items():
+            a, b = co.params(t)
+            for k in ks:
+                j = CK_KEYS.index(k)
+                logs[f"ck2/cal_{t}_{k}_a"] = float(a[j])
+                logs[f"ck2/cal_{t}_{k}_b"] = float(b[j])
+        logs["ck2/cal_refits"] = float(co.n_refits)
+
+    def _calib_online_add(self, S: Dict[str, Any], T: Dict[str, torch.Tensor], phase: str) -> int:
+        """the (raw teacher logit, label target) pairs of this micro-batch: warm-up = the KD candidates (= the label
+        set); on-policy = the label set G of rows with a generation (G_src prev / older; the GT-based fallback rows are
+        not the deployed candidate distribution and are left out)."""
+        co = self.calib_online
+        n = 0
+        if S["extra"] is None:
+            m = S["ok_lab"].bool() & S["cand_ok"].bool().to(S["ok_lab"].device)
+            for t in ("det", "map"):
+                n += co.add(t, T[f"z_{t}"], S["y"], m.to(T[f"ok_{t}"].device) & T[f"ok_{t}"])
+        else:
+            src = S["src"].reshape(-1).to(S["ok_lab"].device)
+            gen = (src == SRC_PREV) | (src == SRC_OLDER)
+            m = S["ok_lab"].bool() & gen[:, None]
+            for t in ("det", "map"):
+                n += co.add(t, T[f"z_{t}_x"], S["y"], m.to(T[f"ok_{t}_x"].device) & T[f"ok_{t}_x"])
+        return n
 
     def labels(self):
         if self._labels is None:
@@ -996,9 +1121,14 @@ class CKE2E2:
 
         # ---- teachers (online, every phase) on the step's KD candidates
         tt = time.time()
+        co = self.calib_online
+        if co is not None:                   # online KD calibration: refit (new slot) BEFORE the teachers run
+            self._calib_online_step(dev, logs)
         tp = self.teachers(dev)
         T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
-                   cand_ok=S["cand_ok"])
+                   cand_ok=S["cand_ok"], extra=(S["extra"] if co is not None else None))
+        if co is not None:
+            logs["ck2/cal_pairs"] = float(self._calib_online_add(S, T, phase))
         t_teacher = time.time() - tt
 
         # ---- student forward (one pass over KD candidates + label set)
@@ -1254,6 +1384,8 @@ def make_ck2_callback(agent):
                                               "world_size": ck.world_size, "time": time.time(),
                                               "ema": ck.ema.state_dict(),
                                               "bev_ctrl": None if ck.bev_ctrl is None else ck.bev_ctrl.state_dict(),
+                                              "kd_calib_online": (None if ck.calib_online is None
+                                                                  else ck.calib_online.summary()),
                                               "cum": dict(ck.cum)})
                 if warn and warn.get("warn"):
                     print("\n" + "!" * 100 + f"\n[ck_e2e2] WARNING epoch {ck.epoch}: {warn['msg']}\n" + "!" * 100,

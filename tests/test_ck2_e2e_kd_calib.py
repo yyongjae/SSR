@@ -347,12 +347,15 @@ def test_config_defaults_yaml_and_validate(tmp_path):
     from tools.ck.e2e2 import launch_util2 as L2
     c = O.CKE2E2Config()
     root = "/home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib"
-    assert c.kd_calib == {"enabled": True, "det": f"{root}/ck2T10__last.json", "map": f"{root}/ck2M10__last.json"}
+    online = {"mode": "file", "refits_per_epoch": 10, "ema_epochs": 1.0, "bins": 4096, "zmax": 20.0, "min_n": 2000.0,
+              "reset_onpolicy": True}                              # online-mode options (2026-11-02), default mode file
+    assert c.kd_calib == {"enabled": True, "det": f"{root}/ck2T10__last.json", "map": f"{root}/ck2M10__last.json",
+                          **online}
     assert L2.load_ck2_yaml()["kd_calib"] == c.kd_calib
     assert c.kd_calib["det"] == str(KC.calib_path(c.teacher_det_run, c.teacher_which))
     assert c.kd_calib["map"] == str(KC.calib_path(c.teacher_map_run, c.teacher_which))
     d = O.CKE2E2Config.from_any({"kd_calib": {"enabled": "false", "det": "null", "map": "None"}}).kd_calib
-    assert d == {"enabled": False, "det": None, "map": None}
+    assert d == {"enabled": False, "det": None, "map": None, **online}
     with pytest.raises(ValueError, match="unknown key"):
         O.CKE2E2Config.from_any({"kd_calib": {"det_path": "/x"}})
     if not TL.have_inputs():

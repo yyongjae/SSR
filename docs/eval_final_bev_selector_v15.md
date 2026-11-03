@@ -617,7 +617,7 @@ bash scripts/km_corridor/train.sh cf_v15 corr30_cf_v15 0,1,2,3
 
 ## 9. `v2_v15_v7_main` (64m BEV, `aux_distill v15 + Refiner v2`) `15ep` / `23ep` / `30ep` 공식 `PDMS` / `navtest EPDMS` / `navhard EPDMS` 평가 및 96-후보 선택 수식 최적화
 
-본 섹션은 64m BEV 격자 (`0~64m × ±32m`, `100×100`, `CK_BEV64=1`) 및 `ck2T10_64m_v7` (DET) + `ck2M10_64m_v7` (MAP, ReSMap front64) Teacher로 학습된 `v2_v15_v7_main`의 **15ep (`Epoch 14`, [`epoch=14-step=9975.ckpt`](file:///workspace/yongjae/ssd/yongjae_refiner/v7/e2e/v2_v15_v7_main/train/lightning_logs/version_0/checkpoints/epoch=14-step=9975.ckpt))**, **23ep (`Epoch 22`, [`epoch=22-step=15295.ckpt`](file:///workspace/yongjae/ssd/yongjae_refiner/v7/e2e/v2_v15_v7_main/train/lightning_logs/version_0/checkpoints/epoch=22-step=15295.ckpt))** 및 **30ep (`Epoch 29`, [`epoch=29-step=19950.ckpt`](file:///workspace/yongjae/ssd/yongjae_refiner/v7/e2e/v2_v15_v7_main/train/lightning_logs/version_0/checkpoints/epoch=29-step=19950.ckpt))**(추가로 `ep10, ep20, ep25` v1 PDMS 포함)에 대해, **SparseDriveV2 방식 공식 `(5/5/2/2/2)` Head-Free 정식 선택 성능** 및 **64m 모델 맞춤 최적화**를 수행한 결과입니다. (전체 단독 리포트: [`optimization_report_v7.md`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/optimization_report_v7.md))
+본 섹션은 64m BEV 격자 (`0~64m × ±32m`, `100×100`, `CK_BEV64=1`) 및 `ck2T10_64m_v7` (DET) + `ck2M10_64m_v7` (MAP, ReSMap front64) Teacher로 학습된 `v2_v15_v7_main`의 **15ep (`Epoch 14`, [`epoch=14-step=9975.ckpt`](file:///workspace/yongjae/ssd/yongjae_refiner/v7/e2e/v2_v15_v7_main/train/lightning_logs/version_0/checkpoints/epoch=14-step=9975.ckpt))**, **23ep (`Epoch 22`, [`epoch=22-step=15295.ckpt`](file:///workspace/yongjae/ssd/yongjae_refiner/v7/e2e/v2_v15_v7_main/train/lightning_logs/version_0/checkpoints/epoch=22-step=15295.ckpt))** 및 **30ep (`Epoch 29`, [`epoch=29-step=19950.ckpt`](file:///workspace/yongjae/ssd/yongjae_refiner/v7/e2e/v2_v15_v7_main/train/lightning_logs/version_0/checkpoints/epoch=29-step=19950.ckpt))**(추가로 `ep10, ep20, ep25` v1 PDMS 포함)에 대해, **SparseDriveV2 방식 공식 `(5/5/2/2/2)` Head-Free 정식 선택 성능** 및 **64m 모델 맞춤 최적화**를 수행한 결과입니다. (전체 단독 리포트: [`optimization_report_v7.md`](file:///workspace/byounggun/SSR/docs/optimization_report_v7.md))
 
 ### 9.1 한눈에 보는 최고 점수 비교 요약 (`v2_v15_v7_main` 64m)
 
@@ -931,7 +931,7 @@ score(k, v) = (
 
 ### 9.5 산출물 JSON 및 스크립트 경로 모음 (`v2_v15_v7_main`, 64m BEV)
 
-- **단독 상세 보고서**: [`optimization_report_v7.md`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/optimization_report_v7.md)
+- **단독 상세 보고서**: [`optimization_report_v7.md`](file:///workspace/byounggun/SSR/docs/optimization_report_v7.md)
 - **최적화 결과 JSON 폴더**: [`/workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/opt_results/`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/opt_results)
   - v1 PDMS (`ep10, ep15, ep20, ep22(23ep), ep25, ep30`):
     - [`v1_pdms_ep22.json`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/opt_results/v1_pdms_ep22.json) / [`v1_pdms_ep30.json`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/opt_results/v1_pdms_ep30.json) / [`v1_pdms_ep20.json`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/opt_results/v1_pdms_ep20.json) / [`v1_pdms_ep25.json`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/opt_results/v1_pdms_ep25.json) / [`v1_pdms_ep15.json`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/opt_results/v1_pdms_ep15.json) / [`v1_pdms_ep10.json`](file:///workspace/byounggun/ssr_outputs/ck2_e2e/v2_v15_v7_main/opt_results/v1_pdms_ep10.json)

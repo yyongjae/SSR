@@ -1,0 +1,449 @@
+{
+  "epoch": "ep22",
+  "baselines": {
+    "v2_col0": {
+      "nc": 98.78,
+      "dac": 96.24,
+      "ep": 82.75,
+      "ttc": 95.6,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 88.65,
+      "pdms_exact": 88.64835989709822
+    },
+    "v2_lat_col0": {
+      "nc": 98.91,
+      "dac": 97.8,
+      "ep": 84.17,
+      "ttc": 95.87,
+      "comfort": 99.98,
+      "ddc": 100.0,
+      "pdms": 90.24,
+      "pdms_exact": 90.24092638544602
+    },
+    "v7_default_b0.25_lat": {
+      "nc": 98.81,
+      "dac": 98.61,
+      "ep": 88.01,
+      "ttc": 95.13,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 91.99,
+      "pdms_exact": 91.98613382033083
+    },
+    "v7_default_b0.25_pool": {
+      "nc": 98.77,
+      "dac": 98.36,
+      "ep": 87.75,
+      "ttc": 95.02,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 91.68,
+      "pdms_exact": 91.68147580400931
+    },
+    "v7_default_b0.50_lat": {
+      "nc": 98.78,
+      "dac": 98.58,
+      "ep": 88.09,
+      "ttc": 95.1,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 91.99,
+      "pdms_exact": 91.98706140424262
+    },
+    "v7_default_b0.50_pool": {
+      "nc": 98.73,
+      "dac": 98.39,
+      "ep": 87.85,
+      "ttc": 94.99,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 91.72,
+      "pdms_exact": 91.71864498715198
+    },
+    "v7_default_b0.75_lat": {
+      "nc": 98.76,
+      "dac": 98.58,
+      "ep": 88.15,
+      "ttc": 95.02,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.97,
+      "pdms_exact": 91.97376615723766
+    },
+    "v7_default_b0.75_pool": {
+      "nc": 98.7,
+      "dac": 98.4,
+      "ep": 87.94,
+      "ttc": 94.94,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.74,
+      "pdms_exact": 91.74277498685075
+    },
+    "v7_default_b1.00_lat": {
+      "nc": 98.77,
+      "dac": 98.53,
+      "ep": 88.14,
+      "ttc": 95.08,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.97,
+      "pdms_exact": 91.96678277711764
+    },
+    "v7_default_b1.00_pool": {
+      "nc": 98.73,
+      "dac": 98.35,
+      "ep": 87.95,
+      "ttc": 95.03,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.76,
+      "pdms_exact": 91.7572119100108
+    },
+    "v7_noim_b0.75_lat": {
+      "nc": 98.71,
+      "dac": 98.7,
+      "ep": 88.86,
+      "ttc": 94.8,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 92.24,
+      "pdms_exact": 92.23842715082952
+    },
+    "v7_noim_b0.75_pool": {
+      "nc": 98.68,
+      "dac": 98.53,
+      "ep": 88.69,
+      "ttc": 94.71,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 92.04,
+      "pdms_exact": 92.03670013744414
+    },
+    "v7_noim_b1.00_lat": {
+      "nc": 98.17,
+      "dac": 98.71,
+      "ep": 91.56,
+      "ttc": 93.6,
+      "comfort": 100.0,
+      "ddc": 99.98,
+      "pdms": 92.76,
+      "pdms_exact": 92.76383483214077
+    },
+    "v7_noim_b1.00_pool": {
+      "nc": 98.14,
+      "dac": 98.67,
+      "ep": 91.5,
+      "ttc": 93.69,
+      "comfort": 100.0,
+      "ddc": 99.98,
+      "pdms": 92.75,
+      "pdms_exact": 92.75057368040595
+    },
+    "f15_default_b0.50_lat": {
+      "nc": 98.84,
+      "dac": 98.77,
+      "ep": 87.96,
+      "ttc": 95.2,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 92.09,
+      "pdms_exact": 92.090111174807
+    },
+    "f15_default_b0.50_pool": {
+      "nc": 98.79,
+      "dac": 98.61,
+      "ep": 87.77,
+      "ttc": 95.1,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 91.86,
+      "pdms_exact": 91.86494333760636
+    },
+    "f15_default_b0.75_lat": {
+      "nc": 98.81,
+      "dac": 98.69,
+      "ep": 88.01,
+      "ttc": 95.11,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 92.03,
+      "pdms_exact": 92.02777981493121
+    },
+    "f15_default_b0.75_pool": {
+      "nc": 98.76,
+      "dac": 98.6,
+      "ep": 87.86,
+      "ttc": 95.04,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 91.87,
+      "pdms_exact": 91.87454180440791
+    },
+    "plugin_b0.50_lat": {
+      "nc": 98.86,
+      "dac": 98.74,
+      "ep": 88.19,
+      "ttc": 95.08,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 92.13,
+      "pdms_exact": 92.13020621260505
+    },
+    "plugin_b0.50_pool": {
+      "nc": 98.82,
+      "dac": 98.61,
+      "ep": 88.04,
+      "ttc": 95.02,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 91.96,
+      "pdms_exact": 91.95591419010192
+    },
+    "plugin_b0.75_lat": {
+      "nc": 98.79,
+      "dac": 98.84,
+      "ep": 88.78,
+      "ttc": 94.94,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 92.36,
+      "pdms_exact": 92.35768210570403
+    },
+    "plugin_b0.75_pool": {
+      "nc": 98.77,
+      "dac": 98.72,
+      "ep": 88.66,
+      "ttc": 94.87,
+      "comfort": 99.99,
+      "ddc": 100.0,
+      "pdms": 92.21,
+      "pdms_exact": 92.20645221141326
+    },
+    "plugin_b1.00_lat": {
+      "nc": 98.24,
+      "dac": 98.82,
+      "ep": 91.4,
+      "ttc": 93.69,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 92.81,
+      "pdms_exact": 92.80684946220514
+    },
+    "plugin_b1.00_pool": {
+      "nc": 98.21,
+      "dac": 98.79,
+      "ep": 91.33,
+      "ttc": 93.73,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 92.77,
+      "pdms_exact": 92.769055761165
+    }
+  },
+  "zeroshot_from_fusion_v15": {
+    "f15_ep22_clean_core_formula_lat": {
+      "nc": 98.5,
+      "dac": 98.75,
+      "ep": 90.97,
+      "ttc": 94.8,
+      "comfort": 100.0,
+      "ddc": 99.98,
+      "pdms": 93.1,
+      "pdms_exact": 93.10234573683687
+    },
+    "f15_ep22_best_lat96_lat": {
+      "nc": 98.53,
+      "dac": 98.71,
+      "ep": 91.19,
+      "ttc": 94.72,
+      "comfort": 100.0,
+      "ddc": 99.98,
+      "pdms": 93.15,
+      "pdms_exact": 93.15048178068088
+    },
+    "f15_ep29_clean_core_formula_lat": {
+      "nc": 98.87,
+      "dac": 98.83,
+      "ep": 90.74,
+      "ttc": 95.69,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 93.48,
+      "pdms_exact": 93.48364850475822
+    },
+    "f15_ep29_best_lat96_lat": {
+      "nc": 98.76,
+      "dac": 98.82,
+      "ep": 90.59,
+      "ttc": 95.5,
+      "comfort": 100.0,
+      "ddc": 99.98,
+      "pdms": 93.34,
+      "pdms_exact": 93.33705050588911
+    }
+  },
+  "clean_core_formula": {
+    "metrics": {
+      "nc": 99.08,
+      "dac": 99.0,
+      "ep": 90.0,
+      "ttc": 96.54,
+      "comfort": 100.0,
+      "ddc": 100.0,
+      "pdms": 93.67,
+      "pdms_exact": 93.67086514732442
+    },
+    "weights": {
+      "v2_final": 4.7359,
+      "log_im": -0.4046,
+      "log_nc_ck": 16.3288,
+      "log_dac_ck": 18.8325,
+      "log_ep_ck": 2.3513,
+      "log_ttc_ck": 22.8185,
+      "log_cmf_ck": 0.8316,
+      "log_rest_ck": 21.6317,
+      "dv_id0": 0.3764,
+      "dv_a_m10": -0.3621,
+      "dv_a_m05": 0.5444,
+      "dv_a_p05": 0.0886,
+      "dv_l_m05": -0.1426,
+      "dv_l_p05": 0.3119
+    }
+  },
+  "best_lat96": {
+    "metrics": {
+      "nc": 99.08,
+      "dac": 98.97,
+      "ep": 90.13,
+      "ttc": 96.58,
+      "comfort": 100.0,
+      "ddc": 100.0,
+      "pdms": 93.72,
+      "pdms_exact": 93.71645133258404
+    },
+    "weights": {
+      "v2_final": 4.7395,
+      "log_im": -0.4046,
+      "log_nc_ck": 15.6928,
+      "log_dac_ck": 18.3927,
+      "log_ep_ck": 2.3515,
+      "log_ttc_ck": 22.7573,
+      "log_cmf_ck": 2.3621,
+      "log_rest_ck": 21.6219,
+      "log_nc_v2": 0.036,
+      "log_dac_v2": -1.1656,
+      "log_ep_v2": -0.0057,
+      "log_ttc_v2": -0.0297,
+      "log_rest_v2": 0.0893,
+      "epdms_ck": 0.0206,
+      "epdms_v2": -0.0016,
+      "safe_prod_ck": -0.8972,
+      "safe_prod_v2": 0.032,
+      "dist_end": 0.0012,
+      "lat_end": -0.0007,
+      "lat_diff": -0.032,
+      "dv_id0": 0.3764,
+      "dv_a_m10": -0.3621,
+      "dv_a_m05": 0.5404,
+      "dv_a_p05": 0.0854,
+      "dv_l_m05": -0.1429,
+      "dv_l_p05": 0.3119,
+      "prank_norm": -0.0016,
+      "is_col0": 0.004
+    }
+  },
+  "best_pool96": {
+    "metrics": {
+      "nc": 99.06,
+      "dac": 98.88,
+      "ep": 90.2,
+      "ttc": 96.58,
+      "comfort": 100.0,
+      "ddc": 100.0,
+      "pdms": 93.69,
+      "pdms_exact": 93.68969133461442
+    },
+    "weights": {
+      "v2_final": 4.7395,
+      "log_im": -0.4046,
+      "log_nc_ck": 14.8968,
+      "log_dac_ck": 18.2407,
+      "log_ep_ck": 2.3515,
+      "log_ttc_ck": 22.3293,
+      "log_cmf_ck": 0.5221,
+      "log_rest_ck": 21.6859,
+      "log_nc_v2": 1.612,
+      "log_dac_v2": -2.3656,
+      "log_ep_v2": -0.0057,
+      "log_ttc_v2": -0.0297,
+      "log_rest_v2": 0.0893,
+      "epdms_ck": -0.2994,
+      "epdms_v2": -0.0016,
+      "safe_prod_ck": -1.1052,
+      "safe_prod_v2": 0.032,
+      "dist_end": 0.0012,
+      "lat_end": -0.0007,
+      "lat_diff": -0.032,
+      "dv_id0": 0.3764,
+      "dv_a_m10": -1.2421,
+      "dv_a_m05": 0.5392,
+      "dv_a_p05": 0.0854,
+      "dv_l_m05": -0.1869,
+      "dv_l_p05": 0.3439,
+      "prank_norm": -0.0016,
+      "is_col0": -0.08
+    }
+  },
+  "best_hybrid96": {
+    "use_lat_per_variant": [
+      1,
+      1,
+      1,
+      1,
+      1,
+      0
+    ],
+    "metrics": {
+      "nc": 99.07,
+      "dac": 98.94,
+      "ep": 90.29,
+      "ttc": 96.54,
+      "comfort": 100.0,
+      "ddc": 100.0,
+      "pdms": 93.75,
+      "pdms_exact": 93.75315249265566
+    },
+    "weights": {
+      "v2_final": 4.7395,
+      "log_im": -0.4046,
+      "log_nc_ck": 14.9288,
+      "log_dac_ck": 18.2407,
+      "log_ep_ck": 2.3515,
+      "log_ttc_ck": 22.3293,
+      "log_cmf_ck": 1.9621,
+      "log_rest_ck": 21.6859,
+      "log_nc_v2": 1.5852,
+      "log_dac_v2": -2.3656,
+      "log_ep_v2": -0.0057,
+      "log_ttc_v2": -0.0297,
+      "log_rest_v2": 0.0893,
+      "epdms_ck": -0.2994,
+      "epdms_v2": -0.0016,
+      "safe_prod_ck": -1.1052,
+      "safe_prod_v2": 0.032,
+      "dist_end": 0.0012,
+      "lat_end": -0.0007,
+      "lat_diff": -0.032,
+      "dv_id0": 0.3764,
+      "dv_a_m10": -1.2421,
+      "dv_a_m05": 0.5392,
+      "dv_a_p05": 0.0894,
+      "dv_l_m05": -0.1409,
+      "dv_l_p05": 0.3439,
+      "prank_norm": -0.0016,
+      "is_col0": -0.08
+    }
+  }
+}

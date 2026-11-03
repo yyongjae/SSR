@@ -1,0 +1,469 @@
+{
+  "epoch": "ep10",
+  "baselines": {
+    "v2_col0": {
+      "nc": 98.66,
+      "dac": 96.8,
+      "ep": 83.1,
+      "ttc": 95.03,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 88.85,
+      "pdms_exact": 88.84732419336311
+    },
+    "v2_lat_col0": {
+      "nc": 98.92,
+      "dac": 97.93,
+      "ep": 84.29,
+      "ttc": 95.56,
+      "comfort": 99.98,
+      "ddc": 99.99,
+      "pdms": 90.27,
+      "pdms_exact": 90.26648683613634
+    },
+    "v7_default_b0.25_lat": {
+      "nc": 99.19,
+      "dac": 98.74,
+      "ep": 86.7,
+      "ttc": 96.29,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 92.06,
+      "pdms_exact": 92.06085682918835
+    },
+    "v7_default_b0.25_pool": {
+      "nc": 99.19,
+      "dac": 98.61,
+      "ep": 86.58,
+      "ttc": 96.26,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 91.92,
+      "pdms_exact": 91.91659972950063
+    },
+    "v7_default_b0.50_lat": {
+      "nc": 99.18,
+      "dac": 98.69,
+      "ep": 86.78,
+      "ttc": 96.25,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.06,
+      "pdms_exact": 92.05959064932901
+    },
+    "v7_default_b0.50_pool": {
+      "nc": 99.17,
+      "dac": 98.6,
+      "ep": 86.69,
+      "ttc": 96.24,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.95,
+      "pdms_exact": 91.9548057753359
+    },
+    "v7_default_b0.75_lat": {
+      "nc": 99.15,
+      "dac": 98.67,
+      "ep": 86.8,
+      "ttc": 96.26,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.06,
+      "pdms_exact": 92.05711409915776
+    },
+    "v7_default_b0.75_pool": {
+      "nc": 99.14,
+      "dac": 98.59,
+      "ep": 86.73,
+      "ttc": 96.25,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.97,
+      "pdms_exact": 91.97010360124494
+    },
+    "v7_default_b1.00_lat": {
+      "nc": 99.15,
+      "dac": 98.66,
+      "ep": 86.78,
+      "ttc": 96.39,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.09,
+      "pdms_exact": 92.09447607150211
+    },
+    "v7_default_b1.00_pool": {
+      "nc": 99.12,
+      "dac": 98.56,
+      "ep": 86.68,
+      "ttc": 96.37,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.97,
+      "pdms_exact": 91.97461138530478
+    },
+    "v7_noim_b0.75_lat": {
+      "nc": 99.14,
+      "dac": 98.82,
+      "ep": 87.55,
+      "ttc": 96.12,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.4,
+      "pdms_exact": 92.39769613018504
+    },
+    "v7_noim_b0.75_pool": {
+      "nc": 99.15,
+      "dac": 98.76,
+      "ep": 87.51,
+      "ttc": 96.09,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.33,
+      "pdms_exact": 92.33306831133223
+    },
+    "v7_noim_b1.00_lat": {
+      "nc": 98.87,
+      "dac": 98.41,
+      "ep": 89.57,
+      "ttc": 95.78,
+      "comfort": 99.98,
+      "ddc": 99.98,
+      "pdms": 92.83,
+      "pdms_exact": 92.82961918095397
+    },
+    "v7_noim_b1.00_pool": {
+      "nc": 98.86,
+      "dac": 98.38,
+      "ep": 89.54,
+      "ttc": 95.73,
+      "comfort": 99.98,
+      "ddc": 99.98,
+      "pdms": 92.78,
+      "pdms_exact": 92.7776085400226
+    },
+    "f15_default_b0.50_lat": {
+      "nc": 99.24,
+      "dac": 98.77,
+      "ep": 86.37,
+      "ttc": 96.34,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.98,
+      "pdms_exact": 91.98163849602672
+    },
+    "f15_default_b0.50_pool": {
+      "nc": 99.21,
+      "dac": 98.71,
+      "ep": 86.31,
+      "ttc": 96.31,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.9,
+      "pdms_exact": 91.90218575665611
+    },
+    "f15_default_b0.75_lat": {
+      "nc": 99.21,
+      "dac": 98.74,
+      "ep": 86.42,
+      "ttc": 96.34,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.98,
+      "pdms_exact": 91.98465101051602
+    },
+    "f15_default_b0.75_pool": {
+      "nc": 99.19,
+      "dac": 98.68,
+      "ep": 86.35,
+      "ttc": 96.3,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 91.91,
+      "pdms_exact": 91.90713385690206
+    },
+    "plugin_b0.50_lat": {
+      "nc": 99.23,
+      "dac": 98.86,
+      "ep": 86.55,
+      "ttc": 96.32,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.1,
+      "pdms_exact": 92.09570981048093
+    },
+    "plugin_b0.50_pool": {
+      "nc": 99.23,
+      "dac": 98.82,
+      "ep": 86.51,
+      "ttc": 96.25,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.03,
+      "pdms_exact": 92.02586011082381
+    },
+    "plugin_b0.75_lat": {
+      "nc": 99.19,
+      "dac": 98.9,
+      "ep": 87.15,
+      "ttc": 96.23,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.33,
+      "pdms_exact": 92.32572959949152
+    },
+    "plugin_b0.75_pool": {
+      "nc": 99.19,
+      "dac": 98.87,
+      "ep": 87.13,
+      "ttc": 96.19,
+      "comfort": 100.0,
+      "ddc": 99.99,
+      "pdms": 92.29,
+      "pdms_exact": 92.28721431959663
+    },
+    "plugin_b1.00_lat": {
+      "nc": 98.86,
+      "dac": 98.64,
+      "ep": 89.17,
+      "ttc": 95.93,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 92.85,
+      "pdms_exact": 92.84806098637462
+    },
+    "plugin_b1.00_pool": {
+      "nc": 98.85,
+      "dac": 98.6,
+      "ep": 89.13,
+      "ttc": 95.89,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 92.8,
+      "pdms_exact": 92.79511377740471
+    }
+  },
+  "zeroshot_from_fusion_v15": {
+    "f15_ep22_clean_core_formula_lat": {
+      "nc": 99.01,
+      "dac": 98.64,
+      "ep": 89.24,
+      "ttc": 96.14,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 92.96,
+      "pdms_exact": 92.96189418405162
+    },
+    "f15_ep22_best_lat96_lat": {
+      "nc": 98.98,
+      "dac": 98.51,
+      "ep": 89.37,
+      "ttc": 96.06,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 92.91,
+      "pdms_exact": 92.91162804387437
+    },
+    "f15_ep29_clean_core_formula_lat": {
+      "nc": 99.18,
+      "dac": 98.86,
+      "ep": 88.2,
+      "ttc": 96.99,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 93.03,
+      "pdms_exact": 93.02590061761236
+    },
+    "f15_ep29_best_lat96_lat": {
+      "nc": 99.16,
+      "dac": 98.83,
+      "ep": 88.16,
+      "ttc": 96.7,
+      "comfort": 99.99,
+      "ddc": 99.98,
+      "pdms": 92.86,
+      "pdms_exact": 92.86099351990386
+    }
+  },
+  "val_tuned_clean_core": {
+    "val_pdms": 92.36,
+    "navtest_metrics": {
+      "nc": 99.02,
+      "dac": 98.78,
+      "ep": 88.33,
+      "ttc": 96.9,
+      "comfort": 100.0,
+      "ddc": 99.98,
+      "pdms": 92.99,
+      "pdms_exact": 92.98602230460429
+    },
+    "weights": {
+      "v2_final": 0.0043,
+      "log_nc_ck": -0.0992,
+      "log_dac_ck": 0.8696,
+      "log_ttc_ck": 0.6498,
+      "log_cmf_ck": 0.2551,
+      "log_rest_ck": 0.9533,
+      "dv_a_m10": 0.004,
+      "dv_a_m05": 0.0011,
+      "dv_l_m05": -0.0024,
+      "dv_l_p05": -0.0003
+    }
+  },
+  "val_tuned_full_lat96": {
+    "val_pdms": 92.38,
+    "navtest_metrics": {
+      "nc": 99.03,
+      "dac": 98.77,
+      "ep": 88.34,
+      "ttc": 96.96,
+      "comfort": 100.0,
+      "ddc": 99.98,
+      "pdms": 93.01,
+      "pdms_exact": 93.01195005468672
+    },
+    "weights": {
+      "v2_final": 0.0043,
+      "log_nc_ck": -0.0652,
+      "log_dac_ck": 0.8616,
+      "log_ttc_ck": 0.6466,
+      "log_cmf_ck": 0.2703,
+      "log_rest_ck": 0.9533,
+      "log_nc_v2": -0.008,
+      "epdms_ck": -0.016,
+      "lat_diff": 0.004,
+      "dv_a_m10": 0.004,
+      "dv_a_m05": -0.0001,
+      "dv_l_m05": -0.0024,
+      "dv_l_p05": -0.0003,
+      "is_col0": 0.0032
+    }
+  },
+  "clean_core_formula": {
+    "metrics": {
+      "nc": 99.1,
+      "dac": 98.88,
+      "ep": 88.71,
+      "ttc": 96.79,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 93.17,
+      "pdms_exact": 93.1709526919188
+    },
+    "weights": {
+      "v2_final": 0.0054,
+      "log_nc_ck": 0.1452,
+      "log_dac_ck": 0.9966,
+      "log_ep_ck": -0.0025,
+      "log_ttc_ck": 0.5228,
+      "log_cmf_ck": 0.2446,
+      "log_rest_ck": 0.9495,
+      "dv_id0": 0.0032,
+      "dv_a_m10": -0.0759,
+      "dv_a_m05": -0.0037,
+      "dv_a_p05": 0.0002,
+      "dv_l_m05": -0.0015,
+      "dv_l_p05": 0.0047
+    }
+  },
+  "best_lat96": {
+    "metrics": {
+      "nc": 99.09,
+      "dac": 98.89,
+      "ep": 88.74,
+      "ttc": 96.81,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 93.2,
+      "pdms_exact": 93.19530938114501
+    },
+    "weights": {
+      "v2_final": 0.0054,
+      "log_nc_ck": 0.12,
+      "log_dac_ck": 0.9966,
+      "log_ep_ck": -0.0025,
+      "log_ttc_ck": 0.5228,
+      "log_cmf_ck": -0.0194,
+      "log_rest_ck": 0.9495,
+      "log_nc_v2": -0.004,
+      "epdms_ck": 0.012,
+      "safe_prod_ck": 0.008,
+      "dv_id0": 0.0032,
+      "dv_a_m10": -0.0759,
+      "dv_a_m05": -0.0037,
+      "dv_a_p05": 0.0002,
+      "dv_l_m05": -0.0015,
+      "dv_l_p05": 0.0047,
+      "is_col0": -0.0032
+    }
+  },
+  "best_pool96": {
+    "metrics": {
+      "nc": 99.09,
+      "dac": 98.84,
+      "ep": 88.69,
+      "ttc": 96.78,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 93.14,
+      "pdms_exact": 93.13898481110873
+    },
+    "weights": {
+      "v2_final": 0.0054,
+      "log_nc_ck": 0.116,
+      "log_dac_ck": 0.9966,
+      "log_ep_ck": -0.0025,
+      "log_ttc_ck": 0.5228,
+      "log_cmf_ck": -0.0194,
+      "log_rest_ck": 0.9507,
+      "log_nc_v2": -0.004,
+      "epdms_ck": 0.012,
+      "safe_prod_ck": 0.008,
+      "dv_id0": 0.0032,
+      "dv_a_m10": -0.0759,
+      "dv_a_m05": -0.0037,
+      "dv_a_p05": 0.0002,
+      "dv_l_m05": -0.0015,
+      "dv_l_p05": 0.0047,
+      "is_col0": 0.0028
+    }
+  },
+  "best_hybrid96": {
+    "use_lat_per_variant": [
+      1,
+      0,
+      1,
+      1,
+      0,
+      1
+    ],
+    "metrics": {
+      "nc": 99.11,
+      "dac": 98.9,
+      "ep": 88.74,
+      "ttc": 96.81,
+      "comfort": 99.99,
+      "ddc": 99.99,
+      "pdms": 93.2,
+      "pdms_exact": 93.20162058320702
+    },
+    "weights": {
+      "v2_final": 0.0054,
+      "log_nc_ck": 0.12,
+      "log_dac_ck": 0.9966,
+      "log_ep_ck": -0.0025,
+      "log_ttc_ck": 0.5228,
+      "log_cmf_ck": -0.0194,
+      "log_rest_ck": 0.9495,
+      "log_nc_v2": -0.004,
+      "epdms_ck": 0.012,
+      "safe_prod_ck": 0.008,
+      "dv_id0": 0.0032,
+      "dv_a_m10": -0.0759,
+      "dv_a_m05": -0.0037,
+      "dv_a_p05": 0.0002,
+      "dv_l_m05": -0.0015,
+      "dv_l_p05": 0.0047,
+      "is_col0": 0.0028
+    }
+  }
+}

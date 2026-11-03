@@ -1116,6 +1116,9 @@ class ParaSSRAgent(AbstractAgent):
             # ck2_* outputs over the 96-candidate pool only; predictions['trajectory'] stays the v2 one
             predictions = dict(predictions)
             predictions.update(self._ck_e2e2.infer(self.ck_student, features, predictions))
+            if self._ck_e2e2.cfg.submit_selection:
+                # opt-in (default off): compute_trajectory submits the refiner pick instead of v2's trajectory
+                predictions["trajectory"] = predictions["ck2_traj"]
         return predictions
 
     def compute_loss(

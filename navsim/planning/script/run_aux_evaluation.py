@@ -648,13 +648,7 @@ def _load_training_agent_config(
         agent_config.config.use_distill = False
     return agent_config
 
-
-def _build_agent(
-    training_config_path: Path, checkpoint_path: Path, device: torch.device
-) -> ParaSSRAgent:
-    agent = instantiate(_load_training_agent_config(training_config_path, checkpoint_path))
-    if not isinstance(agent, ParaSSRAgent):
-        raise TypeError(f"archived config instantiated {type(agent).__name__}, not ParaSSRAgent")
+def _check_aux_protocol(agent: ParaSSRAgent) -> None:
     if not bool(agent.config.use_det_motion_head) and not bool(agent.config.use_map_head):
         raise RuntimeError(
             "auxiliary evaluation needs at least one of the detection and map heads; "
@@ -698,6 +692,18 @@ def _build_agent(
         int(agent.config.map_num_vec) * int(agent.config.map_num_classes) < PROTOCOL_TOP_K
     ):
         raise RuntimeError("map head has fewer logits than protocol top-100")
+
+
+def _build_agent(
+    training_config_path: Path, checkpoint_path: Path, device: torch.device, aux_protocol: bool = True
+) -> ParaSSRAgent:
+    """aux_protocol=False (planning-only callers such as the refiner e2e eval dump) skips _check_aux_protocol: the
+    detection / map metric protocol fixes the 32 m metric grid, which a 64 m planner (v2_v15_v7) does not have."""
+    agent = instantiate(_load_training_agent_config(training_config_path, checkpoint_path))
+    if not isinstance(agent, ParaSSRAgent):
+        raise TypeError(f"archived config instantiated {type(agent).__name__}, not ParaSSRAgent")
+    if aux_protocol:
+        _check_aux_protocol(agent)
     agent.initialize()
     agent.float().to(device)
     agent.eval()

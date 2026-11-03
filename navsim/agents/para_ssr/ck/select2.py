@@ -86,6 +86,26 @@ def select96(v2_final16, v2_im16, prob96, valid96, beta: float, types: Sequence[
     return TIE_ORDER[j].astype(np.int64)
 
 
+def exp_pdms96(prob96) -> np.ndarray:
+    """prob [.., 96, 5] (CK_KEYS order) -> expected PDMS E[NC] P(DAC) (5 EP + 5 TTC + 2 C) / 12, f64 (the official
+    5/5/2 weights; the critic has no DDC output and the NAVSIM v1.1 score has no DDC term)."""
+    p = _np(prob96, np.float64)
+    nc, dac, ep, ttc, cmf = (p[..., i] for i in range(5))
+    return nc * dac * (5 * ep + 5 * ttc + 2 * cmf) / 12.0
+
+
+def select96_pdms(score_logit96, valid96, types: Sequence[int] = VARIANT_SETS["all"]) -> np.ndarray:
+    """Plain expected-PDMS rule (user 2026-11-03): argmax over the allowed columns of exp_pdms96(sigmoid(logit)), the
+    refiner critic alone (no im, no v2 score, nothing tuned).  Sigmoid in f64 from the logits (= eval_ck2.sigmoid);
+    allowed columns and ties as select96.  -> selected column [N] int64."""
+    z = _np(score_logit96, np.float64)
+    s = exp_pdms96(1.0 / (1.0 + np.exp(-z)))
+    ok = allowed_mask(valid96, types) & np.isfinite(s)
+    s = np.where(ok, s, -np.inf)
+    j = np.argmax(s[:, TIE_ORDER], axis=1)
+    return TIE_ORDER[j].astype(np.int64)
+
+
 def use_lat(idx, lat_mode: str) -> np.ndarray:
     """[N] bool: whether the submitted trajectory is the laterally corrected one."""
     if lat_mode not in LAT_MODES:

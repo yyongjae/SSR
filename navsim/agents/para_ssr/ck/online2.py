@@ -148,6 +148,8 @@ _NESTED2 = {"variants": _d_variants, "lat_kd": _d_lat_kd, "warmup": _d_warmup, "
             "bev_kd": _d_bev_kd, "kd_calib": _d_kd_calib}
 KD_CALIB_TEACHERS = ("det", "map")
 _INFER_SELECT_KEYS = ("beta", "set", "lat_mode")
+_INFER_SELECT_OPT = ("rule",)          # rule: "wote" (default, select2.select96) | "pdms" (select2.select96_pdms)
+INFER_SELECT_RULES = ("wote", "pdms")
 
 
 def _b(v) -> bool:
@@ -214,6 +216,7 @@ class CKE2E2Config:
     log_every: int = 1
     infer_outputs: bool = True
     infer_select: Optional[Dict[str, Any]] = None
+    submit_selection: bool = False      # True: predictions['trajectory'] = ck2_traj (the infer_select pick)
     strict_rows: float = 0.999
     bev_kd: Dict[str, Any] = field(default_factory=_d_bev_kd)
 
@@ -257,9 +260,10 @@ class CKE2E2Config:
                     continue
                 if not isinstance(v, dict):
                     raise ValueError(f"ck_e2e2.infer_select must be a mapping or null, got {v!r}")
-                bad = sorted(set(v) - set(_INFER_SELECT_KEYS))
-                if bad or set(v) != set(_INFER_SELECT_KEYS):
-                    raise ValueError(f"ck_e2e2.infer_select needs exactly {list(_INFER_SELECT_KEYS)}, got {sorted(v)}")
+                bad = sorted(set(v) - set(_INFER_SELECT_KEYS) - set(_INFER_SELECT_OPT))
+                if bad or not set(_INFER_SELECT_KEYS) <= set(v):
+                    raise ValueError(f"ck_e2e2.infer_select needs exactly {list(_INFER_SELECT_KEYS)} (optional "
+                                     f"{list(_INFER_SELECT_OPT)}), got {sorted(v)}")
                 kw[k] = dict(v)
             else:
                 kw[k] = v
@@ -268,7 +272,8 @@ class CKE2E2Config:
         return c
 
     def _coerce(self) -> None:
-        for k in ("enabled", "teacher_require_done", "teacher_ep_check", "teacher_amp", "amp", "infer_outputs"):
+        for k in ("enabled", "teacher_require_done", "teacher_ep_check", "teacher_amp", "amp", "infer_outputs",
+                  "submit_selection"):
             setattr(self, k, _b(getattr(self, k)))
         for k in ("topk", "n_var_step", "seed", "score_prior_rows", "record_from_epoch", "onpolicy_from_epoch",
                   "label_lag", "label_refresh_every_mb", "rec_chunk_tokens", "grad_share_every", "log_every"):
@@ -316,6 +321,8 @@ class CKE2E2Config:
         if self.infer_select is not None:
             s = dict(self.infer_select)
             self.infer_select = {"beta": float(s["beta"]), "set": str(s["set"]), "lat_mode": str(s["lat_mode"])}
+            if "rule" in s:
+                self.infer_select["rule"] = str(s["rule"])
         self.io_dir = "" if self.io_dir is None else str(self.io_dir)
         self.teacher_det_run = "" if self.teacher_det_run in (None, "none", "None") else str(self.teacher_det_run)
         self.teacher_map_run = "" if self.teacher_map_run in (None, "none", "None") else str(self.teacher_map_run)
@@ -401,6 +408,10 @@ class CKE2E2Config:
         if self.infer_select is not None:
             if not 0.0 <= self.infer_select["beta"] <= 1.0:
                 raise ValueError("ck_e2e2.infer_select.beta must be in [0, 1]")
+            if self.infer_select.get("rule", "wote") not in INFER_SELECT_RULES:
+                raise ValueError(f"ck_e2e2.infer_select.rule must be one of {INFER_SELECT_RULES}")
+        if self.submit_selection and (self.infer_select is None or not self.infer_outputs):
+            raise ValueError("ck_e2e2.submit_selection needs infer_outputs and an infer_select rule")
         bk = self.bev_kd
         if bk["enabled"]:
             from .bev_kd import DISTANCES, INITS, TEACHERS
@@ -1065,8 +1076,11 @@ class CKE2E2:
         sel = self.cfg.infer_select
         if sel is not None:
             from . import select2 as S2
-            idx = S2.select96(res["ck2_v2_final"], res["ck2_v2_im"], torch.sigmoid(res["ck2_score_logit"]),
-                              res["ck2_valid96"], sel["beta"], types=S2.VARIANT_SETS[sel["set"]])
+            if sel.get("rule", "wote") == "pdms":     # plain expected PDMS of the critic (beta / v2 score unused)
+                idx = S2.select96_pdms(res["ck2_score_logit"], res["ck2_valid96"], types=S2.VARIANT_SETS[sel["set"]])
+            else:
+                idx = S2.select96(res["ck2_v2_final"], res["ck2_v2_im"], torch.sigmoid(res["ck2_score_logit"]),
+                                  res["ck2_valid96"], sel["beta"], types=S2.VARIANT_SETS[sel["set"]])
             idx_t = torch.as_tensor(np.asarray(idx.cpu() if torch.is_tensor(idx) else idx), dtype=torch.long,
                                     device=dev)
             traj, _src = S2.final_traj(res["ck2_cand96"], res["ck2_lat_traj"], idx_t, sel["lat_mode"])

@@ -79,6 +79,7 @@ grad_share_every: 100                        # user (doubled)
 log_every: 1
 infer_outputs: true
 infer_select: null                           # NU30 (selection happens in eval_ck2)
+submit_selection: false                      # true: submitted trajectory = the infer_select pick
 strict_rows: 0.999                           # NU38
 bev_kd:                                      # off in the main run; bevkd_arm.set switches the arm on (teachers [det, map])
   enabled: false

@@ -375,7 +375,7 @@ def run_dump_shard(P: Paths, ckpt: Path, tdf, shard: int, nshard: int, batch_siz
     if len(pos) == 0:
         return {"shard": shard, "n_done": 0}
     t0 = time.time()
-    agent = RAE._build_agent(P.hydra_cfg, ckpt, dev)
+    agent = RAE._build_agent(P.hydra_cfg, ckpt, dev, aux_protocol=False)   # planning only (64 m grid allowed)
     if getattr(agent, "_ck_e2e2", None) is None:
         raise SystemExit("agent has no CK2 module: training config without ck_e2e2.enabled")
     sp = CM.split(P.split)

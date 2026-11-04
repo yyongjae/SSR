@@ -10,8 +10,8 @@
 #   kd_calib.map=/home/external-user/ssd/yongjae_refiner/v7/kd_calib/ck2M10_64m_v7__last.json
 # The 2026-10-27 teachers ck2T10_64m / ck2M10_64m (ssd/yongjae_refiner/ck/ck2/train64) are the same recipe on 2 GPUs and
 # stay usable by swapping the two teacher paths.
-teacher_det_run=/home/external-user/ssd/yongjae_refiner/v7/teachers/ck2T10_64m_v7
-teacher_map_run=/home/external-user/ssd/yongjae_refiner/v7/teachers/ck2M10_64m_v7
+teacher_det_run=/home/external-user/datasets/teacher_cache/refiner/det
+teacher_map_run=/home/external-user/datasets/teacher_cache/refiner/map
 kd_calib.mode=online
 kd_calib.det=null
 kd_calib.map=null

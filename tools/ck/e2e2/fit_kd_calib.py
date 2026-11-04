@@ -52,10 +52,11 @@ from typing import Any, Dict, List, Optional, Sequence  # noqa: E402
 
 import numpy as np  # noqa: E402
 
+from navsim.agents.para_ssr.ck import constants as Cn  # noqa: E402
 from navsim.agents.para_ssr.ck import kd_calib as KC  # noqa: E402
 from tools.ck import ckutil as U  # noqa: E402
 
-CK_DATA = Path("/home/external-user/ssd/yongjae_refiner/ck")
+CK_DATA = Cn.CK_DATA
 K16 = 16
 KST = 9 * 3600
 FORBIDDEN_OUT = ("ck2/train", "ck2/eval")

@@ -12,7 +12,7 @@
 #   RUN=... E2E_DRY_RUN=1 CK2_E2E_APPROVED=1 bash tools/ck/e2e2/train_e2e2.sh start --gpus 0,1   # print overrides only
 #   (internal) train_e2e2.sh _watchdog --gpus ...
 #
-# Layout <E2E_ROOT>/<RUN>/ (E2E_ROOT default /home/external-user/ssd/yongjae_refiner/ck/ck2/e2e):
+# Layout <E2E_ROOT>/<RUN>/ (E2E_ROOT default $SSR_RUN_ROOT, navsim/common/ssr_paths.py):
 #   train/     navsim output_dir (lightning_logs/version_*/checkpoints/{epoch=E-step=S.ckpt,last.ckpt}, code/hydra)
 #   ck_e2e2/   ck_e2e2.io_dir (rec/, lab/, steps_rank0.jsonl, epochs.jsonl, TRAIN_DONE)
 #   labeler/   labeler.log / .pid / .pgid / .exit / .cmd, watchdog.pid / .log / .restarts / .state
@@ -20,14 +20,15 @@
 #              nvidia_smi_start.txt, launch.log
 # start guards: --gpus = 2 or 4 GPUs of 0-3 (user recipe devices 2; 4 = fusion_v1, launch_util2.counters2 halves the
 #   per-rank counters), nvidia-smi <= 1 GiB used on each,
-#   CK2_E2E_APPROVED=1 (main runs) or E2E_SMOKE=1 (only below .../ck/ck2/e2e_smoke/), both CK2 teachers finished
+#   CK2_E2E_APPROVED=1 (main runs) or E2E_SMOKE=1 (only below $E2E_SMOKE_PREFIX, default $SSR_DATA_ROOT/ck/ck2/e2e_smoke/),
+#   both CK2 teachers finished
 #   (done.json, trainer train_ck2, arm T / M, lon head zero, config.json ep_target == ck_e2e2.ep_target -- default
 #   teachers ck2T10dep / ck2M10dep with --ep-target decoupled, user 2026-10-08; launch/teachers.json records the ckpt
 #   sha16 and ep_target) -- smoke runs skip only the done.json requirement, no '=' in paths, no live train.pid, a
 #   fresh start refuses an existing run dir.  KD calibration (ck_e2e2.kd_calib.enabled, user 2026-10-08 ~22:35 KST,
 #   both modes): every kd_calib.det / .map file must exist and match its teacher (run, which, ckpt sha16, ep_target,
 #   KD keys fitted); a missing file is REFUSED with the command to run after the teacher has finished:
-#     CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=$REPO /venv/ssr/bin/python tools/ck/e2e2/fit_kd_calib.py --run <teacher run>
+#     CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=$REPO $SSR_PY tools/ck/e2e2/fit_kd_calib.py --run <teacher run>
 #       --which last      (-> .../ck/ck2/kd_calib/<run>__last.json; recorded with its sha16 in launch/teachers.json)
 #   kd_calib.mode=online (user 2026-11-02, option B; det / map null): no file, fitted inside the run on its own
 #   labelled candidates (navsim ck/kd_calib.OnlineKDCalib; refits in <run>/ck_e2e2/kd_calib_online.jsonl).
@@ -36,15 +37,19 @@
 # ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
 #   after the arm file.  Never pkill / pgrep -f: processes are found through the pid files only.
 # Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu, at most 48: 32 / 48), LABELER_POLL (30),
-#   LABELER_MAX_EPOCH (MAX_EPOCHS-2), E2E_NO_LABELER=1, E2E_WANDB=online|offline|disable, E2E_EXTRA=<Hydra override file>,
+#   LABELER_MAX_EPOCH (MAX_EPOCHS-2), E2E_NO_LABELER=1 (refused with the refiner on: training would silently stay on
+#   warm-up labels), E2E_WANDB=online|offline|disable, E2E_EXTRA=<Hydra override file>,
 #   E2E_SMOKE=1, E2E_WAIT_TIMEOUT, E2E_DRY_RUN=1, WATCHDOG_EVERY (120), LABELER_MAX_RESTARTS (20), LABELER_STALL_S (1200),
-#   E2E_NO_WATCHDOG=1, E2E_NO_DEEP_TEACHER_CHECK=1 (tests: skip loading the teacher ckpts).
+#   E2E_NO_WATCHDOG=1, E2E_NO_DEEP_TEACHER_CHECK=1 (tests: skip loading the teacher ckpts).  WANDB_ENTITY: no default.
+#   ck_e2e2.enabled=false in E2E_EXTRA / E2E_CK_SET = refiner off: no refiner teacher / warm-up check, no labeler, no
+#   watchdog.  (internal) _labeler_cmd --gpus ... prints the labeler command, _print_env the training environment.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"   # repo root of this worktree
-PY=/venv/ssr/bin/python
+source "$REPO/tools/release/load_paths.sh"   # SSR_PY, SSR_DATA_ROOT, SSR_RUN_ROOT, ... (navsim/common/ssr_paths.py)
+PY=$SSR_PY
 LU2="$REPO/tools/ck/e2e2/launch_util2.py"
 LU1="$REPO/tools/ck/e2e/launch_util.py"
-SMOKE_PREFIX=/home/external-user/ssd/yongjae_refiner/ck/ck2/e2e_smoke/
+SMOKE_PREFIX=${E2E_SMOKE_PREFIX:-$SSR_DATA_ROOT/ck/ck2/e2e_smoke/}
 CMD=${1:-}; shift || true
 RESUME=0; GPUS=""; TRAIN_ONLY=0; JSON=0; WAIT_LAB=0
 while [ $# -gt 0 ]; do
@@ -60,7 +65,7 @@ while [ $# -gt 0 ]; do
 done
 RUN=${RUN:?RUN=<run name> is required}
 ARM=${ARM:-main}
-E2E_ROOT=${E2E_ROOT:-/home/external-user/ssd/yongjae_refiner/v7/e2e}
+E2E_ROOT=${E2E_ROOT:-$SSR_RUN_ROOT}
 # v2_v15_v7: never write into another user's tree (aux_distill defaulted to /workspace/byounggun/ssr_outputs/ck2_e2e)
 case "$(readlink -m "$E2E_ROOT")" in /workspace/byounggun*|/home/external-user/byounggun*)
   echo "[train_e2e2] REFUSED: E2E_ROOT=$E2E_ROOT is under byounggun's directory (read-only for this branch)" >&2; exit 3;;
@@ -68,6 +73,9 @@ esac
 R="$E2E_ROOT/$RUN"
 L="$R/launch"; LB="$R/labeler"; IO="$R/ck_e2e2"
 export PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+# data environment of the training process and of the labeler (its scorer reads the maps too)
+DATA_ENV=(NUPLAN_MAP_VERSION=nuplan-maps-v1.0 "NUPLAN_MAPS_ROOT=$NUPLAN_MAPS_ROOT"
+          "OPENSCENE_DATA_ROOT=$OPENSCENE_DATA_ROOT")
 # DataLoader workers hand tensors to the trainer through AF_UNIX sockets under $TMPDIR (pymp-*/listener-*, +32 chars;
 # limit 107): with a long TMPDIR the bind fails inside a worker thread and the first batch hangs without an exit
 # [실측 2026-10-08: a TMPDIR of 87 chars hung a fork DataLoader test].  Training / labeler then use /tmp.
@@ -103,6 +111,14 @@ grp_kill() {  # grp_kill <pgid_file> <pid_file> <needle> <name>: TERM the group,
   log "$4 still alive after 60 s: KILL"
   if [ -n "$pg" ]; then kill -KILL -- "-$pg" 2>/dev/null || kill -KILL "$pid"; else kill -KILL "$pid"; fi
 }
+eff_field() {  # eff_field <dotted key>: the value in launch/ck_e2e2_effective.json of this run, empty if absent
+  [ -f "$L/ck_e2e2_effective.json" ] || return 0
+  "$PY" -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."):
+    d = d.get(k) if isinstance(d, dict) else None
+print("" if d is None else d)' "$L/ck_e2e2_effective.json" "$1"
+}
 need_gpus() { [ -n "$GPUS" ] || die "--gpus <2 or 4 GPUs of 0-3> is required (e.g. --gpus 0,1 or 0,1,2,3)"; }
 
 case "$R" in *=*) die "run dir $R contains '='";; esac
@@ -115,12 +131,15 @@ start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   local ng me lw; ng=$(awk -F, '{print NF}' <<< "$GPUS"); me=${LABELER_MAX_EPOCH:-$(( ${MAX_EPOCHS:-30} - 2 ))}
   lw=${LABELER_WORKERS:-$((16 * ng))}; [ "$lw" -gt 48 ] && lw=48      # labeler MAX_WORKERS = 48 (tools/ck/e2e/labeler.py)
   [ "$me" -lt 0 ] && me=0
-  mkdir -p "$LB"; rm -f "$LB/labeler.exit" "$LB/labeler.pid"
   local LCMD=("$PY" "$REPO/tools/ck/e2e2/labeler2.py" --io-dir "$IO" --world-size "$ng" --workers "$lw"
               --poll "${LABELER_POLL:-30}" --max-epoch "$me" --exit-when-done --train-pid-file "$L/train.pid")
+  local packed; packed=$(eff_field warmup.packed)     # same row -> token table as the training run's warm-up.packed
+  [ -n "$packed" ] && LCMD+=(--tokens "$packed/tokens.parquet")
   [ "${1:-}" = retry ] && LCMD+=(--retry-errors)
+  if [ "${1:-}" = print ]; then echo "${LCMD[*]}"; return 0; fi
+  mkdir -p "$LB"; rm -f "$LB/labeler.exit" "$LB/labeler.pid"
   echo "${LCMD[*]}" > "$LB/labeler.cmd"
-  setsid nohup bash -c "$WRAP" _ "$LB" labeler env PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 "${LCMD[@]}" \
+  setsid nohup bash -c "$WRAP" _ "$LB" labeler env PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 "${DATA_ENV[@]}" "${LCMD[@]}" \
     < /dev/null > /dev/null 2>&1 &
   for _ in $(seq 30); do [ -s "$LB/labeler.pid" ] && break; sleep 0.2; done
   log "labeler2 started pid $(cat "$LB/labeler.pid" 2>/dev/null) W=$lw world $ng max-epoch $me -> $LB/labeler.log"
@@ -202,11 +221,7 @@ do_start() {
         _wb_key="${_wb_key%\"}"; _wb_key="${_wb_key#\"}"
         _wb_key="${_wb_key%\'}"; _wb_key="${_wb_key#\'}"
         if [ -n "$_wb_key" ]; then
-          export WANDB_API_KEY="$_wb_key"
-          export WANDB_ENTITY="${WANDB_ENTITY:-e2ekd}"
-          printf 'machine api.wandb.ai\n  login user\n  password %s\n' "$WANDB_API_KEY" > "$OUTD/.wandb_netrc"
-          chmod 600 "$OUTD/.wandb_netrc"
-          export NETRC="$OUTD/.wandb_netrc"
+          export WANDB_API_KEY="$_wb_key"     # environment only: nothing secret goes into the run folder
         fi
       fi
     done < "$REPO/.env"
@@ -222,17 +237,24 @@ do_start() {
   [ "${E2E_NO_DEEP_TEACHER_CHECK:-0}" = 1 ] && OA+=(--no-deep)
   "$PY" "$LU2" "${OA[@]}" || die "override generation / teacher / KD-calibration check failed (REFUSED line above)"
   mapfile -t OV < "$OUTD/overrides.txt"
-  if [ "${E2E_DRY_RUN:-0}" = 1 ]; then printf '%s\n' "${OV[@]}"; echo "dry run: nothing launched (arm $ARM, $OUTD)"; return 0; fi
+  # the arm the run really is (extras and sets included), not the ARM variable
+  local TRUE_ARM; TRUE_ARM=$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["_arm"])' "$OUTD/ck_e2e2_effective.json") \
+    || die "no arm in $OUTD/ck_e2e2_effective.json"
+  if [ "$TRUE_ARM" = noref ]; then
+    export E2E_NO_LABELER=1
+  elif [ "${E2E_NO_LABELER:-0}" = 1 ]; then
+    die "E2E_NO_LABELER=1 with the refiner on: no on-policy labels, training would silently stay on warm-up labels"
+  fi
+  if [ "${E2E_DRY_RUN:-0}" = 1 ]; then printf '%s\n' "${OV[@]}"; echo "dry run: nothing launched (arm $TRUE_ARM, $OUTD)"; return 0; fi
   mkdir -p "$R/train" "$IO"
   nvidia-smi > "$L/nvidia_smi_start.txt" 2>&1
   local NG; NG=$(awk -F, '{print NF}' <<< "$GPUS")
-  log "start RUN=$RUN arm=$ARM gpus=$GPUS resume=$RESUME ckpt=${CKPT:-none} wandb=$WB overrides=${#OV[@]} (ngpu $NG)"
+  log "start RUN=$RUN arm=$TRUE_ARM gpus=$GPUS resume=$RESUME ckpt=${CKPT:-none} wandb=$WB overrides=${#OV[@]} (ngpu $NG)"
   rm -f "$L/train.exit" "$L/train.pid"
-  setsid nohup env PYTHONPATH=$REPO NUPLAN_MAP_VERSION=nuplan-maps-v1.0 \
-      NUPLAN_MAPS_ROOT=/home/external-user/yongjae/SSR/data/dataset/maps \
-      OPENSCENE_DATA_ROOT=/home/external-user/yongjae/SSR/data/dataset NAVSIM_DEVKIT_ROOT=$REPO \
+  local WB_ENTITY=(); [ -n "${WANDB_ENTITY:-}" ] && WB_ENTITY=(WANDB_ENTITY="$WANDB_ENTITY")
+  setsid nohup env PYTHONPATH=$REPO "${DATA_ENV[@]}" NAVSIM_DEVKIT_ROOT=$REPO \
       NAVSIM_EXP_ROOT="$R" NCCL_SOCKET_IFNAME=lo CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPUS" \
-      WANDB_API_KEY="${WANDB_API_KEY:-}" WANDB_ENTITY="${WANDB_ENTITY:-e2ekd}" NETRC="${NETRC:-}" \
+      WANDB_API_KEY="${WANDB_API_KEY:-}" "${WB_ENTITY[@]}" NETRC="${NETRC:-}" \
       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
       bash -c "$WRAP" _ "$L" train "$PY" "$REPO/navsim/planning/script/run_training.py" "${OV[@]}" < /dev/null > /dev/null 2>&1 &
   for _ in $(seq 50); do [ -s "$L/train.pid" ] && break; sleep 0.2; done
@@ -267,5 +289,7 @@ case "$CMD" in
   wait) do_wait; exit $?;;
   _watchdog) do_watchdog;;
   labeler) mkdir -p "$L"; start_labeler; start_watchdog;;
+  _labeler_cmd) start_labeler print;;
+  _print_env) printf '%s\n' "${DATA_ENV[@]}";;
   *) sed -n '2,12p' "$0"; exit 2;;
 esac

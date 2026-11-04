@@ -1,81 +1,24 @@
-# Navigation-Guided Sparse Scene Representation for End-to-End Autonomous Driving
-Original title: **Dose End-to-End Autonomous Driving Really Need Perception Tasks?**
+# Refiner on v2 + BEV KD for NAVSIM
 
-> Peidong Li, Dixiao Cui
+This branch trains and evaluates an end-to-end planner on [NAVSIM](https://github.com/autonomousvision/navsim): a camera-only v2 planner, BEV knowledge distillation from a LiDAR teacher and a map teacher, and a refiner that scores and picks among candidate trajectories.
 
-> [Zhijia Technology](https://www.smartxtruck.com/), Suzhou, China
+| Read | For |
+|---|---|
+| [docs/SETUP.md](docs/SETUP.md) | Preparing a new server: ordered steps, disk, hours, checks |
+| [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) | Running experiments and ablations with `scripts/experiment.sh` |
+| [docs/FAIRNESS.md](docs/FAIRNESS.md) | What is locked, what to disclose, which earlier numbers not to use |
+| [THIRD_PARTY.md](THIRD_PARTY.md) | Origin and licence of code, data and models |
 
-## [![arXiv](https://img.shields.io/badge/arXiv-Paper-<COLOR>.svg)](https://arxiv.org/abs/2409.18341)
-
-## News
-
-- **2025.03.23** Code and checkpoint released. 🚀
-- **2025.02.01** Chinese Blog of SSR available in [zhihu](https://zhuanlan.zhihu.com/p/14173403896).
-- **2025.01.23** SSR is accepted to ICLR 2025. 🎉
-- **2024.09.30** Paper of SSR available in [arxiv](https://arxiv.org/abs/2409.18341).
-
-## Introduction
-We introduce SSR, a novel framework that leverages navigation-guided Sparse Scene
-Representation, achieving state-of-the-art performance with minimal costs. Inspired by how human drivers selectively focus on scene elements based on navigation cues, we find that only a minimal set of tokens from dense BEV features is necessary for effective scene representation in autonomous driving. 
-<div align="center">
-  <img src="resources/coords.png" width="800"/>
-</div><br/>
-
-## Overview
-SSR consists of two parts: the purple part, which is used during both training and inference, and the gray part, which is only used during training. In the purple part, the dense BEV feature is first compressed by the Scenes TokenLearner into sparse queries, which are then used for planning via cross-attention. In the gray part, the predicted BEV feature is obtained from the BEV world model. The future BEV feature is then used to supervise the predicted BEV feature, enhancing both the scene representation and the planning decoder.
-<div align="center">
-  <img src="resources/SSR.png" width="800"/>
-</div><br/>
-
-## Prepare
-- [Installation](docs/install.md)
-- [Dataset](docs/prepare_dataset.md)
-
-## Train and Test
-### Train SSR with 8 GPUs 
-```shell
-cd /path/to/SSR
-conda activate ssr
-python -m torch.distributed.run --nproc_per_node=8 --master_port=2333 tools/train.py projects/configs/SSR/SSR_e2e.py --launcher pytorch --deterministic --work-dir path/to/save/outputs
+```bash
+bash scripts/experiment.sh check                                    # builds the default recipe on CPU, compares it with the reference
+python tools/release/verify_assets.py --profile full --quick        # are the inputs here, and the right ones
+bash scripts/experiment.sh train GPUS=0,1,2,3,4,5,6,7               # 19.9 h on 8 x 24 GB GPUs
+bash scripts/experiment.sh eval RUN=<name> GPUS=0,1,2,3
 ```
 
-### Eval SSR with 1 GPU
-```shell
-cd /path/to/SSR
-conda activate ssr
-CUDA_VISIBLE_DEVICES=0 python tools/test.py projects/configs/SSR/SSR_e2e.py /path/to/ckpt.pth --launcher none --eval bbox --tmpdir tmp
-```
+## Upstream
 
-## Results
-*After refactoring, the released checkpoint exhibits minor difference with results reported in the paper.
-
-Log and Checkpoint : [Google Drive](https://drive.google.com/drive/folders/1YFG5JsJ6yuLNl0y1yceV8UxMFyh5138a)
-
-Planning distillation from frozen BEVDepth/HDMapNet or BEVFusion/MapTRv2
-teachers is documented in [docs/PLANNING_DISTILLATION.md](docs/PLANNING_DISTILLATION.md).
-The Korean research hypothesis, method, experiment matrix, and success criteria
-are in [docs/PLANNING_DISTILLATION_EXPERIMENT_PLAN_KR.md](docs/PLANNING_DISTILLATION_EXPERIMENT_PLAN_KR.md).
-
-### UniAD-style metric protocal
-| Method | L2<sub>MAX</sub> (m) 1s | L2<sub>MAX</sub> (m) 2s | L2<sub>MAX</sub> (m) 3s | L2<sub>MAX</sub> (m) Avg. | CR<sub>MAX</sub> (%) 1s | CR<sub>MAX</sub> (%) 2s | CR<sub>MAX</sub> (%) 3s | CR<sub>MAX</sub> (%) Avg. | 
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| SSR | 0.25 | 0.64 | 1.33 | 0.74 | 0.00 | 0.08 | 0.43 | 0.17 | 
-
-### VAD-style metric protocal
-| Method | L2<sub>AVG</sub> (m) 1s | L2<sub>AVG</sub> (m) 2s | L2<sub>AVG</sub> (m) 3s | L2<sub>AVG</sub> (m) Avg. | CR<sub>AVG</sub> (%) 1s | CR<sub>AVG</sub> (%) 2s | CR<sub>AVG</sub> (%) 3s | CR<sub>AVG</sub> (%) Avg. |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| SSR | 0.19 | 0.36 | 0.62 | 0.39 | 0.02 | 0.03 | 0.13 | 0.06 |
-
-## Visualization
-We visualize the results of our framework on the nuScenes dataset and Carla Town05 Long benchmark.
-
-### nuScenes
-<div align="center">
-  <img src="resources/vis.png" width="800"/>
-</div><br/>
-
-### Carla
-https://github.com/user-attachments/assets/5cf7825c-5c8e-442e-85d3-894f4095f6d6
+The code base started from SSR ("Navigation-Guided Sparse Scene Representation for End-to-End Autonomous Driving", Peidong Li and Dixiao Cui, Zhijia Technology, ICLR 2025, [arXiv](https://arxiv.org/abs/2409.18341)), a nuScenes planner. Its pipeline (`projects/`, `tools/train.py`, `docs/install.md`, `docs/prepare_dataset.md`) is still in the tree and is not used by this branch.
 
 ## Citation
 If this work is helpful for your research, please consider citing the following BibTeX entry.

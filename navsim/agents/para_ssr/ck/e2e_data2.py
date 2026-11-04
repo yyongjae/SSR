@@ -73,15 +73,15 @@ GEN2_FORMAT = "ck2_96"
 GEN2_ORDER = ("c = k*6 + v; k = v2 top-16 rank (plan_final_rewards desc); "
               "v = id, a-1.0, a-0.5, a+0.5, l-0.5, l+0.5")
 
-_CK = "/home/external-user/ssd/yongjae_refiner/ck"
+_CK = f"{ED.REF_DATA_ROOT}/ck"
 WARMUP_DEFAULT: Dict[str, Any] = {
     "packed": f"{_CK}/packed/navtrain_train",
     "raw_labels": f"{_CK}/labels/navtrain_train/raw256",
     "var_dir": f"{_CK}/ck2/labels/navtrain_train/var_separate_sampler16_accstraight",
     "sampler_seed": 0, "n_var": 32, "sur_groups": "near_mid", "lat_kd_groups": "near_mid",
 }
-TEACHER_DET_RUN = f"{_CK}/ck2/train/ck2T10"            # user 2026-10-09 00:30 KST: official-EP teachers ck2T10 / ck2M10 + KD calibration (navtest: decoupled worse)
-TEACHER_MAP_RUN = f"{_CK}/ck2/train/ck2M10"
+TEACHER_DET_RUN = ""     # no default teacher run: the run's set file names them, validate requires them (use_teachers)
+TEACHER_MAP_RUN = ""
 EP_TARGET_DEFAULT = "official"                           # ck_e2e2.ep_target default (decoupled 10-08 20:10 -> official 10-09 00:30 KST)
 REF_DATA_ROOT = ED.REF_DATA_ROOT
 WU_TARGET_KEYS = ("ck2_wu_ok", "ck2_gt", "ck2_raw_y", "ck2_raw_ok", "ck2_var_traj", "ck2_var_y", "ck2_var_ok",
@@ -414,7 +414,7 @@ class CK2E2ETargetBuilder(_ATB):
       ck_row int64 [] (-1 = token not in packed navtrain_train)
       ref_* + ref_gt_ok (refiner.e2e.GTLoader surrogate GT)
       kd_bev_0 f16 [256,50,100] / kd_ok_0 bool [] (DET, BEVFusion t0); kd_bev_1 / kd_ok_1 (MAP, ReSMap) -- GTLoader
-        rules, teacher-run order (det, map), arms from the runs' config.json
+        rules, teacher-run order (det, map), arms from the runs' config.json; absent with ck_e2e2.use_teachers false
       ck2_wu_ok bool [] (CK2Dataset keep rule), ck2_gt f32 [8,3] (sampler GT), ck2_raw_y f32 [256,5] (raw256 official
         labels as CK targets, CK_KEYS, EP per ck_e2e2.ep_target), ck2_raw_ok bool [256], ck2_var_traj f32 [96,8,3],
         ck2_var_y f32 [96,5] (same rule), ck2_var_ok bool [96],
@@ -431,11 +431,16 @@ class CK2E2ETargetBuilder(_ATB):
         topk = int(c.get("topk", K16) or K16)
         if topk != K16:
             raise ValueError(f"CK2E2ETargetBuilder: topk {topk} != {K16} (generation layout is 16 x 6)")
-        det = c.get("teacher_det_run", TEACHER_DET_RUN)
-        mp = c.get("teacher_map_run", TEACHER_MAP_RUN)
-        if not det:
-            raise ValueError("CK2E2ETargetBuilder: teacher_det_run is required")
-        self.teacher_runs: Tuple[str, ...] = tuple(str(r) for r in (det, mp) if r)
+        use_t = c.get("use_teachers", True)
+        self.use_teachers = use_t if isinstance(use_t, bool) else str(use_t).strip().lower() in ("1", "true", "yes", "on")
+        if self.use_teachers:
+            det = c.get("teacher_det_run", TEACHER_DET_RUN)
+            mp = c.get("teacher_map_run", TEACHER_MAP_RUN)
+            if not det:
+                raise ValueError("CK2E2ETargetBuilder: teacher_det_run is required")
+            self.teacher_runs: Tuple[str, ...] = tuple(str(r) for r in (det, mp) if r)
+        else:                    # ck_e2e2.use_teachers false: this builder reads no teacher BEV, no kd_bev_i / kd_ok_i
+            self.teacher_runs = ()
         root = ref_data_root or c.get("ref_data_root") or getattr(config, "ref_data_root", None) or REF_DATA_ROOT
         self.ref_data_root = str(root)
         self.wcfg = warmup_cfg(c)

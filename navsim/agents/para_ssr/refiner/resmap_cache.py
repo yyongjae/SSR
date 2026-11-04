@@ -43,8 +43,10 @@ from typing import Dict, Iterable, Optional, Union
 
 import numpy as np
 
+from ....common import ssr_paths as _SP
+
 # ----------------------------------------------------------------------------------------------- constants
-RESMAP_ROOT = Path("/home/external-user/datasets/teacher_cache/resmap")
+RESMAP_ROOT = Path(_SP.SSR_TEACHER_CACHE) / "resmap"
 RESMAP_ROOTS = {"navtrain": RESMAP_ROOT, "navtest": RESMAP_ROOT / "navtest"}
 RESMAP_SHA256 = "0eaeda793402a804925b46861a91a3ebe011e608d3b3726604f400be6f296f1a"   # meta.json checkpoint_sha256
 RESMAP_SHA_HEAD = RESMAP_SHA256[:16]
@@ -71,7 +73,7 @@ RESMAP_ORIGIN_NOTE = "rear axle; measured |offset| < 0.05 m (report/refiner_T/re
 from .adapters import BEV64 as _BEV64  # noqa: E402
 
 if _BEV64:
-    RESMAP_ROOT = Path("/home/external-user/datasets/teacher_cache/resmap/stage1_front64")
+    RESMAP_ROOT = Path(_SP.SSR_TEACHER_CACHE) / "resmap/stage1_front64"
     RESMAP_ROOTS = {"navtrain": RESMAP_ROOT, "navtest": RESMAP_ROOT / "navtest"}
     RESMAP_SHA256 = "e67cc78d0da6afe00f0396d9940e98024826d7288117f346b9f85a7ade699858"
     RESMAP_SHA_HEAD = RESMAP_SHA256[:16]
@@ -81,6 +83,15 @@ if _BEV64:
     S_H = 100
     SEG_H = 200
 RESMAP_SPLIT = {"navtrain": "none", "navtest": "none"} if _BEV64 else {"navtrain": "train", "navtest": "none"}
+# the MAP teacher chosen in tools/release/registry.yaml (compose sets these; unset = the cache above).
+# SSR_MAP_REQUIRE_SEG=0: a teacher without a seg head (KD reads only bev).
+if os.environ.get("SSR_MAP_CACHE_ROOT"):
+    RESMAP_ROOT = Path(os.environ["SSR_MAP_CACHE_ROOT"])
+    RESMAP_ROOTS = {"navtrain": RESMAP_ROOT, "navtest": RESMAP_ROOT / "navtest"}
+if os.environ.get("SSR_MAP_SHA256"):
+    RESMAP_SHA256 = os.environ["SSR_MAP_SHA256"]
+    RESMAP_SHA_HEAD = RESMAP_SHA256[:16]
+RESMAP_REQUIRED_FIELDS = ("bev", "seg") if os.environ.get("SSR_MAP_REQUIRE_SEG", "1") != "0" else ("bev",)
 
 
 # ----------------------------------------------------------------------------------------------- transforms
@@ -154,7 +165,7 @@ class ResmapCache:
             raise ValueError(f"ReSMap cache {root}: classes {meta.get('classes')}")
         if list(meta.get("pc_range", [])) != RESMAP_PC_RANGE or list(meta.get("roi_size_m", [])) != RESMAP_ROI_SIZE:
             raise ValueError(f"ReSMap cache {root}: pc_range {meta.get('pc_range')} roi {meta.get('roi_size_m')}")
-        for f in ("bev", "seg"):
+        for f in RESMAP_REQUIRED_FIELDS:
             t = meta.get("tensors", {}).get(f, {})
             if tuple(t.get("shape", ())) != RESMAP_FIELDS[f][0] or t.get("dtype") != RESMAP_FIELDS[f][1]:
                 raise ValueError(f"ReSMap cache {root}: {f} {t}")

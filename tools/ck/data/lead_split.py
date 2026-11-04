@@ -33,7 +33,7 @@ from tools.ck.data import common as CM  # noqa: E402  (pins navsim before extrac
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-EXTRACT = Path("/workspace/yongjae/ssd/yongjae_refiner/direction_analysis/uncertainty/scripts")
+EXTRACT = CM.C.DATA_ROOT / "direction_analysis/uncertainty/scripts"
 OUT_COLS = ("token", "log", "has_lead", "D_1", "D_strong", "D_hard", "lead_v", "lead_gap", "thw", "ttc0", "censored",
             "lead_decel", "error")
 

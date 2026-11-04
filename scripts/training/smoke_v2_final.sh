@@ -14,8 +14,10 @@
 # pass on the label set in on-policy), the last (a, b) per key, whether an on-policy fit (EMA reset) happened.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+source "$REPO/tools/release/load_paths.sh"   # SSR_PY, SSR_DATA_ROOT, SSR_RUN_ROOT, ... (navsim/common/ssr_paths.py)
+export SSR_ALLOW_DIRECT=1
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
-SMOKE_ROOT=${SMOKE_ROOT:-/home/external-user/ssd/yongjae_refiner/ck/ck2/e2e_smoke}
+SMOKE_ROOT=${SMOKE_ROOT:-$SSR_DATA_ROOT/ck/ck2/e2e_smoke}
 TAG=${TAG:-v2final_smoke_$(TZ=Asia/Seoul date +%m%d_%H%M)}
 MEM_LIMIT_GB=${MEM_LIMIT_GB:-22.5}
 SD=$SMOKE_ROOT/_cfg_$TAG
@@ -33,7 +35,7 @@ RUN=$TAG E2E_SMOKE=1 E2E_ROOT=$SMOKE_ROOT E2E_WANDB=disable MAX_EPOCHS=2 LABELER
 RUN=$TAG E2E_ROOT=$SMOKE_ROOT bash "$REPO/scripts/training/train_v2_v15_v7.sh" wait
 R=$SMOKE_ROOT/$TAG
 [ "$(cat "$R/launch/train.exit" 2>/dev/null)" = "0" ] || { echo "[smoke_v2_final] training exit $(cat "$R/launch/train.exit" 2>/dev/null) (see $R/launch/train.log)"; exit 1; }
-/venv/ssr/bin/python - "$R" "$MEM_LIMIT_GB" <<'PY' || { echo "[smoke_v2_final] FAILED (run dir $R)"; exit 1; }
+"$SSR_PY" - "$R" "$MEM_LIMIT_GB" <<'PY' || { echo "[smoke_v2_final] FAILED (run dir $R)"; exit 1; }
 import json, math, sys
 R, mem_limit = sys.argv[1], float(sys.argv[2])
 ep = [json.loads(l) for l in open(f"{R}/ck_e2e2/epochs.jsonl")]

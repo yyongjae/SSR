@@ -39,8 +39,9 @@ def test_defaults_are_the_user_decisions():
     assert c.record_from_epoch == 4 and c.onpolicy_from_epoch == 5 and c.label_lag == 1
     assert c.variants == {"speeds": [-1.0, -0.5, 0.5], "lats": [-0.5, 0.5], "combine": "separate", "s_on_frac": 0.2,
                           "ext": "straight", "compute_dtype": "float64"}
-    # user 2026-10-09 00:30 KST: official-EP teachers and student label targets
-    assert c.teacher_det_run.endswith("ck2/train/ck2T10") and c.teacher_map_run.endswith("ck2/train/ck2M10")
+    # no default teacher run (the run's set file names them); official-EP student label targets
+    assert c.teacher_det_run == "" and c.teacher_map_run == ""
+    assert c.kd_sources == ["det", "map"]
     assert c.ep_target == "official" and c.teacher_which == "last"
     assert c.warmup["var_dir"].endswith("var_separate_sampler16_accstraight")
     assert c.warmup["raw_labels"].endswith("labels/navtrain_train/raw256")

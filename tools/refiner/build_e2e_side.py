@@ -28,7 +28,9 @@ import pandas as pd
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
-os.environ.setdefault("NUPLAN_MAPS_ROOT", str(REPO / "data/dataset/maps"))
+from navsim.common import ssr_paths as _SP  # noqa: E402
+
+os.environ.setdefault("NUPLAN_MAPS_ROOT", _SP.NUPLAN_MAPS_ROOT)
 os.environ.setdefault("NUPLAN_MAP_VERSION", "nuplan-maps-v1.0")
 
 from navsim.agents.para_ssr.refiner import data as RD  # noqa: E402

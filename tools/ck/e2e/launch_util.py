@@ -33,12 +33,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 REPO = str(Path(__file__).resolve().parents[3])   # repo root of this worktree
-PY = "/venv/ssr/bin/python"
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+from navsim.common import ssr_paths as SP  # noqa: E402
+
+PY = SP.SSR_PY
 HERE = Path(__file__).resolve().parent
 CK_YAML = HERE / "ck_e2e.yaml"
-E2E_ROOT = "/home/external-user/ssd/yongjae_refiner/ck/phase2/e2e"
-SMOKE_ROOT = "/home/external-user/ssd/yongjae_refiner/ck/phase2/e2e_smoke"
-CK_DATA = "/home/external-user/ssd/yongjae_refiner/ck"
+CK_DATA = f"{SP.SSR_DATA_ROOT}/ck"
+E2E_ROOT = f"{CK_DATA}/phase2/e2e"
+SMOKE_ROOT = f"{CK_DATA}/phase2/e2e_smoke"
 PACKED_TRAIN = f"{CK_DATA}/packed/navtrain_train"
 ALLOWED_GPUS = ("0", "1", "2", "3")
 N_TRAIN_TOKENS = 85109
@@ -47,8 +51,8 @@ TOKENS_PER_MB = 4
 TRAIN_ENV = {
     "PYTHONPATH": REPO,
     "NUPLAN_MAP_VERSION": "nuplan-maps-v1.0",
-    "NUPLAN_MAPS_ROOT": "/home/external-user/yongjae/SSR/data/dataset/maps",
-    "OPENSCENE_DATA_ROOT": "/home/external-user/yongjae/SSR/data/dataset",
+    "NUPLAN_MAPS_ROOT": SP.NUPLAN_MAPS_ROOT,
+    "OPENSCENE_DATA_ROOT": SP.OPENSCENE_DATA_ROOT,
     "NAVSIM_DEVKIT_ROOT": REPO,
     "NCCL_SOCKET_IFNAME": "lo",
     "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
@@ -64,8 +68,8 @@ GSHARE_WARN = 0.5
 MONITOR_N_GSHARE = 20
 MONITOR_N_STEPS = 500
 
-PLAN_ANCHOR_FILE = "/home/external-user/kyungmin/SSR-v2/data/planning_vb/trajectory_anchors_256.npy"
-PLAN_SCORE_FILE = "/home/external-user/kyungmin/SSR-v2/data/planning_vb/pdm_score_256"
+PLAN_ANCHOR_FILE = f"{REPO}/resources/planning_vb/trajectory_anchors_256.npy"
+PLAN_SCORE_FILE = f"{SP.SSR_PLAN_DATA}/pdm_score_256"
 
 
 class LaunchError(SystemExit):
@@ -633,7 +637,7 @@ def smoke_tokens(n: int = 240, packed: str = PACKED_TRAIN, min_log: int = 20) ->
     metric cache; returns (tokens, logs).  Same set every call (deterministic)."""
     import pandas as pd
     df = pd.read_parquet(Path(packed) / "tokens.parquet")
-    mc_root = Path("/home/external-user/ssd/yongjae_refiner/metric_cache")
+    mc_root = Path(SP.SSR_DATA_ROOT) / "metric_cache"
     cnt = df.groupby("log").size()
     toks, logs = [], []
     for lg in sorted(cnt.index):

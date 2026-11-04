@@ -17,6 +17,7 @@ defaults:
   - _self_
 
 split: trainval
+seed: 0             # global seed of the run (run_training.py)
 
 # Checkpointing. Lightning's implicit default keeps only the newest epoch
 # (monitor=null, save_top_k=1 -> one file, overwritten), which makes it

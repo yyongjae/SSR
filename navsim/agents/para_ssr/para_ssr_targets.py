@@ -285,7 +285,7 @@ class ParaSSRTargetBuilder(AbstractTargetBuilder):
         }
         if cfg.use_det_motion_head:
             targets.update(self._compute_agent_targets(scene, cur_idx))
-        if cfg.use_map_head:
+        if cfg.use_map_head or getattr(cfg, "use_distill", False):      # v15 reads gt_map_* with the map head off too
             targets.update(self._compute_map_targets(scene, cur_idx))
         if getattr(cfg, "refiner_mode", "off") != "off":
             targets.update(self._stage_e_targets(scene))

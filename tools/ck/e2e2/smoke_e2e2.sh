@@ -33,11 +33,12 @@
 # no 'set -e' on purpose: every stage runs and returns its own rc, the loop at the end aggregates them
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
-PY=${SMOKE_PY:-/venv/ssr/bin/python}
+source "$REPO/tools/release/load_paths.sh"   # SSR_PY, SSR_DATA_ROOT, ... (navsim/common/ssr_paths.py)
+PY=${SMOKE_PY:-$SSR_PY}
 LU2="$REPO/tools/ck/e2e2/launch_util2.py"
 TE=${SMOKE_TE:-$REPO/tools/ck/e2e2/train_e2e2.sh}
 TAG=${TAG:-$(TZ=Asia/Seoul date +%m%d_%H%M)}
-SR=${SMOKE_ROOT:-/home/external-user/ssd/yongjae_refiner/ck/ck2/e2e_smoke}/$TAG
+SR=${SMOKE_ROOT:-$SSR_DATA_ROOT/ck/ck2/e2e_smoke}/$TAG
 G1_MB=${G1_MB:-300}
 export PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 # AF_UNIX socket paths under $TMPDIR (DataLoader workers, G0 pytest) are limited to 107 chars (see train_e2e2.sh)

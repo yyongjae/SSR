@@ -135,7 +135,7 @@ def test_single_trajectory_input_and_pdm_fields(env):
 
 def test_nc_record_matches_cf_common(env):
     """nc_track / nc_time_idx equal cf_common.primary_nc of cf_common.score (recorded official events)."""
-    sys.path.insert(0, str(ST.ROOT / "report/collision_counterfactual/counterfactual"))
+    sys.path.insert(0, str(ST.RESEARCH / "report/collision_counterfactual/counterfactual"))
     import cf_common
 
     cf_common.init_worker()

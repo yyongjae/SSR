@@ -12,11 +12,12 @@
 # Rules: OMP_NUM_THREADS=1, workers summed <= 48, no pkill/pgrep -f (pid files), navsim pinned to SSR-ck (run_pinned.py).
 set -u
 CKR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"   # repo root of this worktree
-D=/home/external-user/ssd/yongjae_refiner
+REPO=$CKR source "$CKR/tools/release/load_paths.sh"
+D=$SSR_DATA_ROOT
 CKD=$D/ck
 VB=$CKD/data-map/val_build
 RUNS=$CKD/runs
-PY=/venv/ssr/bin/python
+PY=$SSR_PY
 MC_WORKERS=${MC_WORKERS:-3}          # per part; 12 parts -> 36 workers (leaves room for the dump smoke workers)
 LEAD_WORKERS=${LEAD_WORKERS:-24}
 export PYTHONPATH=$CKR OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=
@@ -52,10 +53,10 @@ a2_finish() {
   done
   cp -p $D/metric_cache/_state/build_summary_before_val_backup.json $D/metric_cache/_state/build_summary.json
   $PY - <<'EOF'
-import json, time
+import json, os, time
 from pathlib import Path
 import pandas as pd
-D = Path('/home/external-user/ssd/yongjae_refiner')
+D = Path(os.environ['SSR_DATA_ROOT'])
 v = pd.read_parquet(D / 'ck/data-map/navtrain_val_tokens.parquet')
 have = [(D / 'metric_cache' / l / 'unknown' / t / 'metric_cache.pkl').is_file() for t, l in zip(v.token, v.log)]
 fail = D / 'metric_cache/_state/failed_tokens.tsv'

@@ -28,6 +28,8 @@ from typing import Dict, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from ....common import ssr_paths as _SP
+
 logger = logging.getLogger(__name__)
 
 BEV_FEATURE_KEY = "bev_feature"
@@ -36,6 +38,29 @@ EXPECTED_TRANSFORM = "student_bev = teacher_bev[:, :, ::-1]"
 
 class TeacherCacheMismatch(RuntimeError):
     """The cache on disk does not describe the model being trained."""
+
+
+def role_store_kwargs(role: str) -> Dict:
+    """Store arguments for a teacher role from the environment compose sets from tools/release/registry.yaml.
+
+    Empty with nothing set: the store then reads ``<root>/<cache_name>``.  Role ``bevfusion``: the cache directories
+    SSR_DET_CACHE_TRAIN / _VAL (absolute, so os.path.join in the store keeps them) and the manifest sha head
+    SSR_DET_SHA_HEAD.  Role ``resmap``: the sharded root SSR_MAP_CACHE_ROOT and the meta sha SSR_MAP_SHA256.
+    """
+    kw: Dict = {}
+    if role == "bevfusion":
+        dirs = [os.environ.get("SSR_DET_CACHE_TRAIN"), os.environ.get("SSR_DET_CACHE_VAL")]
+        dirs = tuple(os.path.abspath(os.path.expanduser(d)) for d in dirs if d)
+        if dirs:
+            kw["cache_subdirs"] = dirs
+        if os.environ.get("SSR_DET_SHA_HEAD"):
+            kw["expect_sha"] = os.environ["SSR_DET_SHA_HEAD"]
+    elif role == "resmap":
+        if os.environ.get("SSR_MAP_CACHE_ROOT"):
+            kw["cache_dir"] = os.path.abspath(os.path.expanduser(os.environ["SSR_MAP_CACHE_ROOT"]))
+        if os.environ.get("SSR_MAP_SHA256"):
+            kw["expect_sha"] = os.environ["SSR_MAP_SHA256"]
+    return kw
 
 
 class TeacherFeatureStore:
@@ -53,9 +78,13 @@ class TeacherFeatureStore:
         ),
         feature_key: str = BEV_FEATURE_KEY,
         flip_w: Optional[bool] = None,
+        cache_dir: Optional[str] = None,
+        expect_sha: Optional[str] = None,
     ) -> None:
         self.root = os.path.abspath(os.path.expanduser(root))
         self.teacher = str(teacher)
+        self.cache_dir = cache_dir            # the teacher's directory itself, instead of <root>/<teacher>
+        self.expect_sha = expect_sha          # checkpoint sha the manifest / meta must record (validate_manifest)
         self.cache_subdirs = tuple(cache_subdirs)
         self.feature_key = str(feature_key)
         if flip_w is None:
@@ -71,6 +100,8 @@ class TeacherFeatureStore:
 
     # ------------------------------------------------------------------ #
     def teacher_root(self) -> str:
+        if self.cache_dir:
+            return self.cache_dir
         base = os.path.join(self.root, self.teacher)
         s1_front64 = os.path.join(base, "stage1_front64")
         wants_100 = any("100x100" in s for s in self.cache_subdirs) and not (
@@ -191,6 +222,10 @@ class TeacherFeatureStore:
                     f"{self.teacher}: index.json exists but meta.json missing under {self.teacher_root()}"
                 )
             where = f"{self.teacher} (sharded)"
+            if self.expect_sha and str(meta.get("checkpoint_sha256", "")) != self.expect_sha:
+                raise TeacherCacheMismatch(
+                    f"{where}: checkpoint_sha256 {meta.get('checkpoint_sha256')!r} != {self.expect_sha!r}"
+                )
             bev_info = meta.get("tensors", {}).get("bev", {})
             bev_shape = bev_info.get("shape", [])
             channels = int(bev_shape[0]) if len(bev_shape) == 3 else int(config.embed_dims)
@@ -224,6 +259,10 @@ class TeacherFeatureStore:
 
         for subdir, manifest in manifests.items():
             where = f"{self.teacher}/{subdir}"
+            if self.expect_sha and str(manifest.get("checkpoint_sha256_head", "")) != self.expect_sha:
+                raise TeacherCacheMismatch(
+                    f"{where}: checkpoint_sha256_head {manifest.get('checkpoint_sha256_head')!r} != {self.expect_sha!r}"
+                )
             got_hw = tuple(int(v) for v in manifest.get("target_bev_shape", ()))
             if got_hw not in want_hws:
                 raise TeacherCacheMismatch(
@@ -446,18 +485,25 @@ class DistillTeacherTargetBuilder(_ATB):
             super().__init__()
         except TypeError:  # pragma: no cover
             pass
-        root = str(getattr(config, "distill_feature_root", "") or "/workspace/teacher_cache")
+        root = str(getattr(config, "distill_feature_root", "") or _SP.SSR_TEACHER_CACHE)
         self._root = os.path.abspath(os.path.expanduser(root))
+        # branch names are role names; the cache behind a role comes from distill_branches and role_store_kwargs
+        branches = getattr(config, "distill_branches", None) or {}
+        det, map_ = branches.get("bevfusion") or {}, branches.get("resmap") or {}
+        self._names = (str(det.get("cache_name", "bevfusion")), str(map_.get("cache_name", "resmap")))
+        self._flips = (bool(det.get("flip_w", True)), bool(map_.get("flip_w", False)))
         self._c = int(getattr(config, "embed_dims", 256))
         self._bev_h = int(getattr(config, "bev_h", 100))
         self._bev_w = int(getattr(config, "bev_w", 100))
         cs = tuple(int(v) for v in getattr(config, "distill_cache_size", (self._bev_h, self._bev_w)))
         if (self._bev_h, self._bev_w) == (100, 100) and cs == (50, 100):
-            if os.path.isdir(os.path.join(self._root, "bevfusion", "cache_train_100x100")):
+            det_kw = role_store_kwargs("bevfusion").get("cache_subdirs")
+            if os.path.isdir(det_kw[0] if det_kw else os.path.join(self._root, self._names[0], "cache_train_100x100")):
                 cs = (100, 100)
         self._cache_size = cs
+        self._off = tuple(str(b) for b in (getattr(config, "distill_off_banks", ()) or ()))
         self._pid: Optional[int] = None
-        self._stores: Optional[Tuple[TeacherFeatureStore, TeacherFeatureStore]] = None
+        self._stores: Optional[Tuple[Optional[TeacherFeatureStore], Optional[TeacherFeatureStore]]] = None
 
     def __getstate__(self):
         d = self.__dict__.copy()
@@ -467,13 +513,15 @@ class DistillTeacherTargetBuilder(_ATB):
     def get_unique_name(self) -> str:
         return f"para_ssr_distill_teachers_{self._cache_size[0]}x{self._cache_size[1]}"
 
-    def _open(self) -> Tuple[TeacherFeatureStore, TeacherFeatureStore]:
+    def _open(self) -> Tuple[Optional[TeacherFeatureStore], Optional[TeacherFeatureStore]]:
         if self._stores is None or self._pid != os.getpid():
             h, w = self._cache_size
             subdirs = (f"cache_train_{h}x{w}", f"cache_val_{h}x{w}")
-            self._stores = (
-                TeacherFeatureStore(self._root, "bevfusion", cache_subdirs=subdirs, flip_w=True),
-                TeacherFeatureStore(self._root, "resmap", cache_subdirs=subdirs, flip_w=False),
+            # a switched-off bank (distill_off_banks) reads nothing: zeros + kd_ok False below
+            self._stores = tuple(
+                None if bank in self._off else TeacherFeatureStore(
+                    self._root, name, flip_w=flip, **{"cache_subdirs": subdirs, **role_store_kwargs(role)})
+                for bank, role, name, flip in zip(("det", "map"), ("bevfusion", "resmap"), self._names, self._flips)
             )
             self._pid = os.getpid()
         return self._stores
@@ -484,7 +532,7 @@ class DistillTeacherTargetBuilder(_ATB):
         h, w = self._cache_size
         out: Dict[str, torch.Tensor] = {}
         for i, store in enumerate(stores):
-            arr = store.load_one_token(token)
+            arr = None if store is None else store.load_one_token(token)
             if arr is not None:
                 out[f"kd_bev_{i}"] = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float16))
                 out[f"kd_ok_{i}"] = torch.tensor(True, dtype=torch.bool)

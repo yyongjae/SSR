@@ -20,7 +20,7 @@ def filter_scenes(data_path: Path, scene_filter: SceneFilter) -> Dict[str, List[
     stop_loading: bool = False
 
     # filter logs
-    log_files = list(data_path.iterdir())
+    log_files = sorted(data_path.iterdir())     # iterdir order is the filesystem's: scene order must not depend on it
     if scene_filter.log_names is not None:
         log_files = [
             log_file

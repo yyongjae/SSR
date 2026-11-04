@@ -147,6 +147,9 @@ class ParaSSRModel(nn.Module):
             getattr(cfg, "norm_requires_grad", False)
         )
         self._backbone_norm_eval = bool(getattr(cfg, "norm_eval", False))
+        self._backbone_bn_mode = str(getattr(cfg, "backbone_bn_mode", "moving"))
+        if self._backbone_bn_mode not in ("moving", "frozen"):
+            raise ValueError(f"backbone_bn_mode must be moving | frozen, got {self._backbone_bn_mode!r}")
 
         self.image_encoder = timm.create_model(
             cfg.image_architecture,
@@ -446,7 +449,10 @@ class ParaSSRModel(nn.Module):
         return n
 
     def train(self, mode: bool = True):
+        # this def is the effective train() (it shadows the one above, which the backbone policy lives in)
         super().train(mode)
+        if getattr(self, "_backbone_bn_mode", "moving") == "frozen":
+            self._apply_backbone_train_policy()
         prefixes = self._trainable_prefixes()
         if mode and prefixes:
             # frozen parts stay in eval mode: BatchNorm statistics and dropout must not drift either

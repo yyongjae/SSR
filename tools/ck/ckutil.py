@@ -31,6 +31,13 @@ def _allowed_gpus():
     return ALLOWED_GPUS
 
 
+def _gpu_allowed(i: str) -> bool:
+    """SSR_GPU_POLICY=any (scripts/experiment.sh): any GPU index; otherwise the pool of _allowed_gpus."""
+    if os.environ.get("SSR_GPU_POLICY") == "any":
+        return i.isdigit()
+    return i in _allowed_gpus()
+
+
 def pin() -> None:
     if sys.path[0] != CK_REPO:
         sys.path.insert(0, CK_REPO)
@@ -55,9 +62,8 @@ def gpu_guard(device: str) -> None:
         return
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     ids = [x.strip() for x in vis.split(",") if x.strip()]
-    allowed = _allowed_gpus()
-    if len(ids) != 1 or ids[0] not in allowed:
-        raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK jobs run on exactly one GPU of {allowed}")
+    if len(ids) != 1 or not _gpu_allowed(ids[0]):
+        raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK jobs run on exactly one GPU of {_allowed_gpus()}")
 
 
 def gpu_guard_ddp(device: str, world_size: int, max_gpus: int = 0) -> None:
@@ -71,9 +77,9 @@ def gpu_guard_ddp(device: str, world_size: int, max_gpus: int = 0) -> None:
         max_gpus = int(os.environ.get("CK_TEACHER_MAX_GPUS", "2"))
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     ids = [x.strip() for x in vis.split(",") if x.strip()]
-    allowed = _allowed_gpus()
-    if not (1 <= len(ids) <= max_gpus) or len(set(ids)) != len(ids) or any(i not in allowed for i in ids):
-        raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK2 jobs run on 1..{max_gpus} distinct GPUs of {allowed}")
+    if not (1 <= len(ids) <= max_gpus) or len(set(ids)) != len(ids) or not all(_gpu_allowed(i) for i in ids):
+        raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r}: CK2 jobs run on 1..{max_gpus} distinct GPUs of "
+                         f"{_allowed_gpus()}")
     if len(ids) != int(world_size):
         raise SystemExit(f"CUDA_VISIBLE_DEVICES={vis!r} has {len(ids)} GPU(s) but WORLD_SIZE={world_size}: "
                          "launch one process per visible GPU (torchrun --nproc_per_node=<#GPUs>)")

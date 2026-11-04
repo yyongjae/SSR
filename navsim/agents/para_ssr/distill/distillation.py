@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ....common import ssr_paths as _SP
 from .adapter import PlanningBEVAdapter, bev_map_to_tokens, bev_tokens_to_map
 from .kd_losses import (
     attention_imitation,
@@ -39,7 +40,7 @@ from .masks import (
     tokens_from_mask,
 )
 from .selector import BEVRegisterSelector
-from .teacher_store import TeacherFeatureStore
+from .teacher_store import TeacherFeatureStore, role_store_kwargs
 
 # Stage-1 checkpoints are Lightning files whose keys carry an ``agent.`` prefix.
 # Accept the plain module too so an exported adapter-only state dict works.
@@ -159,6 +160,8 @@ class PlanningDistillation(nn.Module):
         anchor_proj: bool = True,
         anchor_mode: str = "cross_attn",
         anchor_file: Optional[str] = None,
+        off_banks: Sequence[str] = (),
+        norm_files: Optional[Mapping[str, str]] = None,
         probe_warmup_steps: int = 1000,
         probe_ramp_steps: int = 2000,
         probe_loss_weight: float = 1.0,
@@ -251,6 +254,8 @@ class PlanningDistillation(nn.Module):
         # fusion_v1: the spatial bias is built from the planner's own anchor file
         # (config.plan_anchor_file) instead of the hard-coded byounggun path.
         self.anchor_file = None if anchor_file is None else str(anchor_file)
+        self.off_banks = tuple(off_banks)    # bank names ("bevfusion", "resmap") of distill_off_banks
+        self.norm_files = dict(norm_files or {})    # distill_norm_files
 
         self.adapters = nn.ModuleDict()
         self.stores: Dict[str, TeacherFeatureStore] = {}
@@ -311,13 +316,15 @@ class PlanningDistillation(nn.Module):
             cache_name = cfg.pop("cache_name", name)
             store_kwargs = {k: cfg.pop(k) for k in ("cache_subdirs", "feature_key",
                                                     "flip_w") if k in cfg}
+            store_kwargs.update(role_store_kwargs(name))
             if "cache_subdirs" not in store_kwargs:
                 grid_subdirs = (f"cache_train_{self.cache_size[0]}x{self.cache_size[1]}",
                                 f"cache_val_{self.cache_size[0]}x{self.cache_size[1]}")
                 if os.path.isdir(os.path.join(feature_root, cache_name, grid_subdirs[0])):
                     store_kwargs["cache_subdirs"] = grid_subdirs
-            self.stores[name] = TeacherFeatureStore(
-                feature_root, cache_name, **store_kwargs)
+            if name not in self.off_banks:   # a switched-off bank's cache need not exist (targets source only)
+                self.stores[name] = TeacherFeatureStore(
+                    feature_root, cache_name, **store_kwargs)
             self.loss_weights[name] = float(cfg.pop("loss_weight", 1.0))
             if cfg:
                 raise TypeError(f"unused distillation options for {name}: {cfg}")
@@ -398,9 +405,11 @@ class PlanningDistillation(nn.Module):
                 probe_loss_weight=self.probe_loss_weight,
                 probe_use_ema=self.probe_use_ema,
                 probe_ema_decay=self.probe_ema_decay,
+                norm_files=self.norm_files,
                 **({} if self.anchor_file is None
                    else {"trajectory_anchors_file": self.anchor_file}),
             )
+            self.anchor_distill.off_banks = self.off_banks
 
     # ------------------------------------------------------------------ #
     def validate_manifests(self, config) -> None:
@@ -904,7 +913,7 @@ def build_planning_distillation(config):
     branches = {
         name: dict(spec) for name, spec in config.distill_branches.items()
     }
-    feature_root = str(getattr(config, "distill_feature_root", "") or "/workspace/teacher_cache")
+    feature_root = str(getattr(config, "distill_feature_root", "") or _SP.SSR_TEACHER_CACHE)
     student_bev_size = (int(config.bev_h), int(config.bev_w))
     cache_size = tuple(int(v) for v in config.distill_cache_size)
     if student_bev_size == (100, 100) and cache_size == (50, 100):
@@ -1007,6 +1016,9 @@ def build_planning_distillation(config):
         probe_loss_weight=float(getattr(config, "distill_probe_loss_weight", 0.5)),
         probe_use_ema=bool(getattr(config, "distill_probe_use_ema", True)),
         probe_ema_decay=float(getattr(config, "distill_probe_ema_decay", 0.99)),
+        off_banks=tuple({"det": "bevfusion", "map": "resmap"}[str(b)]
+                        for b in (getattr(config, "distill_off_banks", ()) or ())),
+        norm_files=dict(getattr(config, "distill_norm_files", None) or {}),
     )
     module.validate_manifests(config)
     return module

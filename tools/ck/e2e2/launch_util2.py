@@ -32,7 +32,11 @@ KD-calibration guard (teacher_check(kd_calib=...) -> kd_calib_record, both modes
 ck_e2e2.kd_calib.enabled every configured file (kd_calib.det / .map) must exist and match its teacher (navsim
 ck/kd_calib.check_calib: arm, run, which, the ckpt sha16 of teacher_check, ep_target, every KD key of that teacher
 fitted); a missing file is refused with the fit_kd_calib.py command to run after the teacher has finished.  Recorded
-(file sha16, a / b per key, held-out NLL / ECE) in teachers.json ('kd_calib').
+(file sha16, a / b per key, held-out NLL / ECE) in teachers.json ('kd_calib').  File mode is for archived runs and
+function-level tests: the 'overrides' command refuses it unless SSR_ALLOW_FILE_CALIB=1.
+Refiner off: '++agent.config.ck_e2e2.enabled=false' in the extra file (or a set line).  Extra lines that set ck_e2e2 keys
+are merged BEFORE the checks, so the teacher and warm-up checks are skipped then, ck_e2e2_effective.json says what the
+run really uses, and arm_of gives 'noref'.
 """
 from __future__ import annotations
 
@@ -55,7 +59,7 @@ LaunchError = LU.LaunchError
 PY = LU.PY
 CK2_YAML = HERE / "ck_e2e2.yaml"
 BEVKD_SET = HERE / "bevkd_arm.set"
-CK_DATA = "/home/external-user/ssd/yongjae_refiner/ck"
+CK_DATA = LU.CK_DATA
 E2E_ROOT = f"{CK_DATA}/ck2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/ck2/e2e_smoke"
 IO_SUB = "ck_e2e2"
@@ -103,7 +107,15 @@ def check_paths(ck: Dict[str, Any]) -> None:
             LU.no_equals(v, f"ck_e2e2.{k}")
 
 
+def _false(v: Any) -> bool:
+    return str(v).strip().lower() in ("false", "0", "no", "off")
+
+
 def arm_of(ck: Dict[str, Any]) -> str:
+    if _false(ck.get("enabled", True)):
+        return "noref"                      # no refiner at all
+    if _false(ck.get("use_teachers", True)):
+        return "nokd"                       # no refiner teachers, no refiner KD
     return "bevkd" if bool((ck.get("bev_kd") or {}).get("enabled")) else "main"
 
 
@@ -126,8 +138,8 @@ def teacher_check(det_run: str, map_run: str, which: str = "last", mode: str = "
                   deep: bool = True, ep_target: Optional[str] = None, kd_calib: Optional[Dict[str, Any]] = None,
                   kd_keys: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Refuse a teacher run that is not a finished CK2 run of the right arm (SPEC s7-3 guards):
-    config.json arm T / M, trainer 'train_ck2', ckpt_<which>.pt present, lon head last layer zero (deep), config.json
-    ep_target == ep_target (the student's ck_e2e2.ep_target; None = the CKE2E2Config default; a run without the key
+    config.json arm T / M, trainer 'train_ck2', split navtrain_train, init_from none, ckpt_<which>.pt present, lon head
+    last layer zero (deep), config.json ep_target == ep_target (the student's ck_e2e2.ep_target; None = the CKE2E2Config default; a run without the key
     is 'official'), and in mode 'strict' done.json present (training finished).  -> record of both runs (ckpt sha16,
     done.json, mtimes, ep_target).  kd_calib (the student's ck_e2e2.kd_calib dict; None = not checked): when enabled,
     every configured calibration file must exist and match its teacher (kd_calib_record; KD keys kd_keys, None = the
@@ -153,6 +165,11 @@ def teacher_check(det_run: str, map_run: str, which: str = "last", mode: str = "
             raise LaunchError(f"teacher {name} {rd}: arm {cfg.get('arm')!r} != {arm!r}")
         if cfg.get("trainer") != "train_ck2":
             raise LaunchError(f"teacher {name} {rd}: trainer {cfg.get('trainer')!r} != 'train_ck2'")
+        if cfg.get("split") != "navtrain_train":
+            raise LaunchError(f"teacher {name} {rd}: trained on split {cfg.get('split')!r} != 'navtrain_train'")
+        if cfg.get("init_from") != "none":
+            raise LaunchError(f"teacher {name} {rd}: init_from {cfg.get('init_from')!r} != 'none' (must train from "
+                              f"scratch)")
         try:
             t_ep = run_ep_target(cfg)
         except ValueError as e:
@@ -169,7 +186,8 @@ def teacher_check(det_run: str, map_run: str, which: str = "last", mode: str = "
             raise LaunchError(f"teacher {name} {rd}: {ck.name} missing")
         rec: Dict[str, Any] = {"run": str(rd), "arm": arm, "ckpt": str(ck), "ckpt_mtime": kst(ck.stat().st_mtime),
                                "ckpt_bytes": ck.stat().st_size, "done": json.loads(done.read_text())
-                               if done.is_file() else None, "epochs": cfg.get("epochs"), "ep_target": t_ep}
+                               if done.is_file() else None, "epochs": cfg.get("epochs"), "ep_target": t_ep,
+                               "split": cfg.get("split"), "init_from": cfg.get("init_from")}
         h = hashlib.sha256()
         with open(ck, "rb") as f:
             for blk in iter(lambda: f.read(1 << 24), b""):
@@ -273,8 +291,13 @@ def kd_calib_check(c, teachers: Dict[str, Any]) -> Dict[str, Any]:
 # ----------------------------------------------------------------------------------------------- overrides
 def parse_gpus2(s: str, ngpu: Optional[int] = None) -> List[str]:
     """2 or 4 GPUs of 0-3 (or exactly ngpu when given).  CK_ALLOW_GPU45=1 (user 2026-10-13: the fusion_v1 run on
-    GPUs 2,3,4,5; fusion_v10 on GPUs 4,5,6,7) also admits GPUs 4,5 as a pair and 6,7 as 4,5,6,7."""
-    if os.environ.get("CK_ALLOW_GPU45") == "1" or os.environ.get("CK_ALLOW_GPU4567") == "1":
+    GPUs 2,3,4,5; fusion_v10 on GPUs 4,5,6,7) also admits GPUs 4,5 as a pair and 6,7 as 4,5,6,7.
+    SSR_GPU_POLICY=any (scripts/experiment.sh): any distinct indices; gpu_check2 still requires each one idle."""
+    if os.environ.get("SSR_GPU_POLICY") == "any":
+        g = [x.strip() for x in str(s).split(",") if x.strip()]
+        if not g or not all(x.isdigit() for x in g) or len(set(g)) != len(g):
+            raise LaunchError(f"GPU list {s!r}: distinct GPU indices (SSR_GPU_POLICY=any)")
+    elif os.environ.get("CK_ALLOW_GPU45") == "1" or os.environ.get("CK_ALLOW_GPU4567") == "1":
         g = [x.strip() for x in str(s).split(",") if x.strip()]
         pool = tuple(LU.ALLOWED_GPUS) + EXTRA_GPUS
         bad = [x for x in g if x not in pool]
@@ -336,6 +359,7 @@ def recipe2(run: str, run_dir: str, ngpu: int, workers: int, max_epochs: int, wa
     """launch_util.recipe (v2 r34 source) with the CK2 counters for ngpu GPUs (counters2) / names (SPEC s7-2)."""
     c = counters2(ngpu)
     rep = {
+        "agent.config.max_epochs": f"agent.config.max_epochs={max_epochs}",     # cosine schedule, record_until_epoch
         "+trainer.params.devices": f"+trainer.params.devices={ngpu}",
         "trainer.params.strategy": "trainer.params.strategy=ddp",
         "trainer.params.accumulate_grad_batches": f"trainer.params.accumulate_grad_batches={c['accumulate']}",
@@ -361,6 +385,39 @@ def recipe2(run: str, run_dir: str, ngpu: int, workers: int, max_epochs: int, wa
     return out
 
 
+CK_OVERRIDE = "agent.config.ck_e2e2."
+
+
+def extra_ck_sets(extra: Sequence[str]) -> List[str]:
+    """the ck_e2e2 lines of an extra file as set lines ('++agent.config.ck_e2e2.enabled=false' -> 'enabled=false')."""
+    return [LU._okey(o)[len(CK_OVERRIDE):] + "=" + o.split("=", 1)[1] for o in extra
+            if not o.startswith("~") and "=" in o and LU._okey(o).startswith(CK_OVERRIDE)]
+
+
+def effective_ck(run_dir: str, ngpu: int, ck_sets: Sequence[str] = (), extra: Sequence[str] = (),
+                 ck_yaml=CK2_YAML) -> Dict[str, Any]:
+    """The ck_e2e2 dict of a run: yaml, counters for ngpu, then set lines, then the extra's ck_e2e2 lines.  No check."""
+    ck = scale_mb_counters(load_ck2_yaml(ck_yaml), ngpu)
+    ck["io_dir"] = f"{run_dir}/{IO_SUB}"
+    return LU.apply_sets(ck, list(ck_sets) + extra_ck_sets(extra))
+
+
+def merge_overrides(run_dir: str, ngpu: int, ck: Dict[str, Any], workers: int = 6, max_epochs: int = 30,
+                    extra: Sequence[str] = (), resume_ckpt: Optional[str] = None, wandb: str = "online") -> List[str]:
+    """The ordered Hydra overrides of a run: recipe, ck_e2e2 leaves, output_dir, then extra lines merged by key.  No
+    disk access, no GPU, no torch (tools/release/compose.py predicts the launcher's output with it)."""
+    base = recipe2(Path(run_dir).name, run_dir, ngpu, workers, max_epochs, wandb, arm_of(ck))
+    base += [f"++agent.config.ck_e2e2.{k}={LU.hydra_value(v)}" for k, v in LU.flatten(ck)]
+    base.append(f"output_dir={run_dir}/train/")
+    if resume_ckpt:
+        base.append(f"++resume_checkpoint={LU.no_equals(resume_ckpt, 'resume checkpoint')}")
+    merged: Dict[str, str] = {}
+    for o in base + list(extra):
+        k = LU._okey(o)
+        merged[("~" + k) if o.startswith("~") else k] = o
+    return list(merged.values())
+
+
 def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_epochs: int = 30,
                      ck_sets: Sequence[str] = (), extra: Sequence[str] = (), resume_ckpt: Optional[str] = None,
                      wandb: str = "online", ck_yaml=CK2_YAML, teacher_mode: str = "strict",
@@ -371,34 +428,29 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
     if not os.path.isabs(run_dir):
         raise LaunchError(f"run dir must be absolute: {run_dir}")
     gpus = parse_gpus2(",".join(gpus))
-    run = Path(run_dir).name
-    ck = scale_mb_counters(load_ck2_yaml(ck_yaml), len(gpus))
-    ck["io_dir"] = f"{run_dir}/{IO_SUB}"
-    ck = LU.apply_sets(ck, ck_sets)
+    ck = effective_ck(run_dir, len(gpus), ck_sets, extra, ck_yaml)
     check_paths(ck)
     c = ck2_from_any(ck)
     if not c.enabled:
-        raise LaunchError("ck_e2e2.enabled is false")
-    if teacher_mode == "strict" and not c.teacher_require_done:
-        raise LaunchError("ck_e2e2.teacher_require_done=false is only for smoke runs (E2E_SMOKE=1)")
-    if max_epochs <= c.onpolicy_from_epoch and teacher_mode == "strict":
-        raise LaunchError(f"max_epochs {max_epochs} <= onpolicy_from_epoch {c.onpolicy_from_epoch}")
-    teachers = teacher_check(c.teacher_det_run, c.teacher_map_run, c.teacher_which, teacher_mode, teacher_deep,
-                             ep_target=c.ep_target, kd_calib=c.kd_calib, kd_keys=c.kd_score_keys)
-    bk = bevkd_norms(c)
-    if bk:
-        teachers["bev_kd"] = bk
-    teachers["warmup_sources"] = warmup_check(c)
-    base = recipe2(run, run_dir, len(gpus), workers, max_epochs, wandb, arm_of(ck))
-    base += [f"++agent.config.ck_e2e2.{k}={LU.hydra_value(v)}" for k, v in LU.flatten(ck)]
-    base.append(f"output_dir={run_dir}/train/")
-    if resume_ckpt:
-        base.append(f"++resume_checkpoint={LU.no_equals(resume_ckpt, 'resume checkpoint')}")
-    merged: Dict[str, str] = {}
-    for o in base + list(extra):
-        k = LU._okey(o)
-        merged[("~" + k) if o.startswith("~") else k] = o
-    return list(merged.values()), ck, teachers
+        # refiner off: nothing below reads the refiner's teachers or warm-up labels
+        teachers = {"mode": "none", "enabled": False, "use_teachers": False, "checked": kst(),
+                    "kd_calib": {"enabled": False}}
+    else:
+        if teacher_mode == "strict" and not c.teacher_require_done and c.use_teachers:
+            raise LaunchError("ck_e2e2.teacher_require_done=false is only for smoke runs (E2E_SMOKE=1)")
+        if max_epochs <= c.onpolicy_from_epoch and teacher_mode == "strict":
+            raise LaunchError(f"max_epochs {max_epochs} <= onpolicy_from_epoch {c.onpolicy_from_epoch}")
+        if c.use_teachers:
+            teachers = teacher_check(c.teacher_det_run, c.teacher_map_run, c.teacher_which, teacher_mode, teacher_deep,
+                                     ep_target=c.ep_target, kd_calib=c.kd_calib, kd_keys=c.kd_score_keys)
+            bk = bevkd_norms(c)
+            if bk:
+                teachers["bev_kd"] = bk
+        else:   # CKE2E2Config.validate already refused any teacher / KD setting
+            teachers = {"mode": "none", "use_teachers": False, "checked": kst(), "ep_target": c.ep_target,
+                        "kd_calib": {"enabled": False}}
+        teachers["warmup_sources"] = warmup_check(c)
+    return merge_overrides(run_dir, len(gpus), ck, workers, max_epochs, extra, resume_ckpt, wandb), ck, teachers
 
 
 # ----------------------------------------------------------------------------------------------- labeler health
@@ -752,9 +804,14 @@ def main(argv=None) -> int:
             sets = list(a.ck_set)
             for f in a.ck_set_file:
                 sets += LU.read_lines(f)
+            extra = LU.read_lines(a.extra_file)
             ov, ck, teachers = build_overrides2(a.run_dir, parse_gpus2(a.gpus), a.workers, a.max_epochs, sets,
-                                                LU.read_lines(a.extra_file), a.resume_ckpt or None, a.wandb,
+                                                extra, a.resume_ckpt or None, a.wandb,
                                                 teacher_mode=a.teacher_check, teacher_deep=not a.no_deep)
+            if ck["kd_calib"].get("mode") == "file" and os.environ.get("SSR_ALLOW_FILE_CALIB") != "1":
+                raise LaunchError("ck_e2e2.kd_calib.mode=file reads a calibration fitted on another planner's "
+                                  "candidates: use mode online (or kd_calib.enabled=false), or set "
+                                  "SSR_ALLOW_FILE_CALIB=1 to reproduce an archived run")
             outp = Path(a.out)
             outp.parent.mkdir(parents=True, exist_ok=True)
             for o_ in ov:
@@ -766,6 +823,7 @@ def main(argv=None) -> int:
             eff["_trainer_max_epochs"] = int(m[-1].split("=", 1)[1]) if m else a.max_epochs
             eff["_arm"] = arm_of(ck)
             eff["_ck_sets"] = sets
+            eff["_extra_ck_sets"] = extra_ck_sets(extra)
             LU._write_json(outp.parent / "ck_e2e2_effective.json", eff)
             LU._write_json(outp.parent / "teachers.json", teachers)
         elif a.cmd == "teacher-check":

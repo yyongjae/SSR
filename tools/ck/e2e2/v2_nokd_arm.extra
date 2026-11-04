@@ -1,0 +1,20 @@
+# v2_nokd arm: v2_v15_v7_main WITHOUT any teacher -- baseline v2-seg + refiner v2 (ck_e2e2, no
+# teacher, tools/ck/e2e2/v2_nokd.set) on the front 0-64 m, 100 x 100 BEV.  = tools/ck/e2e2/v2_v15_v7_arm.extra with the
+# BEV selector v15 removed (use_distill false: no probes, no teacher BEV; the distill_* keys of that file only configure
+# the selector and are dropped).  Grid, seg head, undistortion, and through the launcher r34, anchors, plan heads,
+# global batch 128 (4 per GPU x ngpu x accumulate), GradBalancer counters per GPU count, no in-training val, the
+# ck_e2e2 defaults: the same as v2_v15_v7_main.  Launched through scripts/training/train_v2_nokd.sh (CK_BEV64=1).
+wandb.project=v2_v15_v7
+wandb.group=v2_nokd
+# ---- grid: front 0..64 m x +-32 m, 100 x 100 cells of 0.64 m, camera pillars z [-1, 3]
+++agent.config.pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]
+++agent.config.map_pc_range=[-32.0,0.0,-1.0,32.0,64.0,3.0]
+++agent.config.bev_h=100
+++agent.config.bev_w=100
+# ---- map head: v2-seg drivable-area segmentation head (scripts/training/train_v2_r34_seg.sh)
+++agent.config.map_head_type=seg
+++agent.config.bev_seg_weight=3.0
+# ---- lens undistortion (ParaSSRConfig default; explicit for the record)
+++agent.config.undistort=true
+# ---- no BEV KD (v15 selector off)
+++agent.config.use_distill=false

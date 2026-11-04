@@ -38,19 +38,20 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
-ROOT = Path("/home/external-user/yongjae/SSR")
+ROOT = Path(__file__).resolve().parents[2]      # repo root of this worktree
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 
 from navsim.agents.para_ssr.refiner import sdf as SDF  # noqa: E402
+from navsim.common import ssr_paths as _SP  # noqa: E402
 
-DATA = Path("/home/external-user/ssd/yongjae_refiner")
+DATA = Path(_SP.SSR_DATA_ROOT)
 DEFAULT_MC_ROOTS = {
     "navtrain": [DATA / "metric_cache",
-                 ROOT / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache"],
-    "navtest": [ROOT / "data/exp/metric_cache"],
+                 Path(_SP.SSR_RESEARCH_TREE) / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache"],
+    "navtest": [Path(_SP.SSR_NAVTEST_MC)],
 }
 MAX_WORKERS = 4
 

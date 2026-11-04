@@ -10,16 +10,17 @@
 #   - E2E_CK_SET = tools/ck/e2e2/v2_v15_v7.set (refiner teachers + KD calibration);
 #   - GPUs 4-7 (CK_ALLOW_GPU4567=1) only when listed in --gpus (user 2026-11-02: student on 0-7); the launcher keeps the
 #     global batch 128 (4 per GPU x ngpu x accumulate) and rescales its per-rank counters;
-#   - outputs under /home/external-user/ssd/yongjae_refiner/v7/e2e/<RUN> (never under /workspace/byounggun).
+#   - outputs under $E2E_ROOT/<RUN>, default $SSR_RUN_ROOT (never under another user's tree, train_e2e2.sh refuses).
 #
 #   RUN=v2_v15_v7_main CK2_E2E_APPROVED=1 bash scripts/training/train_v2_v15_v7.sh start --gpus 0,1,2,3,4,5,6,7
 #   RUN=v2_v15_v7_main bash scripts/training/train_v2_v15_v7.sh status | stop | wait
 #   RUN=v2_v15_v7_main E2E_DRY_RUN=1 CK2_E2E_APPROVED=1 bash scripts/training/train_v2_v15_v7.sh start --gpus 0,1,2,3
-#   smoke: RUN=<name> E2E_SMOKE=1 E2E_ROOT=/home/external-user/ssd/yongjae_refiner/ck/ck2/e2e_smoke ... (launcher rules)
+#   smoke: RUN=<name> E2E_SMOKE=1 E2E_ROOT=$SSR_DATA_ROOT/ck/ck2/e2e_smoke ... (launcher rules)
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-export CK_BEV64=1
-export E2E_ROOT=${E2E_ROOT:-/home/external-user/ssd/yongjae_refiner/v7/e2e}
+source "$REPO/tools/release/load_paths.sh"   # SSR_PY, SSR_DATA_ROOT, SSR_RUN_ROOT, ... (navsim/common/ssr_paths.py)
+export CK_BEV64=1 SSR_ALLOW_DIRECT=1
+export E2E_ROOT=${E2E_ROOT:-$SSR_RUN_ROOT}
 export E2E_CK_SET=${E2E_CK_SET:-$REPO/tools/ck/e2e2/v2_v15_v7.set}
 SRC_EXTRA=${E2E_EXTRA:-$REPO/tools/ck/e2e2/v2_v15_v7_arm.extra}
 

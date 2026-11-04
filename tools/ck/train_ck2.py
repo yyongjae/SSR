@@ -167,6 +167,9 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--prior-rows", type=int, default=4000)
     ap.add_argument("--train-eval-rows", type=int, default=8192)
     ap.add_argument("--val-raw", type=int, default=1, help="also evaluate the val raw anchors + variants")
+    ap.add_argument("--r34-evals", type=int, default=1, choices=(0, 1),
+                    help="evaluate on the r34 top-16 'cand' sets too (monitoring only; 0 = no r34 file is needed, the "
+                         "raw evals stay; needs --best-metric none or a raw set)")
     ap.add_argument("--eval-n-var", type=int, default=32)
     ap.add_argument("--eval-every", type=int, default=1, help="epochs between evaluations (last epoch always)")
     ap.add_argument("--best-metric", default=None, help="'split:metric:max|min' or 'none' (default by arm)")
@@ -211,7 +214,9 @@ def resolve_args(a):
         raise SystemExit("arm M: no ReSMap cache for the val split (--val-split none)")
     if a.workers > 16:
         raise SystemExit("--workers <= 16 per rank")
-    parse_best(a.best_metric)
+    best = parse_best(a.best_metric)
+    if not a.r34_evals and best is not None and not best[0].endswith(RAW_SUFFIX):
+        raise SystemExit(f"--r34-evals 0: --best-metric {a.best_metric} reads an r34 set (use 'none' or a raw set)")
     return a
 
 
@@ -337,9 +342,11 @@ def build_datasets(a) -> Dict:
     ck2 = dict(var_name=a.var_name, seed=a.seed, sampler_seed=a.sampler_seed, ep_target=ep)
     train = CK2Dataset(a.split, bev=a.arm, n_var=a.n_var, gt=True, limit=a.limit_tokens or 0, **ck2)
     evals = []
+    r34 = bool(getattr(a, "r34_evals", 1))
     if a.val_split and a.val_split != "none":
-        evals.append((a.val_split, "r34", CKDataset(a.val_split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
-                                                    limit=a.val_limit or 0, ep_target=ep)))
+        if r34:
+            evals.append((a.val_split, "r34", CKDataset(a.val_split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
+                                                        limit=a.val_limit or 0, ep_target=ep)))
         if a.val_raw:
             evals.append((a.val_split + RAW_SUFFIX, "raw",
                           CK2Dataset(a.val_split, bev=a.arm, n_var=a.eval_n_var, gt=False, epoch=0,
@@ -351,8 +358,9 @@ def build_datasets(a) -> Dict:
             n_eval = a.train_eval_rows if not a.val_limit else min(a.train_eval_rows, a.val_limit)
             rows = pool[U.log_stratified_rows(tdf["log"].values[pool], n_eval, seed=0)]
             name = TRAIN_EVAL_NAME.format(a.split)
-            evals.append((name, "r34", CKDataset(a.split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
-                                                 rows=rows, ep_target=ep)))
+            if r34:
+                evals.append((name, "r34", CKDataset(a.split, bev=a.arm, k=C().K_CAND, labels="cand", gt=False,
+                                                     rows=rows, ep_target=ep)))
             evals.append((name + RAW_SUFFIX, "raw", CK2Dataset(a.split, bev=a.arm, n_var=a.eval_n_var, gt=False,
                                                                epoch=0, rows=rows, **ck2)))
     return {"train": train, "evals": evals}

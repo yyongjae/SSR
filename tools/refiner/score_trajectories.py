@@ -63,9 +63,9 @@ Per-trajectory output (score_token -> list of K dicts)
   the §3.3 keys are unchanged.
 
 CLI (resumable, <= 4 workers; one metric-cache load per token)
-  python tools/refiner/score_trajectories.py --drafts /home/external-user/ssd/yongjae_refiner/drafts/dev \
-      --tokens /home/external-user/ssd/yongjae_refiner/splits/dev.parquet \
-      --out /home/external-user/ssd/yongjae_refiner/scores/dev.parquet --workers 4
+  python tools/refiner/score_trajectories.py --drafts $SSR_DATA_ROOT/drafts/dev \
+      --tokens $SSR_DATA_ROOT/splits/dev.parquet \
+      --out $SSR_DATA_ROOT/scores/dev.parquet --workers 4
   --drafts : a directory of <token>.npz, a glob of *.npz (token = file stem), or one packed .npz with arrays
              tokens [N] and <key> [N, K, 8, 3].  Array key --key (default 'drafts'); a per-draft 1-D array 'family'
              [K] in a per-token npz is copied to the output.
@@ -96,22 +96,25 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-os.environ.setdefault("NUPLAN_MAPS_ROOT", "/home/external-user/yongjae/SSR/data/dataset/maps")
-os.environ.setdefault("NUPLAN_MAP_VERSION", "nuplan-maps-v1.0")
-
-ROOT = Path("/home/external-user/yongjae/SSR")
-PDM_ATTR = ROOT / "report/perception_reliability/pdm_attr"
+ROOT = Path(__file__).resolve().parents[2]      # repo root of this worktree: scorer sources, yaml, navsim
+PDM_ATTR = Path(__file__).resolve().parent      # rescore_attr.py
 for _p in (str(ROOT), str(PDM_ATTR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-DATA = Path("/home/external-user/ssd/yongjae_refiner")
+from navsim.common import ssr_paths as _SP  # noqa: E402
+
+os.environ.setdefault("NUPLAN_MAPS_ROOT", _SP.NUPLAN_MAPS_ROOT)
+os.environ.setdefault("NUPLAN_MAP_VERSION", "nuplan-maps-v1.0")
+
+RESEARCH = Path(_SP.SSR_RESEARCH_TREE)          # research checks only (archived eval config, older caches)
+DATA = Path(_SP.SSR_DATA_ROOT)
 SCORING_YAML = ROOT / "navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml"
-ARCHIVED_EVAL_CFG = ROOT / "work_dirs/eval/para_ssr_interaction_final/code/hydra/config.yaml"
+ARCHIVED_EVAL_CFG = RESEARCH / "work_dirs/eval/para_ssr_interaction_final/code/hydra/config.yaml"
 MC_ROOTS = (
     DATA / "metric_cache",
-    ROOT / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache",
-    ROOT / "data/exp/metric_cache",
+    RESEARCH / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache",
+    Path(_SP.SSR_NAVTEST_MC),
 )
 SOURCES = (
     Path(__file__).resolve(),

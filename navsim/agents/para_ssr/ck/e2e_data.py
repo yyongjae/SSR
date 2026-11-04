@@ -31,6 +31,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
+from ....common import ssr_paths as _SP
 from .constants import CK_LABEL_IDX, LABEL_COLS
 
 PathLike = Union[str, Path]
@@ -43,15 +44,16 @@ N_LAB = len(LABEL_COLS)             # 9
 CK_IDX = list(CK_LABEL_IDX)
 BEV_SHAPE = (256, 50, 100)
 
+REF_DATA_ROOT = _SP.SSR_DATA_ROOT
+_CK = f"{REF_DATA_ROOT}/ck"
 PHASE1_DEFAULT = {
-    "packed": "/home/external-user/ssd/yongjae_refiner/ck/packed/navtrain_train",
-    "labels_cand": "/home/external-user/ssd/yongjae_refiner/ck/labels/navtrain_train/cand",
-    "labels_kd_corr": "/home/external-user/ssd/yongjae_refiner/ck/labels/navtrain_train/kd_corr",
-    "kd_targets": "/home/external-user/ssd/yongjae_refiner/ck/kd_targets/phase1",
+    "packed": f"{_CK}/packed/navtrain_train",
+    "labels_cand": f"{_CK}/labels/navtrain_train/cand",
+    "labels_kd_corr": f"{_CK}/labels/navtrain_train/kd_corr",
+    "kd_targets": f"{_CK}/kd_targets/phase1",
 }
-TEACHER_DET_RUN = "/home/external-user/ssd/yongjae_refiner/ck/train/ckT_p1"
-TEACHER_MAP_RUN = "/home/external-user/ssd/yongjae_refiner/ck/train/ckM_p1"
-REF_DATA_ROOT = "/home/external-user/ssd/yongjae_refiner"
+TEACHER_DET_RUN = f"{_CK}/train/ckT_p1"
+TEACHER_MAP_RUN = f"{_CK}/train/ckM_p1"
 
 SRC_PHASE1, SRC_PREV, SRC_OLDER = 0, 1, 2      # G_src codes
 

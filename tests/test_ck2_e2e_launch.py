@@ -26,7 +26,7 @@ from tools.ck.e2e2 import launch_util2 as L2  # noqa: E402
 D = Path("/home/external-user/ssd/yongjae_refiner/ck")
 SMOKE_T = D / "ck2/smoke/smoke_ck2T_ddp2"
 SMOKE_M = D / "ck2/smoke/smoke_ck2M_ddp2"
-REAL_T, REAL_M = D / "ck2/train/ck2T10", D / "ck2/train/ck2M10"              # ck_e2e2.yaml defaults (official EP)
+REAL_T, REAL_M = D / "ck2/train/ck2T10", D / "ck2/train/ck2M10"
 SH = REPO / "tools/ck/e2e2/train_e2e2.sh"
 pytestmark = pytest.mark.skipif(not ((SMOKE_T / "done.json").is_file() and (SMOKE_M / "done.json").is_file()),
                                 reason="CK2 smoke teachers absent")
@@ -348,11 +348,10 @@ def test_train_e2e2_dry_run(tmp_path):
     assert _sh(dict(base, CK2_E2E_APPROVED="1"), "start").returncode == 3
     assert _sh(dict(base, CK2_E2E_APPROVED="1"), "start", "--gpus", "0").returncode == 3
     assert _sh(dict(base, CK2_E2E_APPROVED="1"), "start", "--gpus", "1,4").returncode == 3
-    if not ((REAL_T / "done.json").is_file() and (REAL_M / "done.json").is_file()):
-        nb = {k: v for k, v in base.items() if k != "E2E_CK_SET"}
-        r = _sh(dict(nb, CK2_E2E_APPROVED="1", E2E_NO_DEEP_TEACHER_CHECK="1", RUN="dry_real"), "start", "--gpus", "0,1")
-        # yaml-default teachers (ck2T10 / ck2M10) not finished (or not started yet): refused
-        assert r.returncode == 3 and ("done.json" in r.stderr or "no config.json" in r.stderr), r.stderr[-1000:]
+    # no set file: the yaml names no teacher run, so nothing silently falls back to an old teacher
+    nb = {k: v for k, v in base.items() if k != "E2E_CK_SET"}
+    r = _sh(dict(nb, CK2_E2E_APPROVED="1", E2E_NO_DEEP_TEACHER_CHECK="1", RUN="dry_real"), "start", "--gpus", "0,1")
+    assert r.returncode == 3 and "teacher_det_run is required" in r.stderr, r.stderr[-1000:]
     # E2E_SMOKE only below the smoke prefix
     assert _sh(dict(base, E2E_SMOKE="1"), "start", "--gpus", "0,1").returncode == 3
     # 4 GPUs (fusion_v1): the fusion arm overrides on top of the 4-GPU counters

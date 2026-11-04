@@ -1,0 +1,14 @@
+# ck_e2e2 sets of the refiner without any teacher (E2E_CK_SET): same settings as v2_v15_v7_main, no KD.
+# No refiner teacher is loaded or run, this target builder reads no teacher BEV (kd_bev_i absent), and every KD knob is
+# off; CKE2E2Config.validate refuses use_teachers=false with any of these left on.  The refiner keeps its own losses:
+# label BCE on the official labels (warm-up label files, then labeler2 on-policy labels) and the surrogate correction
+# loss, with the v2_v15_v7_main values (lambda_score 1.0, lambda_sur 1.0, candidates, variants, schedule).
+use_teachers=false
+teacher_det_run=null
+teacher_map_run=null
+lambda_kd_score=0.0
+lat_kd.balance=fixed
+lat_kd.fixed=0.0
+kd_calib.enabled=false
+kd_calib.det=null
+kd_calib.map=null

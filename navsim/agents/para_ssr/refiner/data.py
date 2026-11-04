@@ -84,28 +84,33 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Un
 import numpy as np
 import pandas as pd
 
+from ....common import ssr_paths as _SP
 from .adapters import BEV64, BEV_H, BEV_W, IN_CH_T, compute_norm, teacher_to_s_grid
 
 # ----------------------------------------------------------------------------------------------- constants
-DATA_ROOT = Path("/home/external-user/ssd/yongjae_refiner")
-REPO = Path("/home/external-user/yongjae/SSR")
+DATA_ROOT = Path(_SP.SSR_DATA_ROOT)
+_TC = Path(_SP.SSR_TEACHER_CACHE)
 TEACHER_ROOTS = {
-    "navtrain": Path("/home/external-user/datasets/teacher_cache/bevfusion/cache_train_50x100"),
-    "navtest": Path("/home/external-user/datasets/teacher_cache/bevfusion/cache_val_50x100"),
+    "navtrain": _TC / "bevfusion/cache_train_50x100",
+    "navtest": _TC / "bevfusion/cache_val_50x100",
 }
 TEACHER_SHA_HEAD = "cddf943ffec8d6a8"
 if BEV64:   # 64 m BEVFusion teacher (runs/navsim-fusion-64m/epoch_20.pth), cache built 2026-10-27
     TEACHER_ROOTS = {
-        "navtrain": Path("/home/external-user/datasets/teacher_cache/bevfusion/cache_train_100x100"),
-        "navtest": Path("/home/external-user/datasets/teacher_cache/bevfusion/cache_val_100x100"),
+        "navtrain": _TC / "bevfusion/cache_train_100x100",
+        "navtest": _TC / "bevfusion/cache_val_100x100",
     }
     TEACHER_SHA_HEAD = "71ea94f672c89521"
+# the DET teacher chosen in tools/release/registry.yaml (compose sets these; unset = the caches above)
+TEACHER_ROOTS = {"navtrain": Path(os.environ.get("SSR_DET_CACHE_TRAIN") or TEACHER_ROOTS["navtrain"]),
+                 "navtest": Path(os.environ.get("SSR_DET_CACHE_VAL") or TEACHER_ROOTS["navtest"])}
+TEACHER_SHA_HEAD = os.environ.get("SSR_DET_SHA_HEAD") or TEACHER_SHA_HEAD
 TEACHER_LAYOUT = "samples/<token[:2]>/<token>.npz"
 SPLIT_SUBSET = {"train": "navtrain", "dev": "navtrain", "navtest": "navtest"}
 MC_ROOTS = (
     DATA_ROOT / "metric_cache",
-    REPO / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache",
-    REPO / "data/exp/metric_cache",
+    Path(_SP.SSR_RESEARCH_TREE) / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache",
+    Path(_SP.SSR_NAVTEST_MC),
 )
 K_DRAFTS = 13
 A_MAX = 800              # >= 781 (train max) / 592 (dev max) tracks, full objects build 2026-09-28

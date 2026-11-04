@@ -143,7 +143,7 @@ def test_builder_and_warmup_cands_follow_config(tmp_path):
     raw = np.array(np.load(RL / "labels.npy", mmap_mode="r")[rows], np.float32)
     out = {}
     for ep in EP_TARGETS:
-        b = D2.CK2E2ETargetBuilder(SimpleNamespace(ck_e2e2={"ep_target": ep}))
+        b = D2.CK2E2ETargetBuilder(SimpleNamespace(ck_e2e2={"teacher_det_run": str(TL.SMOKE_T), "ep_target": ep}))
         assert b.ep_target == ep and b.src.ep_target == ep
         t = [b.warmup_row(r) for r in rows]
         t = {k: torch.stack([x[k] for x in t]) for k in t[0]}

@@ -12,6 +12,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
+from ....common import ssr_paths as _SP
+
 
 @dataclass
 class ParaSSRConfig:
@@ -96,6 +98,11 @@ class ParaSSRConfig:
     # Original mmdet config: norm_cfg=dict(type="BN", requires_grad=False).
     norm_requires_grad: bool = False
     norm_eval: bool = True
+    # What the effective ParaSSRModel.train() does to the backbone at every train() call.
+    #   "moving": BatchNorm running statistics update during training (every BN, frozen stages included; weights stay
+    #             frozen as above).  frozen_stages / norm_eval then only act at construction.
+    #   "frozen": frozen_stages and norm_eval hold during training too (statistics fixed at their pretrained values).
+    backbone_bn_mode: str = "moving"
 
     encoder_num_layers: int = 3
     encoder_num_points_in_pillar: int = 4
@@ -414,7 +421,7 @@ class ParaSSRConfig:
     # bias along the 256 anchors; attention KL + feature hybrid loss.  Training only.
     distill_v7: bool = False
     distill_v7_weight: float = 1.0         # teammate's distill_loss_weight
-    distill_v7_root: str = "/home/external-user/datasets/teacher_cache"
+    distill_v7_root: str = _SP.SSR_TEACHER_CACHE
     distill_v7_resmap_flip: bool = False   # teammate flips ReSMap L/R; measured wrong (distill/teacher_store.py)
     distill_v7_heads: int = 4
     distill_spatial_sigma: float = 4.0
@@ -520,7 +527,7 @@ class ParaSSRConfig:
     ref_lr_mult: float = 3.0             # refiner lr = lr * 3 (stage-T 3e-4 peak)
     ref_weight_decay: float = 0.01
     ref_clip: float = 1.0                # refiner-only grad-norm clip (before the global 35)
-    ref_data_root: str = "/home/external-user/ssd/yongjae_refiner"
+    ref_data_root: str = _SP.SSR_DATA_ROOT
     kd_teacher_runs: Tuple[str, ...] = ()
     kd_lambda: float = 0.0               # lambda_KD constant (from the pilot rule)
     kd_space: str = ""                   # KD control space raw | tanh | decoded; E2 training refuses "" (user choice)
@@ -607,6 +614,14 @@ class ParaSSRConfig:
     #             transpose only), loaded by the ck_e2e2 dataloader workers for the CK2 teachers
     #             anyway (no extra I/O); tokens with kd_ok False are left out of the term.
     distill_teacher_source: str = "store"
+    # BEV KD banks switched off, subset of ("det", "map") (anchor path v9+ on the "targets" source).  The bank's probe
+    # and student_proj stay in the module, frozen; its share of the KD gradient is removed, not redistributed.
+    distill_off_banks: Tuple[str, ...] = ()
+    # v15 z-score statistics per bank: {bevfusion: path, resmap: path} (absolute or repo-relative).  A named file that
+    # is missing is refused at build; a bank not named here uses the candidate search of distill/anchor_distill.py.
+    distill_norm_files: Dict[str, str] = field(default_factory=dict)
+    # Abort when, over the first 2000 tokens, fewer than this fraction have the active teachers' BEV (rank 0; 0 = off).
+    distill_strict_ok: float = 0.999
     # Legacy v1-v5 knobs (inert on the anchor path; kept because the
     # aux_distill agent yamls set them).
     use_corridor_mask: bool = True

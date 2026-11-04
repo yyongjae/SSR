@@ -49,17 +49,20 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-ROOT = Path("/home/external-user/yongjae/SSR")
+ROOT = Path(__file__).resolve().parents[2]      # repo root of this worktree
 sys.path.insert(0, str(ROOT))
-TRAIN_LOGS = ROOT / "data/dataset/navsim_logs/trainval"
-TEST_LOGS = Path("/home/external-user/navsim/download/test_navsim_logs/test")
-DATA = Path("/home/external-user/ssd/yongjae_refiner")
+from navsim.common import ssr_paths as _SP  # noqa: E402
+
+RESEARCH = Path(_SP.SSR_RESEARCH_TREE)          # verification only (report tables, E's caches)
+TRAIN_LOGS = Path(_SP.OPENSCENE_DATA_ROOT) / "navsim_logs/trainval"
+TEST_LOGS = Path(_SP.SSR_TEST_DATA_ROOT) / "navsim_logs/test/test"
+DATA = Path(_SP.SSR_DATA_ROOT)
 SPLITS = DATA / "splits"
 OUT = DATA / "human"
 MC = DATA / "metric_cache"
-E_MC = ROOT / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache"
-NAVTEST_HUMAN = ROOT / "report/head_ablation_scenes/table.npz"
-REPORT = ROOT / "report/refiner_T"
+E_MC = RESEARCH / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache"
+NAVTEST_HUMAN = RESEARCH / "report/head_ablation_scenes/table.npz"
+REPORT = RESEARCH / "report/refiner_T"
 MAXF = 16          # future frames kept for the path (8 s)
 NTRAJ = 8          # trajectory poses (4 s)
 NSCENE = 10        # scene future frames (5 s)
@@ -203,7 +206,7 @@ def cmd_validate(a):
     command)."""
     import lzma
     import os
-    os.environ.setdefault("NUPLAN_MAPS_ROOT", str(ROOT / "data/dataset/maps"))  # read at navsim import time
+    os.environ.setdefault("NUPLAN_MAPS_ROOT", _SP.NUPLAN_MAPS_ROOT)  # read at navsim import time
     os.environ.setdefault("NUPLAN_MAP_VERSION", "nuplan-maps-v1.0")
     from navsim.common.dataclasses import SceneFilter, SensorConfig
     from navsim.common.dataloader import SceneLoader

@@ -42,9 +42,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path("/home/external-user/yongjae/SSR")
+ROOT = Path(__file__).resolve().parents[2]      # repo root of this worktree
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "report/planner_vs_perception_tests/safety_filter"))
+from navsim.common import ssr_paths as _SP  # noqa: E402
+
+sys.path.insert(0, str(Path(_SP.SSR_RESEARCH_TREE) / "report/planner_vs_perception_tests/safety_filter"))   # sf_common
 
 from navsim.agents.para_ssr.refiner import gt_future as G  # noqa: E402
 

@@ -71,6 +71,7 @@ from typing import Dict, Optional, Sequence, Union
 
 import numpy as np
 
+from ....common import ssr_paths as _SP
 from . import constants as C
 
 log = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ N_ANCHORS = 256
 ANCHORS_FILE = Path(C.ANCHORS)          # byte-identical copy: v2_planning_data/planning_vb/trajectory_anchors_256.npy
 ANCHORS_SHA16 = "6bdf549edc25a959"      # sha256(float32 [256, 8, 3] bytes)[:16], measured 2026-10-07
 OFFICIAL_LABELS = Path(C.CK_DATA) / "raw256" / "pdm_score_256_officialEP"
-WOTE_LABELS = Path("/workspace/yongjae/ssd/yongjae_refiner/v2_planning_data/planning_vb/pdm_score_256")
+WOTE_LABELS = Path(_SP.SSR_PLAN_DATA) / "pdm_score_256"
 
 LABEL_KEYS = tuple(C.CK_KEYS)           # nc, dac, ep, ttc, comfort: the [5, 256] axis-0 order
 EP = LABEL_KEYS.index("ep")

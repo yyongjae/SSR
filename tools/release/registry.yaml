@@ -1,0 +1,77 @@
+# What scripts/experiment.sh can select.  tools/release/compose.py reads this file; the training code then reads the
+# chosen teacher's roots, shas and norm files through what compose emits (env + overrides), so adding a teacher needs
+# no code change: a cache in the contract format (docs/EXPERIMENTS.md) and one entry here.
+# ${NAME} = a root of navsim/common/ssr_paths.py.  Relative paths are relative to the repo.
+
+backbones:
+  # name: {timm: <timm model name>, flags: {ParaSSRConfig key: value}}
+  # Non-ResNet models have no ResNet stage modules to freeze, hence frozen_stages -1 (their stage freezing differs from
+  # the ResNet arms).  convnext_tiny has four feature levels, so its last level index is 3.
+  r18: {timm: resnet18.tv_in1k}
+  r34: {timm: resnet34.tv_in1k}
+  r50: {timm: resnet50.tv_in1k}
+  r101: {timm: resnet101.tv_in1k}
+  r152: {timm: resnet152.tv_in1k}
+  r50d: {timm: resnet50d.ra2_in1k}
+  convnext_tiny: {timm: convnext_tiny.fb_in1k, flags: {frozen_stages: -1, backbone_out_indices: [3]}}
+  regnety_032: {timm: regnety_032.ra_in1k, flags: {frozen_stages: -1}}
+  efficientnet_b0: {timm: efficientnet_b0.ra_in1k, flags: {frozen_stages: -1}}
+  swin:
+    status: refused
+    reason: >-
+      needs code: timm's swin asserts a fixed input size and returns channels-last features (backbone_kwargs in
+      para_ssr_model.py, a permute in extract_img_feat)
+  vit:
+    status: refused
+    reason: >-
+      needs code: dynamic_img_size kwargs, stride 16 means 4x the cells, and para_ssr_features.py fixes the ImageNet
+      mean and std
+
+teachers:
+  # A ready teacher needs:
+  #   status: ready
+  #   layout: per_token_npz for det, sharded for map (the two reader classes of refiner/data.py, refiner/resmap_cache.py)
+  #   cache_name: the name the BEV KD stores log and validate under (distill_branches.<role>.cache_name)
+  #   det: cache_train, cache_val, sha_head (manifest checkpoint_sha256_head)
+  #   map: cache_root, sha256 (meta.json checkpoint_sha256); optional require_seg: false for a teacher with no seg head
+  #   norm_v15: per-channel z-score of the cache for the BEV KD (mean, std); a missing file is refused at agent build
+  #   refiner_run: finished refiner teacher trained on this cache; refiner_ckpt_sha16: first 16 hex of ckpt_last.pt
+  #   Quote every sha: an unquoted one made of digits would be read as a number, and compose refuses it.
+  # status: missing with needs: [...] is refused when selected, listing what is missing.
+  det:
+    bevfusion:
+      status: ready
+      layout: per_token_npz
+      cache_name: bevfusion
+      cache_train: ${SSR_TEACHER_CACHE}/bevfusion/cache_train_100x100
+      cache_val: ${SSR_TEACHER_CACHE}/bevfusion/cache_val_100x100
+      sha_head: "71ea94f672c89521"
+      norm_v15: resources/km_corridor/norm_bevfusion_100x100.npz
+      refiner_run: ${SSR_TEACHER_CACHE}/refiner/det
+      refiner_ckpt_sha16: "66c6a413dd866898"
+    bevformer:
+      status: missing
+      needs:
+        - a BEVFormer teacher trained on NAVSIM on the same front 0-64 m grid (no checkpoint on this server)
+        - a per-token BEV cache (float16, 256 channels, 100 x 100), at least the 85,109 navtrain_train tokens (436 GB)
+        - manifest.json with its axes measured
+        - norm_v15 for the BEV KD
+        - a refiner teacher run trained on that cache (tools/release/setup/run_refiner_teachers.sh recipe)
+  map:
+    resmap:
+      status: ready
+      layout: sharded
+      cache_name: resmap
+      cache_root: ${SSR_TEACHER_CACHE}/resmap/stage1_front64
+      sha256: "e67cc78d0da6afe00f0396d9940e98024826d7288117f346b9f85a7ade699858"
+      norm_v15: resources/km_corridor/norm_resmap_100x100.npz
+      refiner_run: ${SSR_TEACHER_CACHE}/refiner/map
+      refiner_ckpt_sha16: "d436b5c0d4f1f4d6"
+    mask2map:
+      status: missing
+      needs:
+        - a Mask2Map teacher trained on NAVSIM on the same front 0-64 m grid (no code or checkpoint on this server)
+        - a sharded BEV cache (float16, 256 channels, 100 x 100), at least the 85,109 navtrain_train tokens (436 GB)
+        - meta.json with its axes measured; require_seg false if it has no seg head
+        - norm_v15 for the BEV KD
+        - a refiner teacher run trained on that cache (tools/release/setup/run_refiner_teachers.sh recipe)

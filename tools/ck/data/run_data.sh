@@ -13,9 +13,10 @@
 # Worker budget (<= 48 per agent): dump 3 x DUMP_WORKERS(12) + label LABEL_WORKERS(12) = 48.
 set -u
 CKR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"   # repo root of this worktree
-CKD=/home/external-user/ssd/yongjae_refiner/ck
+REPO=$CKR source "$CKR/tools/release/load_paths.sh"
+CKD=$SSR_DATA_ROOT/ck
 RUNS=$CKD/runs
-PY=/venv/ssr/bin/python
+PY=$SSR_PY
 DUMP_WORKERS=${DUMP_WORKERS:-12}
 NSHARD=${NSHARD:-24}
 SPLITS_ORDER=${SPLITS_ORDER:-navtrain_val,navtrain_train,navtest}

@@ -74,6 +74,8 @@ from typing import Dict, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
+from ....common import ssr_paths as _SP
+
 # ----------------------------------------------------------------------------------------- constants
 E_X0 = -8.0            # x of the grid's rear edge [m]  (row 0 side)
 E_X1 = 72.0            # x of the grid's front edge [m]
@@ -99,7 +101,7 @@ EGO_HALF_LEN = 2.588
 EGO_HALF_WID = 1.1485
 EGO_RA2C = 1.461       # rear axle -> box centre along the heading [m]
 
-SDF_ROOT = Path("/home/external-user/ssd/yongjae_refiner/sdf")
+SDF_ROOT = Path(_SP.SSR_DATA_ROOT) / "sdf"
 METRIC_CACHE_MAP_RADIUS = 100.0       # metric_cache_processor._map_radius (around the t0 ego centre)
 
 

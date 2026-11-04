@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from ....common import ssr_paths as _SP
 from .constants import CK_KEYS, CK_LABEL_IDX, KD_CTRL_W, SUR_MARGINS, SUR_TERMS, SUR_WEIGHTS
 
 PHASES = ("replay", "replay_record", "onpolicy")
@@ -49,7 +50,7 @@ PHASE_CODE = {p: i for i, p in enumerate(PHASES)}
 N_ROWS = 85109                       # packed/navtrain_train rows (e2e_data.N_ROWS)
 SIM_IDX = {"nc": 0, "dac": 1, "ttc": 3}   # targets['sim_reward'] key order = CK_KEYS
 RAW_FAIL_R34 = {"nc": 0.024, "dac": 0.034, "ttc": 0.074}   # r34 navtrain_train reference (report 45 §4-3)
-_CK = "/home/external-user/ssd/yongjae_refiner/ck"
+_CK = f"{_SP.SSR_DATA_ROOT}/ck"
 
 
 # ----------------------------------------------------------------------------------------------- config

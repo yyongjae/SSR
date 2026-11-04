@@ -9,12 +9,13 @@ v7 Upgrade:
 - Sharpened Winner & Softmax Importance Weighting (tau=1.0, winner_boost=2.0)
 """
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ....common import ssr_paths as _SP
 from ..modules.transformer_blocks import LearnedPositionalEncoding
 
 
@@ -44,12 +45,14 @@ class TrajectoryAnchorDistillation(nn.Module):
         use_proj: bool = True,
         mode: str = "cross_attn",
         version: str = "v8",
-        trajectory_anchors_file: Optional[str] = "/workspace/byounggun/SSR/data/planning_vb/trajectory_anchors_256.npy",
+        trajectory_anchors_file: Optional[str] = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "../../../../resources/planning_vb/trajectory_anchors_256.npy")),
         probe_warmup_steps: int = 1000,
         probe_ramp_steps: int = 2000,
         probe_loss_weight: float = 1.0,
         probe_use_ema: bool = True,
         probe_ema_decay: float = 0.99,
+        norm_files: Optional[Mapping[str, str]] = None,
     ) -> None:
         super().__init__()
         self.channels = int(channels)
@@ -82,6 +85,7 @@ class TrajectoryAnchorDistillation(nn.Module):
         self.probe_loss_weight = float(probe_loss_weight)
         self.probe_use_ema = bool(probe_use_ema)
         self.probe_ema_decay = float(probe_ema_decay)
+        self.off_banks: Tuple[str, ...] = ()     # bank names ("bevfusion", "resmap") left out of the v9+ bank loop
 
         # 256 Anchor Query Generator: embeds [fut_ts=8 * traj_dims=3] into C
         self.anchor_mlp = nn.Sequential(
@@ -177,26 +181,38 @@ class TrajectoryAnchorDistillation(nn.Module):
             import numpy as np
             from ..ck.bev_kd_arm import TeacherRatioControllers
             repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
+            ck2_train = os.path.join(_SP.SSR_DATA_ROOT, "ck/ck2/train")
             if (self.bev_h, self.bev_w) == (100, 100) or self.pc_range[4] > 40.0:
                 cand_norms = (
                     (
                         os.path.join(repo_root, "resources/km_corridor/norm_bevfusion_100x100.npz"),
-                        "/workspace/teacher_cache/bevfusion/norm_100x100.npz",
-                        "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10/norm.npz",
+                        os.path.join(_SP.SSR_TEACHER_CACHE, "bevfusion/norm_100x100.npz"),
+                        os.path.join(ck2_train, "ck2T10/norm.npz"),
                     ),
                     (
                         os.path.join(repo_root, "resources/km_corridor/norm_resmap_100x100.npz"),
-                        "/workspace/teacher_cache/resmap/stage1_front64/norm_map.npz",
-                        "/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2M10/norm_map.npz",
+                        os.path.join(_SP.SSR_TEACHER_CACHE, "resmap/stage1_front64/norm_map.npz"),
+                        os.path.join(ck2_train, "ck2M10/norm_map.npz"),
                     ),
                 )
             else:
                 cand_norms = (
-                    ("/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10/norm.npz",),
-                    ("/home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2M10/norm_map.npz",),
+                    (os.path.join(ck2_train, "ck2T10/norm.npz"),),
+                    (os.path.join(ck2_train, "ck2M10/norm_map.npz"),),
                 )
-            for bank_idx, norm_paths in enumerate(cand_norms):
-                norm_path = next((p for p in norm_paths if os.path.isfile(p)), None)
+            # distill_norm_files names a bank's file: it must exist.  Never a silent fall back to no z-score or to the
+            # statistics of another teacher.  A bank not named keeps the candidate search.
+            norm_files = dict(norm_files or {})
+            unknown = sorted(set(norm_files) - {"bevfusion", "resmap"})
+            if unknown:
+                raise ValueError(f"distill_norm_files: unknown bank(s) {unknown}, expected bevfusion, resmap")
+            for bank_idx, (bank, norm_paths) in enumerate(zip(("bevfusion", "resmap"), cand_norms)):
+                if norm_files.get(bank):
+                    norm_path = os.path.join(repo_root, os.path.expanduser(str(norm_files[bank])))
+                    if not os.path.isfile(norm_path):
+                        raise FileNotFoundError(f"distill_norm_files.{bank}: {norm_path} not found")
+                else:
+                    norm_path = next((p for p in norm_paths if os.path.isfile(p)), None)
                 if norm_path is not None:
                     with np.load(norm_path, allow_pickle=False) as zf:
                         zm = torch.as_tensor(zf["mean"].astype(np.float32)).view(1, 1, self.channels)
@@ -1038,6 +1054,8 @@ class TrajectoryAnchorDistillation(nn.Module):
                     m_on_policy = self._compute_on_policy_corridor_mask(plan_topk_trajectory, bs, device, dtype)
 
                 for bank, name in enumerate(names):
+                    if name in self.off_banks:
+                        continue
                     probe = self.probes[bank]
                     t_bev = teacher_by_bank[bank].detach()
                     sim_reward_b = sim_reward

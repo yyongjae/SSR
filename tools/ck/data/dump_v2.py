@@ -42,10 +42,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))   # repo root of this worktree
 from tools.ck.data import common as CM  # noqa: E402  (pins navsim)
 
-DATASET = Path("/home/external-user/yongjae/SSR/data/dataset")
+from navsim.common import ssr_paths as _SP  # noqa: E402
+
 os.environ.setdefault("NUPLAN_MAP_VERSION", "nuplan-maps-v1.0")
-os.environ.setdefault("NUPLAN_MAPS_ROOT", str(DATASET / "maps"))
-os.environ.setdefault("OPENSCENE_DATA_ROOT", str(DATASET))
+os.environ.setdefault("NUPLAN_MAPS_ROOT", _SP.NUPLAN_MAPS_ROOT)
+os.environ.setdefault("OPENSCENE_DATA_ROOT", _SP.OPENSCENE_DATA_ROOT)
 os.environ.setdefault("NAVSIM_DEVKIT_ROOT", CM.CK)
 os.environ.setdefault("NAVSIM_EXP_ROOT", str(CM.CK_DATA / "_exp"))
 

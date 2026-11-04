@@ -9,7 +9,7 @@
 #   (internal) train_e2e.sh _watchdog --gpus ...   labeler watchdog, started by 'start'
 #   RUN=v2ck_d_g1 E2E_DRY_RUN=1 CK_E2E_APPROVED=1 bash tools/ck/e2e/train_e2e.sh start   # print overrides only
 #
-# Layout <E2E_ROOT>/<RUN>/ (E2E_ROOT default /home/external-user/ssd/yongjae_refiner/ck/phase2/e2e):
+# Layout <E2E_ROOT>/<RUN>/ (E2E_ROOT default $SSR_DATA_ROOT/ck/phase2/e2e):
 #   train/    navsim output_dir (lightning_logs/version_*/checkpoints/{epoch=E-step=S.ckpt,last.ckpt}, code/hydra)
 #   ck_e2e/   ck_e2e.io_dir (rec/, lab/, steps_rank0.jsonl, epochs.jsonl, TRAIN_DONE)
 #   labeler/  labeler.log, labeler.pid, labeler.pgid, labeler.exit, watchdog.pid, watchdog.log
@@ -32,9 +32,10 @@
 #   WATCHDOG_EVERY (120 s), LABELER_MAX_RESTARTS (20), LABELER_STALL_S (1200 s), E2E_NO_WATCHDOG=1.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"   # repo root of this worktree
-PY=/venv/ssr/bin/python
+source "$REPO/tools/release/load_paths.sh"   # SSR_PY, SSR_DATA_ROOT, SSR_RUN_ROOT, ... (navsim/common/ssr_paths.py)
+PY=$SSR_PY
 LU="$REPO/tools/ck/e2e/launch_util.py"
-SMOKE_PREFIX=/home/external-user/ssd/yongjae_refiner/ck/phase2/e2e_smoke/
+SMOKE_PREFIX=$SSR_DATA_ROOT/ck/phase2/e2e_smoke/
 CMD=${1:-}; shift || true
 RESUME=0; GPUS=0,1,2,3; TRAIN_ONLY=0; JSON=0; WAIT_LAB=0
 while [ $# -gt 0 ]; do
@@ -49,7 +50,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 RUN=${RUN:-v2ck_d_g1}
-E2E_ROOT=${E2E_ROOT:-/home/external-user/ssd/yongjae_refiner/ck/phase2/e2e}
+E2E_ROOT=${E2E_ROOT:-$SSR_DATA_ROOT/ck/phase2/e2e}
 R="$E2E_ROOT/$RUN"
 L="$R/launch"; LB="$R/labeler"; IO="$R/ck_e2e"
 export PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
@@ -182,8 +183,8 @@ do_start() {
   rm -f "$L/train.exit" "$L/train.pid"
   # ---- training (process-group leader = wrapper bash; DDP ranks are its descendants)
   setsid nohup env PYTHONPATH=$REPO NUPLAN_MAP_VERSION=nuplan-maps-v1.0 \
-      NUPLAN_MAPS_ROOT=/home/external-user/yongjae/SSR/data/dataset/maps \
-      OPENSCENE_DATA_ROOT=/home/external-user/yongjae/SSR/data/dataset NAVSIM_DEVKIT_ROOT=$REPO \
+      NUPLAN_MAPS_ROOT="$NUPLAN_MAPS_ROOT" \
+      OPENSCENE_DATA_ROOT="$OPENSCENE_DATA_ROOT" NAVSIM_DEVKIT_ROOT=$REPO \
       NAVSIM_EXP_ROOT="$R" NCCL_SOCKET_IFNAME=lo CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPUS" \
       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
       bash -c "$WRAP" _ "$L" train "$PY" "$REPO/navsim/planning/script/run_training.py" "${OV[@]}" < /dev/null > /dev/null 2>&1 &

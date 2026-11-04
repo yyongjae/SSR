@@ -1,12 +1,34 @@
-from typing import Tuple
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
+import fnmatch
+import hashlib
+import json
+import os
 import cv2
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from hydra.utils import instantiate
 import logging, torch
 from omegaconf import DictConfig
 from pathlib import Path
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
+import yaml
+
+import navsim
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def check_navsim_import(navsim_file: Optional[str], repo_root: Path = REPO_ROOT) -> None:
+    """The package must come from this script's repo.  The hydra config is read relative to this script, so with
+    another checkout on the path (an editable install, no PYTHONPATH) that checkout's model would train with this
+    checkout's config, without any error."""
+    if navsim_file is None or Path(repo_root).resolve() not in Path(navsim_file).resolve().parents:
+        raise RuntimeError(f"navsim is imported from {navsim_file}, not from this repo {repo_root}: set "
+                           f"PYTHONPATH={repo_root}")
+
+
+check_navsim_import(navsim.__file__)     # before any other navsim module is imported
 
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
@@ -35,6 +57,60 @@ def _worker_init(worker_id: int) -> None:
 
 CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
+NAVTEST_FILTER = REPO_ROOT / "navsim/planning/script/config/common/scene_filter/navtest.yaml"
+# test sets of the challenge: never training data
+TEST_SCENE_FILTERS = ("navtest", "navhard*", "private*", "warmup_test*")
+
+
+def check_launch_route(env: Mapping[str, str]) -> None:
+    """A plain call of this script gets the config defaults, which are not the recipe of any experiment (another
+    backbone, BEV grid, map head, no KD, ...).  Runs come through scripts/experiment.sh (SSR_EXPERIMENT_SHA) or a script
+    that states it knows (SSR_ALLOW_DIRECT=1)."""
+    if not env.get("SSR_EXPERIMENT_SHA") and env.get("SSR_ALLOW_DIRECT") != "1":
+        raise RuntimeError("run_training.py was started without a recipe: use scripts/experiment.sh train, or set "
+                           "SSR_ALLOW_DIRECT=1 if the overrides are complete")
+
+
+def check_log_splits(train_logs: Iterable[str], val_logs: Iterable[str], test_logs: Iterable[str]) -> None:
+    train, val, test = set(train_logs), set(val_logs), set(test_logs)
+    for name, shared in (("train / val", train & val), ("train / test", train & test), ("val / test", val & test)):
+        if shared:
+            raise RuntimeError(f"log split: {len(shared)} logs are in both {name}, e.g. {sorted(shared)[:3]}")
+
+
+def check_scene_filter_name(name: Optional[str]) -> None:
+    if name is not None and any(fnmatch.fnmatch(str(name), p) for p in TEST_SCENE_FILTERS):
+        raise RuntimeError(f"scene_filter={name} is a test set: refused for training")
+
+
+def navtest_tokens(path: Path = NAVTEST_FILTER) -> Set[str]:
+    with open(path) as f:
+        return {str(t) for t in yaml.load(f, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))["tokens"]}
+
+
+def check_and_record_train_tokens(tokens: Sequence[str], output_dir: Optional[str], is_rank_zero: bool = True,
+                                  test_tokens: Optional[Set[str]] = None) -> Dict[str, object]:
+    """No final training token may be a navtest token (this holds with the refiner off too, unlike the refiner's packed
+    row check).  Rank 0 writes the token list's sha256 and count to <output_dir>/train_tokens.json, which makes two runs'
+    training sets comparable."""
+    tokens = [str(t) for t in tokens]
+    shared = set(tokens) & (navtest_tokens() if test_tokens is None else test_tokens)
+    if shared:
+        raise RuntimeError(f"{len(shared)} training tokens are navtest tokens, e.g. {sorted(shared)[:3]}")
+    rec = {"train_token_sha256": hashlib.sha256("\n".join(sorted(tokens)).encode()).hexdigest(), "count": len(tokens)}
+    if is_rank_zero and output_dir:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        tmp = out / "train_tokens.json.tmp"
+        tmp.write_text(json.dumps(rec) + "\n")
+        os.replace(tmp, out / "train_tokens.json")
+    return rec
+
+
+def dataset_tokens(data) -> Sequence[str]:
+    """tokens of a Dataset (through its scene loader) or a CacheOnlyDataset."""
+    return data._scene_loader.tokens if hasattr(data, "_scene_loader") else data.tokens
+
 
 def build_datasets(cfg: DictConfig, agent: AbstractAgent) -> Tuple[Dataset, Dataset]:
     train_scene_filter: SceneFilter = instantiate(cfg.scene_filter)
@@ -98,8 +174,12 @@ def build_datasets(cfg: DictConfig, agent: AbstractAgent) -> Tuple[Dataset, Data
 
 @hydra.main(version_base="1.2", config_path=CONFIG_PATH, config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
-    logger.info("Global Seed set to 0")
-    pl.seed_everything(0, workers=True)
+    check_launch_route(os.environ)
+    check_log_splits(cfg.train_logs, cfg.val_logs, cfg.test_logs)
+    check_scene_filter_name(HydraConfig.get().runtime.choices.get("scene_filter"))
+    seed = int(cfg.get("seed", 0))
+    logger.info("Global Seed set to %d", seed)
+    pl.seed_everything(seed, workers=True)
 
     logger.info(f"Path where all results are stored: {cfg.output_dir}")
 
@@ -135,6 +215,8 @@ def main(cfg: DictConfig) -> None:
         # aux_distill BEV distillation: keep only training tokens every teacher
         # cache has (ReSMap covers navtrain train_logs only).  No-op when it is off.
         agent.filter_datasets_to_teacher_cache(train_data, val_data)
+    check_and_record_train_tokens(dataset_tokens(train_data), cfg.output_dir,
+                                  is_rank_zero=int(os.environ.get("LOCAL_RANK", "0")) == 0)
 
     logger.info("Building Datasets")
     if len(train_data) == 0:

@@ -50,6 +50,12 @@ Student CK loss (added after the v2 grad balancer, outside it; ParaSSRAgent.comp
   No longitudinal head: trunk.lon_head is zeroed + frozen and every decode passes z_lon = 0 explicitly (student and
   teachers); trunk.gate_head is frozen.  No tau'_KD, no rescore KD, no control KD on c_lon.
   KD is off for a token without a DET or MAP BEV (combine_teacher kd_ok = det ok & map ok).
+No-teacher mode (use_teachers false): no refiner teacher is loaded or run and the
+  target builder reads no teacher BEV; validate() requires teacher_det_run / teacher_map_run null, lambda_kd_score 0,
+  lat_kd balance 'fixed' with fixed 0, kd_calib / bev_kd off, score_prior not 'teacher'.  A v15 BEV KD alongside gets
+  its teacher BEVs from distill.teacher_store.DistillTeacherTargetBuilder.  L_CK2 = loss_weight * [lambda_score * BCE + lambda_sur * L_sur]: the
+  value and every gradient of the teacher run with lambda_kd_score 0 and lateral-KD weight 0 (the KD terms are not
+  computed; tests/test_ck2_e2e_nokd.py checks the equality).
 BEV-KD arm (bev_kd.enabled; ck/bev_kd_arm.py): + adapter_weight * sum_t L_t(GradScale(bev_embed, lam_t / adapter_weight))
   over bev_kd.teachers (arm: [det, map], user 2026-10-08 ~20:40 KST), one RatioController per teacher (lam_t * |dL_t/dBEV|
   ~ ratio x |g_plan|, measured per teacher on the v2 'gnorm/plan' micro-batches, all-reduced); returned inside the CK
@@ -75,6 +81,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from ....common import ssr_paths as _SP
 from .constants import CK_KEYS, SUR_MARGINS, SUR_TERMS, SUR_WEIGHTS
 from .online import N_ROWS, _sanitize_traj, bev_sgrid, label_supply_warning, student_topk
 
@@ -89,14 +96,13 @@ from .e2e_data2 import (EP_TARGET_DEFAULT, G_K, GROUP_VAR, K16, N_NEAR_MID, NV, 
                         TEACHER_DET_RUN, TEACHER_MAP_RUN, VAR_SAMPLING, VNAMES, CandRecorder2, draw_cols, sample_cols,
                         type_balanced_cols, uniform_cols)
 from .ep_target import EP_TARGETS  # noqa: E402
-from .kd_calib import calib_path  # noqa: E402
 
 PHASES2 = ("warmup", "warmup_record", "onpolicy")
 PHASE2_CODE = {p: i for i, p in enumerate(PHASES2)}
 SUR_GROUP_MAX = {"near": 0, "near_mid": 1, "all": 2}
 SUR_GROUP_N = {"near": 8, "near_mid": 16, "all": 32}
 SCORE_PRIORS = ("ck2_warmup", "teacher", "none")
-_CK = "/home/external-user/ssd/yongjae_refiner/ck"
+_CK = f"{_SP.SSR_DATA_ROOT}/ck"
 
 
 # ----------------------------------------------------------------------------------------------- config
@@ -120,11 +126,11 @@ def _d_onpolicy_label() -> Dict[str, Any]:
 
 
 def _d_kd_calib() -> Dict[str, Any]:
-    # user 2026-10-08 ~22:35 KST: Platt calibration of the teacher logits for KD (files of tools/ck/e2e2/fit_kd_calib.py;
-    # null = that teacher uncalibrated).  mode 'online' (user 2026-11-02, option B): fitted inside the run on the run's
-    # own labelled candidates (kd_calib.OnlineKDCalib; det / map must be null), the remaining keys are its options.
-    return {"enabled": True, "det": str(calib_path(TEACHER_DET_RUN, "last")),
-            "map": str(calib_path(TEACHER_MAP_RUN, "last")), "mode": "file", "refits_per_epoch": 10,
+    # Platt calibration of the teacher logits for KD.  mode 'online' (default): fitted inside the run on the run's own
+    # labelled candidates (kd_calib.OnlineKDCalib; det / map must be null), the remaining keys are its options.
+    # mode 'file': files of tools/ck/e2e2/fit_kd_calib.py (null = that teacher uncalibrated), which were fitted on
+    # another planner's candidates; the launcher CLI refuses it, archived configs still load.
+    return {"enabled": True, "det": None, "map": None, "mode": "online", "refits_per_epoch": 10,
             "ema_epochs": 1.0, "bins": 4096, "zmax": 20.0, "min_n": 2000.0, "reset_onpolicy": True}
 
 
@@ -150,6 +156,9 @@ KD_CALIB_TEACHERS = ("det", "map")
 _INFER_SELECT_KEYS = ("beta", "set", "lat_mode")
 _INFER_SELECT_OPT = ("rule",)          # rule: "wote" (default, select2.select96) | "pdms" (select2.select96_pdms)
 INFER_SELECT_RULES = ("wote", "pdms")
+KD_SOURCES = ("det", "map")
+TOKENS_CHECK = 2000                    # tokens after which the input fractions of _check_inputs are checked
+MAX_LABEL_FALLBACK = 0.01              # largest on-policy fraction per epoch without a labelled generation
 
 
 def _b(v) -> bool:
@@ -178,14 +187,15 @@ class CKE2E2Config:
     variants: Dict[str, Any] = field(default_factory=_d_variants)
     n_var_step: int = 32
     var_sampling: str = "type_balanced"
-    teacher_det_run: str = TEACHER_DET_RUN           # ck2T10 (user 2026-10-09: official-EP teachers)
-    teacher_map_run: str = TEACHER_MAP_RUN           # ck2M10
+    teacher_det_run: str = TEACHER_DET_RUN           # "" = not set: validate requires it unless use_teachers false
+    teacher_map_run: str = TEACHER_MAP_RUN
     teacher_which: str = "last"
     teacher_require_done: bool = True
     teacher_ep_check: bool = True                    # TeacherPair2 refuses teachers whose config.json ep_target !=
     #                                                  ep_target (false only for tests / CPU dry runs whose smoke
     #                                                  teachers predate --ep-target, i.e. 'official')
     teacher_amp: bool = True
+    use_teachers: bool = True                        # false = no refiner teacher, no refiner KD (v2_nokd.set)
     amp: bool = False
     bev_grad_scale: float = 1.0
     seed: int = 0
@@ -196,6 +206,10 @@ class CKE2E2Config:
     lambda_score: float = 1.0
     lambda_kd_score: float = 0.5
     kd_score_keys: List[str] = field(default_factory=lambda: ["nc", "dac", "ep", "ttc"])  # user 10-08: no comfort KD
+    # teachers the KD targets come from (score + lateral).  Both: the combine rule below; one: every KD key and the
+    # lateral target from that teacher alone, kd_score_keys limited to its own keys.  The other teacher is still loaded
+    # and run (its outputs are unused), its BEV cache is still read.
+    kd_sources: List[str] = field(default_factory=lambda: list(KD_SOURCES))
     kd_calib: Dict[str, Any] = field(default_factory=_d_kd_calib)                       # user 10-08 ~22:35 KST
     lambda_sur: float = 1.0
     lat_kd: Dict[str, Any] = field(default_factory=_d_lat_kd)
@@ -252,6 +266,9 @@ class CKE2E2Config:
                 bad = sorted(set(v) - set(base))
                 if bad:
                     raise ValueError(f"ck_e2e2.{k}: unknown key(s) {bad}")
+                if k == "kd_calib" and "mode" not in v and any(_opt_str(v.get(t)) is not None
+                                                               for t in KD_CALIB_TEACHERS):
+                    base["mode"] = "file"      # archived config from before the online mode: a path means file mode
                 base.update(v)
                 kw[k] = base
             elif k == "infer_select":
@@ -272,8 +289,8 @@ class CKE2E2Config:
         return c
 
     def _coerce(self) -> None:
-        for k in ("enabled", "teacher_require_done", "teacher_ep_check", "teacher_amp", "amp", "infer_outputs",
-                  "submit_selection"):
+        for k in ("enabled", "teacher_require_done", "teacher_ep_check", "teacher_amp", "use_teachers", "amp",
+                  "infer_outputs", "submit_selection"):
             setattr(self, k, _b(getattr(self, k)))
         for k in ("topk", "n_var_step", "seed", "score_prior_rows", "record_from_epoch", "onpolicy_from_epoch",
                   "label_lag", "label_refresh_every_mb", "rec_chunk_tokens", "grad_share_every", "log_every"):
@@ -288,6 +305,10 @@ class CKE2E2Config:
         if not ks or len(set(ks)) != len(ks) or any(k not in CK_KEYS for k in ks):
             raise ValueError(f"ck_e2e2.kd_score_keys must be a non-empty subset of {list(CK_KEYS)}, got {ks}")
         self.kd_score_keys = [k for k in CK_KEYS if k in ks]                  # canonical CK_KEYS order
+        ss = _str_list(self.kd_sources)
+        if not ss or len(set(ss)) != len(ss) or any(t not in KD_SOURCES for t in ss):
+            raise ValueError(f"ck_e2e2.kd_sources must be a non-empty subset of {list(KD_SOURCES)}, got {ss}")
+        self.kd_sources = [t for t in KD_SOURCES if t in ss]
         v = dict(self.variants)
         self.variants = {"speeds": [float(a) for a in _str_list(v["speeds"])] if isinstance(v["speeds"], str)
                          else [float(a) for a in v["speeds"]],
@@ -436,9 +457,7 @@ class CKE2E2Config:
         kc = self.kd_calib
         if kc["mode"] not in KD_CALIB_MODES:
             raise ValueError(f"ck_e2e2.kd_calib.mode must be one of {KD_CALIB_MODES}, got {kc['mode']!r}")
-        if kc["mode"] == "online":
-            if not kc["enabled"]:
-                raise ValueError("ck_e2e2.kd_calib.mode online needs kd_calib.enabled true")
+        if kc["mode"] == "online" and kc["enabled"]:
             if any(kc[t] is not None for t in KD_CALIB_TEACHERS):
                 raise ValueError("ck_e2e2.kd_calib.mode online fits the calibration inside the run: kd_calib.det and "
                                  f"kd_calib.map must be null, got {kc['det']!r} / {kc['map']!r}")
@@ -446,16 +465,43 @@ class CKE2E2Config:
                     and kc["min_n"] >= 2):
                 raise ValueError("ck_e2e2.kd_calib online options need refits_per_epoch >= 1, ema_epochs > 0, "
                                  f"bins >= 16, zmax > 0, min_n >= 2; got {kc}")
-        elif kc["enabled"]:
+        elif kc["enabled"]:                   # file mode
             if all(kc[t] is None for t in KD_CALIB_TEACHERS):
                 raise ValueError("ck_e2e2.kd_calib.enabled needs a calibration file for det and / or map")
             for t in KD_CALIB_TEACHERS:
                 if kc[t] is not None and (not os.path.isabs(kc[t]) or "=" in kc[t]):
                     raise ValueError(f"ck_e2e2.kd_calib.{t} must be an absolute path without '=' or null, got "
                                      f"{kc[t]!r}")
+        if len(self.kd_sources) == 1:
+            from .kd_calib import fit_keys
+            own = fit_keys({"det": "T", "map": "M"}[self.kd_sources[0]])
+            bad_keys = [k for k in self.kd_score_keys if k not in own]
+            if bad_keys:
+                raise ValueError(f"ck_e2e2.kd_sources {self.kd_sources}: kd_score_keys {bad_keys} are not keys of that "
+                                 f"teacher ({own})")
+        if not self.use_teachers:
+            # no-teacher mode: every KD knob must say 'off' so the record cannot be read as a KD run
+            bad = []
+            if self.teacher_det_run or self.teacher_map_run:
+                bad.append(f"teacher_det_run / teacher_map_run must be null (got {self.teacher_det_run!r} / "
+                           f"{self.teacher_map_run!r})")
+            if self.lambda_kd_score != 0.0:
+                bad.append(f"lambda_kd_score must be 0 (got {self.lambda_kd_score})")
+            if lk["balance"] != "fixed" or lk["fixed"] != 0.0:
+                bad.append(f"lat_kd must be balance 'fixed' with fixed 0 (got {lk['balance']!r} / {lk['fixed']})")
+            if kc["enabled"]:
+                bad.append("kd_calib.enabled must be false")
+            if bk["enabled"]:
+                bad.append("bev_kd.enabled must be false")
+            if self.score_prior == "teacher":
+                bad.append("score_prior 'teacher' reads the DET teacher run")
+            if bad:
+                raise ValueError("ck_e2e2.use_teachers false: " + "; ".join(bad))
         # teachers: both runs required (the lateral KD target is the mean of the DET and MAP offsets)
         for key, want in (("teacher_det_run", "T"), ("teacher_map_run", "M")):
             run = getattr(self, key)
+            if not run and not self.use_teachers:
+                continue
             if not run:
                 raise ValueError(f"ck_e2e2.{key} is required (lateral KD target = mean of DET and MAP)")
             cj = Path(run) / "config.json"
@@ -548,17 +594,23 @@ class TeacherPair2:
     calib (ck_e2e2.kd_calib when enabled; None = no calibration, the old path): {'det': file | None, 'map': file |
     None} of tools/ck/e2e2/fit_kd_calib.py; each file must match its loaded teacher (kd_calib.check_calib: arm, run,
     which, ckpt sha16, ep_target, and every KD key of kd_keys this teacher is a source of fitted) or construction
-    fails.  run() then uses z' = a_k z + b_k (per key) as the teacher's score logits."""
+    fails.  run() then uses z' = a_k z + b_k (per key) as the teacher's score logits.
+    sources (ck_e2e2.kd_sources): the teachers the KD targets come from; one teacher = all its keys + its own lateral
+    offset and its own ok, the other teacher's outputs are then only logged."""
 
     def __init__(self, det_run: str, map_run: str, which: str = "last", device="cpu", amp: bool = True,
                  require_done: bool = True, ep_target: Optional[str] = None,
-                 calib: Optional[Dict[str, Optional[str]]] = None, kd_keys: Optional[Sequence[str]] = None):
+                 calib: Optional[Dict[str, Optional[str]]] = None, kd_keys: Optional[Sequence[str]] = None,
+                 sources: Sequence[str] = KD_SOURCES):
         from .ep_target import check_ep_target, run_ep_target
         from .model import load_ck
 
         if not det_run or not map_run:
             raise ValueError("TeacherPair2 needs both the DET and the MAP run")
         self.device = torch.device(device)
+        self.sources = tuple(t for t in KD_SOURCES if t in tuple(sources))
+        if not self.sources:
+            raise ValueError(f"TeacherPair2 sources must be a non-empty subset of {KD_SOURCES}, got {list(sources)}")
         self.runs = {"det": str(det_run), "map": str(map_run)}
         nets, eps = {}, {}
         for name, run, arm in (("det", det_run, "T"), ("map", map_run, "M")):
@@ -691,11 +743,15 @@ class TeacherPair2:
 
         det = {"score_logit": logits[0], "ok": tok_ok(ok_det, logits[0], e_det)}
         mp = {"score_logit": logits[1], "ok": tok_ok(ok_map, logits[1], e_map)}
-        comb = combine_teacher(det, mp)
+        if self.sources == ("det",):
+            comb, e_mean = combine_teacher(det, None), e_det
+        elif self.sources == ("map",):
+            comb, e_mean = combine_teacher(mp, None), e_map
+        else:
+            comb, e_mean = combine_teacher(det, mp), 0.5 * (e_det + e_map)
         kd_ok = comb["kd_ok"].bool()
         if cand_ok is not None:
             kd_ok = kd_ok & cand_ok.bool().to(dev)
-        e_mean = 0.5 * (e_det + e_map)
         res = {"kd_score_prob": comb["kd_score_prob"].float(), "kd_e_lat": e_mean, "kd_ok": kd_ok,
                "e_det": e_det, "e_map": e_map, "p_det": torch.sigmoid(logits[0]), "p_map": torch.sigmoid(logits[1]),
                "z_det": raw[0], "z_map": raw[1], "ok_det": det["ok"], "ok_map": mp["ok"]}
@@ -802,6 +858,9 @@ class CKE2E2:
         self._rowmap = None
         self.recorder: Optional[CandRecorder2] = None
         self._rows_checked = False
+        self._inputs = {"tokens": 0, "ref_ok": 0, "kd_ok": 0, "kd_all": 0}   # not in cum: a resumed run checks anew
+        self._inputs_checked = False
+        self._label_src_start: Dict[str, int] = {}
         self.last_clip_norm: Optional[float] = None
 
     # -------------------------------------------------------------------------------------- schedule
@@ -858,6 +917,8 @@ class CKE2E2:
 
     # -------------------------------------------------------------------------------------- lazy pieces
     def teachers(self, device) -> TeacherPair2:
+        if not self.cfg.use_teachers:
+            raise RuntimeError("ck_e2e2.use_teachers is false: no refiner teachers")
         if self._teachers is None:
             c = self.cfg
             kc = c.kd_calib
@@ -866,7 +927,7 @@ class CKE2E2:
                                           c.teacher_amp, c.teacher_require_done,
                                           ep_target=c.ep_target if c.teacher_ep_check else None,
                                           calib=({"det": kc["det"], "map": kc["map"]} if file_mode else None),
-                                          kd_keys=c.kd_score_keys)
+                                          kd_keys=c.kd_score_keys, sources=c.kd_sources)
             self._calib_version_applied = None
             if self._teachers.calib_info:
                 print("[ck_e2e2] KD calibration: " + "; ".join(
@@ -979,6 +1040,60 @@ class CKE2E2:
             if frac < self.cfg.strict_rows:
                 raise RuntimeError(f"ck_e2e2: only {frac:.4f} of the first {self.cum['tokens']} training tokens have "
                                    f"a packed row (< strict_rows {self.cfg.strict_rows})")
+
+    def _check_inputs(self, ref_gt_ok: torch.Tensor, kd_ok: Optional[torch.Tensor]) -> None:
+        """Partly copied caches only show up per token (GTLoader: ref_gt_ok False, teachers: kd_ok False): abort once
+        the first TOKENS_CHECK tokens are in when too few of them have the surrogate GT or (teachers on) a KD target.
+        Counted and checked on rank 0 only (a missing file hits every rank alike)."""
+        if self.cfg.strict_rows <= 0 or self._inputs_checked or self.rank != 0:
+            return
+        c = self._inputs
+        c["tokens"] += int(ref_gt_ok.numel())
+        c["ref_ok"] += int(ref_gt_ok.sum())
+        if kd_ok is not None:
+            c["kd_ok"] += int(kd_ok.sum())
+            c["kd_all"] += int(kd_ok.numel())
+        if c["tokens"] < TOKENS_CHECK:
+            return
+        self._inputs_checked = True
+        frac = c["ref_ok"] / c["tokens"]
+        if frac < self.cfg.strict_rows:
+            raise RuntimeError(f"ck_e2e2: ref_gt_ok on only {frac:.4f} of the first {c['tokens']} training tokens "
+                               f"(< strict_rows {self.cfg.strict_rows}): objects / sdf / side files missing?")
+        if kd_ok is not None:
+            frac = c["kd_ok"] / max(c["kd_all"], 1)
+            if frac < self.cfg.strict_rows:
+                raise RuntimeError(f"ck_e2e2: ck2/kd_ok_frac {frac:.4f} over the first {c['tokens']} training tokens "
+                                   f"(< strict_rows {self.cfg.strict_rows}): teacher BEV cache incomplete?")
+
+    def label_source_epoch_start(self) -> None:
+        self._label_src_start = {n: int(self.cum[f"G_src_{n}"]) for n in SRC_NAMES}
+
+    def label_source_epoch_end(self) -> Optional[Dict[str, Any]]:
+        """on-policy epoch end: tokens trained on warm-up-style fallback labels or none (no labelled generation yet,
+        i.e. a dead or slow labeler).  Above MAX_LABEL_FALLBACK: <io_dir>/INVALID_LABELS.json gets the epoch and an error
+        is printed; training goes on.  Rank 0's tokens only (G_src is counted per rank).  -> the epoch record | None."""
+        if not self._label_src_start or self.phase(self.epoch) != "onpolicy":
+            return None
+        n = {k: int(self.cum[f"G_src_{k}"]) - int(self._label_src_start.get(k, 0)) for k in SRC_NAMES}
+        tot = sum(n.values())
+        rec = {"epoch": int(self.epoch), "tokens_rank0": tot, "fallback": n["fallback"], "nodata": n["nodata"],
+               "frac": (n["fallback"] + n["nodata"]) / max(tot, 1), "limit": MAX_LABEL_FALLBACK}
+        if rec["frac"] > MAX_LABEL_FALLBACK:
+            p = Path(self.cfg.io_dir) / "INVALID_LABELS.json"
+            try:
+                old = json.loads(p.read_text()) if p.is_file() else {"epochs": []}
+                old["epochs"].append(rec)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(old, indent=1))
+                os.replace(tmp, p)
+            except (OSError, ValueError) as e:     # the error line below still reports it
+                print(f"[ck_e2e2] {p} not written: {e}", flush=True)
+            print(f"[ck_e2e2] ERROR epoch {self.epoch}: {rec['frac']:.4f} of rank 0's on-policy tokens had no labelled "
+                  f"generation (limit {MAX_LABEL_FALLBACK}): labeler dead or too slow, this run's labels are not the "
+                  f"recipe's; recorded in {p}", flush=True)
+        return rec
 
     # -------------------------------------------------------------------------------------- step candidates
     @staticmethod
@@ -1133,16 +1248,18 @@ class CKE2E2:
             n_rec = self.recorder.add(rows, V["traj96"], V["valid96"], top["idx"], top["final"], v0v, self.gstep)
             self.cum["rec_tokens"] += n_rec
 
-        # ---- teachers (online, every phase) on the step's KD candidates
+        # ---- teachers (online, every phase) on the step's KD candidates; none in the no-teacher mode
         tt = time.time()
         co = self.calib_online
-        if co is not None:                   # online KD calibration: refit (new slot) BEFORE the teachers run
-            self._calib_online_step(dev, logs)
-        tp = self.teachers(dev)
-        T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"], status,
-                   cand_ok=S["cand_ok"], extra=(S["extra"] if co is not None else None))
-        if co is not None:
-            logs["ck2/cal_pairs"] = float(self._calib_online_add(S, T, phase))
+        T = None
+        if c.use_teachers:
+            if co is not None:               # online KD calibration: refit (new slot) BEFORE the teachers run
+                self._calib_online_step(dev, logs)
+            tp = self.teachers(dev)
+            T = tp.run(targets["kd_bev_0"], targets["kd_ok_0"], targets["kd_bev_1"], targets["kd_ok_1"], S["cand"],
+                       status, cand_ok=S["cand_ok"], extra=(S["extra"] if co is not None else None))
+            if co is not None:
+                logs["ck2/cal_pairs"] = float(self._calib_online_add(S, T, phase))
         t_teacher = time.time() - tt
 
         # ---- student forward (one pass over KD candidates + label set)
@@ -1175,15 +1292,26 @@ class CKE2E2:
             l_sur, terms, nonfin = L.correction_loss(dec, sb, n, n_s, SUR_WEIGHTS, SUR_MARGINS)
             inner = inner + c.lambda_sur * l_sur
         l_sur_val = _f(l_sur)
-        kd_ok = T["kd_ok"].bool() & S["kd_tok_ok"][:, None]
-        ki = [CK_KEYS.index(k) for k in c.kd_score_keys]      # user 2026-10-08: comfort excluded from score KD
-        l_ks = L.score_kd_bce(s_kd[..., ki], T["kd_score_prob"][..., ki], kd_ok)
-        inner = inner + (r * c.lambda_kd_score) * l_ks
-        m_lat = kd_ok & S["lat_mask"]
-        l_lat = _masked_l1(e_s, T["kd_e_lat"], m_lat)
-        l_lat_val = _f(l_lat)
         lk = c.lat_kd
-        if lk["balance"] == "fixed":
+        if T is not None:
+            kd_ok = T["kd_ok"].bool() & S["kd_tok_ok"][:, None]
+            ki = [CK_KEYS.index(k) for k in c.kd_score_keys]      # comfort excluded from score KD by default
+            l_ks = L.score_kd_bce(s_kd[..., ki], T["kd_score_prob"][..., ki], kd_ok)
+            inner = inner + (r * c.lambda_kd_score) * l_ks
+            m_lat = kd_ok & S["lat_mask"]
+            l_lat = _masked_l1(e_s, T["kd_e_lat"], m_lat)
+        else:
+            # no-teacher mode: no score KD, no lateral KD (validate: lambda_kd_score 0, lat_kd fixed 0); the student's
+            # own offsets are still logged over the KD-candidate mask (cand_ok & token ok & lat_mask)
+            kd_ok = torch.zeros(S["cand_ok"].shape, dtype=torch.bool, device=dev)
+            l_ks = bev.new_zeros((), dtype=torch.float32)
+            m_lat = S["cand_ok"].bool().to(dev) & S["kd_tok_ok"][:, None] & S["lat_mask"]
+            l_lat = bev.new_zeros((), dtype=torch.float32)
+        self._check_inputs(ref_gt_ok, kd_ok if T is not None else None)
+        l_lat_val = _f(l_lat)
+        if T is None:
+            w = 0.0
+        elif lk["balance"] == "fixed":
             w = float(lk["fixed"]) if self.mb >= lk["start_mb"] else 0.0
         else:
             # EMA inputs = the all-rank means of this micro-batch (ONE 2-float all-reduce, reached by every rank on
@@ -1192,7 +1320,8 @@ class CKE2E2:
             ema_sur, ema_kd = _dist_mean_many([c.lambda_sur * l_sur_val, l_lat_val], dev)
             self.ema.update(ema_sur, ema_kd)
             w = float(self.ema.weight(self.mb))
-        inner = inner + (r * w) * l_lat
+        if T is not None:
+            inner = inner + (r * w) * l_lat
         loss = c.loss_weight * inner
         loss = loss + 0.0 * (out["score_all"].sum() + out["w_lat_all"].sum())
         loss_val = _f(loss)
@@ -1259,11 +1388,12 @@ class CKE2E2:
             mf = m_lat.float()
             den = float(mf.sum().clamp(min=1.0))
             logs["ck2/e_abs"] = float((e_s.detach().abs().mean(-1) * mf).sum()) / den
-            logs["ck2/e_abs_T"] = float((T["kd_e_lat"].abs().mean(-1).nan_to_num(0.0) * mf).sum()) / den
-            logs["ck2/e_abs_det"] = float((T["e_det"].abs().mean(-1).nan_to_num(0.0) * mf).sum()) / den
-            logs["ck2/e_abs_map"] = float((T["e_map"].abs().mean(-1).nan_to_num(0.0) * mf).sum()) / den
-            logs["ck2/lat_disagree"] = float(((T["e_det"] - T["e_map"]).abs().mean(-1).nan_to_num(0.0)
-                                              * mf).sum()) / den
+            if T is not None:
+                logs["ck2/e_abs_T"] = float((T["kd_e_lat"].abs().mean(-1).nan_to_num(0.0) * mf).sum()) / den
+                logs["ck2/e_abs_det"] = float((T["e_det"].abs().mean(-1).nan_to_num(0.0) * mf).sum()) / den
+                logs["ck2/e_abs_map"] = float((T["e_map"].abs().mean(-1).nan_to_num(0.0) * mf).sum()) / den
+                logs["ck2/lat_disagree"] = float(((T["e_det"] - T["e_map"]).abs().mean(-1).nan_to_num(0.0)
+                                                  * mf).sum()) / den
             logs["ck2/n_cand"] = float(Kc + (0 if S["extra"] is None else S["extra"].shape[1]))
         self.cum["sur_nonfinite"] += int(nonfin)
         logs["ck2/variants_ms"] = 1e3 * t_var
@@ -1389,6 +1519,7 @@ def make_ck2_callback(agent):
                 ck.recorder = CandRecorder2(ck.cfg.io_dir, ck.rank, ck.world_size, ck.epoch, ck.cfg.rec_chunk_tokens)
                 rec = ck.recorder.attempt
             stats = ck.refresh_labels() if phase == "onpolicy" else None
+            ck.label_source_epoch_start()
             if getattr(trainer, "is_global_zero", True):
                 warn = label_supply_warning(ck, stats) if phase == "onpolicy" else None
                 self._append("epochs.jsonl", {"event": "epoch_start", "epoch": ck.epoch, "phase": phase,
@@ -1414,9 +1545,11 @@ def make_ck2_callback(agent):
             else:
                 n = None
             if getattr(trainer, "is_global_zero", True):
+                src = ck.label_source_epoch_end()
                 self._append("epochs.jsonl", {"event": "epoch_end", "epoch": ck.epoch, "rec_tokens_rank0": n,
                                               "mb": ck.mb, "gstep": int(trainer.global_step), "time": time.time(),
-                                              "skipped_steps": ck.skipped_steps, "cum": dict(ck.cum)})
+                                              "skipped_steps": ck.skipped_steps, "label_sources": src,
+                                              "cum": dict(ck.cum)})
 
         # ---- batches
         def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):

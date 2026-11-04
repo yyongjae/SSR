@@ -346,14 +346,10 @@ def test_student_loss_only_the_score_kd_term_changes(tmp_path):
 def test_config_defaults_yaml_and_validate(tmp_path):
     from tools.ck.e2e2 import launch_util2 as L2
     c = O.CKE2E2Config()
-    root = "/home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib"
-    online = {"mode": "file", "refits_per_epoch": 10, "ema_epochs": 1.0, "bins": 4096, "zmax": 20.0, "min_n": 2000.0,
-              "reset_onpolicy": True}                              # online-mode options (2026-11-02), default mode file
-    assert c.kd_calib == {"enabled": True, "det": f"{root}/ck2T10__last.json", "map": f"{root}/ck2M10__last.json",
-                          **online}
+    online = {"mode": "online", "refits_per_epoch": 10, "ema_epochs": 1.0, "bins": 4096, "zmax": 20.0, "min_n": 2000.0,
+              "reset_onpolicy": True}                              # default: the online mode, no file
+    assert c.kd_calib == {"enabled": True, "det": None, "map": None, **online}
     assert L2.load_ck2_yaml()["kd_calib"] == c.kd_calib
-    assert c.kd_calib["det"] == str(KC.calib_path(c.teacher_det_run, c.teacher_which))
-    assert c.kd_calib["map"] == str(KC.calib_path(c.teacher_map_run, c.teacher_which))
     d = O.CKE2E2Config.from_any({"kd_calib": {"enabled": "false", "det": "null", "map": "None"}}).kd_calib
     assert d == {"enabled": False, "det": None, "map": None, **online}
     with pytest.raises(ValueError, match="unknown key"):
@@ -363,8 +359,8 @@ def test_config_defaults_yaml_and_validate(tmp_path):
     base = {"enabled": True, "io_dir": str(tmp_path / "io"), "teacher_det_run": str(TL.SMOKE_T),
             "teacher_map_run": str(TL.SMOKE_M)}
     O.CKE2E2Config.from_any(base).validate()                       # defaults: files need not exist for validate
-    for kc, msg in (({"det": None, "map": None}, "needs a calibration file"), ({"det": "rel/x.json"}, "absolute"),
-                    ({"map": "/a=b.json"}, "absolute")):
+    for kc, msg in (({"mode": "file", "det": None, "map": None}, "needs a calibration file"),
+                    ({"det": "rel/x.json"}, "absolute"), ({"map": "/a=b.json"}, "absolute")):
         with pytest.raises(ValueError, match=msg):
             O.CKE2E2Config.from_any(dict(base, kd_calib=kc)).validate()
     O.CKE2E2Config.from_any(dict(base, kd_calib={"enabled": False, "det": None, "map": None})).validate()
@@ -380,7 +376,7 @@ def test_launcher_refuses_missing_and_records_calibration(tmp_path):
     pM = _write(tmp_path, "M.json", TL.SMOKE_M, "M", P_MAP)
 
     def ov(*sets, name="ck2e2e_cal"):
-        return L2.build_overrides2(str(tmp_path / name), ["0", "1"], ck_sets=SMOKE_BASE + list(sets),
+        return L2.build_overrides2(str(tmp_path / name), ["0", "1"], ck_sets=SMOKE_BASE + ["kd_calib.mode=file"] + list(sets),
                                    wandb="offline", teacher_deep=False)
 
     missing = tmp_path / "kd_calib" / "smoke__last.json"
@@ -418,10 +414,10 @@ def test_launcher_refuses_missing_and_records_calibration(tmp_path):
 def test_train_e2e2_sh_refuses_missing_calibration(tmp_path):
     sets = tmp_path / "s.set"
     missing = tmp_path / "kd_calib" / "x__last.json"
-    sets.write_text("\n".join(SMOKE_BASE + [f"kd_calib.det={missing}"]) + "\n")
+    sets.write_text("\n".join(SMOKE_BASE + ["kd_calib.mode=file", f"kd_calib.det={missing}"]) + "\n")
     env = dict(os.environ, PYTHONPATH=str(REPO), OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", CUDA_VISIBLE_DEVICES="",
                E2E_WANDB="disable", E2E_ROOT=str(tmp_path / "root"), E2E_DRY_RUN="1", E2E_CK_SET=str(sets),
-               RUN="dry_cal", CK2_E2E_APPROVED="1", E2E_NO_DEEP_TEACHER_CHECK="1")
+               RUN="dry_cal", CK2_E2E_APPROVED="1", E2E_NO_DEEP_TEACHER_CHECK="1", SSR_ALLOW_FILE_CALIB="1")
     for k in ("E2E_SMOKE", "ARM"):
         env.pop(k, None)
     r = subprocess.run(["bash", str(REPO / "tools/ck/e2e2/train_e2e2.sh"), "start", "--gpus", "0,1"], env=env,
@@ -432,7 +428,7 @@ def test_train_e2e2_sh_refuses_missing_calibration(tmp_path):
     # with valid files the dry run passes and teachers.json records the calibration sha16
     pT = _write(tmp_path, "T.json", TL.SMOKE_T, "T", P_DET)
     pM = _write(tmp_path, "M.json", TL.SMOKE_M, "M", P_MAP)
-    sets.write_text("\n".join(SMOKE_BASE + [f"kd_calib.det={pT}", f"kd_calib.map={pM}"]) + "\n")
+    sets.write_text("\n".join(SMOKE_BASE + ["kd_calib.mode=file", f"kd_calib.det={pT}", f"kd_calib.map={pM}"]) + "\n")
     r = subprocess.run(["bash", str(REPO / "tools/ck/e2e2/train_e2e2.sh"), "start", "--gpus", "0,1"],
                        env=dict(env, RUN="dry_cal_ok"), capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ....common import ssr_paths as _SP
+
 # ----------------------------------------------------------------------------------------------- keys / sizes
 # Score key order = anchor_planner.SIM_KEYS (no_at_fault_collisions, drivable_area_compliance, ego_progress,
 # time_to_collision_within_bound, comfort): every [.., 5] score tensor uses this order.
@@ -24,8 +26,8 @@ SCORE_SEED_OFFSET = 31337
 
 # ----------------------------------------------------------------------------------------------- paths
 REPO = Path(__file__).resolve().parents[4]           # repo root of this worktree (/workspace/yongjae/SSR-ck2)
-CK_DATA = Path("/home/external-user/ssd/yongjae_refiner/ck")
-DATA_ROOT = Path("/home/external-user/ssd/yongjae_refiner")
+DATA_ROOT = Path(_SP.SSR_DATA_ROOT)
+CK_DATA = DATA_ROOT / "ck"
 
 V2_CKPT = REPO / "v2_source/epoch=29-step=19950.ckpt"   # v2_source -> symlink to SSR-ck/v2_source
 V2_CKPT_SHA16 = "e1cfdbddc5d61125"                   # measured file sha256[:16]; task text quoted 226829cf4126f949
@@ -34,13 +36,13 @@ V2_TRAIN_CFG = REPO / "v2_source/code/hydra/config.yaml"
 V2_NAVTEST_CSV = REPO / "v2_source/2026.09.20.01.28.06.csv"
 V2_NAVTEST_PDMS = 0.88137
 V2_NAVTEST_TOL = 0.002
-ANCHORS = Path("/home/external-user/kyungmin/SSR-v2/data/planning_vb/trajectory_anchors_256.npy")
+ANCHORS = REPO / "resources/planning_vb/trajectory_anchors_256.npy"
 
 TEACHER_CACHE = {
-    "det": {"navtrain": "/home/external-user/datasets/teacher_cache/bevfusion/cache_train_50x100",
-            "navtest": "/home/external-user/datasets/teacher_cache/bevfusion/cache_val_50x100"},
-    "map": {"navtrain": "/home/external-user/datasets/teacher_cache/resmap",          # train logs only (85,109)
-            "navtest": "/home/external-user/datasets/teacher_cache/resmap/navtest"},
+    "det": {"navtrain": f"{_SP.SSR_TEACHER_CACHE}/bevfusion/cache_train_50x100",
+            "navtest": f"{_SP.SSR_TEACHER_CACHE}/bevfusion/cache_val_50x100"},
+    "map": {"navtrain": f"{_SP.SSR_TEACHER_CACHE}/resmap",          # train logs only (85,109)
+            "navtest": f"{_SP.SSR_TEACHER_CACHE}/resmap/navtest"},
 }   # informative (= refiner.data.TEACHER_ROOTS / refiner.resmap_cache.RESMAP_ROOTS); load through
 #     refiner.data.TeacherCache.for_subset(s) / refiner.resmap_cache.ResmapCache.for_subset(s)
 TEACHER_INIT = {"T": DATA_ROOT / "stageE/teachers/stageT4_T_fold0_seed0",
@@ -48,14 +50,12 @@ TEACHER_INIT = {"T": DATA_ROOT / "stageE/teachers/stageT4_T_fold0_seed0",
 NORM_FILE = {"T": "norm.npz", "M": "norm_map.npz"}  # per-arm BEV z-score file in a (v1 or CK) run dir
 
 METRIC_CACHE = {"navtrain": DATA_ROOT / "metric_cache",
-                "navtest": Path("/home/external-user/yongjae/SSR/data/exp/metric_cache")}
-LEAD_SRC = {"navtrain_train": Path("/workspace/yongjae/ssd/yongjae_refiner/direction_analysis/uncertainty/out/"
-                                   "lead_navtrain.parquet"),
-            "navtest": Path("/workspace/yongjae/ssd/yongjae_refiner/direction_analysis/uncertainty/out/"
-                            "lead_navtest.parquet")}
+                "navtest": Path(_SP.SSR_NAVTEST_MC)}
+LEAD_SRC = {"navtrain_train": DATA_ROOT / "direction_analysis/uncertainty/out/lead_navtrain.parquet",
+            "navtest": DATA_ROOT / "direction_analysis/uncertainty/out/lead_navtest.parquet"}
 
-_TRAINVAL_LOGS = "/home/external-user/yongjae/SSR/data/dataset/navsim_logs/trainval"
-_TRAINVAL_SENSORS = "/home/external-user/yongjae/SSR/data/dataset/sensor_blobs/trainval"
+_TRAINVAL_LOGS = f"{_SP.OPENSCENE_DATA_ROOT}/navsim_logs/trainval"
+_TRAINVAL_SENSORS = f"{_SP.OPENSCENE_DATA_ROOT}/sensor_blobs/trainval"
 _SF = "navsim/planning/script/config/common/scene_filter"      # relative to REPO
 
 SPLITS = {
@@ -76,8 +76,8 @@ SPLITS = {
     "navtest": {
         "tokens": str(DATA_ROOT / "splits/navtest.parquet"), "n": 12146, "logs": 136,
         "sha16_sorted_tokens": None,
-        "navsim_logs": "/workspace/navsim_workspace/dataset/navsim_logs/test/test",
-        "sensor_blobs": "/workspace/navsim_workspace/dataset/sensor_blobs/test/test",
+        "navsim_logs": f"{_SP.SSR_TEST_DATA_ROOT}/navsim_logs/test/test",
+        "sensor_blobs": f"{_SP.SSR_TEST_DATA_ROOT}/sensor_blobs/test/test",
         "scene_filter": f"{_SF}/navtest.yaml",
         "teacher_subset": "navtest", "gt_surrogate": False, "map_teacher": True,
         "metric_cache": str(METRIC_CACHE["navtest"]),

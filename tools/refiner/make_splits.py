@@ -52,20 +52,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
-ROOT = Path("/home/external-user/yongjae/SSR")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))    # repo root of this worktree
+from navsim.common import ssr_paths as _SP  # noqa: E402
+
+ROOT = Path(_SP.SSR_RESEARCH_TREE)              # E's token pool and report folder of the first split build
 E_DIR = ROOT / "report/cause_and_correction_tests/E_train_split_feasibility"
 POOL = E_DIR / "tokens/navtrain_token_log.parquet"
 E_MC = E_DIR / "metric_cache"
-DATA = Path("/home/external-user/ssd/yongjae_refiner")
+DATA = Path(_SP.SSR_DATA_ROOT)
 OUT = DATA / "splits"
 REPORT = ROOT / "report/refiner_T"
-TEACHER = Path("/home/external-user/datasets/teacher_cache/bevfusion/cache_train_50x100")
+TEACHER = Path(_SP.SSR_TEACHER_CACHE) / "bevfusion/cache_train_50x100"
 TEACHER_SHA_HEAD = "cddf943ffec8d6a8"
 SPEC_COLS = ["token", "log", "frame_idx", "map_location", "part"]
 STRATA = ["map_location", "part"]

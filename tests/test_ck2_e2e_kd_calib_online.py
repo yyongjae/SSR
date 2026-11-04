@@ -166,14 +166,15 @@ def test_min_n_keeps_identity_and_state_round_trip(tmp_path):
 # ----------------------------------------------------------------------------------------------- config / launcher
 def test_config_rules_and_defaults(tmp_path):
     d = O.CKE2E2Config.from_any({}).kd_calib
-    assert d["mode"] == "file" and d["enabled"] is True                    # default unchanged: the file mode
+    assert d["mode"] == "online" and d["enabled"] is True and d["det"] is None and d["map"] is None
     c = TL.cfg2(tmp_path, kd_calib=ONLINE)
     c.validate()
     assert c.kd_calib["mode"] == "online" and c.kd_calib["det"] is None and c.kd_calib["min_n"] == 10.0
-    for bad, msg in (({"det": "/x/a.json"}, "must be null"), ({"enabled": False}, "enabled true"),
-                     ({"mode": "both"}, "mode must be"), ({"bins": 8}, "bins >= 16")):
+    for bad, msg in (({"det": "/x/a.json"}, "must be null"), ({"mode": "both"}, "mode must be"),
+                     ({"bins": 8}, "bins >= 16")):
         with pytest.raises(ValueError, match=msg):
             TL.cfg2(tmp_path, kd_calib=dict(ONLINE, **bad)).validate()
+    TL.cfg2(tmp_path, kd_calib=dict(ONLINE, enabled=False)).validate()     # calibration off needs no other key
     with pytest.raises(ValueError, match="unknown"):
         O.CKE2E2Config.from_any({"kd_calib": {"modes": "online"}})
     # the yaml defaults carry the new keys with the dataclass defaults

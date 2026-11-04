@@ -15,12 +15,13 @@ variants:                                    # user: speeds -1.0,-0.5,+0.5 m/s^2
   compute_dtype: float64                     # NU22
 n_var_step: 32                               # user "student 32"
 var_sampling: type_balanced                  # NU10
-teacher_det_run: /home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2T10       # user 2026-10-09 00:30 KST (DET, BEVFusion t0; official EP)
-teacher_map_run: /home/external-user/ssd/yongjae_refiner/ck/ck2/train/ck2M10       # user 2026-10-09 00:30 KST (MAP, ReSMap; official EP)
+teacher_det_run: null                        # required unless use_teachers false: the run's set file names it (DET, BEVFusion)
+teacher_map_run: null                        # required unless use_teachers false: the run's set file names it (MAP, ReSMap)
 teacher_which: last                          # NU05 / user 2026-10-08 (KD uses the last ckpt; no best selection)
 teacher_require_done: true                   # NU05
 teacher_ep_check: true                       # report 48: TeacherPair2 refuses teachers whose config.json ep_target != ep_target
 teacher_amp: true                            # user (fp16 no_grad, as the old e2e)
+use_teachers: true                           # false = no refiner teacher, no refiner KD (v2_nokd.set)
 amp: false                                   # NU38 (student fp32, old)
 bev_grad_scale: 1.0                          # NU19 (old)
 seed: 0
@@ -32,13 +33,14 @@ loss_weight: 1.0
 lambda_score: 1.0                            # user (label BCE 1.0)
 lambda_kd_score: 0.5                         # user (score KD 0.5)
 kd_score_keys: [nc, dac, ep, ttc]            # user 2026-10-08: comfort NOT distilled (kinematic, no privileged info; labels only)
-kd_calib:                                    # user 2026-10-08 ~22:35 KST: Platt calibration of each teacher's KD logits
-  enabled: true                              # (per key, a z + b, NLL fit on navtrain_train r34 top-16; fit_kd_calib.py);
-  det: /home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/ck2T10__last.json      # DET keys nc / ep / ttc
-  map: /home/external-user/ssd/yongjae_refiner/ck/ck2/kd_calib/ck2M10__last.json      # MAP keys dac / ep
-  mode: file                                 # file (det / map above) | online (user 2026-11-02, option B: fitted inside
-  refits_per_epoch: 10                       #   the run on its own labelled candidates, det / map null; kd_calib.py
-  ema_epochs: 1.0                            #   OnlineKDCalib) -- these six keys are the online options
+kd_sources: [det, map]                       # teachers of the KD targets; one = its own keys only (kd_score_keys) and its lateral offset
+kd_calib:                                    # Platt calibration of each teacher's KD logits (per key, a z + b)
+  enabled: true
+  det: null                                  # file mode only (tools/ck/e2e2/fit_kd_calib.py on another planner's
+  map: null                                  #   candidates): DET keys nc / ep / ttc, MAP keys dac / ep
+  mode: online                               # online: fitted inside the run on its own labelled candidates (kd_calib.py
+  refits_per_epoch: 10                       #   OnlineKDCalib; these six keys are its options, det / map null) | file:
+  ema_epochs: 1.0                            #   launcher CLI refuses it unless SSR_ALLOW_FILE_CALIB=1
   bins: 4096
   zmax: 20.0
   min_n: 2000.0

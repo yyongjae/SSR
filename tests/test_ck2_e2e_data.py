@@ -149,16 +149,18 @@ def test_builder_missing_token_and_guards(builder):
         D2.CK2E2ETargetBuilder({"topk": 8})
     with pytest.raises(ValueError):
         D2.CK2E2ETargetBuilder({"teacher_det_run": ""})
-    b = D2.CK2E2ETargetBuilder({"teacher_map_run": ""})
-    assert b.teacher_runs == (D2.TEACHER_DET_RUN,) and b.ep_target == "official"
+    with pytest.raises(ValueError, match="teacher_det_run"):
+        D2.CK2E2ETargetBuilder({})                     # no default teacher run
+    b = D2.CK2E2ETargetBuilder({"teacher_det_run": TDET, "teacher_map_run": ""})
+    assert b.teacher_runs == (TDET,) and b.ep_target == "official"
     with pytest.raises(ValueError, match="ep_target"):
-        D2.CK2E2ETargetBuilder({"ep_target": "bogus"})
+        D2.CK2E2ETargetBuilder({"teacher_det_run": TDET, "ep_target": "bogus"})
     # config forms: ParaSSRConfig-like namespace, nested warm-up override, DictConfig
     from omegaconf import OmegaConf
-    ns = SimpleNamespace(ck_e2e2={"warmup": {"n_var": 16}}, ref_data_root="/x")
+    ns = SimpleNamespace(ck_e2e2={"teacher_det_run": TDET, "warmup": {"n_var": 16}}, ref_data_root="/x")
     b2 = D2.CK2E2ETargetBuilder(ns)
     assert b2.wcfg["n_var"] == 16 and b2.wcfg["var_dir"] == W["var_dir"] and b2.ref_data_root == "/x"
-    b3 = D2.CK2E2ETargetBuilder(OmegaConf.create({"warmup": {"sampler_seed": 3}}))
+    b3 = D2.CK2E2ETargetBuilder(OmegaConf.create({"teacher_det_run": TDET, "warmup": {"sampler_seed": 3}}))
     assert b3.wcfg["sampler_seed"] == 3
 
 

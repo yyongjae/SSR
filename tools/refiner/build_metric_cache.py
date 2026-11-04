@@ -8,9 +8,11 @@ What is cached and how (same definition as report/cause_and_correction_tests/E_t
   cache.cache_path (--out), navsim_log_path (trainval or test logs) and output_dir; scene_filter.log_names / tokens
   are set per chunk inside cache_scenarios (as the repo does per log).
   Provenance: _init() and run_chunk() below are copied from e2_cache.py (sha256 E2_CACHE_SHA256, 2026-09-28) with
-  only the return value extended; nothing is imported from E at runtime.  SAVED_CFG's sha256 is asserted at start.
+  only the return value extended; nothing is imported from E at runtime.  SAVED_CFG is a byte copy of the navtest
+  cache's saved config, kept in the repo; its sha256 is asserted at start (it records paths and a worker count of the
+  machine that built that cache; only the keys above are read from it as paths).
 Layout (repo MetricCacheProcessor layout): <out>/<log>/unknown/<token>/metric_cache.pkl  (lzma pickle of MetricCache).
-  Default <out> = /home/external-user/ssd/yongjae_refiner/metric_cache.  Loaders: mc_path(), load_mc().
+  Default <out> = $SSR_DATA_ROOT/metric_cache.  Loaders: mc_path(), load_mc().
 
 Reuse of E's 9,000 navtrain caches ("seed"): split tokens that have E's cache are COPIED (not symlinked: E's folder
   lives in the repo report tree; a copy on the ssd is robust to clean-ups and faster to read) with an atomic
@@ -59,26 +61,29 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-ROOT = Path("/home/external-user/yongjae/SSR")
+ROOT = Path(__file__).resolve().parents[2]      # repo root of this worktree
 sys.path.insert(0, str(ROOT))
-SAVED_CFG = ROOT / "data/exp/metric_cache/metadata/code/hydra/config.yaml"
+from navsim.common import ssr_paths as _SP  # noqa: E402
+
+RESEARCH = Path(_SP.SSR_RESEARCH_TREE)          # verify-* only (E's caches, report tables)
+SAVED_CFG = ROOT / "resources/metric_cache_saved_config.yaml"
 SAVED_CFG_SHA256 = "92d42853253622b29eabf8e488a97741e350eb3d5a360cb45f69cb0a4b444f84"
 E2_CACHE_SHA256 = "9e19488582622282a58c4b801f624578640d8b966926de00a769d5ad181cdd9e"
-TRAIN_LOGS = ROOT / "data/dataset/navsim_logs/trainval"
-TEST_LOGS = Path("/home/external-user/navsim/download/test_navsim_logs/test")
-NAVTEST_MC = ROOT / "data/exp/metric_cache"
-E_DIR = ROOT / "report/cause_and_correction_tests/E_train_split_feasibility"
+TRAIN_LOGS = Path(_SP.OPENSCENE_DATA_ROOT) / "navsim_logs/trainval"
+TEST_LOGS = Path(_SP.SSR_TEST_DATA_ROOT) / "navsim_logs/test/test"
+NAVTEST_MC = Path(_SP.SSR_NAVTEST_MC)
+E_DIR = RESEARCH / "report/cause_and_correction_tests/E_train_split_feasibility"
 E_MC = E_DIR / "metric_cache"
-NAVTEST_TABLE = ROOT / "report/perception_reliability/pdm_attr/table.parquet"
-CF_DIR = ROOT / "report/collision_counterfactual/counterfactual"
-DATA = Path("/home/external-user/ssd/yongjae_refiner")
+NAVTEST_TABLE = RESEARCH / "report/perception_reliability/pdm_attr/table.parquet"
+CF_DIR = RESEARCH / "report/collision_counterfactual/counterfactual"
+DATA = Path(_SP.SSR_DATA_ROOT)
 OUT = DATA / "metric_cache"
 VERIFY_ROOT = DATA / "metric_cache_verify"  # re-cached verification tokens (kept OUTSIDE OUT: navtest tokens must never
                                             # be picked up by a glob over the stage-T cache)
 SPLITS = DATA / "splits"
-REPORT = ROOT / "report/refiner_T"
-ENV = dict(NUPLAN_MAPS_ROOT=str(ROOT / "data/dataset/maps"), NUPLAN_MAP_VERSION="nuplan-maps-v1.0",
-           OPENSCENE_DATA_ROOT=str(ROOT / "data/dataset"))
+REPORT = RESEARCH / "report/refiner_T"
+ENV = dict(NUPLAN_MAPS_ROOT=_SP.NUPLAN_MAPS_ROOT, NUPLAN_MAP_VERSION="nuplan-maps-v1.0",
+           OPENSCENE_DATA_ROOT=_SP.OPENSCENE_DATA_ROOT)
 SCORE_KEYS = ["nc", "dac", "ddc", "ep", "ttc", "comfort", "pdms"]
 
 

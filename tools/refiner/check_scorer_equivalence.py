@@ -36,7 +36,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import score_trajectories as ST  # noqa: E402
 
-ROOT = ST.ROOT
+ROOT = ST.RESEARCH
 NAVTEST_MC = ROOT / "data/exp/metric_cache"
 E_MC = ROOT / "report/cause_and_correction_tests/E_train_split_feasibility/metric_cache"
 MODEL_PKL = ROOT / "work_dirs/eval/para_ssr_interaction_final_navtest_trajectories.pkl"

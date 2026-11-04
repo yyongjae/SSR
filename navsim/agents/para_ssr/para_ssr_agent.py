@@ -105,6 +105,12 @@ class WarmupCosLR(_LRScheduler):
 logger = logging.getLogger(__name__)
 
 
+def _is_rank_zero() -> bool:
+    import torch.distributed as dist
+
+    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+
+
 class ParaSSRLoggingCallback(pl.Callback):
     """Publishes the per-term loss breakdown, BEV diagnostics and wall-clock time.
 
@@ -385,6 +391,9 @@ class ParaSSRAgent(AbstractAgent):
     # (ck/bev_kd_arm.py) is a registered submodule `ck_bev_kd`: deliberately NO class attribute of that name (it would
     # shadow nn.Module.__getattr__ and hide the registered module); read it with getattr(self, "ck_bev_kd", None).
     _ck_e2e2 = None
+    # first-2000-token check of the teacher BEVs read by the BEV KD (_check_distill_teachers)
+    _distill_checked = False
+    _distill_seen = None
 
     def __init__(
         self,
@@ -777,6 +786,15 @@ class ParaSSRAgent(AbstractAgent):
             raise ValueError("use_distill (trajectory-anchor path) needs the anchor planner: plan_anchor true and an "
                              f"existing plan_anchor_file (got plan_anchor={getattr(config, 'plan_anchor', None)}, "
                              f"plan_anchor_file={anchor_file})")
+        off = tuple(str(b) for b in (getattr(config, "distill_off_banks", ()) or ()))
+        if off:
+            if any(b not in ("det", "map") for b in off) or len(set(off)) != len(off) or len(off) > 1:
+                raise ValueError(f"distill_off_banks must name one of det | map (both off = use_distill false), "
+                                 f"got {list(off)}")
+            if str(getattr(config, "distill_teacher_source", "store")) != "targets":
+                raise ValueError("distill_off_banks needs distill_teacher_source 'targets'")
+            if not any(bool(getattr(config, f"distill_selector_v{v}", False)) for v in range(9, 17)):
+                raise ValueError("distill_off_banks needs the probe path (distill_selector_v9 .. v16)")
         from .distill.distillation import build_planning_distillation
 
         # CPU generator only: torch.manual_seed would also re-seed the (queued) CUDA generators
@@ -796,6 +814,10 @@ class ParaSSRAgent(AbstractAgent):
         trainable_prefix = "anchor_distill." if is_pgp else "anchor_distill.student_proj."
         for name, param in module.named_parameters():
             param.requires_grad_(name.startswith(trainable_prefix))
+        for bank in (i for i, b in enumerate(("det", "map")) if b in off):
+            # a skipped bank never gets a gradient, and plain DDP needs one for every trainable parameter
+            for part in ("probes", "student_proj"):
+                getattr(module.anchor_distill, part)[bank].requires_grad_(False)
         return module
 
     def distill_parameters(self) -> List[torch.nn.Parameter]:
@@ -843,7 +865,10 @@ class ParaSSRAgent(AbstractAgent):
             # kd_bev_0 = DET / BEVFusion, kd_bev_1 = MAP / ReSMap; any grid size (km's 64 m port, 100 x 100)
             from .distill.adapter import bev_map_to_tokens
 
-            ok = targets["kd_ok_0"].bool() & targets["kd_ok_1"].bool()
+            off = tuple(getattr(cfg, "distill_off_banks", ()) or ())
+            oks = [targets[f"kd_ok_{i}"].bool() for i, b in enumerate(("det", "map")) if b not in off]
+            ok = oks[0] if len(oks) == 1 else oks[0] & oks[1]
+            self._check_distill_teachers(ok)
             inputs["teacher_tokens"] = (bev_map_to_tokens(targets["kd_bev_0"]).float(),
                                         bev_map_to_tokens(targets["kd_bev_1"]).float())
             out["distill/teacher_ok_frac"] = ok.float().mean().detach()
@@ -917,6 +942,25 @@ class ParaSSRAgent(AbstractAgent):
                     out["distill/g_unit_probe_map"] = bev.new_tensor(float(g_red["probe_map"]))
             self._log_distill_bev_grad(bev, total, out)
         return total, out
+
+    def _check_distill_teachers(self, ok: torch.Tensor) -> None:
+        """A partly copied teacher cache only shows up per token (kd_ok False, distill/teacher_ok_frac): abort once the
+        first 2000 tokens are in when too few of them have the active teachers' BEV.  Rank 0 only (a missing file hits
+        every rank alike); a resumed run checks anew."""
+        strict = float(getattr(self._config, "distill_strict_ok", 0.0))
+        if strict <= 0 or not self.training or self._distill_checked or not _is_rank_zero():
+            return
+        if self._distill_seen is None:
+            self._distill_seen = [0, 0]
+        self._distill_seen[0] += int(ok.numel())
+        self._distill_seen[1] += int(ok.sum())
+        if self._distill_seen[0] < 2000:
+            return
+        self._distill_checked = True
+        frac = self._distill_seen[1] / self._distill_seen[0]
+        if frac < strict:
+            raise RuntimeError(f"distill/teacher_ok_frac {frac:.4f} over the first {self._distill_seen[0]} training "
+                               f"tokens (< distill_strict_ok {strict}): teacher BEV cache incomplete?")
 
     def _log_distill_bev_grad(self, bev: torch.Tensor, distill_loss: torch.Tensor, logs: Dict) -> None:
         """||d L_distill / d bev_embed|| on the gnorm/plan cadence (aux_distill telemetry; same micro-batches on every
@@ -1085,12 +1129,15 @@ class ParaSSRAgent(AbstractAgent):
 
             builders.append(CKE2ETargetBuilder(cfg))
         if self._ck_e2e2 is not None:
-            # also emits kd_bev_{0,1} / kd_ok_{0,1} (refiner teachers and v15 read the same tensors)
+            # also emits kd_bev_{0,1} / kd_ok_{0,1} (refiner teachers and v15 read the same tensors), except with
+            # ck_e2e2.use_teachers false (no refiner teacher: no teacher BEV from this builder)
             from .ck.e2e_data2 import CK2E2ETargetBuilder
 
             builders.append(CK2E2ETargetBuilder(cfg))
-        elif getattr(cfg, "use_distill", False) and str(getattr(cfg, "distill_teacher_source", "store")) == "targets":
-            # km's 64 m port (eba0524): teacher BEVs without the refiner
+        kd_in_ck2_targets = self._ck_e2e2 is not None and self._ck_e2e2.cfg.use_teachers
+        if (not kd_in_ck2_targets and getattr(cfg, "use_distill", False)
+                and str(getattr(cfg, "distill_teacher_source", "store")) == "targets"):
+            # teacher BEVs without the refiner teachers (same values as the refiner's reader: check_teacher_inputs.py)
             from .distill.teacher_store import DistillTeacherTargetBuilder
 
             builders.append(DistillTeacherTargetBuilder(cfg))

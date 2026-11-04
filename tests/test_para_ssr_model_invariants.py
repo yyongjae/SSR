@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import timm
 import torch
 import torch.nn as nn
@@ -189,18 +191,46 @@ def test_grid_mask_mode_one_retained_fraction_and_determinism():
     torch.testing.assert_close(mode_one_first + mode_zero, images)
 
 
-def test_timm_backbone_freeze_and_norm_eval_survive_train_call():
+def _backbone_stub(bn_mode):
     model = ParaSSRModel.__new__(ParaSSRModel)
     nn.Module.__init__(model)
+    model._config = SimpleNamespace()       # read by the effective train() (no finetune flag: no frozen prefixes)
     model._backbone_frozen_stages = 1
     model._backbone_norm_requires_grad = False
     model._backbone_norm_eval = True
+    model._backbone_bn_mode = bn_mode
     model.image_encoder = timm.create_model(
         "resnet18", pretrained=False, features_only=True, out_indices=(4,)
     )
-
     model._apply_backbone_train_policy()
+    return model
+
+
+def test_backbone_bn_mode_moving_keeps_weights_frozen_and_statistics_moving():
+    """backbone_bn_mode 'moving' (default): train() puts every BN in training mode, the frozen stage's too, so running
+    statistics update; the weights stay frozen as the policy left them at construction."""
+    model = _backbone_stub("moving")
+    bn1 = model.image_encoder.bn1
+    assert not bn1.training                 # the policy ran at construction
     model.train()
+    batch_norms = [m for m in model.image_encoder.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    assert batch_norms and all(m.training for m in batch_norms)
+    assert all(not p.requires_grad for m in batch_norms for p in m.parameters())
+    assert not model.image_encoder.conv1.weight.requires_grad
+    assert model.image_encoder.layer2[0].conv1.weight.requires_grad
+    before = int(bn1.num_batches_tracked)
+    model.image_encoder(torch.zeros(2, 3, 32, 32))
+    assert int(bn1.num_batches_tracked) == before + 1
+
+
+def test_backbone_bn_mode_frozen_survives_train_call():
+    """backbone_bn_mode 'frozen': frozen_stages and norm_eval hold through every train() call."""
+    model = _backbone_stub("frozen")
+
+    model.train()
+    before = int(model.image_encoder.bn1.num_batches_tracked)
+    model.image_encoder(torch.zeros(2, 3, 32, 32))
+    assert int(model.image_encoder.bn1.num_batches_tracked) == before
 
     for stage_name in ("conv1", "bn1", "act1", "maxpool", "layer1"):
         stage = getattr(model.image_encoder, stage_name)

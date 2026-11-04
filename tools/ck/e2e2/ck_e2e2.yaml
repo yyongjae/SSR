@@ -1,6 +1,6 @@
 # CK2 e2e (v2 + CK2 student from scratch, 30 epochs, 2 GPUs) -- ParaSSRConfig.ck_e2e2 for the main run
 # (SPEC ck2e2e s7-1 = CKE2E2Config defaults).  launch_util2.py turns every leaf into '++agent.config.ck_e2e2.<key>=<value>'
-# (nested dicts as dotted leaves).  io_dir is filled at launch with <RUN>/ck_e2e2.  The BEV-KD arm = this file +
+# (nested dicts as dotted leaves).  io_dir is filled at launch with <RUN>/refiner.  The BEV-KD arm = this file +
 # bevkd_arm.set; smoke overrides live in smoke_e2e2.sh (E2E_CK_SET), never here.
 # user = USER DECISIONS of the CK2 e2e task; NUxx = non-user choice (SPEC s9, listed with the reason there).
 enabled: true

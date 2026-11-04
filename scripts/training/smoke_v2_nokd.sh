@@ -39,7 +39,7 @@ PYTHONPATH=$REPO "$SSR_PY" - "$R" "$MEM_LIMIT_GB" "$NG" <<'PY' || { echo "[smoke
 import glob, json, math, sys
 import torch
 R, mem_limit, ng = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
-ep = [json.loads(l) for l in open(f"{R}/ck_e2e2/epochs.jsonl")]
+ep = [json.loads(l) for l in open(f"{R}/refiner/epochs.jsonl")]
 ends = [e for e in ep if e["event"] == "epoch_end"]
 phases = [e.get("phase") for e in ep if e["event"] == "epoch_start"]
 assert len(ends) == 2 and phases == ["warmup_record", "onpolicy"], (len(ends), phases)
@@ -47,17 +47,17 @@ cum = ends[-1]["cum"]
 assert cum["nonfinite_loss"] == 0 and cum["sur_nonfinite"] == 0, cum
 # generation 0 (epoch-0 recording) fully labelled by labeler2; the overlap of the two 60-mb epochs is only a few tokens
 # per rank, so G_src_prev of the smoke is printed, not checked
-lab = json.load(open(f"{R}/ck_e2e2/lab/status.json"))
+lab = json.load(open(f"{R}/refiner/lab/status.json"))
 g0 = (lab.get("epochs") or {}).get("0") or {}
 assert lab.get("tokens_ok", 0) > 0 and lab.get("tokens_err", 1) == 0 and g0.get("done") and g0.get("rows_done", 0) > 0, lab
-st = [json.loads(l) for l in open(f"{R}/ck_e2e2/steps_rank0.jsonl")]
+st = [json.loads(l) for l in open(f"{R}/refiner/steps_rank0.jsonl")]
 bad = sorted({k for s in st for k, v in s.items() if isinstance(v, float) and not math.isfinite(v)})
 assert not bad, bad[:10]
 mem = max(s.get("mem_gb", 0) for s in st)
 assert mem < mem_limit, f"peak mem {mem} GB >= {mem_limit}"
 tj = json.load(open(f"{R}/launch/teachers.json"))
 assert tj.get("mode") == "none" and tj.get("use_teachers") is False and "det" not in tj and "map" not in tj, tj
-eff = json.load(open(f"{R}/launch/ck_e2e2_effective.json"))
+eff = json.load(open(f"{R}/launch/refiner_effective.json"))
 assert eff["use_teachers"] is False and eff["_arm"] == "nokd" and eff["lambda_kd_score"] == 0.0, eff
 for s in st:
     assert s.get("ck2/kd_score", 0.0) == 0.0 and s.get("ck2/w_lat", 0.0) == 0.0 and s.get("ck2/kd_ok_frac", 0.0) == 0.0, s

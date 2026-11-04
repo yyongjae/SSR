@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """CK2 e2e launch helpers (SPEC ck2e2e s7).  Used by train_e2e2.sh / smoke_e2e2.sh; importable for tests.
 tools/ck/e2e/launch_util.py is imported unchanged (recipe, hydra_value, flatten, apply_sets, read_lines, GPU / pid / ckpt
-helpers, W&B mode); this file adds the CK2 recipe, the ck_e2e2 dict, the teacher guards and the ck_e2e2 io-dir status.
+helpers, W&B mode); this file adds the CK2 recipe, the ck_e2e2 dict, the teacher guards and the status of <run>/refiner.
 
   launch_util2.py overrides  --run-dir R --gpus 0,1 [--workers 6] [--max-epochs 30] [--ck-set k=v ...] [--ck-set-file F]
                              [--extra-file F] [--resume-ckpt P] [--wandb online|offline|disable]
@@ -19,7 +19,7 @@ Recipe (user): v2 r34 source on 2 GPUs = the old 4-GPU recipe with devices 2, ba
 2026-10-13, fusion_v1) = the old 4-GPU counters: devices 4, accumulate 8 (global 128), 5300 / 100 / 100, and the
 ck_e2e2 per-rank micro-batch counters halved (MB_COUNTERS: lat_kd.start_mb, label_refresh_every_mb, grad_share_every,
 bev_kd.start_mb), so every schedule keeps its meaning in samples / optimizer steps; experiment_name
-<run> (prefixed 'ck2e2e_' unless it already starts with 'ck2e2e'), W&B project para-ssr-v2, name <run>, group ck2e2e, tags [ck2e2e, main | bevkd].  plan_score_file stays the
+<run> (prefixed 'refiner_' unless it already starts with 'refiner'), W&B project ssr, name <run>, group refiner, tags [refiner, <arm>].  plan_score_file stays the
 WoTE pdm_score_256 (user: v2 keeps its labels).  Then '++agent.config.ck_e2e2.<leaf>=<value>' for every leaf of
 ck_e2e2.yaml (+ --ck-set / --ck-set-file lines) and output_dir=<R>/train/.
 Teacher guard (teacher_check, both modes): config.json arm T / M, trainer train_ck2, ckpt present, lon head zero,
@@ -35,7 +35,7 @@ fitted); a missing file is refused with the fit_kd_calib.py command to run after
 (file sha16, a / b per key, held-out NLL / ECE) in teachers.json ('kd_calib').  File mode is for archived runs and
 function-level tests: the 'overrides' command refuses it unless SSR_ALLOW_FILE_CALIB=1.
 Refiner off: '++agent.config.ck_e2e2.enabled=false' in the extra file (or a set line).  Extra lines that set ck_e2e2 keys
-are merged BEFORE the checks, so the teacher and warm-up checks are skipped then, ck_e2e2_effective.json says what the
+are merged BEFORE the checks, so the teacher and warm-up checks are skipped then, refiner_effective.json says what the
 run really uses, and arm_of gives 'noref'.
 """
 from __future__ import annotations
@@ -62,8 +62,9 @@ BEVKD_SET = HERE / "bevkd_arm.set"
 CK_DATA = LU.CK_DATA
 E2E_ROOT = f"{CK_DATA}/ck2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/ck2/e2e_smoke"
-IO_SUB = "ck_e2e2"
-NGPU = 2                          # user: 2 GPUs per run (devices 2)
+IO_SUB = "refiner"                # <run>/refiner = ck_e2e2.io_dir (the Hydra key keeps its name)
+EFFECTIVE_JSON = "refiner_effective.json"     # <run>/launch/: the ck_e2e2 dict the run really uses
+NGPU = 2                         # user: 2 GPUs per run (devices 2)
 NGPU_ALLOWED = (2, 4, 8)          # user 2026-10-13: 4 GPUs for the fusion_v1 / fusion_v10 runs; 2026-11-02:
                                   # 8 GPUs (0-7, CK_ALLOW_GPU4567=1) for the v2_v15_v7 student (same global batch 128)
 EXTRA_GPUS = ("4", "5", "6", "7")  # only with CK_ALLOW_GPU45=1 (2,3,4,5 or 4,5,6,7)
@@ -75,8 +76,9 @@ TOKENS_PER_MB = 4
 GLOBAL_BATCH = NGPU * TOKENS_PER_MB * ACCUMULATE            # 128
 # ck_e2e2 leaves counted in per-rank micro-batches (the 2-GPU values doubled the 4-GPU run's, ck_e2e2.yaml)
 MB_COUNTERS = ("lat_kd.start_mb", "label_refresh_every_mb", "grad_share_every", "bev_kd.start_mb")
-WANDB_PROJECT = "para-ssr-v2"
-WANDB_GROUP = "ck2e2e"
+WANDB_PROJECT = "ssr"
+WANDB_GROUP = "refiner"
+EXPERIMENT_PREFIX = "refiner"
 GSHARE_WARN = 0.5
 KST = 9 * 3600
 
@@ -366,8 +368,10 @@ def recipe2(run: str, run_dir: str, ngpu: int, workers: int, max_epochs: int, wa
         "agent.config.grad_balance_warmup_iters": f"agent.config.grad_balance_warmup_iters={c['balance_warmup']}",
         "agent.config.grad_balance_interval": f"agent.config.grad_balance_interval={c['balance_interval']}",
         "agent.config.grad_norm_log_interval": f"agent.config.grad_norm_log_interval={c['grad_norm_log']}",
-        "experiment_name": f"experiment_name={run if run.startswith('ck2e2e') else 'ck2e2e_' + run}",
+        "experiment_name": "experiment_name=" + (run if run.startswith(EXPERIMENT_PREFIX) else f"{EXPERIMENT_PREFIX}_{run}"),
     }
+    if wandb != "disable":
+        rep["wandb.project"] = f"wandb.project={WANDB_PROJECT}"
     out, seen = [], set()
     for o in LU.recipe(run, run_dir, ngpu, workers, max_epochs, wandb):
         k = o.split("=", 1)[0]
@@ -380,8 +384,8 @@ def recipe2(run: str, run_dir: str, ngpu: int, workers: int, max_epochs: int, wa
     if missing:
         raise LaunchError(f"launch_util.recipe no longer has {sorted(missing)}")
     if wandb != "disable":
-        tags = f"[ck2e2e,{arm}]" if ngpu == NGPU else f"[ck2e2e,{arm},gpu{ngpu}]"
-        out += [f"wandb.project={WANDB_PROJECT}", f"wandb.group={WANDB_GROUP}", f"wandb.tags={tags}"]
+        tags = f"[{WANDB_GROUP},{arm}]" if ngpu == NGPU else f"[{WANDB_GROUP},{arm},gpu{ngpu}]"
+        out += [f"wandb.group={WANDB_GROUP}", f"wandb.tags={tags}"]
     return out
 
 
@@ -456,7 +460,7 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
 # ----------------------------------------------------------------------------------------------- labeler health
 def labeler_health2(run_dir: str, state_path: str, stall_s: float = 1200.0, now: Optional[float] = None
                     ) -> Tuple[bool, str]:
-    """= launch_util.labeler_health with the ck_e2e2 io dir (lab/status.json of labeler2)."""
+    """= launch_util.labeler_health with the refiner io dir (lab/status.json of labeler2)."""
     now = time.time() if now is None else float(now)
     sp = Path(run_dir) / IO_SUB / "lab/status.json"
     pidf = Path(run_dir) / "labeler/labeler.pid"
@@ -512,7 +516,7 @@ def run_status2(run_dir: str, max_epochs: int = 30) -> Dict[str, Any]:
                       "restarts": len(rs.read_text().splitlines()) if rs.is_file() else 0}
     st["labeler_disabled"] = not (R / "labeler").is_dir()
     st["train_done"] = (IO / "TRAIN_DONE").exists()
-    eff = R / "launch/ck_e2e2_effective.json"
+    eff = R / "launch" / EFFECTIVE_JSON
     if eff.is_file():
         try:
             e = json.loads(eff.read_text())
@@ -722,7 +726,7 @@ def smoke_check2(run_dir: str, ngpu: int = NGPU, onpolicy_epochs: Sequence[int] 
     res["gshare_mean"] = LU._mean([LU._num(r.get("ck2/gshare")) for r in recs if "ck2/gshare" in r])
     res["e_abs_T_mean"] = LU._mean([LU._num(r.get("ck2/e_abs_T")) for r in recs])
     arm, bk_cfg = None, {}
-    eff = R / "launch/ck_e2e2_effective.json"
+    eff = R / "launch" / EFFECTIVE_JSON
     if eff.is_file():
         try:
             e = json.loads(eff.read_text())
@@ -824,7 +828,7 @@ def main(argv=None) -> int:
             eff["_arm"] = arm_of(ck)
             eff["_ck_sets"] = sets
             eff["_extra_ck_sets"] = extra_ck_sets(extra)
-            LU._write_json(outp.parent / "ck_e2e2_effective.json", eff)
+            LU._write_json(outp.parent / EFFECTIVE_JSON, eff)
             LU._write_json(outp.parent / "teachers.json", teachers)
         elif a.cmd == "teacher-check":
             kc = ({"enabled": True, "det": a.kd_calib_det or None, "map": a.kd_calib_map or None}

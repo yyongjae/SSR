@@ -2,8 +2,8 @@
 # CK2 e2e: v2 + CK2 student from scratch, 30 epochs, r34 recipe on 2 GPUs (SPEC ck2e2e s7-3; logic of
 # tools/ck/e2e/train_e2e.sh with the CK2 constants).  Two runs (user): GPUs 0,1 = CK2 main, GPUs 2,3 = CK2 + BEV KD.
 #
-#   RUN=ck2e2e_main  CK2_E2E_APPROVED=1 bash tools/ck/e2e2/train_e2e2.sh start --gpus 0,1
-#   RUN=ck2e2e_bevkd CK2_E2E_APPROVED=1 ARM=bevkd bash tools/ck/e2e2/train_e2e2.sh start --gpus 2,3
+#   RUN=main  CK2_E2E_APPROVED=1 bash tools/ck/e2e2/train_e2e2.sh start --gpus 0,1
+#   RUN=bevkd CK2_E2E_APPROVED=1 ARM=bevkd bash tools/ck/e2e2/train_e2e2.sh start --gpus 2,3
 #   RUN=... bash tools/ck/e2e2/train_e2e2.sh start --resume --gpus <same>      # newest last.ckpt
 #   RUN=... bash tools/ck/e2e2/train_e2e2.sh status [--json]
 #   RUN=... bash tools/ck/e2e2/train_e2e2.sh stop [--train-only]
@@ -14,9 +14,9 @@
 #
 # Layout <E2E_ROOT>/<RUN>/ (E2E_ROOT default $SSR_RUN_ROOT, navsim/common/ssr_paths.py):
 #   train/     navsim output_dir (lightning_logs/version_*/checkpoints/{epoch=E-step=S.ckpt,last.ckpt}, code/hydra)
-#   ck_e2e2/   ck_e2e2.io_dir (rec/, lab/, steps_rank0.jsonl, epochs.jsonl, TRAIN_DONE)
+#   refiner/   ck_e2e2.io_dir (rec/, lab/, steps_rank0.jsonl, epochs.jsonl, TRAIN_DONE)
 #   labeler/   labeler.log / .pid / .pgid / .exit / .cmd, watchdog.pid / .log / .restarts / .state
-#   launch/    train.log / .pid / .pgid / .exit, overrides.txt, ck_e2e2_effective.json, teachers.json,
+#   launch/    train.log / .pid / .pgid / .exit, overrides.txt, refiner_effective.json, teachers.json,
 #              nvidia_smi_start.txt, launch.log
 # start guards: --gpus = 2 or 4 GPUs of 0-3 (user recipe devices 2; 4 = fusion_v1, launch_util2.counters2 halves the
 #   per-rank counters), nvidia-smi <= 1 GiB used on each,
@@ -31,7 +31,7 @@
 #     CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=$REPO $SSR_PY tools/ck/e2e2/fit_kd_calib.py --run <teacher run>
 #       --which last      (-> .../ck/ck2/kd_calib/<run>__last.json; recorded with its sha16 in launch/teachers.json)
 #   kd_calib.mode=online (user 2026-11-02, option B; det / map null): no file, fitted inside the run on its own
-#   labelled candidates (navsim ck/kd_calib.OnlineKDCalib; refits in <run>/ck_e2e2/kd_calib_online.jsonl).
+#   labelled candidates (navsim ck/kd_calib.OnlineKDCalib; refits in <run>/refiner/kd_calib_online.jsonl).
 # -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (min(16 x ngpu, 48) workers, --world-size ngpu, --max-epoch
 #   MAX_EPOCHS-2, --exit-when-done --train-pid-file) -> watchdog (restart a dead / hung labeler while training lives).
 # ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
@@ -71,7 +71,7 @@ case "$(readlink -m "$E2E_ROOT")" in /workspace/byounggun*|/home/external-user/b
   echo "[train_e2e2] REFUSED: E2E_ROOT=$E2E_ROOT is under byounggun's directory (read-only for this branch)" >&2; exit 3;;
 esac
 R="$E2E_ROOT/$RUN"
-L="$R/launch"; LB="$R/labeler"; IO="$R/ck_e2e2"
+L="$R/launch"; LB="$R/labeler"; IO="$R/refiner"
 export PYTHONPATH=$REPO OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 # data environment of the training process and of the labeler (its scorer reads the maps too)
 DATA_ENV=(NUPLAN_MAP_VERSION=nuplan-maps-v1.0 "NUPLAN_MAPS_ROOT=$NUPLAN_MAPS_ROOT"
@@ -111,13 +111,13 @@ grp_kill() {  # grp_kill <pgid_file> <pid_file> <needle> <name>: TERM the group,
   log "$4 still alive after 60 s: KILL"
   if [ -n "$pg" ]; then kill -KILL -- "-$pg" 2>/dev/null || kill -KILL "$pid"; else kill -KILL "$pid"; fi
 }
-eff_field() {  # eff_field <dotted key>: the value in launch/ck_e2e2_effective.json of this run, empty if absent
-  [ -f "$L/ck_e2e2_effective.json" ] || return 0
+eff_field() {  # eff_field <dotted key>: the value in launch/refiner_effective.json of this run, empty if absent
+  [ -f "$L/refiner_effective.json" ] || return 0
   "$PY" -c 'import json, sys
 d = json.load(open(sys.argv[1]))
 for k in sys.argv[2].split("."):
     d = d.get(k) if isinstance(d, dict) else None
-print("" if d is None else d)' "$L/ck_e2e2_effective.json" "$1"
+print("" if d is None else d)' "$L/refiner_effective.json" "$1"
 }
 need_gpus() { [ -n "$GPUS" ] || die "--gpus <2 or 4 GPUs of 0-3> is required (e.g. --gpus 0,1 or 0,1,2,3)"; }
 
@@ -238,8 +238,8 @@ do_start() {
   "$PY" "$LU2" "${OA[@]}" || die "override generation / teacher / KD-calibration check failed (REFUSED line above)"
   mapfile -t OV < "$OUTD/overrides.txt"
   # the arm the run really is (extras and sets included), not the ARM variable
-  local TRUE_ARM; TRUE_ARM=$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["_arm"])' "$OUTD/ck_e2e2_effective.json") \
-    || die "no arm in $OUTD/ck_e2e2_effective.json"
+  local TRUE_ARM; TRUE_ARM=$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["_arm"])' "$OUTD/refiner_effective.json") \
+    || die "no arm in $OUTD/refiner_effective.json"
   if [ "$TRUE_ARM" = noref ]; then
     export E2E_NO_LABELER=1
   elif [ "${E2E_NO_LABELER:-0}" = 1 ]; then

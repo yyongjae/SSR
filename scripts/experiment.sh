@@ -30,7 +30,7 @@ EPOCHS=30                   # trainer + agent.max_epochs + labeler max
 GPUS=0,1,2,3,4,5,6,7        # 2, 4 or 8 distinct indices, each with < 1 GiB used; the reference recipe is 8
 SAVE_EVERY=1                # checkpoint every N epochs (must divide EPOCHS); not in the name, not in the hash
 RUN_ROOT=/home/external-user/experiments  # empty: $SSR_RUN_ROOT
-TAG=                        # [A-Za-z0-9.-]+, suffix of the run name
+TAG=                        # [A-Za-z0-9.-]+, a letter or digit first; goes into the run name
 WANDB=offline               # online | offline | disable; not in the hash
 EXTRA=                      # raw Hydra lines, ';'-separated: adds _x to the name and enters the hash
 DRY=0                       # 1: train and smoke print what they would do and launch nothing
@@ -175,9 +175,9 @@ do_check() {
 undo_failed_start() {  # the launcher refused before training: leave no run folder behind
   if [ ! -e "$R/launch/train.pid" ] && [ ! -d "$R/train/lightning_logs" ]; then
     rm -rf "$R/launch/gen"
-    rm -f "$R/launch/settings.json" "$R/launch/verify_assets.log" "$R/launch/overrides.txt" "$R/launch/ck_e2e2_effective.json" \
+    rm -f "$R/launch/settings.json" "$R/launch/verify_assets.log" "$R/launch/overrides.txt" "$R/launch/refiner_effective.json" \
       "$R/launch/teachers.json" "$R/launch/git_status.txt" "$R/launch/git_dirty.diff" "$R/launch/git_untracked.tar.gz"
-    rmdir "$R/train" "$R/ck_e2e2" "$R/launch" "$R" 2> /dev/null
+    rmdir "$R/train" "$R/refiner" "$R/launch" "$R" 2> /dev/null
   fi
   return 0
 }
@@ -292,7 +292,7 @@ do_smoke() {
   [ "$rc" = 0 ] || say "training exit $rc (see $R/launch/train.log)"
   py "$SMOKE_CHECK" --run-dir "$R" --mem-limit-gb "$MEM_LIMIT_GB" || die "smoke failed: $R"
   if [ "$SMOKE_KEEP" = 0 ]; then
-    rm -rf "$R/ck_e2e2/rec" "$R/ck_e2e2/lab"
+    rm -rf "$R/refiner/rec" "$R/refiner/lab"
     local c; for c in "$R"/train/lightning_logs/version_*/checkpoints; do rm -rf "$c"; done
     say "removed this smoke's checkpoints, rec, lab; logs and json kept"
   fi
@@ -350,15 +350,15 @@ do_purge() {
   only_keys purge RUN CONFIRM RUN_ROOT
   [ -n "$RUN" ] || die "purge needs RUN=<name>"
   resolve_run
-  [ "$CONFIRM" = 1 ] || die "purge removes $R/ck_e2e2/{lab,rec}: add CONFIRM=1"
-  [ -f "$R/ck_e2e2/TRAIN_DONE" ] || die "$R has no ck_e2e2/TRAIN_DONE: the run is not finished"
+  [ "$CONFIRM" = 1 ] || die "purge removes $R/refiner/{lab,rec}: add CONFIRM=1"
+  [ -f "$R/refiner/TRAIN_DONE" ] || die "$R has no refiner/TRAIN_DONE: the run is not finished"
   local p; p=$(cat "$R/launch/train.pid" 2>/dev/null || true)
   if [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] && tr '\0' ' ' < "/proc/$p/cmdline" | grep -q run_training; then
     die "training of $RUN is still running (pid $p)"
   fi
-  du -sh "$R/ck_e2e2/lab" "$R/ck_e2e2/rec" 2> /dev/null
-  rm -rf "$R/ck_e2e2/lab" "$R/ck_e2e2/rec"
-  say "removed $R/ck_e2e2/{lab,rec}"
+  du -sh "$R/refiner/lab" "$R/refiner/rec" 2> /dev/null
+  rm -rf "$R/refiner/lab" "$R/refiner/rec"
+  say "removed $R/refiner/{lab,rec}"
 }
 
 case "$CMD" in

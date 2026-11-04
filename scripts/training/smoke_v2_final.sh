@@ -8,7 +8,7 @@
 #   env: TAG (run name), MEM_LIMIT_GB (22.5, peak torch memory per GPU), SMOKE_ROOT (launcher-enforced smoke prefix)
 #
 # Checks (exit 1 on failure): training exit 0, two epochs (warmup_record, onpolicy), no non-finite loss / step value,
-# peak memory < MEM_LIMIT_GB, launch/teachers.json kd_calib mode 'online', ck_e2e2/kd_calib_online.jsonl with >= 5
+# peak memory < MEM_LIMIT_GB, launch/teachers.json kd_calib mode 'online', refiner/kd_calib_online.jsonl with >= 5
 # warm-up refits whose every key (DET nc / ep / ttc, MAP dac / ep) is fitted with finite a > 0, >= 1 on-policy window,
 # ck2/cal_* in the step log.  Printed (not checked): per-phase sec_step and ck2/teacher_ms (cost of the extra teacher
 # pass on the label set in on-policy), the last (a, b) per key, whether an on-policy fit (EMA reset) happened.
@@ -38,13 +38,13 @@ R=$SMOKE_ROOT/$TAG
 "$SSR_PY" - "$R" "$MEM_LIMIT_GB" <<'PY' || { echo "[smoke_v2_final] FAILED (run dir $R)"; exit 1; }
 import json, math, sys
 R, mem_limit = sys.argv[1], float(sys.argv[2])
-ep = [json.loads(l) for l in open(f"{R}/ck_e2e2/epochs.jsonl")]
+ep = [json.loads(l) for l in open(f"{R}/refiner/epochs.jsonl")]
 ends = [e for e in ep if e["event"] == "epoch_end"]
 phases = [e.get("phase") for e in ep if e["event"] == "epoch_start"]
 assert len(ends) == 2 and phases == ["warmup_record", "onpolicy"], (len(ends), phases)
 cum = ends[-1]["cum"]
 assert cum["nonfinite_loss"] == 0 and cum["sur_nonfinite"] == 0, cum
-st = [json.loads(l) for l in open(f"{R}/ck_e2e2/steps_rank0.jsonl")]
+st = [json.loads(l) for l in open(f"{R}/refiner/steps_rank0.jsonl")]
 bad = sorted({k for s in st for k, v in s.items() if isinstance(v, float) and not math.isfinite(v)})
 assert not bad, bad[:10]
 mem = max(s.get("mem_gb", 0) for s in st)
@@ -52,7 +52,7 @@ assert mem < mem_limit, f"peak mem {mem} GB >= {mem_limit}"
 tj = json.load(open(f"{R}/launch/teachers.json"))
 assert (tj.get("kd_calib") or {}).get("mode") == "online", tj.get("kd_calib")
 assert any("ck2/cal_det_nc_a" in s for s in st), "no ck2/cal_* in steps_rank0.jsonl"
-cal = [json.loads(l) for l in open(f"{R}/ck_e2e2/kd_calib_online.jsonl")]
+cal = [json.loads(l) for l in open(f"{R}/refiner/kd_calib_online.jsonl")]
 KEYS = ("det/nc", "det/ep", "det/ttc", "map/dac", "map/ep")
 wu = [c for c in cal if c["window_phase"] == "warmup_record" and "keys" in c]
 assert len(wu) >= 5, f"{len(wu)} warm-up refits"

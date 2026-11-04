@@ -37,7 +37,7 @@ SMOKE_SETS = [f"teacher_det_run={SMOKE_T}", f"teacher_map_run={SMOKE_M}", "ep_ta
 
 
 def _ov(tmp, sets=(), gpus=("0", "1"), **kw):
-    return L2.build_overrides2(str(tmp / "ck2e2e_test"), list(gpus), ck_sets=list(SMOKE_SETS) + list(sets),
+    return L2.build_overrides2(str(tmp / "refiner_test"), list(gpus), ck_sets=list(SMOKE_SETS) + list(sets),
                                wandb=kw.pop("wandb", "offline"), **kw)
 
 
@@ -59,10 +59,12 @@ def test_recipe_and_ck_leaves(tmp_path):
     assert _get(ov, "agent.config.max_epochs") == "30" and _get(ov, "trainer.params.max_epochs") == "30"
     assert _get(ov, "agent.config.image_architecture") == "resnet34.tv_in1k" and _get(ov, "agent.lr") == "1e-4"
     assert _get(ov, "agent.config.plan_score_file").endswith("/planning_vb/pdm_score_256")      # v2 keeps WoTE labels
-    assert _get(ov, "experiment_name") == "ck2e2e_test" and _get(ov, "wandb.name") == "ck2e2e_test"
-    assert _get(ov, "wandb.project") == "para-ssr-v2" and _get(ov, "wandb.group") == "ck2e2e"
-    assert _get(ov, "wandb.tags") == "[ck2e2e,main]"
-    assert _get(ov, "output_dir") == f"{tmp_path}/ck2e2e_test/train/"
+    assert _get(ov, "experiment_name") == "refiner_test" and _get(ov, "wandb.name") == "refiner_test"
+    assert _get(ov, "wandb.project") == "ssr" and _get(ov, "wandb.group") == "refiner"
+    assert _get(ov, "wandb.tags") == "[refiner,main]"
+    assert _get(ov, "output_dir") == f"{tmp_path}/refiner_test/train/"
+    assert "wandb.project=para-ssr-v2" not in L2.recipe2("refiner_test", str(tmp_path), 2, 6, 30, "offline")
+    assert "experiment_name=refiner_main_abc123" in L2.recipe2("main_abc123", str(tmp_path), 2, 6, 30, "offline")
     # doubled per-mb constants and the user decisions
     c = "agent.config.ck_e2e2."
     want = {"enabled": "true", "lat_kd.start_mb": "1000", "label_refresh_every_mb": "1000", "grad_share_every": "100",
@@ -70,10 +72,10 @@ def test_recipe_and_ck_leaves(tmp_path):
             "label_lag": "1", "variants.ext": "straight", "variants.speeds": "[-1.0,-0.5,0.5]",
             "variants.lats": "[-0.5,0.5]", "variants.combine": "separate", "teacher_amp": "true",
             "teacher_which": "last", "bev_kd.enabled": "false", "infer_select": "null",
-            "io_dir": f"{tmp_path}/ck2e2e_test/ck_e2e2", "teacher_det_run": str(SMOKE_T)}
+            "io_dir": f"{tmp_path}/refiner_test/refiner", "teacher_det_run": str(SMOKE_T)}
     for k, v in want.items():
         assert _get(ov, c + k) == v, k
-    assert ck["io_dir"] == f"{tmp_path}/ck2e2e_test/ck_e2e2"
+    assert ck["io_dir"] == f"{tmp_path}/refiner_test/refiner"
     assert teachers["det"]["ckpt_sha16"] and teachers["map"]["arm"] == "M" and "lon_head" in teachers["det"]
     # every CKE2E2Config leaf is in the yaml and the yaml equals the dataclass defaults (enabled / io_dir aside)
     from navsim.agents.para_ssr.ck.online2 import CKE2E2Config
@@ -109,7 +111,7 @@ def test_bevkd_arm_set_file(tmp_path):
                  "cap": "0.25", "start_mb": "10600", "ratio_det": "null", "ratio_map": "null", "cap_det": "null",
                  "cap_map": "null"}.items():
         assert _get(ov, c + k) == v, k
-    assert _get(ov, "wandb.tags") == "[ck2e2e,bevkd]" and L2.arm_of(ck) == "bevkd"
+    assert _get(ov, "wandb.tags") == "[refiner,bevkd]" and L2.arm_of(ck) == "bevkd"
     # everything else identical to the main run (same recipe / seed / data order)
     ov_m, _, _ = _ov(tmp_path)
     diff = sorted(set(ov) ^ set(ov_m))
@@ -138,7 +140,7 @@ def test_smoke_check2_and_status_per_teacher(tmp_path):
     R = tmp_path / "g1_bevkd"
     (R / L2.IO_SUB).mkdir(parents=True)
     (R / "launch").mkdir()
-    (R / "launch/ck_e2e2_effective.json").write_text(json.dumps(
+    (R / "launch/refiner_effective.json").write_text(json.dumps(
         {"bev_kd": {"enabled": True, "teachers": ["det", "map"], "start_mb": 2}}))
     recs = []
     for mb in range(6):
@@ -275,7 +277,7 @@ def test_four_gpus_keep_the_schedule_in_samples(tmp_path):
                  "bev_kd.start_mb": "5300"}.items():
         assert _get(ov, c + k) == v, k
     assert ck["lat_kd"]["start_mb"] == 500 and ck["grad_share_every"] == 50 and ck["bev_kd"]["start_mb"] == 5300
-    assert _get(ov, "wandb.tags") == "[ck2e2e,main,gpu4]"
+    assert _get(ov, "wandb.tags") == "[refiner,main,gpu4]"
     ov2, _, _ = _ov(tmp_path, ["grad_share_every=7"], gpus=("0", "1", "2", "3"))
     assert _get(ov2, c + "grad_share_every") == "7"
     c2, c4 = L2.counters2(2), L2.counters2(4)
@@ -336,7 +338,7 @@ def test_train_e2e2_dry_run(tmp_path):
     assert "++agent.config.ck_e2e2.bev_kd.enabled=false" in out and "dry run: nothing launched (arm main" in out
     R = tmp_path / "root/dry_main"
     assert not (R / "launch/train.pid").exists() and not (R / "train").exists() and not (R / "labeler").exists()
-    assert (R / "launch_dryrun/teachers.json").is_file() and (R / "launch_dryrun/ck_e2e2_effective.json").is_file()
+    assert (R / "launch_dryrun/teachers.json").is_file() and (R / "launch_dryrun/refiner_effective.json").is_file()
     r = _sh(dict(base, CK2_E2E_APPROVED="1", ARM="bevkd", RUN="dry_bevkd"), "start", "--gpus", "2,3")
     assert r.returncode == 0, r.stderr[-2000:]
     assert "++agent.config.ck_e2e2.bev_kd.enabled=true" in r.stdout and "arm bevkd" in r.stdout
@@ -391,8 +393,8 @@ def test_hydra_compose_full_override_list(tmp_path):
         assert int(cfg.dataloader.params.batch_size) == 4 and cfg.trainer.params.strategy == "ddp"
         assert int(cfg.agent.config.grad_balance_warmup_iters) == 10600
         assert int(cfg.agent.config.grad_balance_interval) == 200 and int(cfg.agent.config.grad_norm_log_interval) == 200
-        assert list(cfg.wandb.tags) == ["ck2e2e", L2.arm_of(ck)] and cfg.wandb.group == "ck2e2e"
-        assert cfg.wandb.project == "para-ssr-v2" and cfg.wandb.name == "ck2e2e_test"
+        assert list(cfg.wandb.tags) == ["refiner", L2.arm_of(ck)] and cfg.wandb.group == "refiner"
+        assert cfg.wandb.project == "ssr" and cfg.wandb.name == "refiner_test"
         assert dict(OmegaConf.to_container(cfg.agent.config.grad_balance_target)) == {"plan": 0.4, "det": 0.3, "map": 0.3}
         pc = instantiate(cfg.agent.config)
         assert CKE2E2Config.from_any(pc.ck_e2e2).to_dict() == CKE2E2Config.from_any(ck).to_dict()

@@ -37,7 +37,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `table` | `<RUN_ROOT>/*/eval/*/summary.json`을 표로 출력합니다. | 평가 결과 |
 | `assets` | 이 설정에 필요한 파일이 맞게 있는지 확인합니다 (`QUICK=1`은 빠른 확인). | 없음 |
 | `teachers` | refiner teacher 두 개를 학습합니다 (`GPUS_DET=`, `GPUS_MAP=`, `WHICH=both|det|map`). 각 2.8시간, GPU 4장. | BEV 캐시 |
-| `purge` | `RUN=<이름> CONFIRM=1`. `TRAIN_DONE`이 있는 run의 `ck_e2e2/{lab,rec}`만 지웁니다. 평가에 쓰지 않는 파일입니다. | 없음 |
+| `purge` | `RUN=<이름> CONFIRM=1`. `TRAIN_DONE`이 있는 run의 `refiner/{lab,rec}`만 지웁니다. 평가에 쓰지 않는 파일입니다. | 없음 |
 
 `train`이 거부하는 경우:
 
@@ -51,17 +51,17 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 
 ## 3. 설정
 
-| 키 | 값 | 기본 | 이름에 들어가는 부분 | 뜻 |
+| 키 | 값 | 기본 | 기본값과 다를 때 이름에 들어가는 부분 | 뜻 |
 |---|---|---|---|---|
-| `REFINER` | on off | on | `ref1` `ref0` | refiner 전체를 켜고 끕니다. 끄면 labeler도 안 돌고 v2 head 궤적을 제출합니다. |
-| `REFINER_KD` | on off score lat | on | `rkd1` `rkd0` `rkdS` `rkdL` | refiner로 가는 KD. `off`는 teacher를 아예 읽지 않습니다. `score`는 score KD만 남기고 lateral KD를 끕니다. `lat`는 lateral KD만 남기고 score KD를 끕니다. |
-| `BEV_KD` | on off | on | `bkd1` `bkd0` | BEV KD v15 (student BEV로 가는 KD). |
-| `DET_KD` | on off off_bev off_ref | on | `det1` `det0` `det0b` `det0r` | DET teacher에서 오는 KD. `off`는 두 경로 모두, `off_bev`는 BEV KD만, `off_ref`는 refiner KD만 끕니다. |
-| `MAP_KD` | on off off_bev off_ref | on | `map1` `map0` `map0b` `map0r` | MAP teacher에서 오는 KD. 값의 뜻은 같습니다. |
-| `BACKBONE` | r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 | r34 | 맨 앞 | timm 이름과 필요한 플래그는 registry에 있습니다. swin, vit는 코드가 더 필요해서 거부합니다. |
+| `REFINER` | on off | on | `ref-off` | refiner 전체를 켜고 끕니다. 끄면 labeler도 안 돌고 v2 head 궤적을 제출합니다. |
+| `REFINER_KD` | on off score lat | on | `rkd-off` `rkd-score` `rkd-lat` | refiner로 가는 KD. `off`는 teacher를 아예 읽지 않습니다. `score`는 score KD만 남기고 lateral KD를 끕니다. `lat`는 lateral KD만 남기고 score KD를 끕니다. |
+| `BEV_KD` | on off | on | `bkd-off` | BEV KD v15 (student BEV로 가는 KD). |
+| `DET_KD` | on off off_bev off_ref | on | `detkd-off` `detkd-offbev` `detkd-offref` | DET teacher에서 오는 KD. `off`는 두 경로 모두, `off_bev`는 BEV KD만, `off_ref`는 refiner KD만 끕니다. |
+| `MAP_KD` | on off off_bev off_ref | on | `mapkd-off` `mapkd-offbev` `mapkd-offref` | MAP teacher에서 오는 KD. 값의 뜻은 같습니다. |
+| `BACKBONE` | r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 | r34 | 이름 그대로 (`r50`), 맨 앞 | timm 이름과 필요한 플래그는 registry에 있습니다. swin, vit는 코드가 더 필요해서 거부합니다. |
 | `DET_TEACHER` | registry 이름 | bevfusion | `<det>-<map>` | DET teacher. `bevformer`는 등록만 되어 있고 없어서, 무엇이 부족한지 출력하고 거부합니다. |
 | `MAP_TEACHER` | registry 이름 | resmap | `<det>-<map>` | MAP teacher. `mask2map`도 같습니다. |
-| `INTERACTION` | on off | on | `st` 안의 `noint` | task interaction. |
+| `INTERACTION` | on off | on | `noint` | task interaction. |
 | `DET_HEAD` | on off | on | `nodet` | det head. off는 `INTERACTION=off`가 필요합니다. |
 | `MAP_HEAD` | seg vector off | seg | `vecmap` `nomap` | map head. off는 `INTERACTION=off`가 필요합니다. |
 | `FRAMES` | `2,3` `3` `0,1,2,3` | `2,3` | `f1` `f4` | 입력 프레임. |
@@ -69,15 +69,15 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `HEADING` | xy free | xy | `headfree` | heading을 경로에서 계산(xy)하거나 별도 head로 예측(free)합니다. |
 | `PILLAR_Z` | `a,b` | `-1,3` | `z<a>_<b>` | 카메라 pillar 높이 범위(m). 소수점은 이름에서 `p`가 됩니다 (`z-1p5_2p5`). |
 | `BEV_RANGE` | 64 32 | 64 | `r32` | 앞쪽 범위. 32는 `REFINER=off BEV_KD=off`일 때만 됩니다. 32 m teacher 캐시가 없기 때문입니다. |
-| `BN` | moving frozen | moving | `bnm` `bnf` | backbone BatchNorm 통계. moving이 지금까지의 v7 숫자 뒤에 있는 동작입니다. 비교할 run들은 같은 값이어야 합니다. |
+| `BN` | moving frozen | moving | `bn-frozen` | backbone BatchNorm 통계. moving이 지금까지의 v7 숫자 뒤에 있는 동작입니다. 비교할 run들은 같은 값이어야 합니다. |
 | `SEED` | 정수 | 0 | `s<N>` | 전역 seed, `ck_e2e2.seed`, `distill_probe_seed`. `warmup.sampler_seed`는 0 고정입니다 (미리 만든 label과 묶여 있음). |
 | `EPOCHS` | 정수 | 30 | `e<N>` | trainer, `agent.max_epochs`, labeler 상한을 함께 바꿉니다. refiner를 켜면 6 이상이어야 합니다. |
 | `GPUS` | 쉼표 목록 | `0,...,7` | `g<N>` | 2, 4, 8장. 번호 제한은 없고, 각 GPU 사용량이 1 GiB 미만이어야 합니다. 기준은 8장입니다. |
 | `SAVE_EVERY` | 정수 | 1 | 없음 | N epoch마다 checkpoint. `EPOCHS`를 나누어떨어뜨려야 합니다 (평가는 마지막 epoch를 읽음). hash에도 안 들어갑니다. `resume`은 마지막으로 저장된 지점부터 이어갑니다. |
 | `RUN_ROOT` | 경로 | `$SSR_RUN_ROOT` | 없음 | run 폴더 위치. |
-| `TAG` | `[A-Za-z0-9.-]+` | 없음 | 접미사 | 같은 설정을 다시 돌릴 때 등. |
+| `TAG` | `[A-Za-z0-9.-]+` | 없음 | 값 그대로, hash 앞 | 같은 설정을 다시 돌릴 때 등. 글자나 숫자로 시작해야 합니다. `main`, `smoke`, 그리고 `v2`, `ck` 같은 옛 이름 조각은 거부합니다. |
 | `WANDB` | online offline disable | offline | 없음 | hash에 안 들어갑니다. 팀 계정은 `WANDB_ENTITY`로 지정합니다 (기본값 없음). |
-| `EXTRA` | Hydra 줄, `;`로 구분 | 없음 | `_x` | 위 키에 없는 것을 바꿀 때. hash에 들어갑니다. |
+| `EXTRA` | Hydra 줄, `;`로 구분 | 없음 | `x` | 위 키에 없는 것을 바꿀 때. hash에 들어갑니다. |
 | `DRY` | 0 1 | 0 | 없음 | 1이면 `train`, `smoke`가 시작하지 않고 출력만 합니다. |
 
 명령별 옵션: `RUN`, `EPOCH`, `EPDMS`, `CONFIRM`, `QUICK`, `BASE`(표의 기준 run), `CHECK_ROOT`, `REGISTRY`(registry 파일 경로), `ALLOW_DIRTY`, `ALLOW_MIXED`, `ALLOW_COMMIT_CHANGE`, `FORCE_CONCURRENT`, `MIN_FREE_GB`, `MEM_LIMIT_GB`(기본 22.5), `SMOKE_KEEP`(0이면 통과 후 그 스모크의 ckpt, rec, lab 삭제), `GPUS_DET`, `GPUS_MAP`, `WHICH`. 그 외 키는 거부합니다.
@@ -89,27 +89,50 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 
 ## 4. 폴더 이름
 
+기본값과 다른 것만 아래 순서대로 `_`로 잇고, 맨 뒤에 hash를 붙입니다. 다른 것이 없으면 `main_<hash6>`입니다.
+
 ```
-v2f_<bb>_<det>-<map>_ref<>_rkd<>_bkd<>_det<>_map<>_st<base|a.b>_bn<>_e<N>_g<N>_s<N>[_<TAG>][_x]_<hash6>
+[backbone] [<det>-<map>] [ref-off] [rkd-off|rkd-score|rkd-lat] [bkd-off] [detkd-off|detkd-offbev|detkd-offref]
+[mapkd-off|mapkd-offbev|mapkd-offref] [noint nodet vecmap|nomap f1|f4 dist headfree z<a>_<b> r32]
+[bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 ```
 
-예: `v2f_r34_bevfusion-resmap_ref1_rkd1_bkd1_det1_map1_stbase_bnm_e30_g8_s0_c04aa7`
+| 인자 | 이름 |
+|---|---|
+| (없음) | `main_<hash6>` |
+| `DET_KD=off` | `detkd-off_<hash6>` |
+| `BACKBONE=r50` | `r50_<hash6>` |
+| `REFINER_KD=off BEV_KD=off` | `rkd-off_bkd-off_<hash6>` |
+| `REFINER=off BEV_KD=off` | `ref-off_bkd-off_<hash6>` |
+| `BACKBONE=r50 REFINER_KD=score MAP_KD=off_ref SEED=1 TAG=try1` | `r50_rkd-score_mapkd-offref_s1_try1_<hash6>` |
 
-- 기본값도 생략하지 않습니다. 정렬과 grep이 그대로 되고, 기본값이 바뀌어도 이름의 뜻이 그대로입니다.
+- 기본값은 이름에 쓰지 않습니다. 기본값이 코드에서 바뀌면 override가 바뀌므로 hash가 바뀌어 다른 이름이 됩니다.
 - `hash6`는 실제 Hydra override 전체(run 경로, wandb 줄 제외, 데이터 경로는 자리표시자로 바꿈)와 쓰는 teacher의 sha 고정값으로 계산합니다. commit은 넣지 않습니다. 그래서 같은 설정은 어느 서버에서든 같은 이름이고, 레시피 기본값이 코드에서 바뀌면 이름이 바뀝니다.
 - 전체 기록은 `<run>/launch/settings.json`에 있습니다: 설정, override sha, commit, dirty 여부, GPU 목록, 호스트, python과 torch 버전, teacher 고정값, 파일 확인 결과. 이 파일의 설정으로 이름을 다시 만들 수 있습니다.
+- 스모크는 앞에 `smoke_`가 붙습니다: `smoke_main_<hash6>`.
 
-한 설정이 한 이름만 갖도록 다음을 정리합니다:
+run 폴더 안의 이름:
+
+| 경로 또는 값 | 내용 |
+|---|---|
+| `<run>/refiner/` | refiner 기록 (`rec/`, `lab/`, `steps_rank0.jsonl`, `epochs.jsonl`, `TRAIN_DONE`). Hydra 키는 `ck_e2e2.io_dir` 그대로입니다. |
+| `<run>/launch/refiner_effective.json` | 이 run이 실제로 쓴 refiner 설정 |
+| `experiment_name` | `refiner_<run>` |
+| W&B | project `ssr`, group `refiner`, name `<run>`, tags `[refiner,<arm>]` (2 GPU가 아니면 `gpu<N>` 추가) |
+
+디스크의 데이터 폴더(`$SSR_DATA_ROOT/ck/packed`, `ck/labels`, `ck/ck2/labels` 등)와 Hydra 키 `ck_e2e2`, 환경 변수 이름은 그대로입니다.
+
+한 설정이 한 이름만 갖도록 다음을 정리합니다. 다른 설정에서 따라오는 값은 이름에 쓰지 않습니다.
 
 | 입력 | 결과 |
 |---|---|
-| `REFINER=off` | `rkd0`로 고정 |
-| `REFINER_KD=off BEV_KD=off` | `det0 map0`로 고정 |
-| `REFINER_KD=off DET_KD=off` (또는 `REFINER=off`) | `off`는 `off_bev`가 됩니다 (`det0b`). `off_ref`는 뜻이 없어 거부합니다. |
-| `BEV_KD=off DET_KD=off` | `off`는 `off_ref`가 됩니다 (`det0r`). `off_bev`는 거부합니다. |
+| `REFINER=off` | `REFINER_KD=off`로 고정. 이름은 `ref-off`만 씁니다. |
+| `REFINER_KD=off BEV_KD=off` | `DET_KD=off MAP_KD=off`로 고정. 이름은 `rkd-off_bkd-off`입니다. |
+| `REFINER_KD=off DET_KD=off` (또는 `REFINER=off`) | `off`는 `off_bev`가 됩니다 (`rkd-off_detkd-offbev`). `off_ref`는 뜻이 없어 거부합니다. |
+| `BEV_KD=off DET_KD=off` | `off`는 `off_ref`가 됩니다 (`bkd-off_detkd-offref`). `off_bev`는 거부합니다. |
 | `DET_KD=off MAP_KD=off` (KD가 하나라도 켜짐) | 거부합니다. `REFINER_KD=off BEV_KD=off`를 쓰세요. |
 | 양쪽 BEV bank 또는 양쪽 refiner source를 모두 끔 | 거부합니다. 각각 `BEV_KD=off`, `REFINER_KD=off`를 쓰세요. |
-| 아무도 읽지 않는 teacher | 이름에서 기본 teacher로 돌아갑니다. |
+| 아무도 읽지 않는 teacher | 기본 teacher로 돌아가 이름에 나오지 않습니다. |
 
 기본 레시피의 override는 `tools/release/reference/main_overrides.txt`(참조 run의 override, 경로만 자리표시자로 바꿈)와 다음 줄만 다를 수 있습니다. `check`가 이를 확인하고 PASS/FAIL을 출력합니다.
 

@@ -70,7 +70,7 @@ def _calib_checks(run: Path, s: Dict[str, str], steps, teachers, checks, info) -
     if len(src) == 1:
         kd_keys = list(KD_KEYS_OF[src[0]])
     keys = [f"{t}/{k}" for t in ("det", "map") for k in KD_KEYS_OF[t] if k in kd_keys]
-    cal = read_jsonl(run / "ck_e2e2/kd_calib_online.jsonl")
+    cal = read_jsonl(run / "refiner/kd_calib_online.jsonl")
     wu = [c for c in cal if c.get("window_phase") == "warmup_record" and "keys" in c]
     checks["kd_calib_ge_5_warmup_refits"] = len(wu) >= 5
     good = True
@@ -88,7 +88,7 @@ def _calib_checks(run: Path, s: Dict[str, str], steps, teachers, checks, info) -
 
 
 def _refiner_checks(run: Path, s: Dict[str, str], checks: Dict[str, bool], info: Dict[str, Any]) -> List[Dict[str, Any]]:
-    io = run / "ck_e2e2"
+    io = run / "refiner"
     ep = read_jsonl(io / "epochs.jsonl")
     ends = [e for e in ep if e.get("event") == "epoch_end"]
     phases = [e.get("phase") for e in ep if e.get("event") == "epoch_start"]
@@ -151,7 +151,7 @@ def check_run(run_dir: str, mem_limit_gb: float = 22.5) -> Dict[str, Any]:
     if s["REFINER"] == "on":
         steps = _refiner_checks(run, s, checks, info)
     else:
-        checks["no_refiner_files"] = not (run / "ck_e2e2/steps_rank0.jsonl").exists()
+        checks["no_refiner_files"] = not (run / "refiner/steps_rank0.jsonl").exists()
 
     # memory
     torch_peak = max((float(r.get("mem_gb", 0.0)) for r in steps), default=0.0) or None

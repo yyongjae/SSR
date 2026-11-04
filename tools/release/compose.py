@@ -18,10 +18,13 @@ data on disk.  scripts/experiment.sh is its one caller; the CLI below writes wha
   compose.py dirty-record --out-dir D               save the uncommitted diff into the run folder
   compose.py resume-check --composition J --settings-json F [--allow-commit-change]
 
-Run name, always explicit so that sort and grep work and a changed default cannot silently rename a run:
-  v2f_<bb>_<det>-<map>_ref<>_rkd<>_bkd<>_det<>_map<>_st<base|a.b>_bn<>_e<N>_g<N>_s<N>[_<TAG>][_x]_<hash6>
+Run name: only what differs from the defaults, in a fixed order, joined with _, then the hash (main_<hash6> by default):
+  [<bb>] [<det>-<map>] [ref-off] [rkd-off|score|lat] [bkd-off] [detkd-off|offbev|offref] [mapkd-off|offbev|offref]
+  [noint nodet vecmap|nomap f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
+A setting implied by another one gets no part: REFINER=off is ref-off only, REFINER_KD=off BEV_KD=off is rkd-off_bkd-off.
 hash6 = sha256 over the resolved overrides, minus run-path and wandb lines, with data roots written as placeholders so
-one config has one name on every server, plus the registry pins of the teachers in use.  Never the commit.
+one config has one name on every server, plus the registry pins of the teachers in use.  Never the commit.  A changed
+default changes the overrides, so it changes the hash; launch/settings.json of a run has every setting.
 """
 from __future__ import annotations
 
@@ -53,7 +56,6 @@ REFERENCE = REPO / "tools/release/reference/main_overrides.txt"
 ARM_EXTRA = REPO / "tools/ck/e2e2/v2_v15_v7_arm.extra"
 AGENT_YAML = REPO / "navsim/planning/script/config/common/agent/para_ssr_agent.yaml"
 ANCHORS_REL = "resources/planning_vb/trajectory_anchors_256.npy"
-WANDB_PROJECT = "v2_final"
 
 # every setting and its default; scripts/experiment.sh has the same block at its top (a test compares them)
 DEFAULTS: Dict[str, str] = {
@@ -74,9 +76,10 @@ CHOICES: Dict[str, Tuple[str, ...]] = {
 # settings that describe where or how a run is launched, not what it trains
 NOT_RECIPE = ("GPUS", "SAVE_EVERY", "RUN_ROOT", "TAG", "WANDB", "DRY")
 GPU_COUNTS = (2, 4, 8)
-RKD_PART = {"on": "1", "off": "0", "score": "S", "lat": "L"}
-TKD_PART = {"on": "1", "off": "0", "off_bev": "0b", "off_ref": "0r"}
-KD_KEYS_OF = {"det": ["nc", "ep", "ttc"], "map": ["dac", "ep"]}   # kd_calib.fit_keys: a single teacher teaches its own keys
+NAME_DEFAULT = "main"                      # the run name's first part when no setting differs from the defaults
+NAME_SMOKE = "smoke"                       # prefix of a smoke run (scripts/experiment.sh looks for smoke_*)
+NAME_REFUSED_PARTS = ("v2", "v2f", "ck", "v7", "v15")    # the run name is what people read: no old branch words in it
+KD_KEYS_OF ={"det": ["nc", "ep", "ttc"], "map": ["dac", "ep"]}   # kd_calib.fit_keys: a single teacher teaches its own keys
 ONPOLICY_FROM_EPOCH = 5           # ck_e2e2.yaml; the launcher repeats this refusal with the merged value
 # Refused in EXTRA: the locked values of the release (docs/EXPERIMENTS.md).
 EXTRA_REFUSED = ("infer_select", "submit_selection", "kd_calib", "teacher_", "warmup.", "distill_lambda_", "distill_tau_",
@@ -231,8 +234,11 @@ def canonicalize(raw: Mapping[str, str], reg: Optional[Mapping[str, Any]] = None
     if not all(g.isdigit() for g in gpus) or len(set(gpus)) != len(gpus) or len(gpus) not in GPU_COUNTS:
         raise Refused(f"GPUS={s['GPUS']}: {' | '.join(map(str, GPU_COUNTS))} distinct GPU indices")
     s["GPUS"] = ",".join(gpus)
-    if s["TAG"] and not re.fullmatch(r"[A-Za-z0-9.-]+", s["TAG"]):
-        raise Refused(f"TAG={s['TAG']}: characters A-Za-z0-9.- only")
+    # a tag can be the first part of the run name
+    if s["TAG"] and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", s["TAG"]):
+        raise Refused(f"TAG={s['TAG']}: characters A-Za-z0-9.- only, a letter or digit first")
+    if s["TAG"] in (NAME_DEFAULT, NAME_SMOKE):
+        raise Refused(f"TAG={s['TAG']}: the run name would read as the default recipe or as a smoke run")
     if s["RUN_ROOT"] and (not os.path.isabs(s["RUN_ROOT"]) or "=" in s["RUN_ROOT"]):
         raise Refused(f"RUN_ROOT={s['RUN_ROOT']}: an absolute path without '='")
     a, b = parse_pillar_z(s["PILLAR_Z"])
@@ -329,21 +335,45 @@ def _st_parts(s: Mapping[str, str]) -> List[str]:
     return p
 
 
+def _teacher_kd_part(s: Mapping[str, str], key: str, label: str) -> List[str]:
+    """The name part of DET_KD / MAP_KD on canonical settings: nothing when on, nothing when no KD runs at all."""
+    if s[key] == "on" or (s["REFINER_KD"] == "off" and s["BEV_KD"] == "off"):
+        return []
+    return [f"{label}-{s[key].replace('_', '')}"]
+
+
 def run_name(s: Mapping[str, str], hash6: str) -> str:
-    st = ".".join(_st_parts(s)) or "base"
-    bn = "bnm" if s["BN"] == "moving" else "bnf"
-    parts = [f"v2f_{s['BACKBONE']}_{s['DET_TEACHER']}-{s['MAP_TEACHER']}", f"ref{'1' if s['REFINER'] == 'on' else '0'}",
-             f"rkd{RKD_PART[s['REFINER_KD']]}", f"bkd{'1' if s['BEV_KD'] == 'on' else '0'}",
-             f"det{TKD_PART[s['DET_KD']]}", f"map{TKD_PART[s['MAP_KD']]}", f"st{st}", bn, f"e{s['EPOCHS']}",
-             f"g{len(s['GPUS'].split(','))}", f"s{s['SEED']}"]
+    parts: List[str] = []
+    if s["BACKBONE"] != DEFAULTS["BACKBONE"]:
+        parts.append(s["BACKBONE"])
+    if s["DET_TEACHER"] != DEFAULTS["DET_TEACHER"] or s["MAP_TEACHER"] != DEFAULTS["MAP_TEACHER"]:
+        parts.append(f"{s['DET_TEACHER']}-{s['MAP_TEACHER']}")
+    if s["REFINER"] == "off":
+        parts.append("ref-off")           # the refiner KD goes with it
+    elif s["REFINER_KD"] != "on":
+        parts.append(f"rkd-{s['REFINER_KD']}")
+    if s["BEV_KD"] == "off":
+        parts.append("bkd-off")
+    parts += _teacher_kd_part(s, "DET_KD", "detkd") + _teacher_kd_part(s, "MAP_KD", "mapkd")
+    parts += _st_parts(s)
+    if s["BN"] != DEFAULTS["BN"]:
+        parts.append(f"bn-{s['BN']}")
+    if s["EPOCHS"] != DEFAULTS["EPOCHS"]:
+        parts.append(f"e{s['EPOCHS']}")
+    if len(s["GPUS"].split(",")) != len(DEFAULTS["GPUS"].split(",")):
+        parts.append(f"g{len(s['GPUS'].split(','))}")
+    if s["SEED"] != DEFAULTS["SEED"]:
+        parts.append(f"s{s['SEED']}")
     if s["TAG"]:
         parts.append(s["TAG"])
     if s["EXTRA"]:
         parts.append("x")
-    parts.append(hash6)
-    name = "_".join(parts)
+    name = "_".join((parts or [NAME_DEFAULT]) + [hash6])
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
         raise Refused(f"run name {name!r} has a character outside A-Za-z0-9_.-")
+    bad = sorted(set(re.split(r"[_.-]", name)) & set(NAME_REFUSED_PARTS))
+    if bad:
+        raise Refused(f"run name {name!r} has the part(s) {', '.join(bad)}: choose another TAG or registry name")
     return name
 
 
@@ -402,9 +432,6 @@ def extra_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mappin
     if bev:                          # v15 probe schedule in per-rank micro-batches (train_v2_v15_v7.sh)
         put(f"++agent.config.distill_probe_warmup_steps={20 if smoke else 21200 // ng}")
         put(f"++agent.config.distill_probe_ramp_steps={20 if smoke else 10600 // ng}")
-    if s["WANDB"] != "disable":
-        put(f"wandb.project={WANDB_PROJECT}")
-        put(f"wandb.group=ref{RKD_PART[s['REFINER_KD']] if s['REFINER'] == 'on' else 'off'}_bkd{'1' if bev else '0'}")
     for line in LU.read_lines(str(ARM_EXTRA)):
         key = LU._okey(line)
         if key.startswith("wandb."):
@@ -643,7 +670,7 @@ def compose(raw: Mapping[str, str], registry: Optional[str] = None, run_root: Op
     name = run_name(s, hash6)
     root = (run_root or s["RUN_ROOT"] or roots["SSR_RUN_ROOT"]).rstrip("/")
     if smoke:
-        name = "smoke_" + name
+        name = f"{NAME_SMOKE}_{name}"
         root = root if run_root else root + "/_smoke"
         s = dict(s, WANDB="disable")
     run_dir = f"{root}/{name}"

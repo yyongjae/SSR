@@ -228,7 +228,7 @@ def main(argv=None) -> int:
         return 0 if res["pass"] else 4
     root = D / "ck2/e2e_smoke_cpu" / f"dryrun_{a.tag}_{a.arm}"
     assert not root.exists(), f"{root} exists (new --tag)"
-    io = root / "ck_e2e2"
+    io = root / "refiner"
     root.mkdir(parents=True)
     ck2 = ck2_dict(io, a.arm)
     res = {"root": str(root), "arm": a.arm, "started": time.strftime("%F %T KST", time.gmtime(time.time() + 9 * 3600)),

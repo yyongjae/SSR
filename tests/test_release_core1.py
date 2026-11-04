@@ -114,7 +114,7 @@ def test_refiner_off_from_the_extra_skips_the_refiner_checks(tmp_path, monkeypat
     ov, ck, teachers = L2.build_overrides2(str(tmp_path / "noref"), ["0", "1"], wandb="offline", extra=[OFF_EXTRA])
     assert ck["enabled"] is False and L2.arm_of(ck) == "noref"
     assert teachers["mode"] == "none" and teachers["enabled"] is False and "warmup_sources" not in teachers
-    assert OFF_EXTRA in ov and "wandb.tags=[ck2e2e,noref]" in ov
+    assert OFF_EXTRA in ov and "wandb.tags=[refiner,noref]" in ov
 
 
 @need_smoke
@@ -126,7 +126,7 @@ def test_effective_record_includes_extra_lines(tmp_path):
     out = tmp_path / "launch/overrides.txt"
     assert L2.main(["overrides", "--run-dir", str(tmp_path / "ck2e2e_x"), "--gpus", "0,1", "--wandb", "offline",
                     "--no-deep", "--ck-set-file", str(s), "--extra-file", str(p), "--out", str(out)]) == 0
-    eff = json.loads((out.parent / "ck_e2e2_effective.json").read_text())
+    eff = json.loads((out.parent / "refiner_effective.json").read_text())
     assert eff["lambda_kd_score"] == 0.25 and eff["_extra_ck_sets"] == ["lambda_kd_score=0.25"] and eff["_arm"] == "main"
     assert "++agent.config.ck_e2e2.lambda_kd_score=0.25" in out.read_text().splitlines()
     # a key the config does not have is refused here, not at agent build
@@ -180,7 +180,7 @@ def test_shell_no_labeler_needs_refiner_off_and_prints_the_true_arm(tmp_path):
     assert r.returncode == 3 and "E2E_NO_LABELER=1 with the refiner on" in r.stderr, r.stderr[-800:]
     r = _sh(dict(base, RUN="off", E2E_EXTRA=str(x), E2E_NO_LABELER="1"), "start", "--gpus", "0,1")
     assert r.returncode == 0 and "arm noref" in r.stdout, r.stderr[-800:]
-    eff = json.loads((tmp_path / "root/off/launch_dryrun/ck_e2e2_effective.json").read_text())
+    eff = json.loads((tmp_path / "root/off/launch_dryrun/refiner_effective.json").read_text())
     assert eff["enabled"] is False and eff["_arm"] == "noref"
     assert json.loads((tmp_path / "root/off/launch_dryrun/teachers.json").read_text())["mode"] == "none"
     # no labeler flag needed either: the effective config decides
@@ -191,12 +191,12 @@ def test_shell_no_labeler_needs_refiner_off_and_prints_the_true_arm(tmp_path):
 def test_shell_labeler_gets_the_tokens_of_the_run_and_the_data_env(tmp_path):
     L = tmp_path / "root/r/launch"
     L.mkdir(parents=True)
-    (L / "ck_e2e2_effective.json").write_text(json.dumps({"warmup": {"packed": "/elsewhere/packed/navtrain_train"}}))
+    (L / "refiner_effective.json").write_text(json.dumps({"warmup": {"packed": "/elsewhere/packed/navtrain_train"}}))
     base = {"E2E_ROOT": str(tmp_path / "root"), "RUN": "r"}
     r = _sh(base, "_labeler_cmd", "--gpus", "0,1,2,3")
     assert r.returncode == 0 and "--tokens /elsewhere/packed/navtrain_train/tokens.parquet" in r.stdout, r.stderr
     assert "--world-size 4" in r.stdout and "--workers 48" in r.stdout
-    (L / "ck_e2e2_effective.json").unlink()
+    (L / "refiner_effective.json").unlink()
     assert "--tokens" not in _sh(base, "_labeler_cmd", "--gpus", "0,1").stdout    # a run from before this record
     env = _sh(base, "_print_env").stdout.splitlines()
     assert {e.split("=")[0] for e in env} == {"NUPLAN_MAP_VERSION", "NUPLAN_MAPS_ROOT", "OPENSCENE_DATA_ROOT"}

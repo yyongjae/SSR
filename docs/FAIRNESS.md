@@ -21,7 +21,7 @@
 | 코드 상태 | `train`, `eval`은 dirty tree를 거부. `ALLOW_DIRTY=1`이면 `git_dirty: true`와 diff를 run 폴더에 남긴다 |
 | 표 | `table`은 GPU 수, 커밋, 프로토콜 버전이 섞이면 거부(`ALLOW_MIXED=1`), 차이가 CI보다 작으면 경고 |
 
-`online2.validate`는 `infer_select`가 비어 있거나 `RELEASE_SELECT`와 같아야 통과시킨다. 옛 평가 도구(`eval_e2e2.py`, `eval_ck2.py`, `run_pdm_score*.py` 등)는 `SSR_RESEARCH_TOOLS=1` 없이는 실행되지 않는다.
+평가 고정이 보류되어 있어 차단은 적용되지 않았다. 지금은 `online2.validate`가 다른 `infer_select`도 통과시키고, 옛 평가 도구(`eval_e2e2.py`, `eval_ck2.py`, `run_pdm_score*.py` 등)도 그대로 실행된다. 어떤 선택 규칙으로 평가했는지는 직접 확인해야 한다.
 
 **이 선택 식 자체가 사후에 정해졌다.** 2-7을 본다.
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -65,46 +66,71 @@ def test_script_block_equals_the_compose_defaults():
 
 
 def test_defaults_match_the_contract_name():
-    assert re.fullmatch(r"v2f_r34_bevfusion-resmap_ref1_rkd1_bkd1_det1_map1_stbase_bnm_e30_g8_s0_[0-9a-f]{6}", name())
+    assert re.fullmatch(r"main_[0-9a-f]{6}", name())
 
 
+# run name without the hash -> settings
 ARMS = {
-    "main": {}, "noref": {"REFINER": "off"}, "norefkd": {"REFINER_KD": "off"}, "noscorekd": {"REFINER_KD": "lat"},
-    "nolatkd": {"REFINER_KD": "score"}, "nobevkd": {"BEV_KD": "off"}, "nokd": {"REFINER_KD": "off", "BEV_KD": "off"},
-    "base": {"REFINER": "off", "BEV_KD": "off"}, "detoff": {"DET_KD": "off"}, "mapoff": {"MAP_KD": "off"},
-    "bevkd_detoff": {"DET_KD": "off_bev"}, "bevkd_mapoff": {"MAP_KD": "off_bev"}, "refkd_detoff": {"DET_KD": "off_ref"},
-    "refkd_mapoff": {"MAP_KD": "off_ref"}, "noref_detoff": {"REFINER": "off", "DET_KD": "off"},
-    "norefkd_mapoff": {"REFINER_KD": "off", "MAP_KD": "off"}, "mix": {"DET_KD": "off_bev", "MAP_KD": "off_ref"},
-    "r18": {"BACKBONE": "r18"}, "r50": {"BACKBONE": "r50"}, "r101": {"BACKBONE": "r101"}, "r152": {"BACKBONE": "r152"},
-    "r50d": {"BACKBONE": "r50d"}, "cnxt": {"BACKBONE": "convnext_tiny"}, "regnet": {"BACKBONE": "regnety_032"},
-    "effnet": {"BACKBONE": "efficientnet_b0"}, "noint": {"INTERACTION": "off"},
-    "nodet": {"INTERACTION": "off", "DET_HEAD": "off"}, "nomap": {"INTERACTION": "off", "MAP_HEAD": "off"},
-    "noheads": {"INTERACTION": "off", "DET_HEAD": "off", "MAP_HEAD": "off"}, "vecmap": {"MAP_HEAD": "vector"},
-    "dist": {"UNDISTORT": "off"}, "z22": {"PILLAR_Z": "-2,2"}, "z15": {"PILLAR_Z": "-1.5,2.5"},
-    "r32": {"BEV_RANGE": "32", "REFINER": "off", "BEV_KD": "off"}, "f1": {"FRAMES": "3"}, "f4": {"FRAMES": "0,1,2,3"},
-    "headfree": {"HEADING": "free"}, "bnf": {"BN": "frozen"}, "s1": {"SEED": "1"}, "e20": {"EPOCHS": "20"},
-    "g4": {"GPUS": "0,1,2,3"}, "g2": {"GPUS": "0,1"}, "tag": {"TAG": "a.1-b"}, "x": {"EXTRA": "agent.lr=2e-4"},
+    "main": {}, "ref-off": {"REFINER": "off"}, "rkd-off": {"REFINER_KD": "off"}, "rkd-lat": {"REFINER_KD": "lat"},
+    "rkd-score": {"REFINER_KD": "score"}, "bkd-off": {"BEV_KD": "off"}, "rkd-off_bkd-off": {"REFINER_KD": "off", "BEV_KD": "off"},
+    "ref-off_bkd-off": {"REFINER": "off", "BEV_KD": "off"}, "detkd-off": {"DET_KD": "off"}, "mapkd-off": {"MAP_KD": "off"},
+    "detkd-offbev": {"DET_KD": "off_bev"}, "mapkd-offbev": {"MAP_KD": "off_bev"}, "detkd-offref": {"DET_KD": "off_ref"},
+    "mapkd-offref": {"MAP_KD": "off_ref"}, "ref-off_detkd-offbev": {"REFINER": "off", "DET_KD": "off"},
+    "ref-off_mapkd-offbev": {"REFINER": "off", "MAP_KD": "off"}, "rkd-off_detkd-offbev": {"REFINER_KD": "off", "DET_KD": "off"},
+    "rkd-off_mapkd-offbev": {"REFINER_KD": "off", "MAP_KD": "off"}, "bkd-off_detkd-offref": {"BEV_KD": "off", "DET_KD": "off"},
+    "rkd-score_detkd-offref": {"REFINER_KD": "score", "DET_KD": "off_ref"}, "rkd-lat_mapkd-offref": {"REFINER_KD": "lat", "MAP_KD": "off_ref"},
+    "detkd-offbev_mapkd-offref": {"DET_KD": "off_bev", "MAP_KD": "off_ref"}, "r18": {"BACKBONE": "r18"}, "r50": {"BACKBONE": "r50"},
+    "r101": {"BACKBONE": "r101"}, "r152": {"BACKBONE": "r152"}, "r50d": {"BACKBONE": "r50d"},
+    "convnext_tiny": {"BACKBONE": "convnext_tiny"}, "regnety_032": {"BACKBONE": "regnety_032"},
+    "efficientnet_b0": {"BACKBONE": "efficientnet_b0"}, "convnext_tiny_bn-frozen": {"BACKBONE": "convnext_tiny", "BN": "frozen"},
+    "noint": {"INTERACTION": "off"}, "noint_nodet": {"INTERACTION": "off", "DET_HEAD": "off"},
+    "noint_nomap": {"INTERACTION": "off", "MAP_HEAD": "off"}, "noint_nodet_nomap": {"INTERACTION": "off", "DET_HEAD": "off", "MAP_HEAD": "off"},
+    "vecmap": {"MAP_HEAD": "vector"}, "dist": {"UNDISTORT": "off"}, "z-2_2": {"PILLAR_Z": "-2,2"}, "z-1p5_2p5": {"PILLAR_Z": "-1.5,2.5"},
+    "ref-off_bkd-off_r32": {"BEV_RANGE": "32", "REFINER": "off", "BEV_KD": "off"}, "f1": {"FRAMES": "3"}, "f4": {"FRAMES": "0,1,2,3"},
+    "headfree": {"HEADING": "free"}, "bn-frozen": {"BN": "frozen"}, "s1": {"SEED": "1"}, "e20": {"EPOCHS": "20"},
+    "g4": {"GPUS": "0,1,2,3"}, "g2": {"GPUS": "4,5"}, "a.1-b": {"TAG": "a.1-b"}, "x": {"EXTRA": "agent.lr=2e-4"},
+    "ref-off_bkd-off_x": {"REFINER": "off", "BEV_KD": "off", "EXTRA": "agent.config.plan_anchor=false"},
+    # every part at once, in the fixed order
+    "r50_rkd-score_bkd-off_detkd-offref_noint_nodet_vecmap_f4_dist_headfree_z-2_2_bn-frozen_e20_g4_s1_a1_x": {
+        "BACKBONE": "r50", "REFINER_KD": "score", "BEV_KD": "off", "DET_KD": "off", "INTERACTION": "off", "DET_HEAD": "off",
+        "MAP_HEAD": "vector", "FRAMES": "0,1,2,3", "UNDISTORT": "off", "HEADING": "free", "PILLAR_Z": "-2,2", "BN": "frozen",
+        "EPOCHS": "20", "GPUS": "0,1,2,3", "SEED": "1", "TAG": "a1", "EXTRA": "agent.lr=2e-4"},
 }
 
 
-def test_arm_names_are_distinct_and_in_charset():
-    names = {k: C.compose(v).run for k, v in ARMS.items()}
-    assert len(ARMS) >= 15 and len(set(names.values())) == len(names), names
-    for n in names.values():
-        assert NAME_RE.fullmatch(n) and n.startswith("v2f_") and len(n) < 200
-    # parts of the name
-    assert "_ref0_rkd0_bkd0_det0_map0_" in names["base"]
-    assert "_ref1_rkd0_bkd0_det0_map0_" in names["nokd"]
-    assert "_rkdL_" in names["noscorekd"] and "_rkdS_" in names["nolatkd"]
-    assert "_det0_map1_" in names["detoff"] and "_det0b_map1_" in names["bevkd_detoff"]
-    assert "_det1_map0r_" in names["refkd_mapoff"] and "_det0b_map0r_" in names["mix"]
-    assert names["cnxt"].startswith("v2f_convnext_tiny_") and "_stz-1p5_2p5_" in names["z15"]
-    assert "_stnoint.nodet.nomap_" in names["noheads"] and "_str32_" in names["r32"]
-    assert "_stf1_" in names["f1"] and "_stf4_" in names["f4"] and "_stdist_" in names["dist"]
-    assert "_stvecmap_" in names["vecmap"] and "_stheadfree_" in names["headfree"]
-    assert "_bnf_" in names["bnf"] and "_s1_" in names["s1"] and "_e20_" in names["e20"]
-    assert "_g4_" in names["g4"] and "_g2_" in names["g2"]
-    assert "_a.1-b_" in names["tag"] and re.search(r"_x_[0-9a-f]{6}$", names["x"])
+def _doc_arms():
+    """The settings of every row of docs/EXPERIMENTS.md section 5."""
+    sec = (REPO / "docs/EXPERIMENTS.md").read_text().split("## 5. ")[1].split("## 6. ")[0]
+    rows = re.findall(r"^\| [^|]+ \| ([^|]*) \| (?:full|base|refiner_noteacher) \|", sec, flags=re.M)
+    return [dict(x.split("=", 1) for x in shlex.split("" if a.startswith("(") else a.strip().strip("`"))) for a in rows]
+
+
+def _clean_name(n):
+    """In the charset, ends in the hash, none of the old branch words in it, also not inside a word."""
+    assert NAME_RE.fullmatch(n) and re.search(r"_[0-9a-f]{6}$", n) and len(n) < 200, n
+    assert not set(re.split(r"[_.-]", n)) & {"v2", "v2f", "ck", "v7", "v15"}, n
+    assert not re.search(r"v2|ck|v7|v15", n), n
+
+
+@pytest.mark.parametrize("want, kw", ARMS.items())
+def test_arm_name(want, kw):
+    assert name(**kw).rsplit("_", 1)[0] == want
+
+
+def test_arm_names_are_distinct_and_clean():
+    names = [C.compose(v).run for v in ARMS.values()]
+    assert len(set(names)) == len(names) == len(ARMS)
+    for n in names:
+        _clean_name(n)
+
+
+def test_every_documented_arm_has_its_own_name():
+    arms = _doc_arms()
+    names = [C.compose(v).run for v in arms]
+    assert len(arms) >= 38 and len(set(names)) == len(names), sorted(names)
+    for n in names:
+        _clean_name(n)
+    assert names[0].startswith("main_")
 
 
 @pytest.mark.parametrize("a, b", [
@@ -135,7 +161,9 @@ def test_one_config_one_name(a, b):
     ({"MAP_HEAD": "off"}, "need INTERACTION=off"), ({"BEV_RANGE": "32"}, "only with REFINER=off BEV_KD=off"),
     ({"BEV_RANGE": "32", "REFINER": "off"}, "only with"), ({"BEV_RANGE": "32", "BEV_KD": "off"}, "only with"),
     ({"GPUS": "0,1,2"}, "distinct"), ({"GPUS": "0,0"}, "distinct"), ({"GPUS": "a,b"}, "distinct"), ({"GPUS": "0"}, "distinct"),
-    ({"TAG": "a_b"}, "characters"), ({"TAG": "a/b"}, "characters"), ({"SEED": "-1"}, "integer"), ({"EPOCHS": "x"}, "integer"),
+    ({"TAG": "a_b"}, "characters"), ({"TAG": "a/b"}, "characters"), ({"TAG": "-a"}, "characters"), ({"TAG": ".a"}, "characters"),
+    ({"TAG": "main"}, "default recipe"), ({"TAG": "smoke"}, "smoke run"), ({"TAG": "v2"}, "has the part"),
+    ({"TAG": "a-ck.b"}, "has the part"), ({"SEED": "-1"}, "integer"), ({"EPOCHS": "x"}, "integer"),
     ({"EPOCHS": "5"}, "needs more than 5"), ({"SAVE_EVERY": "7"}, "does not divide"), ({"PILLAR_Z": "3,1"}, "below"),
     ({"PILLAR_Z": "1"}, "a,b"), ({"PILLAR_Z": "a,b"}, "a,b"), ({"REFINER": "maybe"}, "one of"), ({"FRAMES": "1,3"}, "one of"),
     ({"BN": "x"}, "one of"), ({"WANDB": "x"}, "one of"), ({"RUN_ROOT": "rel/path"}, "absolute"), ({"RUN_ROOT": "/a=b"}, "absolute"),
@@ -347,6 +375,22 @@ def test_backbone_lines(bb, arch, flags):
         assert k[f"agent.config.{f}"] == v
 
 
+def test_output_names_of_a_run():
+    c = C.compose({"RUN_ROOT": "/tmp/rr"})
+    k = _kv(c)
+    assert k["experiment_name"] == "refiner_" + c.run and k["wandb.name"] == c.run
+    assert k[CK + "io_dir"] == f"/tmp/rr/{c.run}/refiner" and k["output_dir"] == f"/tmp/rr/{c.run}/train/"
+    assert k["wandb.project"] == "ssr" and k["wandb.group"] == "refiner" and k["wandb.tags"] == "[refiner,main,gpu8]"
+    assert _kv(C.compose({"REFINER": "off"}))["wandb.tags"] == "[refiner,noref,gpu8]"
+    for o in c.overrides:
+        key = C.LU._okey(o)
+        if key.startswith("wandb.") or key in ("experiment_name", "output_dir", CK + "io_dir"):
+            assert not re.search(r"ck2e2e|ck_e2e|para-ssr|v2_v15_v7|v2_final", o.split("=", 1)[1]), o
+    # the data folders of the warm-up labels stay as they are on disk
+    assert k[CK + "warmup.packed"].endswith("/ck/packed/navtrain_train")
+    assert k[CK + "warmup.var_dir"].endswith("/ck/ck2/labels/navtrain_train/var_separate_sampler16_accstraight")
+
+
 def test_launch_environment_of_the_main_recipe():
     c = C.compose({})
     assert c.env["SSR_EXPERIMENT_SHA"] == c.hash6 and c.env["CK2_E2E_APPROVED"] == "1" and c.env["SSR_GPU_POLICY"] == "any"
@@ -475,7 +519,7 @@ def test_a_new_teacher_needs_only_a_registry_entry(tmp_path):
     p = _alias_registry(tmp_path)
     c = C.compose({"DET_TEACHER": "bevfusion_alias", "MAP_TEACHER": "resmap_alias"}, registry=str(p))
     k = _kv(c)
-    assert c.run.startswith("v2f_r34_bevfusion_alias-resmap_alias_")
+    assert c.run.startswith("bevfusion_alias-resmap_alias_")
     assert k["agent.config.distill_branches.bevfusion.cache_name"] == "bevfusion_alias"
     assert k["agent.config.distill_branches.resmap.cache_name"] == "resmap_alias"
     assert c.env["SSR_DET_SHA_HEAD"] == "71ea94f672c89521" and c.pins["map"]["name"] == "resmap_alias"
@@ -624,25 +668,25 @@ def test_eval_passes_exactly_the_four_positions(tmp_path, stubs):
 
 def _fake_run(root, name, done=True):
     r = Path(root) / name
-    for d in ("ck_e2e2/lab/ep000", "ck_e2e2/rec/ep000", "launch", "train"):
+    for d in ("refiner/lab/ep000", "refiner/rec/ep000", "launch", "train"):
         (r / d).mkdir(parents=True)
-    (r / "ck_e2e2/steps_rank0.jsonl").write_text("{}\n")
+    (r / "refiner/steps_rank0.jsonl").write_text("{}\n")
     if done:
-        (r / "ck_e2e2/TRAIN_DONE").write_text("")
+        (r / "refiner/TRAIN_DONE").write_text("")
     return r
 
 
 def test_purge_removes_only_lab_and_rec_after_train_done(tmp_path):
     root = f"RUN_ROOT={tmp_path}"
     r = _fake_run(tmp_path, "run1")
-    assert "CONFIRM=1" in sh("purge", "RUN=run1", root).stderr and (r / "ck_e2e2/lab").exists()
+    assert "CONFIRM=1" in sh("purge", "RUN=run1", root).stderr and (r / "refiner/lab").exists()
     r2 = _fake_run(tmp_path, "run2", done=False)
     x = sh("purge", "RUN=run2", root, "CONFIRM=1")
-    assert x.returncode == 3 and "TRAIN_DONE" in x.stderr and (r2 / "ck_e2e2/rec").exists()
+    assert x.returncode == 3 and "TRAIN_DONE" in x.stderr and (r2 / "refiner/rec").exists()
     x = sh("purge", "RUN=run1", root, "CONFIRM=1")
     assert x.returncode == 0, x.stderr
-    assert not (r / "ck_e2e2/lab").exists() and not (r / "ck_e2e2/rec").exists()
-    assert (r / "ck_e2e2/steps_rank0.jsonl").exists() and (r / "train").exists() and (r / "ck_e2e2/TRAIN_DONE").exists()
+    assert not (r / "refiner/lab").exists() and not (r / "refiner/rec").exists()
+    assert (r / "refiner/steps_rank0.jsonl").exists() and (r / "train").exists() and (r / "refiner/TRAIN_DONE").exists()
 
 
 def test_purge_refuses_a_live_training(tmp_path):
@@ -654,7 +698,7 @@ def test_purge_refuses_a_live_training(tmp_path):
         time.sleep(0.3)
         x = sh("purge", "RUN=run1", f"RUN_ROOT={tmp_path}", "CONFIRM=1")
         assert x.returncode == 3 and "still running" in x.stderr, x.stderr
-        assert (r / "ck_e2e2/lab").exists()
+        assert (r / "refiner/lab").exists()
     finally:
         p.kill()
         p.wait()
@@ -766,11 +810,11 @@ def test_smoke_flow_with_a_stub_launcher(tmp_path, stubs):
     n2 = "smoke_" + C.compose({"RUN_ROOT": str(root), "REFINER_KD": "off", "BEV_KD": "off", "TAG": "b"}).run
     R = root / "_smoke" / n2
     stub_e2e = Path(stubs["SSR_RELEASE_TEST_STUBS"]) / "train_e2e2.sh"
-    stub_e2e.write_text(stub_e2e.read_text().replace("  wait) exit 0;;", '  wait) mkdir -p "$R/ck_e2e2/rec" "$R/ck_e2e2/lab" '
+    stub_e2e.write_text(stub_e2e.read_text().replace("  wait) exit 0;;", '  wait) mkdir -p "$R/refiner/rec" "$R/refiner/lab" '
                                                      '"$R/train/lightning_logs/version_0/checkpoints"; exit 0;;'))
     r = sh("smoke", *tag, **stubs)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert not (R / "ck_e2e2/rec").exists() and not (R / "ck_e2e2/lab").exists()
+    assert not (R / "refiner/rec").exists() and not (R / "refiner/lab").exists()
     assert not (R / "train/lightning_logs/version_0/checkpoints").exists()
     assert (R / "launch/settings.json").is_file() and (R / "launch/overrides.txt").is_file()
 
@@ -860,7 +904,7 @@ def _common_files(run, ckpt_keys):
 
 
 def _refiner_files(run, teachers, mem=15.0, kd=0.3, lat=0.2, teacher_ms=80.0, nan=False):
-    io = run / "ck_e2e2"
+    io = run / "refiner"
     (io / "lab").mkdir(parents=True)
     ep = [{"event": "epoch_start", "epoch": 0, "phase": "warmup_record"}, {"event": "epoch_end", "epoch": 0, "cum": {}},
           {"event": "epoch_start", "epoch": 1, "phase": "onpolicy"},
@@ -878,7 +922,7 @@ def _refiner_files(run, teachers, mem=15.0, kd=0.3, lat=0.2, teacher_ms=80.0, na
 def _calib_file(run, keys):
     ok = {k: {"fitted": True, "a": 1.0, "b": 0.0} for k in keys}
     lines = [{"window_phase": "warmup_record", "keys": ok} for _ in range(5)] + [{"window_phase": "onpolicy"}]
-    (run / "ck_e2e2/kd_calib_online.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+    (run / "refiner/kd_calib_online.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
 
 
 T_ON = {"det": {}, "map": {}, "kd_calib": {"enabled": True, "mode": "online"}}
@@ -897,10 +941,10 @@ def test_smoke_check_main_passes_and_catches_each_failure(tmp_path):
     assert res["info"]["peak_mem_torch_gb"] == 15.0
     assert not SC.check_run(str(run), mem_limit_gb=10.0)["pass"]
     # non-finite step value
-    good = (run / "ck_e2e2/steps_rank0.jsonl").read_text()
-    (run / "ck_e2e2/steps_rank0.jsonl").write_text(good.replace('"mem_gb": 15.0', '"ck2/loss": NaN, "mem_gb": 15.0'))
+    good = (run / "refiner/steps_rank0.jsonl").read_text()
+    (run / "refiner/steps_rank0.jsonl").write_text(good.replace('"mem_gb": 15.0', '"ck2/loss": NaN, "mem_gb": 15.0'))
     assert not SC.check_run(str(run))["checks"]["no_nonfinite_step_value"]
-    (run / "ck_e2e2/steps_rank0.jsonl").write_text(good)
+    (run / "refiner/steps_rank0.jsonl").write_text(good)
     # exit code
     (run / "launch/train.exit").write_text("1\n")
     assert not SC.check_run(str(run))["checks"]["train_exit_0"]
@@ -940,7 +984,7 @@ def test_smoke_check_follows_the_refiner_kd_setting(tmp_path, kw, teachers, need
     res = SC.check_run(str(run))
     assert res["pass"], res
     # KD on where the settings say off
-    steps = run / "ck_e2e2/steps_rank0.jsonl"
+    steps = run / "refiner/steps_rank0.jsonl"
     txt = steps.read_text()
     steps.write_text(txt.replace(f'"ck2/wt_kd_score": {kd}', '"ck2/wt_kd_score": 0.7').replace(
         f'"ck2/wt_lat_kd": {lat}', '"ck2/wt_lat_kd": 0.7'))
@@ -990,7 +1034,7 @@ def test_smoke_check_on_real_smoke_records(tmp_path, name_, kw, may_fail):
     (run / "launch").mkdir(parents=True)
     for f in ("train.exit", "teachers.json"):
         (run / "launch" / f).write_bytes((real / "launch" / f).read_bytes())
-    os.symlink(real / "ck_e2e2", run / "ck_e2e2")
+    os.symlink(real / "ck_e2e2", run / "refiner")    # those records were written before the folder was renamed
     os.symlink(real / "train", run / "train")
     _settings(run, **kw)
     res = SC.check_run(str(run))
@@ -1031,10 +1075,9 @@ def _summary(root, run, ep=30, g=8, commit="c" * 40, proto="release-1", rule="la
 
 @needs_table
 def test_table_prints_rows_marks_manual_and_warns(tmp_path, capsys):
-    _summary(tmp_path, "v2f_r50_bevfusion-resmap_ref1_rkd1_bkd1_det1_map1_stbase_bnm_e30_g8_s0_aaaaaa")
-    _summary(tmp_path, "v2f_r34_bevfusion-resmap_ref1_rkd1_bkd0_det1_map1_stbase_bnm_e30_g8_s0_bbbbbb", ep=15, rule="manual",
-             delta=(0.1, -0.2, 0.4))
-    _summary(tmp_path, "v2f_r34_bevfusion-resmap_ref0_rkd0_bkd0_det0_map0_stbase_bnm_e30_g8_s0_cccccc", selection="none", delta=None)
+    _summary(tmp_path, "r50_aaaaaa")
+    _summary(tmp_path, "bkd-off_bbbbbb", ep=15, rule="manual", delta=(0.1, -0.2, 0.4))
+    _summary(tmp_path, "ref-off_bkd-off_cccccc", selection="none", delta=None)
     assert TB.main(["--run-root", str(tmp_path)]) == 0
     out = capsys.readouterr().out
     assert "| Run | ep |" in out and "| 15* | refiner_pick |" in out and "chosen by hand" in out
@@ -1063,6 +1106,7 @@ def test_table_paired_delta_against_the_base_run(tmp_path, capsys):
     n = 40
     (cache / "metadata/x.csv").write_text("file_name\n" + "\n".join(f"{cache}/log{i % 8}/type/t{i}/metric_cache.pkl" for i in range(n)) + "\n")
     root = tmp_path / "runs"
+    # table.py DEFAULT_RECIPE (eval side, frozen) still has the old name of the default recipe; move this with it: main_aaaaaa
     base = "v2f_r34_bevfusion-resmap_ref1_rkd1_bkd1_det1_map1_stbase_bnm_e30_g8_s0_aaaaaa"
     sc = [0.5 + 0.01 * (i % 7) for i in range(n)]
     _summary(root, base, scores=sc, cache=cache)

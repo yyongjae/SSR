@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """CK2 e2e background labeler: official PDM labels (score_token, LQR) of the 96 trajectories per token recorded in training.
 
-  labeler2.py --io-dir <RUN>/ck_e2e2 [--world-size 2] [--workers 32] [--poll 30] [--max-epoch 28] [--exit-when-done]
+  labeler2.py --io-dir <RUN>/refiner [--world-size 2] [--workers 32] [--poll 30] [--max-epoch 28] [--exit-when-done]
               [--train-pid-file <RUN>/launch/train.pid] [--retry-errors] [--once] [--limit-chunks N] [--skip-invalid]
               [--pid-file F] [--exit-file F]
 

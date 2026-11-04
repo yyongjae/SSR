@@ -159,7 +159,7 @@ def test_launch_overrides_and_diff_to_v2_v15_v7(tmp_path):
     f = _flat(ov)
     assert teachers["mode"] == "none" and teachers["use_teachers"] is False and "det" not in teachers \
         and "map" not in teachers and teachers["warmup_sources"]["n_rows"] == 85109
-    assert L2.arm_of(ck) == "nokd" and f["wandb.tags"] == "wandb.tags=[ck2e2e,nokd,gpu4]"
+    assert L2.arm_of(ck) == "nokd" and f["wandb.tags"] == "wandb.tags=[refiner,nokd,gpu4]"
     for k, v in (("use_teachers", "false"), ("teacher_det_run", "null"), ("teacher_map_run", "null"),
                  ("lambda_kd_score", "0.0"), ("lat_kd.balance", "fixed"), ("lat_kd.fixed", "0.0"),
                  ("kd_calib.enabled", "false"), ("bev_kd.enabled", "false"), ("lambda_score", "1.0"),

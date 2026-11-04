@@ -103,7 +103,7 @@ G1() {
   local t0 frc=0 lrc; t0=$(date +%s)
   while [ ! -f "$SR/g1_main/launch/train.exit" ] || [ ! -f "$SR/g1_bevkd/launch/train.exit" ]; do
     for r in g1_main g1_bevkd; do
-      [ -f "$SR/$r/ck_e2e2/lab/status.json" ] && { tr -d '\n' < "$SR/$r/ck_e2e2/lab/status.json"; echo; } \
+      [ -f "$SR/$r/refiner/lab/status.json" ] && { tr -d '\n' < "$SR/$r/refiner/lab/status.json"; echo; } \
         >> "$SR/$r/lab_snapshots.jsonl"
     done
     nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader >> "$SR/g1_nvsmi.csv" 2>/dev/null

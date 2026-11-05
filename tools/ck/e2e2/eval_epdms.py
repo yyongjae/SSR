@@ -45,6 +45,7 @@ CK = str(Path(__file__).resolve().parents[3])
 if CK not in sys.path:
     sys.path.insert(0, CK)
 from navsim.common import ssr_paths as SP  # noqa: E402
+from navsim.agents.para_ssr.ck import select2 as S2  # noqa: E402
 
 NAVSIM22 = os.environ.get("NAVSIM22_ROOT") or SP.NAVSIM_V22_POST
 DATA_ROOT = Path(os.environ.get("SSR_TEST_DATA_ROOT") or SP.SSR_TEST_DATA_ROOT)
@@ -432,7 +433,55 @@ def run_dump_shard(
             pr = agent(fg)
             if "ck2_cand96" not in pr:
                 pr = dict(pr)
-                pr.update(agent._ck_e2e2.infer(agent.ck_student, fg, pr))
+                if getattr(agent, "_ck_e2e2", None) is not None and getattr(agent, "ck_student", None) is not None:
+                    pr.update(agent._ck_e2e2.infer(agent.ck_student, fg, pr))
+                elif "plan_final_rewards" in pr:
+                    from navsim.agents.para_ssr.ck.online import student_topk
+
+                    top = student_topk(pr, 16)
+                    cand16 = top["cand"]  # [B, 16, 8, 3]
+                    B = cand16.shape[0]
+                    cand96_t = cand16.repeat_interleave(6, dim=1).contiguous()
+                    valid96_t = torch.zeros((B, 96), dtype=torch.bool, device=cand16.device)
+                    valid96_t[:, ::6] = torch.isfinite(cand16).flatten(2).all(-1)
+                    sim16 = top["sim"].clamp(1e-6, 1.0 - 1e-6)
+                    logit16 = torch.log(sim16) - torch.log1p(-sim16)
+                    logit96_t = logit16.repeat_interleave(6, dim=1).contiguous()
+                    pr.update(
+                        {
+                            "ck2_cand96": cand96_t,
+                            "ck2_lat_traj": cand96_t,
+                            "ck2_valid96": valid96_t,
+                            "ck2_v2_final": top["final"],
+                            "ck2_v2_im": top["im"],
+                            "ck2_v2_sim": top["sim"],
+                            "ck2_score_logit": logit96_t,
+                        }
+                    )
+                else:
+                    traj = pr["trajectory"].detach().float()
+                    B = traj.shape[0]
+                    cand96_t = traj.unsqueeze(1).expand(B, 96, 8, 3).contiguous()
+                    valid96_t = torch.zeros((B, 96), dtype=torch.bool, device=traj.device)
+                    valid96_t[:, 0] = True
+                    v2_final_t = torch.full((B, 16), -1e9, dtype=torch.float32, device=traj.device)
+                    v2_final_t[:, 0] = 0.0
+                    v2_im_t = torch.zeros((B, 16), dtype=torch.float32, device=traj.device)
+                    v2_im_t[:, 0] = 1.0
+                    v2_sim_t = torch.full((B, 16, 5), 0.5, dtype=torch.float32, device=traj.device)
+                    logit96_t = torch.full((B, 96, 5), -30.0, dtype=torch.float32, device=traj.device)
+                    logit96_t[:, 0] = 10.0
+                    pr.update(
+                        {
+                            "ck2_cand96": cand96_t,
+                            "ck2_lat_traj": cand96_t,
+                            "ck2_valid96": valid96_t,
+                            "ck2_v2_final": v2_final_t,
+                            "ck2_v2_im": v2_im_t,
+                            "ck2_v2_sim": v2_sim_t,
+                            "ck2_score_logit": logit96_t,
+                        }
+                    )
         cand96 = pr["ck2_cand96"].detach().float().cpu().numpy()
         lat_traj = pr["ck2_lat_traj"].detach().float().cpu().numpy()
         v2_final = pr["ck2_v2_final"].detach().float().cpu().numpy()
@@ -623,6 +672,20 @@ def _ensure_navsim22() -> None:
         mod = sys.modules.get(mod_name)
         mod_file = getattr(mod, "__file__", "") or ""
         if mod_file and not mod_file.startswith(NAVSIM22):
+            sys.modules.pop(mod_name, None)
+
+
+def _ensure_navsim_v1() -> None:
+    while NAVSIM22 in sys.path:
+        sys.path.remove(NAVSIM22)
+    for p in (str(Path(CK) / "tools/refiner"), CK):
+        if p in sys.path:
+            sys.path.remove(p)
+        sys.path.insert(0, p)
+    for mod_name in [k for k in list(sys.modules) if k == "navsim" or k.startswith("navsim.")]:
+        mod = sys.modules.get(mod_name)
+        mod_file = getattr(mod, "__file__", "") or ""
+        if mod_file and not mod_file.startswith(CK):
             sys.modules.pop(mod_name, None)
 
 
@@ -842,7 +905,7 @@ def select_epdms_trajectories(
     ar = np.arange(N)
     tok2idx = {t: i for i, t in enumerate(toks)}
     vtype = np.arange(96) % 6
-    ok_all = valid96 | (vtype[None, :] == 0)
+    ok_all = valid96 if not valid96[:, 1:].any() else (valid96 | (vtype[None, :] == 0))
 
     prob96 = 1.0 / (1.0 + np.exp(-logit96))
     v2f96 = np.repeat(v2_final, 6, axis=1)
@@ -924,8 +987,6 @@ def select_pdms_trajectories(
     """Select final trajectories over the 96-candidate pool using the official PDMS formula without imitation:
     PDMS(p) = NC * DAC * (5 * EP + 5 * TTC + 2 * C) / 12  (select2.select96_pdms when beta=1.0, or w='plugin' when beta<1.0).
     """
-    from navsim.agents.para_ssr.ck import select2 as S2
-
     toks, cand96, lat96, v2_final, v2_im, _, logit96, valid96 = load_pool_arrays(pool_dir)
     types = S2.VARIANT_SETS[pdms_set]
     if pdms_beta == 1.0:
@@ -1357,32 +1418,78 @@ def _fmt_pdms_metrics(m: Dict[str, float]) -> str:
     )
 
 
+_V1_MC_INDEX: Dict[str, str] = {}
+_V1_ST = None
+
+
+def _init_pdms_v1_worker(mc_index: Dict[str, str]) -> None:
+    global _V1_MC_INDEX, _V1_ST
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    _ensure_navsim_v1()
+    import score_trajectories as ST
+
+    ST.get_simulator_scorer()
+    _V1_MC_INDEX = mc_index
+    _V1_ST = ST
+
+
+def _score_pdms_v1_item(item: Tuple[str, np.ndarray]) -> Dict[str, float]:
+    tok, poses = item
+    mc = _V1_ST.load_metric_cache(_V1_MC_INDEX[tok])
+    r = _V1_ST.score_token(mc, poses[None, ...])[0]
+    nc = float(r["nc"])
+    dac = float(r["dac"])
+    ddc = float(r["ddc"])
+    ep = float(r["ep"])
+    ttc = float(r["ttc"])
+    cmf = float(r["comfort"])
+    pdms = float(r["pdms"])
+    pdms_v11 = nc * dac * (5.0 * ep + 5.0 * ttc + 2.0 * cmf) / 12.0
+    return {
+        "nc": nc,
+        "dac": dac,
+        "ddc": ddc,
+        "ep": ep,
+        "ttc": ttc,
+        "comfort": cmf,
+        "pdms": pdms,
+        "pdms_v11": pdms_v11,
+    }
+
+
 def evaluate_trajectories_pdms_v1(
     traj_dict: Dict[str, np.ndarray],
     all_tokens: List[str],
-    mc_dir: str,
+    mc_v1_dir: str,
     workers: int,
 ) -> Dict[str, Any]:
-    """Evaluate official NAVSIM v1 PDMS on navtest (NC * DAC * DDC * (5*EP + 5*TTC + 2*C) / 12)."""
-    _ensure_navsim22()
+    """Evaluate official NAVSIM v1 PDMS on navtest using tools/refiner/score_trajectories.py and SSR_NAVTEST_MC."""
+    import multiprocessing as mp
+
     t0 = time.time()
-    todo_items = [(tok, np.ascontiguousarray(traj_dict[tok], dtype=np.float32).reshape(-1, 3)) for tok in all_tokens]
-    cs = max(1, min(32, len(todo_items) // (workers * 2)))
+    _ensure_navsim_v1()
+    import score_trajectories as ST
+
+    mc_index = ST.index_metric_cache(roots=[Path(mc_v1_dir)], tokens=all_tokens)
+    missing = [t for t in all_tokens if t not in mc_index]
+    if missing:
+        raise SystemExit(
+            f"[pdms_v1] {len(missing)}/{len(all_tokens)} tokens missing in v1 metric cache {mc_v1_dir} "
+            f"(e.g. {missing[:3]})"
+        )
+    todo_items = [(tok, np.ascontiguousarray(traj_dict[tok], dtype=np.float32).reshape(8, 3)) for tok in all_tokens]
+    cs = max(1, min(32, len(todo_items) // max(workers * 2, 1)))
     rows = []
-    with ProcessPoolExecutor(max_workers=workers, initializer=_init_epdms_worker, initargs=(mc_dir, "navtest")) as ex:
-        for _, r in zip(todo_items, ex.map(_score_one_item, todo_items, chunksize=cs)):
-            wm = r["bef_weighted_metrics"]
-            nc = float(r.get("bef_nc", r["no_at_fault_collisions"]))
-            dac = float(r.get("bef_dac", r["drivable_area_compliance"]))
-            ddc = float(r.get("bef_ddc", r["driving_direction_compliance"]))
-            ep = float(wm[0])
-            ttc = float(wm[1])
-            cmf = float(wm[3])
-            w_avg = (5.0 * ep + 5.0 * ttc + 2.0 * cmf) / 12.0
-            pdms = nc * dac * ddc * w_avg
-            pdms_v11 = nc * dac * w_avg
-            rows.append({"nc": nc, "dac": dac, "ddc": ddc, "ep": ep, "ttc": ttc, "comfort": cmf,
-                         "pdms": pdms, "pdms_v11": pdms_v11})
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=ctx,
+        initializer=_init_pdms_v1_worker,
+        initargs=(mc_index,),
+    ) as ex:
+        for r in ex.map(_score_pdms_v1_item, todo_items, chunksize=cs):
+            rows.append(r)
     df = pd.DataFrame(rows)
     avg = {k: float(v) * 100.0 for k, v in df.mean(skipna=True).items()}
     return {
@@ -1408,6 +1515,7 @@ def stage_eval(
     pdms_beta: float = 1.0,
     pdms_set: str = "all",
     pdms_lat_mode: str = "on",
+    mc_navtest_v1: str = MC_NAVTEST_V1_DEFAULT,
 ) -> Path:
     pool_dir = resolve_pool_dir(run_dir, out_dir, tag, split)
     if not ((pool_dir / "tokens.json").is_file() and (pool_dir / "lat_traj.npy").is_file()):
@@ -1423,7 +1531,7 @@ def stage_eval(
         tdict_pdms = select_pdms_trajectories(
             pool_dir, pdms_beta=pdms_beta, pdms_set=pdms_set, pdms_lat_mode=pdms_lat_mode
         )
-        res_pdms = evaluate_trajectories_pdms_v1(tdict_pdms, all_tokens_nt, mc_navtest, workers=workers)
+        res_pdms = evaluate_trajectories_pdms_v1(tdict_pdms, all_tokens_nt, mc_navtest_v1, workers=workers)
         log(f"[navtest {tag}] Official PDMS (no-im, beta={pdms_beta}, set={pdms_set}, lat={pdms_lat_mode}) "
             f"{_fmt_pdms_metrics(res_pdms['metrics'])}")
         pdms_path = res_dir / f"pdms_navtest_{tag}.json"
@@ -1587,6 +1695,7 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pdms-set", default="all", help="PDMS selector variant set (default: all)")
     ap.add_argument("--pdms-lat-mode", default="on", help="PDMS selector lateral mode (default: on)")
     ap.add_argument("--mc-navtest", default=MC_NAVTEST_DEFAULT, help="NAVSIM v2.2 metric cache path for navtest")
+    ap.add_argument("--mc-navtest-v1", default=MC_NAVTEST_V1_DEFAULT, help="NAVSIM v1 metric cache path for navtest PDMS")
     ap.add_argument("--mc-navhard", default=MC_NAVHARD_DEFAULT, help="NAVSIM v2.2 metric cache path for navhard")
     ap.add_argument("--fresh", action="store_true", help="Remove cached pool96/kin_cache/results in out-dir first")
     ap.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
@@ -1662,6 +1771,7 @@ def main(argv=None) -> int:
                     pdms_beta=a.pdms_beta,
                     pdms_set=a.pdms_set,
                     pdms_lat_mode=a.pdms_lat_mode,
+                    mc_navtest_v1=a.mc_navtest_v1,
                 )
         elif s == "summary":
             stage_summary(out_dir, tag)

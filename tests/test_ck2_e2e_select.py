@@ -234,19 +234,19 @@ def test_named_selection_weight_sets(tmp_path):
     _fake_root(root, run, "navtrain_val", seed=0)
     _fake_root(root, run, "navtest", seed=1)
     lead = tmp_path / "lead"
-    assert EV.out_name("navtrain_val") == "navtrain_val" and EV.out_name("navtest", "plugin") == "navtest__selw_plugin"
+    assert EV.out_name("navtrain_val") == "navtrain_val" and EV.out_name("navtest", "default") == "navtest__selw_default"
     m0 = EV.run_eval(root, run, "navtrain_val", n_boot=20, lead_root=lead)
-    mp = EV.run_eval(root, run, "navtrain_val", n_boot=20, lead_root=lead, sel_w="plugin")
-    assert m0["sel_w"] == "default" and m0["sel_w_values"] == [0.1, 0.5, 0.5, 1.0]
-    assert mp["sel_w"] == "plugin" and mp["sel_w_values"] == [0.0, 1.0, 1.0, 1.0]
+    md = EV.run_eval(root, run, "navtrain_val", n_boot=20, lead_root=lead, sel_w="default")
+    assert m0["sel_w"] == "plugin" and m0["sel_w_values"] == [0.0, 1.0, 1.0, 1.0]
+    assert md["sel_w"] == "default" and md["sel_w_values"] == [0.1, 0.5, 0.5, 1.0]
     d = root / "eval" / run
-    assert (d / "navtrain_val" / "metrics.json").is_file() and (d / "navtrain_val__selw_plugin" / "metrics.json").is_file()
+    assert (d / "navtrain_val" / "metrics.json").is_file() and (d / "navtrain_val__selw_default" / "metrics.json").is_file()
     with pytest.raises(SystemExit, match="selection weights"):
         EV.run_eval(root, run, "navtest", fix_from=str(d / "navtrain_val" / "metrics.json"), n_boot=20,
-                    lead_root=lead, sel_w="plugin")
-    t = EV.run_eval(root, run, "navtest", fix_from=str(d / "navtrain_val__selw_plugin" / "metrics.json"), n_boot=20,
-                    lead_root=lead, sel_w="plugin")
-    assert t["sel_w"] == "plugin" and (d / "navtest__selw_plugin" / "metrics.json").is_file()
+                    lead_root=lead, sel_w="default")
+    t = EV.run_eval(root, run, "navtest", fix_from=str(d / "navtrain_val__selw_default" / "metrics.json"), n_boot=20,
+                    lead_root=lead, sel_w="default")
+    assert t["sel_w"] == "default" and (d / "navtest__selw_default" / "metrics.json").is_file()
     assert EV.main(["--root", str(root), "--run", run, "--split", "navtrain_val", "--bootstrap", "10",
                     "--sel-w", "noim", "--out", str(tmp_path / "cli")]) == 0
     assert json.loads((tmp_path / "cli" / "metrics.json").read_text())["sel_w"] == "noim"

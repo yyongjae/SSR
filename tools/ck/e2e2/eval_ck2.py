@@ -28,8 +28,8 @@ Choice (navtrain_val only): the 'sel' row with the highest mean PDMS among lat_m
 Metrics (eval_ck.row_metrics): PDMS, NC / DAC / EP / TTC / C / DDC means, fail rates, lead-decel NC|TTC failure (n),
   Delta vs v2 with the paired log-cluster bootstrap 95% CI (eval_ck.log_bootstrap), changed fraction, lateral-applied
   fraction, selection share per variant type.  Calibration offset OFF by default (user).
-Selection weights --sel-w (select.SEL_W_SETS): 'default' = SEL_W (0.1, 0.5, 0.5, 1.0) unchanged; 'plugin' = (0, 1, 1, 1)
-  (w_im 0, NC 1, DAC 1, rest 1) / 'noim' are optional comparison sets (navtrain_val first).  A non-default set writes to
+Selection weights --sel-w (select.SEL_W_SETS): 'plugin' = (0, 1, 1, 1) (official PDMS without imitation, default);
+  'default' = SEL_W (0.1, 0.5, 0.5, 1.0) / 'noim' are optional comparison sets.  A non-default set writes to
   <split>__selw_<name> (default out dir) and is recorded in metrics.json ('sel_w', 'sel_w_values').
 Frozen eval spec (report 48 F1-c / F3): the navtrain_val run stores ONE spec in metrics.json['eval_spec'] (+ eval_spec.json):
   the chosen beta / variant set (name + type ids) / lateral mode, choose_lat, the selection weights (name + 4 values),
@@ -70,6 +70,7 @@ from tools.ck.eval_ck import log_bootstrap, row_metrics  # noqa: E402
 CK_DATA = Path("/home/external-user/ssd/yongjae_refiner/ck")
 SET_PREF = ("all", "all_noaccel", "speed", "decel", "lat", "none")            # tie-break order (NU46)
 LAT_PREF = ("on", "on_except_latvar", "off")
+DEFAULT_SEL_W = "plugin"                                                      # official PDMS (0, 1, 1, 1), no imitation
 KST = 9 * 3600
 
 
@@ -105,11 +106,12 @@ def _key(r: Dict[str, Any]) -> str:
 def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray, valid96: np.ndarray,
                   v2_final16: np.ndarray, v2_im16: np.ndarray, logs: np.ndarray, lead_mask: Optional[np.ndarray],
                   combos: Sequence[Tuple[float, str, str]], n_boot: int = 2000, seed: int = 0,
-                  offset=None, extra_rows: bool = True, sel_w="default") -> Dict[str, Any]:
+                  offset=None, extra_rows: bool = True, sel_w=DEFAULT_SEL_W) -> Dict[str, Any]:
     """Arrays already restricted to the evaluation tokens.  lab_* [n, 96, 9] (LABEL_COLS), prob96 [n, 96, 5],
-    valid96 [n, 96], v2_final16 / v2_im16 [n, 16]; sel_w = select2.select96 weights (SEL_W_SETS name or 4 floats).
+    valid96 [n, 96], v2_final16 / v2_im16 [n, 16]; sel_w = select2.select96 weights (SEL_W_SETS name or 4 floats,
+    default 'plugin' = official PDMS without imitation).
     -> {'rows': [...], 'idx': {key: [n]}}."""
-    w_sel = S2.resolve_w(sel_w)
+    w_sel = S2.resolve_w(DEFAULT_SEL_W if sel_w is None else sel_w)
     L = Cn.LBL
     P = L["pdms"]
     n = lab_pool.shape[0]
@@ -152,6 +154,12 @@ def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray,
         ib = ob % S2.G_K
         chosen = np.where(lat_b[:, None], lab_lat[ar, ib], lab_pool[ar, ib])
         add({"variant": "oracle96_lat", "beta": None, "set": "all", "lat_mode": "best"}, ib, chosen, lat_b)
+        p_cal = S2.apply_offset(prob96, offset)
+        s_pdms = S2.exp_pdms96(p_cal)
+        s_pdms = np.where(allow & np.isfinite(s_pdms), s_pdms, -np.inf)
+        idx_pdms = S2.TIE_ORDER[np.argmax(s_pdms[:, S2.TIE_ORDER], axis=1)].astype(np.int64)
+        add({"variant": "pdms", "beta": 1.0, "set": "all", "lat_mode": "on"}, idx_pdms,
+            S2.chosen_labels(lab_pool, lab_lat, idx_pdms, "on"), t0)
     cache: Dict[Tuple[float, str], np.ndarray] = {}
     for beta, sname, lat_mode in combos:
         k = (float(beta), sname)
@@ -362,19 +370,19 @@ def table_md(res: Dict[str, Any]) -> str:
     return "\n".join(L) + "\n"
 
 
-def out_name(split: str, sel_w="default", offset=None) -> str:
-    """default out dir name: <split> for the default weights, <split>__selw_<name> otherwise, + __cal_<sha8> when a
-    calibration offset is applied (offset_tag)."""
-    n = S2.sel_w_name(sel_w)
-    base = split if n == "default" else f"{split}__selw_{n.replace(',', '_')}"
+def out_name(split: str, sel_w=DEFAULT_SEL_W, offset=None) -> str:
+    """default out dir name: <split> for the default weights ('plugin'), <split>__selw_<name> otherwise, + __cal_<sha8>
+    when a calibration offset is applied (offset_tag)."""
+    n = S2.sel_w_name(DEFAULT_SEL_W if sel_w is None else sel_w)
+    base = split if n == DEFAULT_SEL_W else f"{split}__selw_{n.replace(',', '_')}"
     return base + offset_tag(offset)
 
 
 def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: int = 2000,
              calib_offset: Optional[str] = None, lead_root: Path = CK_DATA / "lead", choose_lat: str = "on",
              sel_w=None) -> Dict[str, Any]:
-    """sel_w / calib_offset None (or ''): navtrain_val = 'default' / OFF; navtest = inherited from the frozen val spec
-    (--fix-from), an explicit value must equal it."""
+    """sel_w / calib_offset None (or ''): navtrain_val = 'plugin' (official PDMS without imitation) / OFF; navtest =
+    inherited from the frozen val spec (--fix-from), an explicit value must equal it."""
     root = Path(root)
     cur = model_meta(root, run, split)
     fixed = spec_in = None
@@ -391,7 +399,7 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
                      (f"inherited from val: {(cal_src or {}).get('path')}" if calib_offset in (None, "")
                       else calib_offset))
     else:
-        w_sel = S2.resolve_w(sel_w or "default")
+        w_sel = S2.resolve_w(sel_w or DEFAULT_SEL_W)
         cal = calib_offset or "none"
         offset = read_offset(cal)
         cal_src = offset_source(cal)
@@ -487,8 +495,9 @@ def main(argv=None) -> int:
                     help="navtrain_val choice: 'on' (default, user: lateral applied after selection; beta / variant "
                          "set chosen) | 'any' (the lateral mode is chosen too)")
     ap.add_argument("--sel-w", default=None, choices=tuple(S2.SEL_W_SETS),
-                    help="selection weight set (select.SEL_W_SETS): default = SEL_W | noim | plugin (0, 1, 1, 1); "
-                         "unset: 'default' on navtrain_val, inherited from the val spec on navtest")
+                    help="selection weight set (select.SEL_W_SETS): plugin (0, 1, 1, 1, official PDMS without imitation, "
+                         "default) | default (= SEL_W) | noim; unset: 'plugin' on navtrain_val, inherited from the val "
+                         "spec on navtest")
     a = ap.parse_args(argv)
     run_eval(a.root, a.run, a.split, a.out or None, a.fix_from, a.bootstrap, a.calib_offset, choose_lat=a.choose_lat,
              sel_w=a.sel_w)

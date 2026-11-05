@@ -562,13 +562,13 @@ def stage_infer_check(P: Paths, a, tol_logit: float = 3e-2, tol_traj: float = 2e
 # ----------------------------------------------------------------------------------------------- eval / summary
 def stage_eval(P: Paths, a) -> Path:
     """navtrain_val: choice + frozen spec under out_name(split, sel_w, offset).  navtest: --fix-from (default: the val
-    result of the same --sel-w / --calib-offset, i.e. 'default' / OFF when unset) restores the frozen spec; the out
+    result of the same --sel-w / --calib-offset, i.e. 'plugin' / OFF when unset) restores the frozen spec; the out
     dir follows the RESTORED weights / offset (eval_ck2.run_eval)."""
     fix = a.fix_from
     sel_w = getattr(a, "sel_w", None) or None
     cal = getattr(a, "calib_offset", "") or ""
     if P.split == "navtest" and not fix:
-        cand = P.root / "eval" / P.name / EV.out_name("navtrain_val", sel_w or "default", EV.read_offset(cal)) / \
+        cand = P.root / "eval" / P.name / EV.out_name("navtrain_val", sel_w or EV.DEFAULT_SEL_W, EV.read_offset(cal)) / \
             "metrics.json"
         if not cand.is_file():
             raise SystemExit(f"navtest needs --fix-from (beta / variant set / lateral mode are chosen on navtrain_val "
@@ -584,21 +584,21 @@ def _pct(x) -> str:
 
 
 def stage_summary(run_dir: Path, sel_w=None, offset=None) -> Dict:
-    """summary of the out_name(split, sel_w, offset) result dirs (default: 'default' weights, no calibration).  Each
-    split's checkpoint is taken from its own metrics.json ('model'); val and navtest of different checkpoints are
-    refused (SystemExit: a stale navtest result after a new val, or the reverse)."""
+    """summary of the out_name(split, sel_w, offset) result dirs (default: 'plugin' weights = official PDMS without
+    imitation, no calibration).  Each split's checkpoint is taken from its own metrics.json ('model'); val and navtest of
+    different checkpoints are refused (SystemExit: a stale navtest result after a new val, or the reverse)."""
     name = Path(run_dir).name
     ev = Path(run_dir) / "eval"
     out: Dict[str, Any] = {"run": name, "created": EV.kst(), "ckpt_pin": U.read_json(ev / "ckpt.json"), "splits": {},
-                           "sel_w": EV.S2.sel_w_name(sel_w or "default"), "calib_offset_values": offset}
+                           "sel_w": EV.S2.sel_w_name(sel_w or EV.DEFAULT_SEL_W), "calib_offset_values": offset}
     ck_by: Dict[str, Any] = {}
     for split in ("navtrain_val", "navtest"):
-        mp = ev / "root" / "eval" / name / EV.out_name(split, sel_w or "default", offset) / "metrics.json"
+        mp = ev / "root" / "eval" / name / EV.out_name(split, sel_w or EV.DEFAULT_SEL_W, offset) / "metrics.json"
         if not mp.is_file():
             continue
         m = json.loads(mp.read_text())
         ck_by[split] = {k: (m.get("model") or {}).get(k) for k in ("ckpt", "ckpt_sha16", "ep_target", "code_sha16")}
-        keep = {"v2", "v2_lat", "oracle16", "oracle96", "oracle96_lat", m.get("representative"),
+        keep = {"v2", "v2_lat", "oracle16", "oracle96", "oracle96_lat", "pdms", m.get("representative"),
                 "sel b=1 set=all lat=on"}
         rows = {r["key"]: r for r in m["rows"] if r["key"] in keep}
         out["splits"][split] = {"n_eval": m["n_eval"], "n_total": m["n_total"], "n_logs": m["n_logs"],
@@ -673,8 +673,9 @@ def get_parser():
     ap.add_argument("--choose-lat", default="on", choices=["on", "any"],
                     help="navtrain_val choice: on (default, user: lateral applied after selection) | any")
     ap.add_argument("--sel-w", default=None, choices=tuple(EV.S2.SEL_W_SETS),
-                    help="selection weight set: default (= SEL_W) | noim | plugin (0, 1, 1, 1); comparison only; "
-                         "unset: 'default' on navtrain_val, inherited from the frozen val spec on navtest")
+                    help="selection weight set: plugin (0, 1, 1, 1, official PDMS without imitation, default) | "
+                         "default (= SEL_W) | noim; unset: 'plugin' on navtrain_val, inherited from the frozen val spec "
+                         "on navtest")
     ap.add_argument("--fresh", action="store_true")
     ap.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--nshard", type=int, default=1, help=argparse.SUPPRESS)

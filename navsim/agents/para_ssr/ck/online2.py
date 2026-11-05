@@ -154,8 +154,8 @@ _NESTED2 = {"variants": _d_variants, "lat_kd": _d_lat_kd, "warmup": _d_warmup, "
             "bev_kd": _d_bev_kd, "kd_calib": _d_kd_calib}
 KD_CALIB_TEACHERS = ("det", "map")
 _INFER_SELECT_KEYS = ("beta", "set", "lat_mode")
-_INFER_SELECT_OPT = ("rule",)          # rule: "wote" (default, select2.select96) | "pdms" (select2.select96_pdms)
-INFER_SELECT_RULES = ("wote", "pdms")
+_INFER_SELECT_OPT = ("rule",)          # rule: "pdms" (default, select2.select96_pdms) | "wote" (select2.select96)
+INFER_SELECT_RULES = ("pdms", "wote")
 KD_SOURCES = ("det", "map")
 TOKENS_CHECK = 2000                    # tokens after which the input fractions of _check_inputs are checked
 MAX_LABEL_FALLBACK = 0.01              # largest on-policy fraction per epoch without a labelled generation
@@ -429,7 +429,7 @@ class CKE2E2Config:
         if self.infer_select is not None:
             if not 0.0 <= self.infer_select["beta"] <= 1.0:
                 raise ValueError("ck_e2e2.infer_select.beta must be in [0, 1]")
-            if self.infer_select.get("rule", "wote") not in INFER_SELECT_RULES:
+            if self.infer_select.get("rule", "pdms") not in INFER_SELECT_RULES:
                 raise ValueError(f"ck_e2e2.infer_select.rule must be one of {INFER_SELECT_RULES}")
         if self.submit_selection and (self.infer_select is None or not self.infer_outputs):
             raise ValueError("ck_e2e2.submit_selection needs infer_outputs and an infer_select rule")
@@ -1191,11 +1191,13 @@ class CKE2E2:
         sel = self.cfg.infer_select
         if sel is not None:
             from . import select2 as S2
-            if sel.get("rule", "wote") == "pdms":     # plain expected PDMS of the critic (beta / v2 score unused)
+            rule = sel.get("rule", "pdms" if sel["beta"] == 1.0 else "wote")
+            if rule == "pdms":     # plain expected PDMS of the critic (beta / v2 score / im unused)
                 idx = S2.select96_pdms(res["ck2_score_logit"], res["ck2_valid96"], types=S2.VARIANT_SETS[sel["set"]])
             else:
+                w_sel = "default" if sel.get("rule") == "wote" else "plugin"
                 idx = S2.select96(res["ck2_v2_final"], res["ck2_v2_im"], torch.sigmoid(res["ck2_score_logit"]),
-                                  res["ck2_valid96"], sel["beta"], types=S2.VARIANT_SETS[sel["set"]])
+                                  res["ck2_valid96"], sel["beta"], types=S2.VARIANT_SETS[sel["set"]], w=w_sel)
             idx_t = torch.as_tensor(np.asarray(idx.cpu() if torch.is_tensor(idx) else idx), dtype=torch.long,
                                     device=dev)
             traj, _src = S2.final_traj(res["ck2_cand96"], res["ck2_lat_traj"], idx_t, sel["lat_mode"])

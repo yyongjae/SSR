@@ -12,6 +12,7 @@ read, the row says "not checked". Open questions are in [docs/FAIRNESS.md](docs/
 | `navsim/planning/simulation/planner/pdm_planner` | nuPlan devkit and PDM | see the upstream links in the code | not checked |
 | `navsim/agents/para_ssr/modules/anchor_planner.py`, anchors | WoTE | not checked | Anchor file and `pdm_score_256` come from WoTE's published data |
 | `navsim/agents/para_ssr/modules/kinematics.py` | TOAD, DiffusionDriveV2 | not checked | Ported, per the code comments |
+| `navsim/agents/para_ssr/modules/dinov2_lora.py` | DrivoR, [valeoai/DrivoR](https://github.com/valeoai/DrivoR) @ `fc6e5aa`, which adapts [mrabiabrn/robustbev](https://github.com/mrabiabrn/robustbev) | DrivoR: Apache-2.0 (`LICENSE` read); robustbev: not checked | LoRA on q and v of timm's ViT, ported and rewritten; no scene tokens |
 | `navsim/agents/para_ssr/modules/lidar_encoder.py` | SafeDrive | not checked | LiDAR path; not on the camera path |
 | `navsim/agents/para_ssr/modules/tokenlearner.py` | TokenLearner (scenic) | not checked | |
 | `navsim/agents/WoTE/modules/blocks.py` | DAB-DETR through WoTE | not checked | |
@@ -35,6 +36,7 @@ installed but not used on the camera path.
 | BEVFusion code | [yyongjae/bevfusion](https://github.com/yyongjae/bevfusion) @ `b939770`, from MIT BEVFusion; OpenMMLab headers | Apache-2.0 | 64 m checkpoint and cache are not published |
 | Swin nuImages pretrain (for BEVFusion) | Upstream BEVFusion download link | nuImages terms | Not checked |
 | ResNet-34 weights | timm `resnet34.tv_in1k` through HF, revision `1b7b21cca82ff974d341713f777bf740c2db38c4` on the reference server | Model card terms; ImageNet | Downloaded at first training start; the code does not pin the revision. Not used at inference (`backbone_pretrained=False`) |
+| DINOv2 ViT-S weights | timm `vit_small_patch14_reg4_dinov2.lvd142m` through HF, revision `c04b5193082a8d5b0c4856c7937384a48136c5de`, `model.safetensors` sha16 `dca70548ecd7b03f` | apache-2.0 per the HF model card | Downloaded at first training start if not cached; the code does not pin the revision. Not used at inference (`backbone_pretrained=False`) |
 | Anchors, `pdm_score_256` | WoTE (repository data, Google Drive) | not checked | Scores come from the NAVSIM scorer on navtrain; no trained weights |
 
 ## Citation

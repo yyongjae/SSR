@@ -16,6 +16,19 @@ backbones:
   convnext_tiny: {timm: convnext_tiny.fb_in1k, flags: {frozen_stages: -1, backbone_out_indices: [3]}}
   regnety_032: {timm: regnety_032.ra_in1k, flags: {frozen_stages: -1}}
   efficientnet_b0: {timm: efficientnet_b0.ra_in1k, flags: {frozen_stages: -1}}
+  # DrivoR's image backbone (drivoR.yaml): pretrained weights frozen, LoRA rank 32 on q and v of every block
+  # (modules/dinov2_lora.py).  The LoRA terms are new parameters and learn at the head lr, as in DrivoR (one lr for
+  # everything), not at the 0.1 x of a pretrained CNN.  A patch is 14 pixels, so the input moves to a multiple of it:
+  #   dino_vits14       770 x 420, 55 x 30 tokens: the framing of r34 (768 x 416), so the backbone is what a comparison changes.
+  #                     770 x 436 keeps r34's crop_top 16, which is about the same rows of the original image.
+  #   dino_vits14_1148  1148 x 672 with no crop, 82 x 48 tokens: DrivoR's input (image_size in drivoR.yaml).  smoke needs
+  #                     MEM_LIMIT_GB=30 (peak 23.1 GiB, 28.8 GiB in nvidia-smi, on real data).
+  dino_vits14:
+    timm: vit_small_patch14_reg4_dinov2.lvd142m
+    flags: {frozen_stages: -1, image_size: [770, 436], vit_lora_rank: 32, backbone_lr_mult: 1.0}
+  dino_vits14_1148:
+    timm: vit_small_patch14_reg4_dinov2.lvd142m
+    flags: {frozen_stages: -1, image_size: [1148, 672], crop_top: 0, vit_lora_rank: 32, backbone_lr_mult: 1.0}
   swin:
     status: refused
     reason: >-

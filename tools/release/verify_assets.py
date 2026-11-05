@@ -5,7 +5,7 @@
                    [--det-teacher NAME] [--map-teacher NAME] [--registry FILE] [--workers 12] [--json FILE]
 
 Profiles (docs/SETUP.md has the disk and hours of each):
-  base               REFINER=off BEV_KD=off: dataset, maps, anchors, pdm_score_256, pdm_score_256_officialEP
+  base               REFINER=off BEV_KD=off: dataset, maps, anchors, pdm_score_256_officialEP
   refiner_noteacher  base + navtrain metric cache, GT stores (objects, sdf, e2e_side), packed, warm-up labels
   full               refiner_noteacher + the two BEV teacher caches and the two refiner teacher runs
 
@@ -85,7 +85,6 @@ REPO_FILES_REFINER = {
     "navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml": "8d097e448ba6975c",
 }
 ANCHORS_SHA16 = "6bdf549edc25a959"     # float32 [256, 8, 3], the value anchor_sampler checks
-PDM_SCORE = {"npy": "3b9e6c3e75bc698e", "tokens": "b1278ec613611037", "shape": (103288, 5, 256)}
 OFFICIAL_EP = {"npy": "a707bd3508ff04e9", "tokens": "b1278ec613611037", "shape": (103288, 5, 256)}   # agent.config.plan_score_file
 NAVTRAIN_LOGS, TRAINVAL_LOG_PICKLES, TEST_LOG_PICKLES = 1192, 1310, 147
 NAVTEST_TOKENS = 12146
@@ -345,25 +344,6 @@ def check_dataset_test(c: Ctx) -> None:
               f"{SETUP}/10_download_dataset.sh (only evaluation reads these)", soft=True)
 
 
-def check_pdm_score(c: Ctx) -> None:
-    d = Path(c.p["SSR_PLAN_DATA"])
-    fix = (f"copy pdm_score_256.npy and pdm_score_256.tokens.json into SSR_PLAN_DATA={d} (no public packed copy; "
-           "docs/SETUP.md says how to rebuild it)")
-    npy, tok = d / "pdm_score_256.npy", d / "pdm_score_256.tokens.json"
-    bad = []
-    if not npy.is_file():
-        bad.append(f"{npy} missing")
-    elif npy_header(npy)[0] != PDM_SCORE["shape"]:
-        bad.append(f"{npy}: shape {npy_header(npy)[0]} != {PDM_SCORE['shape']}")
-    elif not c.quick and sha16_file(npy) != PDM_SCORE["npy"]:
-        bad.append(f"{npy} differs from pin {PDM_SCORE['npy']}")
-    if not tok.is_file():
-        bad.append(f"{tok} missing")
-    elif sha16_file(tok) != PDM_SCORE["tokens"]:
-        bad.append(f"{tok} differs from pin {PDM_SCORE['tokens']}")
-    c.verdict("pdm_score_256", bad, f"{'shape + tokens' if c.quick else 'file + tokens'} equal their pins", fix)
-
-
 def check_official_ep(c: Ctx) -> None:
     d = c.ck / "raw256"
     fix = (f"copy pdm_score_256_officialEP.npy and pdm_score_256_officialEP.tokens.json into {d}, or run "
@@ -389,6 +369,10 @@ def check_timm(c: Ctx) -> None:
     c.verdict("weights.resnet34", [] if _has_entry(d) else [f"not cached under {hub}"], f"cached under {hub}",
               "first training start downloads it (ImageNet weights, needs network); other backbones have their own "
               "file", soft=True)
+    d = hub / "models--timm--vit_small_patch14_reg4_dinov2.lvd142m/snapshots"
+    c.verdict("weights.dino_vits14", [] if _has_entry(d) else [f"not cached under {hub}"], f"cached under {hub}",
+              "first training start downloads it (needs network): hf download timm/vit_small_patch14_reg4_dinov2.lvd142m "
+              "model.safetensors", soft=True)
 
 
 def check_eval_assets(c: Ctx) -> None:
@@ -738,7 +722,7 @@ def check_refiner_teachers(c: Ctx) -> None:
 BASE_CHECKS: Sequence[Callable[[Ctx], None]] = (
     check_env, check_navsim_import,
     lambda c: check_repo_files(c, REPO_FILES, "repo.pinned_files"),
-    check_anchors, check_tokens, check_dataset, check_pdm_score, check_official_ep, check_timm, check_dataset_test,
+    check_anchors, check_tokens, check_dataset, check_official_ep, check_timm, check_dataset_test,
     check_eval_assets)
 REFINER_CHECKS: Sequence[Callable[[Ctx], None]] = (
     lambda c: check_repo_files(c, REPO_FILES_REFINER, "repo.pinned_files_refiner"),

@@ -325,10 +325,6 @@ class Tree:
         (self.test / "sensor_blobs/test/test/logT").mkdir(parents=True)
         # plan data
         self.plan.mkdir()
-        np.save(self.plan / "pdm_score_256.npy", np.zeros((3, 5, 256), np.float16))
-        (self.plan / "pdm_score_256.tokens.json").write_text("[]")
-        self.mp.setattr(VA, "PDM_SCORE", {"npy": VA.sha16_file(self.plan / "pdm_score_256.npy"), "shape": (3, 5, 256),
-                                          "tokens": VA.sha16_file(self.plan / "pdm_score_256.tokens.json")})
         off = self.root / "data/ck/raw256"
         off.mkdir(parents=True, exist_ok=True)
         np.save(off / "pdm_score_256_officialEP.npy", np.ones((3, 5, 256), np.float16))
@@ -336,7 +332,8 @@ class Tree:
         self.mp.setattr(VA, "OFFICIAL_EP", {"npy": VA.sha16_file(off / "pdm_score_256_officialEP.npy"), "shape": (3, 5, 256),
                                             "tokens": VA.sha16_file(off / "pdm_score_256_officialEP.tokens.json")})
         # eval trees, weights
-        for d in ("v11/navsim", "v22a", "v22b", "v22c", "hf/hub/models--timm--resnet34.tv_in1k/snapshots/x"):
+        for d in ("v11/navsim", "v22a", "v22b", "v22c", "hf/hub/models--timm--resnet34.tv_in1k/snapshots/x",
+                  "hf/hub/models--timm--vit_small_patch14_reg4_dinov2.lvd142m/snapshots/x"):
             (self.root / d).mkdir(parents=True)
         c = self.root / "v11c/logT/unknown/t0000000000000t0"
         c.mkdir(parents=True)
@@ -477,7 +474,6 @@ def test_verify_full_mode_hashes_arrays(tree, capsys, monkeypatch):
     ("tc/det/samples/a0/a0000000000000a1.npz", "teacher.det.bevfusion.cache", "60_teacher_bev.sh"),
     ("tc/map/bev/s0.npy", "teacher.map.resmap.cache", "60_teacher_bev.sh"),
     ("runs/rM/ckpt_last.pt", "teacher.map.resmap.refiner_run", "run_refiner_teachers.sh"),
-    ("plan/pdm_score_256.tokens.json", "pdm_score_256", "SSR_PLAN_DATA"),
     ("data/ck/raw256/pdm_score_256_officialEP.tokens.json", "official_ep", "assemble_official_ep.py"),
     ("ds/maps/nuplan-maps-v1.0.json", "dataset.trainval", "10_download_dataset.sh"),
 ])
@@ -489,6 +485,13 @@ def test_verify_partial_copy_fails_and_names_the_fix(tree, capsys, rel, name, fi
     line = [i for i, x in enumerate(out.splitlines()) if x.startswith(f"FAIL  {name}")]
     assert line, out
     assert fix in out.splitlines()[line[0] + 1]
+
+
+def test_verify_does_not_ask_for_the_wote_score_file(tree, capsys):
+    """Training reads pdm_score_256_officialEP.  This tree has no pdm_score_256.npy and the row is gone, not failing."""
+    assert not (tree.plan / "pdm_score_256.npy").exists()
+    tree.run()
+    assert not [x for x in rows(capsys).splitlines() if x.split()[1:2] == ["pdm_score_256:"]]
 
 
 def test_verify_missing_camera_directory_and_image(tree, capsys):

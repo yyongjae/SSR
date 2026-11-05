@@ -42,6 +42,9 @@ class ParaSSRConfig:
     # navsim images are 1920x1080. 0.4 -> 768x432, then drop 16 rows of sky.
     image_scale: float = 0.4
     crop_top: int = 16
+    # (W, H) to resize to instead of image_scale, before crop_top.  A DINOv2 backbone needs it: its input size is fixed at
+    # construction and must be a multiple of the patch (DrivoR: 1148 x 672, 82 x 48 tokens per camera).
+    image_size: Optional[Tuple[int, int]] = None
     # lens distortion correction before resize / crop (1b3b00c, SafeDrive-style; km cf_v15).  False only to
     # evaluate checkpoints trained on distorted images or for parity tests against the pre-fix base.
     undistort: bool = True
@@ -102,7 +105,10 @@ class ParaSSRConfig:
     #   "moving": BatchNorm running statistics update during training (every BN, frozen stages included; weights stay
     #             frozen as above).  frozen_stages / norm_eval then only act at construction.
     #   "frozen": frozen_stages and norm_eval hold during training too (statistics fixed at their pretrained values).
+    # A DINOv2 backbone has no BatchNorm, so this does nothing to it.
     backbone_bn_mode: str = "moving"
+    # Rank of the LoRA terms of a DINOv2 backbone (modules/dinov2_lora.py); its pretrained weights stay frozen.  DrivoR: 32.
+    vit_lora_rank: int = 32
 
     encoder_num_layers: int = 3
     encoder_num_points_in_pillar: int = 4

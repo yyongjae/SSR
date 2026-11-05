@@ -65,6 +65,19 @@ def test_script_block_equals_the_compose_defaults():
     assert seen == {k: v for k, v in C.DEFAULTS.items() if k != "RUN_ROOT"}
 
 
+def test_the_dino_input_sizes_fit_the_patch_and_r34s_framing():
+    from navsim.agents.para_ssr.configs.default import ParaSSRConfig
+    reg = C.load_registry()["backbones"]
+    for name, hw in (("dino_vits14", (420, 770)), ("dino_vits14_1148", (672, 1148))):
+        f = reg[name]["flags"]
+        w, h = f["image_size"]
+        assert (h - f.get("crop_top", ParaSSRConfig.crop_top), w) == hw and hw[0] % 14 == 0 and hw[1] % 14 == 0
+    # dino_vits14 keeps r34's crop and stays within 1 % of its scale on both axes
+    d = ParaSSRConfig()
+    assert "crop_top" not in reg["dino_vits14"]["flags"] and d.image_scale == 0.4 and d.crop_top == 16
+    assert abs(770 / 1920 / d.image_scale - 1) < 0.01 and abs(436 / 1080 / d.image_scale - 1) < 0.01
+
+
 def test_defaults_match_the_contract_name():
     assert re.fullmatch(r"main_[0-9a-f]{6}", name())
 
@@ -82,7 +95,9 @@ ARMS = {
     "detkd-offbev_mapkd-offref": {"DET_KD": "off_bev", "MAP_KD": "off_ref"}, "r18": {"BACKBONE": "r18"}, "r50": {"BACKBONE": "r50"},
     "r101": {"BACKBONE": "r101"}, "r152": {"BACKBONE": "r152"}, "r50d": {"BACKBONE": "r50d"},
     "convnext_tiny": {"BACKBONE": "convnext_tiny"}, "regnety_032": {"BACKBONE": "regnety_032"},
-    "efficientnet_b0": {"BACKBONE": "efficientnet_b0"}, "convnext_tiny_bn-frozen": {"BACKBONE": "convnext_tiny", "BN": "frozen"},
+    "efficientnet_b0": {"BACKBONE": "efficientnet_b0"}, "dino_vits14": {"BACKBONE": "dino_vits14"},
+    "dino_vits14_1148": {"BACKBONE": "dino_vits14_1148"},
+    "convnext_tiny_bn-frozen": {"BACKBONE": "convnext_tiny", "BN": "frozen"},
     "dist": {"UNDISTORT": "off"}, "z-2_2": {"PILLAR_Z": "-2,2"}, "z-1p5_2p5": {"PILLAR_Z": "-1.5,2.5"},
     "ref-off_bkd-off_r32": {"BEV_RANGE": "32", "REFINER": "off", "BEV_KD": "off"}, "f1": {"FRAMES": "3"}, "f4": {"FRAMES": "0,1,2,3"},
     "headfree": {"HEADING": "free"}, "bn-frozen": {"BN": "frozen"}, "s1": {"SEED": "1"}, "e20": {"EPOCHS": "20"},
@@ -198,7 +213,8 @@ def test_extra_refuses_the_locked_keys(line):
 
 @pytest.mark.parametrize("line, setting", [
     ("agent.config.use_distill=false", "BEV_KD"), ("++agent.config.ck_e2e2.enabled=false", "REFINER"),
-    ("agent.config.image_architecture=resnet50.a1_in1k", "BACKBONE"), ("agent.config.frame_indices=[3]", "FRAMES"),
+    ("agent.config.image_architecture=resnet50.a1_in1k", "BACKBONE"), ("++agent.config.image_size=[770,420]", "BACKBONE"),
+    ("++agent.config.vit_lora_rank=8", "BACKBONE"), ("agent.config.frame_indices=[3]", "FRAMES"),
     ("agent.config.ck_e2e2.lat_kd.fixed=0.0", "REFINER_KD"), ("trainer.params.max_epochs=3", "EPOCHS"),
 ])
 def test_extra_cannot_contradict_the_run_name(line, setting):
@@ -381,6 +397,10 @@ def test_32m_lines():
     ("r50", "resnet50.tv_in1k", {}), ("r50d", "resnet50d.ra2_in1k", {}),
     ("convnext_tiny", "convnext_tiny.fb_in1k", {"frozen_stages": "-1", "backbone_out_indices": "[3]"}),
     ("efficientnet_b0", "efficientnet_b0.ra_in1k", {"frozen_stages": "-1"}),
+    ("dino_vits14", "vit_small_patch14_reg4_dinov2.lvd142m", {"frozen_stages": "-1", "image_size": "[770,436]", "vit_lora_rank": "32",
+                                                              "backbone_lr_mult": "1.0"}),
+    ("dino_vits14_1148", "vit_small_patch14_reg4_dinov2.lvd142m", {"frozen_stages": "-1", "image_size": "[1148,672]", "crop_top": "0",
+                                                                   "vit_lora_rank": "32", "backbone_lr_mult": "1.0"}),
 ])
 def test_backbone_lines(bb, arch, flags):
     k = _kv(C.compose({"BACKBONE": bb}))

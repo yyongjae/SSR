@@ -140,6 +140,9 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
             ("undistort", bool(getattr(cfg, "undistort", True))),
             ("use_lidar", cfg.use_lidar),
         ]
+        # Only when set: the cache name of every image_scale config stays what it was.
+        if getattr(cfg, "image_size", None):
+            fields.append(("image_size", tuple(int(v) for v in cfg.image_size)))
         if cfg.use_lidar:
             # Only what reaches the tensor: padding length, z clip and layout.
             # Pillar/backbone sizes are model-side and do not touch the cache.
@@ -264,8 +267,11 @@ class ParaSSRFeatureBuilder(AbstractFeatureBuilder):
                     and getattr(cam, "distortion", None) is not None):
                 img = undistort_image(img, cam.intrinsics, cam.distortion)
             h, w = img.shape[:2]
-            new_w = int(round(w * cfg.image_scale))
-            new_h = int(round(h * cfg.image_scale))
+            if getattr(cfg, "image_size", None):
+                new_w, new_h = (int(v) for v in cfg.image_size)
+            else:
+                new_w = int(round(w * cfg.image_scale))
+                new_h = int(round(h * cfg.image_scale))
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             if cfg.crop_top:
                 img = img[cfg.crop_top :]

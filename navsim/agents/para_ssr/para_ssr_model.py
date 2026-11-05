@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from .modules.bevformer import BEVFormerEncoder, SSRPerceptionTransformer
 from .modules.det_motion_head import ParaDetMotionHead
+from .modules.dinov2_lora import Dinov2LoRAEncoder, is_dinov2
 from .modules.lidar_encoder import build_lidar_encoder
 from .modules.map_head import ParaMapHead
 from .modules.planner_head import ParaSSRPlannerHead
@@ -151,14 +152,18 @@ class ParaSSRModel(nn.Module):
         if self._backbone_bn_mode not in ("moving", "frozen"):
             raise ValueError(f"backbone_bn_mode must be moving | frozen, got {self._backbone_bn_mode!r}")
 
-        self.image_encoder = timm.create_model(
-            cfg.image_architecture,
-            pretrained=bool(getattr(cfg, "backbone_pretrained", True)),
-            features_only=True,
-            out_indices=cfg.backbone_out_indices,
-        )
+        if is_dinov2(cfg.image_architecture):
+            self.image_encoder = Dinov2LoRAEncoder.from_config(cfg)
+            backbone_channels = self.image_encoder.num_features
+        else:
+            self.image_encoder = timm.create_model(
+                cfg.image_architecture,
+                pretrained=bool(getattr(cfg, "backbone_pretrained", True)),
+                features_only=True,
+                out_indices=cfg.backbone_out_indices,
+            )
+            backbone_channels = self.image_encoder.feature_info.channels()[-1]
         self._apply_backbone_train_policy()
-        backbone_channels = self.image_encoder.feature_info.channels()[-1]
         self.img_neck = SingleLevelFPN(backbone_channels, cfg.embed_dims)
         self.grid_mask = GridMask() if cfg.use_grid_mask else None
 

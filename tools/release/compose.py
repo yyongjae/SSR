@@ -7,7 +7,7 @@ data on disk.  scripts/experiment.sh is its one caller; the CLI below writes wha
 
   compose.py name KEY=VALUE ...                     print the run name
   compose.py emit --out-dir D [--run-root R] [--smoke] KEY=VALUE ...
-                                                    write D/{ck.set,arm.extra,env.sh,composition.json}, print the name
+                                                    write D/{refiner.set,arm.extra,env.sh,composition.json}, print the name
   compose.py verify --composition J --overrides F [--teachers-json T]
                                                     launcher output == prediction, teacher sha pins, reference diff
   compose.py reference --overrides F --run-dir R --plan-data P --teacher-cache T --data-root D
@@ -20,7 +20,7 @@ data on disk.  scripts/experiment.sh is its one caller; the CLI below writes wha
 
 Run name: only what differs from the defaults, in a fixed order, joined with _, then the hash (main_<hash6> by default):
   [<bb>] [<det>-<map>] [ref-off] [rkd-off|score|lat] [bkd-off] [detkd-off|offbev|offref] [mapkd-off|offbev|offref]
-  [noint nodet vecmap|nomap f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
+  [f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 A setting implied by another one gets no part: REFINER=off is ref-off only, REFINER_KD=off BEV_KD=off is rkd-off_bkd-off.
 hash6 = sha256 over the resolved overrides, minus run-path and wandb lines, with data roots written as placeholders so
 one config has one name on every server, plus the registry pins of the teachers in use.  Never the commit.  A changed
@@ -61,15 +61,13 @@ ANCHORS_REL = "resources/planning_vb/trajectory_anchors_256.npy"
 DEFAULTS: Dict[str, str] = {
     "REFINER": "on", "REFINER_KD": "on", "BEV_KD": "on", "DET_KD": "on", "MAP_KD": "on",
     "BACKBONE": "r34", "DET_TEACHER": "bevfusion", "MAP_TEACHER": "resmap",
-    "INTERACTION": "on", "DET_HEAD": "on", "MAP_HEAD": "seg", "FRAMES": "2,3", "UNDISTORT": "on", "HEADING": "xy",
-    "PILLAR_Z": "-1,3", "BEV_RANGE": "64", "BN": "moving",
+    "FRAMES": "2,3", "UNDISTORT": "on", "HEADING": "xy", "PILLAR_Z": "-1,3", "BEV_RANGE": "64", "BN": "moving",
     "SEED": "0", "EPOCHS": "30", "GPUS": "0,1,2,3,4,5,6,7", "SAVE_EVERY": "1",
     "RUN_ROOT": "", "TAG": "", "WANDB": "offline", "EXTRA": "", "DRY": "0",
 }
 CHOICES: Dict[str, Tuple[str, ...]] = {
     "REFINER": ("on", "off"), "REFINER_KD": ("on", "off", "score", "lat"), "BEV_KD": ("on", "off"),
     "DET_KD": ("on", "off", "off_bev", "off_ref"), "MAP_KD": ("on", "off", "off_bev", "off_ref"),
-    "INTERACTION": ("on", "off"), "DET_HEAD": ("on", "off"), "MAP_HEAD": ("seg", "vector", "off"),
     "FRAMES": ("2,3", "3", "0,1,2,3"), "UNDISTORT": ("on", "off"), "HEADING": ("xy", "free"),
     "BEV_RANGE": ("64", "32"), "BN": ("moving", "frozen"), "WANDB": ("online", "offline", "disable"), "DRY": ("0", "1"),
 }
@@ -78,12 +76,15 @@ NOT_RECIPE = ("GPUS", "SAVE_EVERY", "RUN_ROOT", "TAG", "WANDB", "DRY")
 GPU_COUNTS = (2, 4, 8)
 NAME_DEFAULT = "main"                      # the run name's first part when no setting differs from the defaults
 NAME_SMOKE = "smoke"                       # prefix of a smoke run (scripts/experiment.sh looks for smoke_*)
-NAME_REFUSED_PARTS = ("v2", "v2f", "ck", "v7", "v15")    # the run name is what people read: no old branch words in it
+# the run name is what people read: no old branch words in it.  One part of the name (split on _ . -), any case: ck, ck2, ck2e2e,
+# v2, v2f, v2final, v7c, v15x.  ckpt and v20 are other words.
+NAME_REFUSED_PART = re.compile(r"(?i)(ck|ck[0-9].*|v(2|7|15)|v(2|7|15)[a-z].*)")
 KD_KEYS_OF ={"det": ["nc", "ep", "ttc"], "map": ["dac", "ep"]}   # kd_calib.fit_keys: a single teacher teaches its own keys
 ONPOLICY_FROM_EPOCH = 5           # ck_e2e2.yaml; the launcher repeats this refusal with the merged value
 # Refused in EXTRA: the locked values of the release (docs/EXPERIMENTS.md).
 EXTRA_REFUSED = ("infer_select", "submit_selection", "kd_calib", "teacher_", "warmup.", "distill_lambda_", "distill_tau_",
-                 "plan_anchor_file", "dataloader.params.batch_size", "io_dir", "output_dir", "seed")
+                 "plan_anchor_file", "dataloader.params.batch_size", "io_dir", "output_dir", "seed",
+                 "use_task_interaction", "use_det_motion_head", "use_map_head", "map_head_type", "bev_seg_weight")
 # Keys a setting owns: through EXTRA the run name would say something else than the run does.
 EXTRA_OWNED = {
     "agent.config.ck_e2e2.enabled": "REFINER", "agent.config.ck_e2e2.use_teachers": "REFINER_KD",
@@ -92,9 +93,7 @@ EXTRA_OWNED = {
     "agent.config.distill_off_banks": "DET_KD / MAP_KD", "agent.config.use_distill": "BEV_KD",
     "agent.config.image_architecture": "BACKBONE", "agent.config.frozen_stages": "BACKBONE",
     "agent.config.backbone_out_indices": "BACKBONE", "agent.config.distill_branches": "DET_TEACHER / MAP_TEACHER",
-    "agent.config.distill_norm_files": "DET_TEACHER / MAP_TEACHER", "agent.config.use_task_interaction": "INTERACTION",
-    "agent.config.use_det_motion_head": "DET_HEAD", "agent.config.use_map_head": "MAP_HEAD",
-    "agent.config.map_head_type": "MAP_HEAD", "agent.config.bev_seg_weight": "MAP_HEAD",
+    "agent.config.distill_norm_files": "DET_TEACHER / MAP_TEACHER",
     "agent.config.frame_indices": "FRAMES", "agent.config.undistort": "UNDISTORT",
     "agent.config.plan_heading_from_xy": "HEADING", "agent.config.pc_range": "PILLAR_Z / BEV_RANGE",
     "agent.config.map_pc_range": "PILLAR_Z / BEV_RANGE", "agent.config.bev_h": "BEV_RANGE",
@@ -278,9 +277,6 @@ def canonicalize(raw: Mapping[str, str], reg: Optional[Mapping[str, Any]] = None
             s[tk] = default_teacher(role)
 
     # student
-    if s["INTERACTION"] == "on" and (s["DET_HEAD"] == "off" or s["MAP_HEAD"] == "off"):
-        raise Refused("DET_HEAD=off / MAP_HEAD=off need INTERACTION=off (para_ssr_model refuses interaction without its "
-                      "heads)")
     if s["BEV_RANGE"] == "32" and (s["REFINER"] == "on" or s["BEV_KD"] == "on"):
         raise Refused("BEV_RANGE=32 only with REFINER=off BEV_KD=off: the 32 m teacher caches no longer exist")
     if s["REFINER"] == "on" and int(s["EPOCHS"]) <= ONPOLICY_FROM_EPOCH:
@@ -315,12 +311,6 @@ def is_default_recipe(s: Mapping[str, str]) -> bool:
 # ----------------------------------------------------------------------------------------------- the run's lines
 def _st_parts(s: Mapping[str, str]) -> List[str]:
     p: List[str] = []
-    if s["INTERACTION"] == "off":
-        p.append("noint")
-    if s["DET_HEAD"] == "off":
-        p.append("nodet")
-    if s["MAP_HEAD"] != "seg":
-        p.append("vecmap" if s["MAP_HEAD"] == "vector" else "nomap")
     if s["FRAMES"] != DEFAULTS["FRAMES"]:
         p.append("f1" if s["FRAMES"] == "3" else "f4")
     if s["UNDISTORT"] == "off":
@@ -371,7 +361,7 @@ def run_name(s: Mapping[str, str], hash6: str) -> str:
     name = "_".join((parts or [NAME_DEFAULT]) + [hash6])
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
         raise Refused(f"run name {name!r} has a character outside A-Za-z0-9_.-")
-    bad = sorted(set(re.split(r"[_.-]", name)) & set(NAME_REFUSED_PARTS))
+    bad = sorted({p for p in re.split(r"[_.-]", name) if NAME_REFUSED_PART.fullmatch(p)})
     if bad:
         raise Refused(f"run name {name!r} has the part(s) {', '.join(bad)}: choose another TAG or registry name")
     return name
@@ -445,15 +435,6 @@ def extra_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mappin
     put(f"++agent.config.map_pc_range={grid}")
     if s["BEV_RANGE"] == "32":
         put("++agent.config.bev_h=50")
-    if s["MAP_HEAD"] != "seg":
-        put("++agent.config.map_head_type=vector")
-        put("++agent.config.bev_seg_weight=0.0")
-    if s["MAP_HEAD"] == "off":
-        put("agent.config.use_map_head=false")
-    if s["INTERACTION"] == "off":
-        put("agent.config.use_task_interaction=false")
-    if s["DET_HEAD"] == "off":
-        put("agent.config.use_det_motion_head=false")
     if s["FRAMES"] != DEFAULTS["FRAMES"]:
         put(f"++agent.config.frame_indices=[{s['FRAMES']}]")
     if s["UNDISTORT"] == "off":
@@ -700,9 +681,9 @@ def _write(path: Path, text: str) -> None:
 def write_composition(c: Composition, out_dir: str) -> None:
     d = Path(out_dir)
     d.mkdir(parents=True, exist_ok=True)
-    _write(d / "ck.set", f"# generated by tools/release/compose.py for {c.run}\n" + "\n".join(c.set_lines) + "\n")
+    _write(d / "refiner.set", f"# generated by tools/release/compose.py for {c.run}\n" + "\n".join(c.set_lines) + "\n")
     _write(d / "arm.extra", f"# generated by tools/release/compose.py for {c.run}\n" + "\n".join(c.extra_lines) + "\n")
-    env = dict(c.env, E2E_CK_SET=str(d / "ck.set"), E2E_EXTRA=str(d / "arm.extra"))
+    env = dict(c.env, E2E_CK_SET=str(d / "refiner.set"), E2E_EXTRA=str(d / "arm.extra"))
     lines = ["unset " + " ".join(CONTROL_ENV)]
     lines += [f"export {k}={shlex.quote(v)}" for k, v in env.items()]
     lines += [f"CP_RUN={shlex.quote(c.run)}", f"CP_RUN_DIR={shlex.quote(c.run_dir)}", f"CP_RUN_ROOT={shlex.quote(c.run_root)}",

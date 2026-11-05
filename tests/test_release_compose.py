@@ -83,17 +83,15 @@ ARMS = {
     "r101": {"BACKBONE": "r101"}, "r152": {"BACKBONE": "r152"}, "r50d": {"BACKBONE": "r50d"},
     "convnext_tiny": {"BACKBONE": "convnext_tiny"}, "regnety_032": {"BACKBONE": "regnety_032"},
     "efficientnet_b0": {"BACKBONE": "efficientnet_b0"}, "convnext_tiny_bn-frozen": {"BACKBONE": "convnext_tiny", "BN": "frozen"},
-    "noint": {"INTERACTION": "off"}, "noint_nodet": {"INTERACTION": "off", "DET_HEAD": "off"},
-    "noint_nomap": {"INTERACTION": "off", "MAP_HEAD": "off"}, "noint_nodet_nomap": {"INTERACTION": "off", "DET_HEAD": "off", "MAP_HEAD": "off"},
-    "vecmap": {"MAP_HEAD": "vector"}, "dist": {"UNDISTORT": "off"}, "z-2_2": {"PILLAR_Z": "-2,2"}, "z-1p5_2p5": {"PILLAR_Z": "-1.5,2.5"},
+    "dist": {"UNDISTORT": "off"}, "z-2_2": {"PILLAR_Z": "-2,2"}, "z-1p5_2p5": {"PILLAR_Z": "-1.5,2.5"},
     "ref-off_bkd-off_r32": {"BEV_RANGE": "32", "REFINER": "off", "BEV_KD": "off"}, "f1": {"FRAMES": "3"}, "f4": {"FRAMES": "0,1,2,3"},
     "headfree": {"HEADING": "free"}, "bn-frozen": {"BN": "frozen"}, "s1": {"SEED": "1"}, "e20": {"EPOCHS": "20"},
     "g4": {"GPUS": "0,1,2,3"}, "g2": {"GPUS": "4,5"}, "a.1-b": {"TAG": "a.1-b"}, "x": {"EXTRA": "agent.lr=2e-4"},
     "ref-off_bkd-off_x": {"REFINER": "off", "BEV_KD": "off", "EXTRA": "agent.config.plan_anchor=false"},
     # every part at once, in the fixed order
-    "r50_rkd-score_bkd-off_detkd-offref_noint_nodet_vecmap_f4_dist_headfree_z-2_2_bn-frozen_e20_g4_s1_a1_x": {
-        "BACKBONE": "r50", "REFINER_KD": "score", "BEV_KD": "off", "DET_KD": "off", "INTERACTION": "off", "DET_HEAD": "off",
-        "MAP_HEAD": "vector", "FRAMES": "0,1,2,3", "UNDISTORT": "off", "HEADING": "free", "PILLAR_Z": "-2,2", "BN": "frozen",
+    "r50_rkd-score_bkd-off_detkd-offref_f4_dist_headfree_z-2_2_bn-frozen_e20_g4_s1_a1_x": {
+        "BACKBONE": "r50", "REFINER_KD": "score", "BEV_KD": "off", "DET_KD": "off",
+        "FRAMES": "0,1,2,3", "UNDISTORT": "off", "HEADING": "free", "PILLAR_Z": "-2,2", "BN": "frozen",
         "EPOCHS": "20", "GPUS": "0,1,2,3", "SEED": "1", "TAG": "a1", "EXTRA": "agent.lr=2e-4"},
 }
 
@@ -127,7 +125,7 @@ def test_arm_names_are_distinct_and_clean():
 def test_every_documented_arm_has_its_own_name():
     arms = _doc_arms()
     names = [C.compose(v).run for v in arms]
-    assert len(arms) >= 38 and len(set(names)) == len(names), sorted(names)
+    assert len(arms) >= 33 and len(set(names)) == len(names), sorted(names)
     for n in names:
         _clean_name(n)
     assert names[0].startswith("main_")
@@ -157,13 +155,19 @@ def test_one_config_one_name(a, b):
     ({"DET_KD": "off_ref", "REFINER_KD": "off"}, "means nothing"), ({"DET_KD": "off_ref", "REFINER": "off"}, "means nothing"),
     ({"MAP_KD": "off_bev", "BEV_KD": "off"}, "means nothing"), ({"DET_KD": "off_bev", "MAP_KD": "off_bev"}, "use BEV_KD=off"),
     ({"DET_KD": "off", "MAP_KD": "off_bev"}, "use BEV_KD=off"), ({"DET_KD": "off_ref", "MAP_KD": "off_ref"}, "use REFINER_KD=off"),
-    ({"DET_KD": "off", "MAP_KD": "off_ref"}, "use REFINER_KD=off"), ({"DET_HEAD": "off"}, "need INTERACTION=off"),
-    ({"MAP_HEAD": "off"}, "need INTERACTION=off"), ({"BEV_RANGE": "32"}, "only with REFINER=off BEV_KD=off"),
+    ({"DET_KD": "off", "MAP_KD": "off_ref"}, "use REFINER_KD=off"), ({"INTERACTION": "off"}, "unknown setting"),
+    ({"DET_HEAD": "off"}, "unknown setting"), ({"MAP_HEAD": "vector"}, "unknown setting"),
+    ({"EXTRA": "agent.config.use_task_interaction=false"}, "locked"), ({"EXTRA": "agent.config.use_det_motion_head=false"}, "locked"),
+    ({"EXTRA": "agent.config.use_map_head=false"}, "locked"), ({"EXTRA": "++agent.config.map_head_type=vector"}, "locked"),
+    ({"EXTRA": "++agent.config.bev_seg_weight=0.0"}, "locked"), ({"BEV_RANGE": "32"}, "only with REFINER=off BEV_KD=off"),
     ({"BEV_RANGE": "32", "REFINER": "off"}, "only with"), ({"BEV_RANGE": "32", "BEV_KD": "off"}, "only with"),
     ({"GPUS": "0,1,2"}, "distinct"), ({"GPUS": "0,0"}, "distinct"), ({"GPUS": "a,b"}, "distinct"), ({"GPUS": "0"}, "distinct"),
     ({"TAG": "a_b"}, "characters"), ({"TAG": "a/b"}, "characters"), ({"TAG": "-a"}, "characters"), ({"TAG": ".a"}, "characters"),
     ({"TAG": "main"}, "default recipe"), ({"TAG": "smoke"}, "smoke run"), ({"TAG": "v2"}, "has the part"),
-    ({"TAG": "a-ck.b"}, "has the part"), ({"SEED": "-1"}, "integer"), ({"EPOCHS": "x"}, "integer"),
+    ({"TAG": "a-ck.b"}, "has the part"), ({"TAG": "ck2"}, "has the part"), ({"TAG": "CK"}, "has the part"),
+    ({"TAG": "V2"}, "has the part"), ({"TAG": "v2f"}, "has the part"), ({"TAG": "v2final"}, "has the part"),
+    ({"TAG": "v7c"}, "has the part"), ({"TAG": "v15x"}, "has the part"), ({"TAG": "a-Ck2e2e"}, "has the part"),
+    ({"SEED": "-1"}, "integer"), ({"EPOCHS": "x"}, "integer"),
     ({"EPOCHS": "5"}, "needs more than 5"), ({"SAVE_EVERY": "7"}, "does not divide"), ({"PILLAR_Z": "3,1"}, "below"),
     ({"PILLAR_Z": "1"}, "a,b"), ({"PILLAR_Z": "a,b"}, "a,b"), ({"REFINER": "maybe"}, "one of"), ({"FRAMES": "1,3"}, "one of"),
     ({"BN": "x"}, "one of"), ({"WANDB": "x"}, "one of"), ({"RUN_ROOT": "rel/path"}, "absolute"), ({"RUN_ROOT": "/a=b"}, "absolute"),
@@ -172,6 +176,11 @@ def test_one_config_one_name(a, b):
 def test_refusals(kw, msg):
     with pytest.raises(C.Refused, match=msg):
         C.compose(kw)
+
+
+@pytest.mark.parametrize("tag", ["ckpt", "v20", "v150", "check", "track", "v8"])
+def test_tag_guard_leaves_other_words_alone(tag):
+    assert C.compose({"TAG": tag}).run.startswith(tag + "_")
 
 
 @pytest.mark.parametrize("line", [
@@ -248,10 +257,18 @@ def test_one_config_one_name_on_any_server():
     assert d["env"]["E2E_ROOT"] == "/mnt/d/runs"
 
 
-def test_hash_follows_the_registry_pins(tmp_path):
+def _wrong_det_pin(tmp_path):
+    """registry.yaml with the pin of the det teacher, the first in the file, replaced; a new teacher run changes the real pin."""
     txt = (REPO / "tools/release/registry.yaml").read_text()
+    pin = re.search(r'refiner_ckpt_sha16: "[0-9a-f]{16}"', txt).group(0)
+    assert pin != 'refiner_ckpt_sha16: "ffffffffffffffff"'
     new = tmp_path / "r.yaml"
-    new.write_text(txt.replace('refiner_ckpt_sha16: "66c6a413dd866898"', 'refiner_ckpt_sha16: "ffffffffffffffff"'))
+    new.write_text(txt.replace(pin, 'refiner_ckpt_sha16: "ffffffffffffffff"', 1))
+    return new
+
+
+def test_hash_follows_the_registry_pins(tmp_path):
+    new = _wrong_det_pin(tmp_path)
     assert C.compose({}, registry=str(new)).hash6 != C.compose({}).hash6
     # that teacher is read by nothing with the refiner KD off and its bank off: its pin is not part of the config
     a = {"REFINER_KD": "off", "DET_KD": "off"}
@@ -345,11 +362,8 @@ def test_counters_follow_the_gpu_count(n, acc, warm, probe):
 
 
 def test_student_lines():
-    k = _kv(C.compose({"INTERACTION": "off", "DET_HEAD": "off", "MAP_HEAD": "off", "UNDISTORT": "off", "HEADING": "free",
-                       "FRAMES": "0,1,2,3", "PILLAR_Z": "-2,2.5", "BN": "frozen"}))
-    assert k["agent.config.use_task_interaction"] == "false" and k["agent.config.use_det_motion_head"] == "false"
-    assert k["agent.config.use_map_head"] == "false" and k["agent.config.map_head_type"] == "vector"
-    assert k["agent.config.bev_seg_weight"] == "0.0" and k["agent.config.undistort"] == "false"
+    k = _kv(C.compose({"UNDISTORT": "off", "HEADING": "free", "FRAMES": "0,1,2,3", "PILLAR_Z": "-2,2.5", "BN": "frozen"}))
+    assert k["agent.config.undistort"] == "false"
     assert k["agent.config.plan_heading_from_xy"] == "false" and k["agent.config.frame_indices"] == "[0,1,2,3]"
     assert k["agent.config.pc_range"] == k["agent.config.map_pc_range"] == "[-32.0,0.0,-2.0,32.0,64.0,2.5]"
     assert k["agent.config.backbone_bn_mode"] == "frozen"
@@ -486,7 +500,7 @@ def test_write_composition_and_name_from_settings_json(tmp_path):
     assert rec["gpus"] == ["0", "1", "2", "3"] and rec["asset_check"]["exit"] == 0 and len(rec["commit"]) == 40
     env = (tmp_path / "gen/env.sh").read_text()
     assert env.startswith("unset ") and f"export SSR_EXPERIMENT_SHA={c.hash6}" in env and "E2E_CK_SET=" in env
-    assert L2.LU.read_lines(str(tmp_path / "gen/ck.set")) == c.set_lines
+    assert L2.LU.read_lines(str(tmp_path / "gen/refiner.set")) == c.set_lines
     assert L2.LU.read_lines(str(tmp_path / "gen/arm.extra")) == c.extra_lines
 
 
@@ -764,7 +778,7 @@ def test_train_flow_with_a_stub_launcher(tmp_path, stubs):
     rec = json.loads((R / "launch/settings.json").read_text())
     assert rec["run"] == n and C.compose(rec["settings"]).run == n and rec["hostname"] and rec["torch"]
     assert rec["asset_check"] == {"profile": "full", "quick": True, "exit": 0, "log": "launch/verify_assets.log"}
-    assert (R / "launch/verify_assets.log").is_file() and (R / "launch/gen/ck.set").is_file()
+    assert (R / "launch/verify_assets.log").is_file() and (R / "launch/gen/refiner.set").is_file()
     assert rec["overrides_sha256"] == C._sha(C.LU.read_lines(str(R / "launch/overrides.txt")))
     log = Path(stubs["STUB_LOG"]).read_text()
     assert f"{root} {n} sha={rec['hash6']} start --gpus 0,1,2,3,4,5,6,7" in log and "SSR_GPU_POLICY=any" in log
@@ -849,9 +863,7 @@ def test_real_check(tmp_path, kw, want):
 
 @server_only
 def test_real_check_refuses_a_wrong_teacher_pin(tmp_path):
-    txt = (REPO / "tools/release/registry.yaml").read_text()
-    new = tmp_path / "r.yaml"
-    new.write_text(txt.replace('refiner_ckpt_sha16: "66c6a413dd866898"', 'refiner_ckpt_sha16: "ffffffffffffffff"'))
+    new = _wrong_det_pin(tmp_path)
     r = sh("check", f"CHECK_ROOT={tmp_path}", f"REGISTRY={new}")
     assert r.returncode == 3 and "!= registry ffffffffffffffff" in r.stdout, r.stdout + r.stderr
 

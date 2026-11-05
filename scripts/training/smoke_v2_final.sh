@@ -18,7 +18,7 @@ source "$REPO/tools/release/load_paths.sh"   # SSR_PY, SSR_DATA_ROOT, SSR_RUN_RO
 export SSR_ALLOW_DIRECT=1
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 SMOKE_ROOT=${SMOKE_ROOT:-$SSR_DATA_ROOT/ck/ck2/e2e_smoke}
-TAG=${TAG:-v2final_smoke_$(TZ=Asia/Seoul date +%m%d_%H%M)}
+TAG=${TAG:-main_smoke_$(TZ=Asia/Seoul date +%m%d_%H%M)}
 MEM_LIMIT_GB=${MEM_LIMIT_GB:-22.5}
 SD=$SMOKE_ROOT/_cfg_$TAG
 mkdir -p "$SD"

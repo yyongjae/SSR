@@ -48,7 +48,7 @@ teachers:
       sha_head: "71ea94f672c89521"
       norm_v15: resources/km_corridor/norm_bevfusion_100x100.npz
       refiner_run: ${SSR_TEACHER_CACHE}/refiner/det
-      refiner_ckpt_sha16: "66c6a413dd866898"
+      refiner_ckpt_sha16: "ad244538115275ee"
     bevformer:
       status: missing
       needs:
@@ -66,7 +66,7 @@ teachers:
       sha256: "e67cc78d0da6afe00f0396d9940e98024826d7288117f346b9f85a7ade699858"
       norm_v15: resources/km_corridor/norm_resmap_100x100.npz
       refiner_run: ${SSR_TEACHER_CACHE}/refiner/map
-      refiner_ckpt_sha16: "d436b5c0d4f1f4d6"
+      refiner_ckpt_sha16: "78657859c9838024"
     mask2map:
       status: missing
       needs:

@@ -61,9 +61,6 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `BACKBONE` | r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 | r34 | 이름 그대로 (`r50`), 맨 앞 | timm 이름과 필요한 플래그는 registry에 있습니다. swin, vit는 코드가 더 필요해서 거부합니다. |
 | `DET_TEACHER` | registry 이름 | bevfusion | `<det>-<map>` | DET teacher. `bevformer`는 등록만 되어 있고 없어서, 무엇이 부족한지 출력하고 거부합니다. |
 | `MAP_TEACHER` | registry 이름 | resmap | `<det>-<map>` | MAP teacher. `mask2map`도 같습니다. |
-| `INTERACTION` | on off | on | `noint` | task interaction. |
-| `DET_HEAD` | on off | on | `nodet` | det head. off는 `INTERACTION=off`가 필요합니다. |
-| `MAP_HEAD` | seg vector off | seg | `vecmap` `nomap` | map head. off는 `INTERACTION=off`가 필요합니다. |
 | `FRAMES` | `2,3` `3` `0,1,2,3` | `2,3` | `f1` `f4` | 입력 프레임. |
 | `UNDISTORT` | on off | on | `dist` | 렌즈 왜곡 보정. |
 | `HEADING` | xy free | xy | `headfree` | heading을 경로에서 계산(xy)하거나 별도 head로 예측(free)합니다. |
@@ -74,8 +71,8 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `EPOCHS` | 정수 | 30 | `e<N>` | trainer, `agent.max_epochs`, labeler 상한을 함께 바꿉니다. refiner를 켜면 6 이상이어야 합니다. |
 | `GPUS` | 쉼표 목록 | `0,...,7` | `g<N>` | 2, 4, 8장. 번호 제한은 없고, 각 GPU 사용량이 1 GiB 미만이어야 합니다. 기준은 8장입니다. |
 | `SAVE_EVERY` | 정수 | 1 | 없음 | N epoch마다 checkpoint. `EPOCHS`를 나누어떨어뜨려야 합니다 (평가는 마지막 epoch를 읽음). hash에도 안 들어갑니다. `resume`은 마지막으로 저장된 지점부터 이어갑니다. |
-| `RUN_ROOT` | 경로 | `$SSR_RUN_ROOT` | 없음 | run 폴더 위치. |
-| `TAG` | `[A-Za-z0-9.-]+` | 없음 | 값 그대로, hash 앞 | 같은 설정을 다시 돌릴 때 등. 글자나 숫자로 시작해야 합니다. `main`, `smoke`, 그리고 `v2`, `ck` 같은 옛 이름 조각은 거부합니다. |
+| `RUN_ROOT` | 경로 | `/home/external-user/experiments` | 없음 | run 폴더 위치. 값을 비우면(`RUN_ROOT=`) `$SSR_RUN_ROOT`를 씁니다. |
+| `TAG` | `[A-Za-z0-9.-]+` | 없음 | 값 그대로, hash 앞 | 같은 설정을 다시 돌릴 때 등. 글자나 숫자로 시작해야 합니다. `main`, `smoke`, 그리고 옛 이름 조각(대소문자 무관: `ck`, `ck2`, `v2`, `v2f`, `v7c`, `v15x` 등)은 거부합니다. |
 | `WANDB` | online offline disable | offline | 없음 | hash에 안 들어갑니다. 팀 계정은 `WANDB_ENTITY`로 지정합니다 (기본값 없음). |
 | `EXTRA` | Hydra 줄, `;`로 구분 | 없음 | `x` | 위 키에 없는 것을 바꿀 때. hash에 들어갑니다. |
 | `DRY` | 0 1 | 0 | 없음 | 1이면 `train`, `smoke`가 시작하지 않고 출력만 합니다. |
@@ -85,6 +82,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 `EXTRA`에서 거부하는 것:
 
 - 고정된 값: `infer_select`, `submit_selection`, `kd_calib`, `teacher_`, `warmup.`, `distill_lambda_`, `distill_tau_`, `plan_anchor_file`, `dataloader.params.batch_size`, `io_dir`, `output_dir`, `seed`.
+- e2e 구조: `use_task_interaction`, `use_det_motion_head`, `use_map_head`, `map_head_type`, `bev_seg_weight`. task interaction, det head, seg map head는 항상 켜져 있고 실험에서 바꾸지 않습니다.
 - 위 표의 키가 정하는 값 (`use_distill`, `ck_e2e2.enabled`, `image_architecture` 등). 이름과 실제가 달라지기 때문입니다. 해당 키를 쓰라고 안내합니다.
 
 ## 4. 폴더 이름
@@ -93,7 +91,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 
 ```
 [backbone] [<det>-<map>] [ref-off] [rkd-off|rkd-score|rkd-lat] [bkd-off] [detkd-off|detkd-offbev|detkd-offref]
-[mapkd-off|mapkd-offbev|mapkd-offref] [noint nodet vecmap|nomap f1|f4 dist headfree z<a>_<b> r32]
+[mapkd-off|mapkd-offbev|mapkd-offref] [f1|f4 dist headfree z<a>_<b> r32]
 [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 ```
 
@@ -173,11 +171,6 @@ run 폴더 안의 이름:
 | backbone ConvNeXt | `BACKBONE=convnext_tiny` | full | 측정 안 됨. 단계 동결이 ResNet과 다름 |
 | backbone RegNetY | `BACKBONE=regnety_032` | full | 측정 안 됨. 단계 동결이 ResNet과 다름 |
 | backbone EfficientNet | `BACKBONE=efficientnet_b0` | full | 측정 안 됨. 단계 동결이 ResNet과 다름 |
-| interaction 끔 | `INTERACTION=off` | full | 약 20 h |
-| det head 끔 | `INTERACTION=off DET_HEAD=off` | full | 약 20 h |
-| map head 끔 | `INTERACTION=off MAP_HEAD=off` | full | 약 20 h |
-| head 둘 다 끔 | `INTERACTION=off DET_HEAD=off MAP_HEAD=off` | full | 약 20 h |
-| vector map head | `MAP_HEAD=vector` | full | 약 20 h |
 | 렌즈 보정 끔 | `UNDISTORT=off` | full | 20 h |
 | pillar 높이 | `PILLAR_Z=-2,2` | full | 20 h |
 | 프레임 1장 | `FRAMES=3` | full | 20 h 아래 |
@@ -223,7 +216,8 @@ run 폴더 안의 이름:
 - 기본은 마지막 epoch입니다. `EPOCH=15`는 `epoch=14-*.ckpt`를 뜻하고, 표에 `*`로 표시되며 `epoch_rule: manual`로 남습니다.
 - navtest를 볼 때마다 `<run>/eval/ledger.jsonl`에 한 줄이 쌓입니다.
 - `table`은 GPU 수, commit, protocol 버전이 섞이면 거부합니다 (`ALLOW_MIXED=1`로 출력 가능). GPU 수가 다르면 optimizer step당 BatchNorm 갱신 횟수, GridMask, EMA가 달라져서 단일 요인 비교가 아닙니다.
-- `vs base` 열은 기준 run(`BASE=<이름>`, 없으면 기본 레시피 run)과 같은 token에서 비교한 차이와 log 단위 bootstrap 95% 구간입니다. 구간이 0을 포함하면 표 아래에 경고가 나옵니다.
+- `vs base` 열은 기준 run(`BASE=<이름>`)과 같은 token에서 비교한 차이와 log 단위 bootstrap 95% 구간입니다. 구간이 0을 포함하면 표 아래에 경고가 나옵니다.
+- 지금은 `BASE=<이름>`이 필수입니다 (예: `BASE=main_<hash>`). `tools/release/table.py`의 `DEFAULT_RECIPE`가 아직 옛 이름 형식이라 새 이름의 기본 레시피 run을 찾지 못하고, `BASE` 없이 돌리면 `vs base` 열이 메시지 없이 빠집니다. table.py는 평가 쪽이라 고정되어 있어서 고치지 않았습니다.
 
 ## 8. 아직 확인되지 않은 것
 

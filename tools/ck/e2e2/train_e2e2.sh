@@ -203,6 +203,9 @@ do_start() {
     die "main run needs CK2_E2E_APPROVED=1 (user approval after the GPU smoke)"
   fi
   if p=$(alive "$L/train.pid" run_training); then die "training already running (pid $p)"; fi
+  if [ "$RESUME" = 1 ] && [ -d "$R/ck_e2e2" ] && [ ! -d "$IO" ]; then   # rec/ and lab/ of a run from before the folder change
+    die "$R keeps its data in ck_e2e2/, this launcher reads refiner/: move it (mv \"$R/ck_e2e2\" \"$IO\"), or use a new RUN"
+  fi
   if [ "$RESUME" = 0 ] && { [ -d "$R/train/lightning_logs" ] || [ -d "$IO/rec" ]; }; then
     die "$R already has a run; use --resume (or a new RUN)"
   fi

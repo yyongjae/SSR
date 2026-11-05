@@ -327,6 +327,20 @@ def _sh(env_extra, *args, timeout=600):
     return subprocess.run(["bash", str(SH)] + list(args), env=env, capture_output=True, text=True, timeout=timeout)
 
 
+def test_resume_refuses_a_run_with_the_old_data_folder(tmp_path):
+    """A run from before the folder change keeps rec/ and lab/ in ck_e2e2/: a resume must not go on with an empty refiner/."""
+    R = tmp_path / "root/old"
+    (R / "ck_e2e2/rec").mkdir(parents=True)
+    base = {"E2E_ROOT": str(tmp_path / "root"), "E2E_DRY_RUN": "1", "RUN": "old", "CK2_E2E_APPROVED": "1"}
+    r = _sh(base, "start", "--resume", "--gpus", "0,1")
+    assert r.returncode != 0 and "keeps its data in ck_e2e2/" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert not (R / "refiner").exists() and not (R / "launch_dryrun").exists()
+    # moved as the message says, the refusal is gone (the next one: no checkpoint in this fake run)
+    (R / "ck_e2e2").rename(R / "refiner")
+    r = _sh(base, "start", "--resume", "--gpus", "0,1")
+    assert r.returncode != 0 and "no last.ckpt" in r.stdout + r.stderr, r.stdout + r.stderr
+
+
 def test_train_e2e2_dry_run(tmp_path):
     sets = tmp_path / "smoke_teachers.set"
     sets.write_text("\n".join(SMOKE_SETS) + "\n")

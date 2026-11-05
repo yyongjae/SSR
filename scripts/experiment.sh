@@ -16,9 +16,6 @@ MAP_KD=on                   # on | off (both KD paths) | off_bev | off_ref: KD f
 BACKBONE=r34                # r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 (tools/release/registry.yaml)
 DET_TEACHER=bevfusion       # registry name
 MAP_TEACHER=resmap          # registry name
-INTERACTION=on              # on | off: task interaction
-DET_HEAD=on                 # on | off (off needs INTERACTION=off)
-MAP_HEAD=seg                # seg | vector | off (off needs INTERACTION=off)
 FRAMES=2,3                  # 2,3 | 3 | 0,1,2,3: history frames
 UNDISTORT=on                # on | off: lens undistortion
 HEADING=xy                  # xy (heading from the path) | free (own head)
@@ -51,7 +48,7 @@ if [ -n "${SSR_RELEASE_TEST_STUBS:-}" ]; then
   E2E_START=$SSR_RELEASE_TEST_STUBS/train_e2e2.sh; VERIFY_ASSETS=$SSR_RELEASE_TEST_STUBS/verify_assets.py
   EVAL_SH=$SSR_RELEASE_TEST_STUBS/eval.sh; SMOKE_CHECK=$SSR_RELEASE_TEST_STUBS/smoke_check.py
 fi
-SETTINGS=(REFINER REFINER_KD BEV_KD DET_KD MAP_KD BACKBONE DET_TEACHER MAP_TEACHER INTERACTION DET_HEAD MAP_HEAD FRAMES
+SETTINGS=(REFINER REFINER_KD BEV_KD DET_KD MAP_KD BACKBONE DET_TEACHER MAP_TEACHER FRAMES
           UNDISTORT HEADING PILLAR_Z BEV_RANGE BN SEED EPOCHS GPUS SAVE_EVERY RUN_ROOT TAG WANDB EXTRA DRY)
 # options of single commands; these may also come from the environment
 RUN=""; EPOCH=""; EPDMS=""; CONFIRM=${CONFIRM:-0}; REGISTRY=${REGISTRY:-}; CHECK_ROOT=${CHECK_ROOT:-}
@@ -195,8 +192,8 @@ do_train() {
   if [ "$DRY" = 1 ]; then
     cp_emit "$CHECK_DIR/gen_real"
     say "(DRY) would run: RUN=$CP_RUN E2E_ROOT=$E2E_ROOT bash $E2E start --gpus $GPUS"
-    say "(DRY) env, set file, extra file: $CHECK_DIR/gen_real/{env.sh,ck.set,arm.extra}"
-    sed 's/^/  set   /' "$CHECK_DIR/gen_real/ck.set"; sed 's/^/  extra /' "$CHECK_DIR/gen_real/arm.extra"
+    say "(DRY) env, set file, extra file: $CHECK_DIR/gen_real/{env.sh,refiner.set,arm.extra}"
+    sed 's/^/  set   /' "$CHECK_DIR/gen_real/refiner.set"; sed 's/^/  extra /' "$CHECK_DIR/gen_real/arm.extra"
     return 0
   fi
   local prof; prof=$CP_PROFILE
@@ -271,7 +268,7 @@ do_smoke() {
   R=$RUN_ROOT/_smoke/$name
   if [ "$DRY" = 1 ]; then
     preflight --smoke
-    sed 's/^/  set   /' "$CHECK_DIR/gen/ck.set"; sed 's/^/  extra /' "$CHECK_DIR/gen/arm.extra"
+    sed 's/^/  set   /' "$CHECK_DIR/gen/refiner.set"; sed 's/^/  extra /' "$CHECK_DIR/gen/arm.extra"
     say "(DRY) smoke overrides checked, nothing launched: $CHECK_DIR"
     return 0
   fi

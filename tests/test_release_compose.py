@@ -245,7 +245,7 @@ def test_one_config_one_name_on_any_server():
     assert d["run"] == name()
     over = "\n".join(d["over"])
     # every root the recipe reads comes from the environment
-    for needle in ("agent.config.plan_score_file=/mnt/c/plan/pdm_score_256",
+    for needle in ("agent.config.plan_score_file=/mnt/a/data/ck/raw256/pdm_score_256_officialEP",
                    "agent.config.ck_e2e2.warmup.packed=/mnt/a/data/ck/packed/navtrain_train",
                    "agent.config.ck_e2e2.teacher_det_run=/mnt/b/tc/refiner/det",
                    "agent.config.distill_feature_root=/mnt/b/tc", "agent.config.ref_data_root=/mnt/a/data",

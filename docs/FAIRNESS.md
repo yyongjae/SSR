@@ -92,7 +92,7 @@
 | ReSMap front64 | 제3자 모델, cc-by-nc-4.0, 18 epoch 계획 중 9 epoch. 입력에 위성 영상. val 로그 포함, **학습 split은 확인하지 못했다.** 설정 경로 문자열에 `rideflux`가 있어 비공개 데이터 사용 여부를 소유자에게 물어야 한다 |
 | refiner teacher | 데이터셋, 고정 앵커, 규칙 변형만 사용. 기존 teacher는 모니터링에 r34 후보를 썼다(가중치에는 안 들어감). 새 레시피는 `--r34-evals 0` |
 | 앵커 | WoTE k-means, navtrain 전체(val 포함) |
-| `pdm_score_256` | WoTE에서 온 값. 학습된 가중치는 쓰지 않음. EP 열에 알려진 batch artifact가 있다. val 토큰도 들어 있으나 학습은 train만 읽는다 |
+| `pdm_score_256_officialEP` | v2 head의 점수 라벨. 앵커마다 PDM-Closed와 1대1로 채점한 값이다. NC, DAC, TTC, C는 WoTE의 `pdm_score_256`과 비트 단위로 같고 EP만 다르다(WoTE는 256개를 한 batch로 채점했다). 채점은 v1.0 꼴 fork라 EP 곱셈 항에 DDC가 들어가, v1.1 식과 값의 0.0027 %가 다르다. val 토큰도 들어 있으나 학습은 train만 읽는다. 이 라벨로 학습한 값은 WoTE 라벨로 학습한 예전 숫자와 직접 비교할 수 없다 |
 | online KD 보정 | run 자신의 값. labeler 시점에 영향받는다 |
 | 설계 상수 | 변형 종류, 가속 확장, `sur_groups`는 r34 후보 통계를 보고 정했다. 수치 입력은 아니다 |
 

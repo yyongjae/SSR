@@ -540,6 +540,7 @@ ALLOWED_CHANGED = {
     "agent.config.ck_e2e2.kd_calib.det": _CK + "kd_calib.det=null",
     "agent.config.ck_e2e2.kd_calib.map": _CK + "kd_calib.map=null",
     "agent.config.plan_anchor_file": "agent.config.plan_anchor_file=${REPO}/" + ANCHORS_REL,
+    "agent.config.plan_score_file": "agent.config.plan_score_file=${SSR_DATA_ROOT}/ck/raw256/pdm_score_256_officialEP",
 }
 ALLOWED_NEW = {
     "seed": "seed=0",

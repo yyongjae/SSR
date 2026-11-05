@@ -8,7 +8,7 @@
 
 | 프로필 | 돌릴 수 있는 실험 | 디스크 | 추가로 필요한 것 |
 |---|---|---:|---|
-| `base` | `REFINER=off BEV_KD=off` | 약 693 GiB | 데이터셋, 지도, 앵커, `pdm_score_256`, 평가용 원본 NAVSIM |
+| `base` | `REFINER=off BEV_KD=off` | 약 693 GiB | 데이터셋, 지도, 앵커, `pdm_score_256`, `pdm_score_256_officialEP`, 평가용 원본 NAVSIM |
 | `refiner_noteacher` | `REFINER=on REFINER_KD=off BEV_KD=off` | 약 743 GiB | 위 + navtrain metric cache, GT store, packed, warm-up 라벨 |
 | `full` | 그 밖의 모든 실험 (기본 main 포함) | 약 1,979 GiB (1.93 TiB) | 위 + BEV teacher cache 2개, refiner teacher 2개 |
 
@@ -32,7 +32,7 @@
 | 5 | `20_metric_cache_navtrain.sh` | navtrain metric cache | `refiner_noteacher`, `full` | 34 GiB | 41 + 9분 (CPU 64 + 36 worker) | 아니오 | 3 |
 | 6 | `30_gt_stores.sh` | objects, sdf, e2e_side | `refiner_noteacher`, `full` | 12.5 GiB | 약 1시간 | 아니오 | 5 |
 | 7 | `40_packed_from_dataset.sh` | `ck/packed/*` (`repack_dataset.py`) | `refiner_noteacher`, `full` | 16 MB | 1분 | 아니오 | 2 |
-| 8 | `50_warmup_labels.sh` | raw256, 변형 라벨 (`make_raw256_traj.py`) | `refiner_noteacher`, `full` | 3.1 + 2.4 GiB | raw256 2.4시간, 변형 약 50분 (CPU 48 worker) | 아니오 | 4, 5, 7 |
+| 8 | `50_warmup_labels.sh` | raw256, 변형 라벨 (`make_raw256_traj.py`), 공식 EP 파일 (`assemble_official_ep.py`) | `refiner_noteacher`, `full` | 3.1 + 2.4 + 0.25 GiB | raw256 2.4시간, 변형 약 50분 (CPU 48 worker) | 아니오 | 4, 5, 7 |
 | 9 | `60_teacher_bev.sh` | ReSMap, BEVFusion cache | `full` | 727 + 508 GiB | ReSMap 약 1시간, BEVFusion 복사 시간 미측정 | 아니오 (재생성은 예) | 없음 |
 | 10 | `run_refiner_teachers.sh` | refiner teacher 2개 | `full` | 1 GiB | 2.77시간 | **4 + 4 GPU** | 6, 7, 8, 9 |
 | 11 | `70_pristine_navsim.sh` | 원본 NAVSIM v1.1, v2.2, navtest cache | 평가 | 3 + 3.6 GiB | v1.1 cache 44분 | 아니오 | 2 |
@@ -44,6 +44,8 @@
 합계(앞뒤로 겹치지 않게 그대로 더한 추정): BEVFusion을 복사하면 약 38시간(복사 시간 제외), 다시 학습하면 약 78시간이다. CPU 단계는 동시에 돌릴 수 있다. 예전 서버에서는 metric cache와 sdf, side를 겹쳐 돌렸다.
 
 **선택:** `20_metric_cache_navtest_fork.sh`는 연구 도구(`SSR_NAVTEST_MC`)용이다. release 경로에는 필요 없다.
+
+**공식 EP 파일:** v2 head의 점수 라벨 `agent.config.plan_score_file`은 `ck/raw256/pdm_score_256_officialEP`를 읽는다. 8번 단계 끝의 `assemble_official_ep.py`가 raw256 라벨로 만들며, 체크섬이 pin과 다르면 파일을 만들지 않는다. 8번을 돌리지 않는 `base` 프로필은 이 파일 2개를 복사해야 한다. `pdm_score_256`은 토큰 순서와 NC, DAC, TTC, C 대조에 쓴다.
 
 ## 3. 명령
 
@@ -60,7 +62,7 @@ bash $S/15_token_lists.sh
 K=16 bash $S/20_metric_cache_navtrain.sh
 bash $S/30_gt_stores.sh
 bash $S/40_packed_from_dataset.sh
-bash $S/50_warmup_labels.sh
+bash $S/50_warmup_labels.sh             # 끝에 공식 EP 파일도 만든다
 BEVFUSION_SRC=host:/path/cache_train_100x100/ bash $S/60_teacher_bev.sh
 bash scripts/experiment.sh teachers     # run_refiner_teachers.sh. GPU 8장, 2.77시간
 bash $S/70_pristine_navsim.sh
@@ -106,6 +108,7 @@ python tools/release/verify_assets.py --profile {base,refiner_noteacher,full} [-
 | 변형 val | labels `3db198fbd7a00d07`, ok `c6ed18f987be86f3`, traj `9a9e488338450b24`, anchor_idx `c8e5c5a8893e3a99`, valid `ac4f8db652148258` |
 | 앵커 | 배열 `6bdf549edc25a959`, 파일 `44f64a763473c3a8` (`resources/planning_vb/`) |
 | `pdm_score_256` | npy 파일 `3b9e6c3e75bc698e`, tokens 파일 `b1278ec613611037`, shape [103288, 5, 256] |
+| `pdm_score_256_officialEP` | npy 파일 `a707bd3508ff04e9`, tokens 파일 `b1278ec613611037`, shape [103288, 5, 256] |
 | 저장된 metric cache 설정 | `resources/metric_cache_saved_config.yaml` sha256 `92d42853...` |
 | GT 로더 기대값 | gt_n 85109, gt_ok 85109, p_pdm_nonfinite 0, cl_n_lt2 0, sdf_absmax_zero 0, sdf_absmax_max 10.0, obj_n_max 800, obj_n_zero 68, p_pdm_zero 4370, p_pdm_max 67.8193 |
 | BEVFusion 64 m | manifest head `71ea94f672c89521`, 103,288 파일, 파일당 5,278,014 B |
@@ -128,6 +131,7 @@ python tools/release/verify_assets.py --profile {base,refiner_noteacher,full} [-
 | objects, sdf, e2e_side | 재생성 | 아니오 | |
 | packed | 재생성 (`repack_dataset.py`) | 아니오 | 이 서버 기존 폴더와 전체 행이 비트 단위로 같음을 확인했다 |
 | raw256, 변형 라벨 | 재생성 | 아니오 | 변형은 `--ext straight` 한 번으로 만든다. 옛 빌드는 두 번 돌려 손으로 합쳤다 |
+| `pdm_score_256_officialEP` | 복사 또는 재생성 (`assemble_official_ep.py`) | 아니오 | 복사하면 2개 파일 0.25 GiB. 재생성은 metric cache와 raw256 라벨이 있어야 한다. 양쪽 다 위 pin으로 확인한다 |
 | ReSMap front64 | 다운로드 | HF 공개, cc-by-nc-4.0 | revision 고정. `bev/`와 json만 받으면 781 GB다 |
 | **BEVFusion 64 m 체크포인트와 cache** | **복사** | **아니오** | 지금은 이 서버에만 있다. 545 GB |
 | **`pdm_score_256`** | **복사** | **가공본은 비공개** | WoTE 저장소(Google Drive)의 `formatted_pdm_score_256.npy`를 `tools/plan_v2/pack_pdm_scores.py`로 묶어 다시 만들 수 있다. 학습된 가중치를 쓰지 않는다. 다시 만든 파일이 pin과 같은지는 확인하지 못했다 |
@@ -146,7 +150,7 @@ python tools/release/verify_assets.py --profile {base,refiner_noteacher,full} [-
 |---|---|---|---|
 | objects, sdf, e2e_side | `ref_gt_ok=False`, 측방 손실이 토큰별로 꺼짐 | `verify_assets` `gt.*` | `online2._check_inputs`: 처음 2,000 토큰에서 `strict_rows` 아래면 중단 (rank 0 기준) |
 | teacher BEV 토큰 일부 | 0으로 채우고 `kd_ok=False`, KD가 토큰별로 꺼짐 | `teacher.*.cache` | 같은 검사, `ck2/kd_ok_frac`. refiner off면 `distill_strict_ok` |
-| `pdm_score_256` 토큰 일부 | `sim_reward_valid=0` | `pdm_score_256` (tokens 해시) | 없음 |
+| `pdm_score_256_officialEP` 토큰 일부 | `sim_reward_valid=0` | `official_ep` (tokens 해시) | 없음 |
 | metric cache 일부, labeler 느림 | on-policy 라벨 대신 warm-up 라벨 사용 | `metric_cache.*` | epoch 끝에 fallback > 1 %면 `<io_dir>/INVALID_LABELS.json` 기록, 멈추지는 않음. rank 0 기준 |
 | warm-up 행 읽기 실패 | `ck2_wu_ok=False` | `labels.*` | `_check_rows`: 처음 2,000 토큰 |
 | `meta.json`, `_plan.json`이 없음 | 출처 비교를 건너뜀 | `packed.*`, `labels.*` (pin으로 비교) | 없음 |

@@ -69,7 +69,7 @@ MONITOR_N_GSHARE = 20
 MONITOR_N_STEPS = 500
 
 PLAN_ANCHOR_FILE = f"{REPO}/resources/planning_vb/trajectory_anchors_256.npy"
-PLAN_SCORE_FILE = f"{SP.SSR_PLAN_DATA}/pdm_score_256"
+PLAN_SCORE_FILE = f"{SP.SSR_DATA_ROOT}/ck/raw256/pdm_score_256_officialEP"   # NC, DAC, TTC, C as pdm_score_256, official EP
 
 
 class LaunchError(SystemExit):

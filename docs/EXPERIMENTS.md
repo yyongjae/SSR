@@ -137,6 +137,7 @@ run 폴더 안의 이름:
 - run에서 나오는 값: `experiment_name`, `wandb.*`, `io_dir`, `output_dir`.
 - KD calibration: `mode=online`, `det=null`, `map=null`, online 옵션 6개, `submit_selection=false`.
 - `plan_anchor_file`: 저장소 안의 파일 (참조 run의 파일과 바이트가 같음).
+- `plan_score_file`: 공식 EP 파일 `ck/raw256/pdm_score_256_officialEP`. 참조 run은 WoTE의 `pdm_score_256`을 썼습니다.
 - 새로 명시한 키의 기본값: `seed=0`, `backbone_bn_mode=moving`, `use_teachers=true`, `kd_sources=[det,map]`, `distill_off_banks=[]`, `distill_norm_files`.
 
 ## 5. 실험 목록
@@ -183,7 +184,7 @@ run 폴더 안의 이름:
 
 | Profile | 무엇 | 디스크 |
 |---|---|---|
-| base | 데이터셋, 지도, anchor, `pdm_score_256`, 환경 | 약 693 GiB |
+| base | 데이터셋, 지도, anchor, `pdm_score_256`, `pdm_score_256_officialEP`, 환경 | 약 693 GiB |
 | refiner_noteacher | base + navtrain metric cache, GT 저장소, packed, warm-up label | 약 743 GiB |
 | full | refiner_noteacher + BEV teacher 캐시 2개, refiner teacher run 2개 | 약 1.93 TiB |
 

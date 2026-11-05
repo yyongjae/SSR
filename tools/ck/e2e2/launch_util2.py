@@ -19,8 +19,8 @@ Recipe (user): v2 r34 source on 2 GPUs = the old 4-GPU recipe with devices 2, ba
 2026-10-13, fusion_v1) = the old 4-GPU counters: devices 4, accumulate 8 (global 128), 5300 / 100 / 100, and the
 ck_e2e2 per-rank micro-batch counters halved (MB_COUNTERS: lat_kd.start_mb, label_refresh_every_mb, grad_share_every,
 bev_kd.start_mb), so every schedule keeps its meaning in samples / optimizer steps; experiment_name
-<run> (prefixed 'refiner_' unless it already starts with 'refiner'), W&B project ssr, name <run>, group refiner, tags [refiner, <arm>].  plan_score_file stays the
-WoTE pdm_score_256 (user: v2 keeps its labels).  Then '++agent.config.ck_e2e2.<leaf>=<value>' for every leaf of
+<run> (prefixed 'refiner_' unless it already starts with 'refiner'), W&B project ssr, name <run>, group refiner, tags [refiner, <arm>].  plan_score_file is
+ck/raw256/pdm_score_256_officialEP (user 11-05: the v2 head trains on the official EP).  Then '++agent.config.ck_e2e2.<leaf>=<value>' for every leaf of
 ck_e2e2.yaml (+ --ck-set / --ck-set-file lines) and output_dir=<R>/train/.
 Teacher guard (teacher_check, both modes): config.json arm T / M, trainer train_ck2, ckpt present, lon head zero,
 ep_target == the student's ck_e2e2.ep_target (a run without the key = 'official'; user 2026-10-08: label BCE and EP KD

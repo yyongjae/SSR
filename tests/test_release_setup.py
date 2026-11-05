@@ -329,6 +329,12 @@ class Tree:
         (self.plan / "pdm_score_256.tokens.json").write_text("[]")
         self.mp.setattr(VA, "PDM_SCORE", {"npy": VA.sha16_file(self.plan / "pdm_score_256.npy"), "shape": (3, 5, 256),
                                           "tokens": VA.sha16_file(self.plan / "pdm_score_256.tokens.json")})
+        off = self.root / "data/ck/raw256"
+        off.mkdir(parents=True, exist_ok=True)
+        np.save(off / "pdm_score_256_officialEP.npy", np.ones((3, 5, 256), np.float16))
+        (off / "pdm_score_256_officialEP.tokens.json").write_text("[]")
+        self.mp.setattr(VA, "OFFICIAL_EP", {"npy": VA.sha16_file(off / "pdm_score_256_officialEP.npy"), "shape": (3, 5, 256),
+                                            "tokens": VA.sha16_file(off / "pdm_score_256_officialEP.tokens.json")})
         # eval trees, weights
         for d in ("v11/navsim", "v22a", "v22b", "v22c", "hf/hub/models--timm--resnet34.tv_in1k/snapshots/x"):
             (self.root / d).mkdir(parents=True)
@@ -472,6 +478,7 @@ def test_verify_full_mode_hashes_arrays(tree, capsys, monkeypatch):
     ("tc/map/bev/s0.npy", "teacher.map.resmap.cache", "60_teacher_bev.sh"),
     ("runs/rM/ckpt_last.pt", "teacher.map.resmap.refiner_run", "run_refiner_teachers.sh"),
     ("plan/pdm_score_256.tokens.json", "pdm_score_256", "SSR_PLAN_DATA"),
+    ("data/ck/raw256/pdm_score_256_officialEP.tokens.json", "official_ep", "assemble_official_ep.py"),
     ("ds/maps/nuplan-maps-v1.0.json", "dataset.trainval", "10_download_dataset.sh"),
 ])
 def test_verify_partial_copy_fails_and_names_the_fix(tree, capsys, rel, name, fix):
@@ -803,6 +810,9 @@ def test_warmup_recipe_lines(tmp_path):
     assert any("label_cands.py --split navtrain_train --traj" in x and "--name raw256 --workers 48" in x for x in g)
     v = [x for x in g if "label_variants.py" in x]
     assert len(v) == 1 and "--combine separate --ext straight --name var_separate_sampler16_accstraight --workers 48" in v[0]
+    assert not any("assemble_official_ep.py" in x for x in g) and "copy pdm_score_256_officialEP.npy" in out
+    both = _grid(run_script("50_warmup_labels.sh", script_env(tmp_path, SPLITS="navtrain_train navtrain_val")).stdout)
+    assert any("assemble_official_ep.py" in x for x in both)
 
 
 def test_resmap_download_is_pinned_to_a_revision_and_reads_only_bev(tmp_path):

@@ -213,8 +213,8 @@ def test_constants_with_no_env_are_todays_values():
     assert d["py"] == TODAY["SSR_PY"] and d["lu_e2e"] == f"{k}/ck/phase2/e2e" and d["l2_e2e"] == f"{k}/ck/ck2/e2e"
     assert d["train_env"]["OPENSCENE_DATA_ROOT"] == DATASET_LITERAL
     assert d["train_env"]["NUPLAN_MAPS_ROOT"] == DATASET_LITERAL + "/maps"
-    assert d["anchor"] == d["anchors"] and d["score"] == f"{TODAY['SSR_PLAN_DATA']}/pdm_score_256"
-    assert d["wote"] == d["score"]
+    assert d["anchor"] == d["anchors"] and d["score"] == f"{k}/ck/raw256/pdm_score_256_officialEP"
+    assert d["wote"] == f"{TODAY['SSR_PLAN_DATA']}/pdm_score_256"
     if SERVER_DATASET:   # two spellings of one tree on this server: same file as before
         assert Path(d["lead"]["navtest"]).resolve() == Path(
             "/workspace/yongjae/ssd/yongjae_refiner/direction_analysis/uncertainty/out/lead_navtest.parquet").resolve()
@@ -232,7 +232,7 @@ def test_constants_follow_the_environment(tmp_path):
             assert not s.startswith(root), s
     assert d["splits"]["navtest"]["navsim_logs"] == "/new/test/navsim_logs/test/test"
     assert d["train_env"]["NUPLAN_MAPS_ROOT"] == ds + "/maps" and d["py"] == "/new/py"
-    assert d["score"] == "/new/plan/pdm_score_256" and d["wote"] == "/new/plan/pdm_score_256"
+    assert d["score"] == "/new/data/ck/raw256/pdm_score_256_officialEP" and d["wote"] == "/new/plan/pdm_score_256"
     assert d["mc_roots"] == ["/new/data/metric_cache",
                              "/new/research/report/cause_and_correction_tests/E_train_split_feasibility/metric_cache",
                              "/new/mc"]

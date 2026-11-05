@@ -58,7 +58,7 @@ def test_recipe_and_ck_leaves(tmp_path):
     assert _get(ov, "agent.config.grad_norm_log_interval") == "200"
     assert _get(ov, "agent.config.max_epochs") == "30" and _get(ov, "trainer.params.max_epochs") == "30"
     assert _get(ov, "agent.config.image_architecture") == "resnet34.tv_in1k" and _get(ov, "agent.lr") == "1e-4"
-    assert _get(ov, "agent.config.plan_score_file").endswith("/planning_vb/pdm_score_256")      # v2 keeps WoTE labels
+    assert _get(ov, "agent.config.plan_score_file").endswith("/ck/raw256/pdm_score_256_officialEP")
     assert _get(ov, "experiment_name") == "refiner_test" and _get(ov, "wandb.name") == "refiner_test"
     assert _get(ov, "wandb.project") == "ssr" and _get(ov, "wandb.group") == "refiner"
     assert _get(ov, "wandb.tags") == "[refiner,main]"
@@ -412,7 +412,7 @@ def test_hydra_compose_full_override_list(tmp_path):
         assert dict(OmegaConf.to_container(cfg.agent.config.grad_balance_target)) == {"plan": 0.4, "det": 0.3, "map": 0.3}
         pc = instantiate(cfg.agent.config)
         assert CKE2E2Config.from_any(pc.ck_e2e2).to_dict() == CKE2E2Config.from_any(ck).to_dict()
-        assert pc.ck_e2e == {} and pc.plan_score_file.endswith("pdm_score_256")
+        assert pc.ck_e2e == {} and pc.plan_score_file.endswith("pdm_score_256_officialEP")
     GlobalHydra.instance().clear()
 
 

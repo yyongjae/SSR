@@ -62,14 +62,18 @@ teachers:
       norm_v15: resources/km_corridor/norm_bevfusion_100x100.npz
       refiner_run: ${SSR_TEACHER_CACHE}/refiner/det
       refiner_ckpt_sha16: "ad244538115275ee"
+    # Camera-only BEVFormer (BEVFormer repo, bevformer_navsim_base, epoch_5.pth), cached 2026-11-10 over the navtrain
+    # allow-list (103,288 tokens) with prev_bev along the real 0.5 s chain; axes measured (held-out box probe AUC 0.982).
     bevformer:
-      status: missing
-      needs:
-        - a BEVFormer teacher trained on NAVSIM on the same front 0-64 m grid (no checkpoint on this server)
-        - a per-token BEV cache (float16, 256 channels, 100 x 100), at least the 85,109 navtrain_train tokens (436 GB)
-        - manifest.json with its axes measured
-        - norm_v15 for the BEV KD
-        - a refiner teacher run trained on that cache (tools/release/setup/run_refiner_teachers.sh recipe)
+      status: ready
+      layout: per_token_npz
+      cache_name: bevformer
+      cache_train: ${SSR_TEACHER_CACHE}/bevformer/cache_train_100x100
+      cache_val: ${SSR_TEACHER_CACHE}/bevformer/cache_val_100x100
+      sha_head: "4ca4f1aa55011beb"
+      norm_v15: resources/km_corridor/norm_bevformer_100x100.npz
+      refiner_run: ${SSR_TEACHER_CACHE}/refiner/det_bevformer
+      refiner_ckpt_sha16: "d0956b6867221f26"
   map:
     resmap:
       status: ready
@@ -80,11 +84,14 @@ teachers:
       norm_v15: resources/km_corridor/norm_resmap_100x100.npz
       refiner_run: ${SSR_TEACHER_CACHE}/refiner/map
       refiner_ckpt_sha16: "78657859c9838024"
+    # Camera-only Mask2Map (Mask2Map_navsim navsim-front64, ep18 + 1-epoch BN-frozen fine-tune), cached 2026-11-10 in the
+    # ReSMap stage1_front64 layout (navtrain allow-list 103,288 + navtest/ 12,146); bev = LSS output post ReLU, with seg.
     mask2map:
-      status: missing
-      needs:
-        - a Mask2Map teacher trained on NAVSIM on the same front 0-64 m grid (no code or checkpoint on this server)
-        - a sharded BEV cache (float16, 256 channels, 100 x 100), at least the 85,109 navtrain_train tokens (436 GB)
-        - meta.json with its axes measured; require_seg false if it has no seg head
-        - norm_v15 for the BEV KD
-        - a refiner teacher run trained on that cache (tools/release/setup/run_refiner_teachers.sh recipe)
+      status: ready
+      layout: sharded
+      cache_name: mask2map
+      cache_root: ${SSR_TEACHER_CACHE}/mask2map/front64
+      sha256: "579665a7309beb17621dcbad511031776015f0a58c65a2beee1ee58ed45771e4"
+      norm_v15: resources/km_corridor/norm_mask2map_100x100.npz
+      refiner_run: ${SSR_TEACHER_CACHE}/refiner/map_mask2map
+      refiner_ckpt_sha16: "598db971d0cb4083"

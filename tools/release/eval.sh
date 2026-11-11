@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Evaluation entry point called by `bash scripts/experiment.sh eval RUN=<name> GPUS=... [EPOCH=<n>] [EPDMS=0|1]`.
-# Runs EPDMS evaluation (Option B+ default: beta=0.75, w_safe=1.50, w_cc=2.0) on navtest and navhard_two_stage.
+# Runs EPDMS evaluation (Option B+ default: beta=0.80, w_safe=2.0, w_cc=1.0) on navtest and navhard_two_stage.
 set -euo pipefail
 
 RUN_DIR="${1:?usage: eval.sh <RUN_DIR> <GPUS> [EPOCH] [EPDMS]}"

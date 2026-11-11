@@ -16,7 +16,7 @@ Stages (--stage all runs dump -> eval -> summary):
            when available.
   eval     Computes ego-kinematic comfort/corridor features (HC, CC, 2-frame EC) for the 96 candidates,
            selects the trajectory per token via our Stage-1/Stage-2 risk-averse log-linear blend
-           (beta=0.75, w_safe=1.50, w_cc=2.0), and runs official NAVSIM v2.2 EPDMS scoring.
+           (beta=0.80, w_safe=2.0, w_cc=1.0), and runs official NAVSIM v2.2 EPDMS scoring.
   summary  Writes markdown and JSON summaries of all 9 EPDMS sub-metrics and composite EPDMS scores.
 """
 from __future__ import annotations
@@ -883,9 +883,9 @@ def select_epdms_trajectories(
     split: str,
     kin: Dict[str, Any],
     all_mappings_nh: Optional[Dict[Tuple[str, str], List[Tuple[str, str]]]] = None,
-    beta: float = 0.75,
-    w_safe: float = 1.50,
-    w_cc: float = 2.0,
+    beta: float = 0.80,
+    w_safe: float = 2.0,
+    w_cc: float = 1.0,
 ) -> Dict[str, np.ndarray]:
     """Select final trajectories over the 96-candidate pool using our Stage-1/Stage-2 EPDMS blend."""
     _ensure_navsim22()
@@ -1688,9 +1688,9 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--batch-size", type=int, default=8, help="Batch size per dump GPU shard")
     ap.add_argument("--workers-dump", type=int, default=2, help="DataLoader workers per dump GPU shard")
     ap.add_argument("--workers", type=int, default=48, help="CPU worker processes for kinematic & EPDMS scoring")
-    ap.add_argument("--beta", type=float, default=0.75, help="Stage-1 / Stage-2 blend factor beta for EPDMS (default: 0.75)")
-    ap.add_argument("--w-safe", type=float, default=1.50, help="Risk-averse safety log-weight w_safe for EPDMS (default: 1.50)")
-    ap.add_argument("--w-cc", type=float, default=2.0, help="Stage-1 corridor consistency weight w_cc for EPDMS (default: 2.0)")
+    ap.add_argument("--beta", type=float, default=0.80, help="Stage-1 / Stage-2 blend factor beta for EPDMS (default: 0.80)")
+    ap.add_argument("--w-safe", type=float, default=2.0, help="Risk-averse safety log-weight w_safe for EPDMS (default: 2.0)")
+    ap.add_argument("--w-cc", type=float, default=1.0, help="Stage-1 corridor consistency weight w_cc for EPDMS (default: 1.0)")
     ap.add_argument("--pdms-beta", type=float, default=1.0, help="PDMS selector beta (default: 1.0, pure official PDMS without imitation)")
     ap.add_argument("--pdms-set", default="all", help="PDMS selector variant set (default: all)")
     ap.add_argument("--pdms-lat-mode", default="on", help="PDMS selector lateral mode (default: on)")

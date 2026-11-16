@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Check that the assets one profile needs are on this server, and that they are the right ones.
 
-  verify_assets.py --profile {base,refiner_noteacher,full} [--quick] [--strict] [--only GROUP]
-                   [--det-teacher NAME] [--map-teacher NAME] [--registry FILE] [--workers 12] [--json FILE]
+  verify_assets.py --profile {base,refiner_noteacher,full} [--data {navtrain,trainval_simscale}] [--quick] [--strict]
+                   [--only GROUP] [--det-teacher NAME] [--map-teacher NAME] [--registry FILE] [--workers 12] [--json FILE]
 
 Profiles (docs/SETUP.md has the disk and hours of each):
   base               REFINER=off BEV_KD=off: dataset, maps, anchors, pdm_score_256_officialEP
@@ -14,6 +14,14 @@ index files, a fixed sample of tokens.  Without it every token of a coverage che
 and all 85,109 tokens go through the training GT loader, whose statistics must equal the reference (a few minutes, CPU).
 --only runs one group of the profile (dataset, metric_cache, gt, packed, labels, teacher_cache, teachers): the setup scripts
 use it to check their own step.
+
+--data trainval_simscale (default navtrain: the checks above, unchanged) checks the inputs of that recipe instead: its token
+table (splits/trainval_simscale.parquet), the SimScale scene pickles and images, and for EVERY row of the table the metric
+cache (SimScale: 41 GT maps extended at constant velocity to 51), the GT stores, the packed / raw256 / variant rows (row order = the table, token_sha16
+of tokens.token_sha16), pdm_score_256_officialEP_trainval_simscale, the DET cache files and the MAP index (default teachers
+bevformer + mask2map: BEVFusion and ReSMap need LiDAR or satellite images, which SimScale does not have) and the refiner
+teacher runs.  A missing row is a FAIL.  --quick: a fixed sample of real and SimScale rows instead of every row.  A table
+built in mini mode (development) is a WARN.
 
 Each line says PASS, WARN or FAIL, and a WARN or FAIL names the fix.
   FAIL  the training this profile describes would stop, or would silently run without the input.  Exit code 1.
@@ -49,6 +57,7 @@ if str(ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 from navsim.common import ssr_paths as SP  # noqa: E402
+from navsim.agents.para_ssr.ck.tokens import token_sha16  # noqa: E402
 
 PROFILES = ("base", "refiner_noteacher", "full")
 SETUP = "tools/release/setup"
@@ -56,7 +65,8 @@ N_SAMPLE = 200                 # tokens of a --quick coverage check
 N_READ = 8                     # sampled files opened and read
 
 # ----------------------------------------------------------------------------------------------- pins
-# sha256(array bytes)[:16] unless it says file (sha256 of the file)[:16].  tokens = np.array(tokens, "U16").
+# sha256(array bytes)[:16] unless it says file (sha256 of the file)[:16].  tokens: navsim/agents/para_ssr/ck/tokens.token_sha16
+# (= np.array(tokens, "U16") for 16-character tokens; a SimScale token is never truncated).
 N_TOKENS = {"navtrain_train": 85109, "navtrain_val": 18179}
 PINS: Dict[str, Dict[str, str]] = {
     "packed/navtrain_train": {"token_sha16": "0b56b9aecbe1f094", "gt_traj": "ad3654bd81bdb82f",
@@ -98,6 +108,18 @@ NAVSIM_V11_COMMIT = "0811876c274e8b058ab2be9b3dcd4d37bd23f177"
 TRACKED_TOKENS = "resources/km_corridor/packed/{split}/tokens.parquet"
 REGISTRY = "tools/release/registry.yaml"
 RESMAP_CHANNELS_HWC = (256, 100, 100)
+# --data trainval_simscale
+DATA = ("navtrain", "trainval_simscale")
+TVSIM = "trainval_simscale"
+TVSIM_TEACHERS = {"det": "bevformer", "map": "mask2map"}     # camera-only: the only teachers a SimScale scene can have
+TVSIM_SCORE = "pdm_score_256_officialEP_trainval_simscale"
+TABLE_COLUMNS = ("token", "log", "city", "row", "source", "round", "pkl")    # = navsim.common.simscale.TABLE_COLUMNS
+SOURCES = ("navtrain_train", "navtrain_val", "simscale")      # the table's blocks, in row order
+REPO_FILES_TVSIM = {"resources/metric_cache_saved_config_simscale.yaml": "12c573f170b3aa71"}
+OBS_MAPS = 51                     # metric cache observation: proposals + 1 s of TTC look-ahead (5 s), every cache
+OBS_EXTRAPOLATED_FROM = {"real": None, "simscale": 41}   # SimScale: 4 s GT, then constant velocity (PDMObservation)
+SIM_CAMERA_FRAMES = (0, 1, 2, 3)                              # the camera teachers read all four history frames
+VAR_NAMES = ["id", "a-1.0", "a-0.5", "a+0.5", "l-0.5", "l+0.5"]   # = e2e_data2.VNAMES
 
 
 # ----------------------------------------------------------------------------------------------- report
@@ -118,12 +140,47 @@ class Report:
 
 class Ctx:
     def __init__(self, paths: Dict[str, str], quick: bool, workers: int, rep: Report, det: str, mapt: str,
-                 registry: Optional[dict]):
+                 registry: Optional[dict], data: str = "navtrain"):
         self.p, self.quick, self.workers, self.rep = paths, quick, workers, rep
         self.det, self.mapt, self.registry = det, mapt, registry
         self.data = Path(paths["SSR_DATA_ROOT"])
         self.ck = self.data / "ck"
+        self.data_key = data
         self._tokens: Dict[str, object] = {}
+
+    # the tokens a training of --data reads: navtrain_train, or every row of the trainval_simscale table
+    @property
+    def train_split(self) -> str:
+        return TVSIM if self.data_key == TVSIM else "navtrain_train"
+
+    def train_tokens(self):
+        return self.table() if self.data_key == TVSIM else self.tokens("navtrain_train")
+
+    def train_coverage(self) -> List[Tuple[str, str]]:
+        """train_tokens to look at: all, or with --quick a fixed sample (trainval_simscale: half of it SimScale rows)."""
+        if self.data_key != TVSIM:
+            return self.coverage("navtrain_train")
+        df = self.table()
+        if not self.quick:
+            return list(zip(df.token.tolist(), df.log.tolist()))
+        rng, pick = np.random.default_rng(0), []
+        for m in ((df.source != "simscale").to_numpy(), (df.source == "simscale").to_numpy()):
+            idx = np.flatnonzero(m)
+            pick += sorted(rng.choice(idx, min(N_SAMPLE // 2, len(idx)), replace=False).tolist())
+        return [(df.token.iat[i], df.log.iat[i]) for i in sorted(pick)]
+
+    def table(self):
+        """The trainval_simscale token table (TABLE_COLUMNS, row order = every row-indexed asset)."""
+        if "_table" not in self._tokens:
+            import pandas as pd
+            p = self.data / "splits/trainval_simscale.parquet"
+            if not p.is_file():
+                raise FileNotFoundError(f"{p} missing ({SETUP}/16_trainval_simscale_table.sh)")
+            df = pd.read_parquet(p)
+            for k in ("token", "log", "source", "pkl"):
+                df[k] = df[k].astype(str)
+            self._tokens["_table"] = df
+        return self._tokens["_table"]
 
     # one verdict per check: a list of problems -> FAIL (or WARN when soft), an empty list -> PASS with `good`
     def verdict(self, name: str, problems: Sequence[str], good: str, fix: str, soft: bool = False) -> None:
@@ -276,7 +333,7 @@ def check_tokens(c: Ctx) -> None:
     bad = []
     for split, n in N_TOKENS.items():
         df = c.tokens(split)
-        got = sha16_array(np.array(df.token.tolist(), "U16"))
+        got = token_sha16(df.token.tolist())
         want = PINS[f"packed/{split}"]["token_sha16"]
         if len(df) != n or got != want:
             bad.append(f"{split}: {len(df)} tokens, sha16 {got} (expected {n}, {want})")
@@ -404,6 +461,11 @@ def check_scorer(c: Ctx) -> None:
 def check_metric_cache(c: Ctx, split: str = "navtrain_train", soft: bool = False) -> None:
     root = c.data / "metric_cache"
     fix = f"{SETUP}/20_metric_cache_navtrain.sh"
+    if split == "navtrain_train":           # the training tokens of --data (trainval_simscale: every table row)
+        split, tab, toks = c.train_split, c.train_tokens(), c.train_coverage()
+        fix += " (SPLITS=trainval_simscale)" if split == TVSIM else ""
+    else:
+        tab, toks = c.tokens(split), c.coverage(split)
     bad = []
     done = root / "_state/done_tokens.txt"
     if not root.is_dir():
@@ -411,12 +473,11 @@ def check_metric_cache(c: Ctx, split: str = "navtrain_train", soft: bool = False
         return
     if done.is_file():
         have = set(done.read_text().split())
-        lack = [t for t in c.tokens(split).token if t not in have]
+        lack = [t for t in tab.token if t not in have]
         if lack:
             bad.append(f"{len(lack)} tokens not in _state/done_tokens.txt, e.g. {lack[0]}")
     else:
         bad.append(f"{done} missing")
-    toks = c.coverage(split)
     paths = [root / g / "unknown" / t / "metric_cache.pkl" for t, g in toks]
     lost = missing_paths(paths, c.workers)
     if lost:
@@ -427,14 +488,14 @@ def check_metric_cache(c: Ctx, split: str = "navtrain_train", soft: bool = False
         with open(p, "rb") as f:
             if f.read(6) != b"\xfd7zXZ\x00":
                 bad.append(f"{p}: not an xz stream")
-    c.verdict(f"metric_cache.{split}", bad, f"{len(paths)} of {len(c.tokens(split))} tokens checked present; "
+    c.verdict(f"metric_cache.{split}", bad, f"{len(paths)} of {len(tab)} tokens checked present; "
               f"{n_read} headers read", fix, soft)
 
 
 def check_gt_stores(c: Ctx) -> None:
-    fix = f"{SETUP}/30_gt_stores.sh"
+    fix = f"{SETUP}/30_gt_stores.sh" + (" (SPLIT=trainval_simscale)" if c.data_key == TVSIM else "")
     split = "navtrain_train"
-    toks = c.coverage(split)
+    toks = c.train_coverage()
     obj_dirs = [c.data / "objects" / d for d in ("train", "navtrain", "dev")]
     have_obj = set()
     for d in obj_dirs:
@@ -452,7 +513,7 @@ def check_gt_stores(c: Ctx) -> None:
               f"{len(toks)} tokens present", fix)
     if c.quick:
         bad, n_read = [], 0
-        for t, _ in c.sample(split, N_READ):
+        for t, _ in (c.sample(split, N_READ) if c.data_key != TVSIM else toks[:: max(1, len(toks) // N_READ)][:N_READ]):
             p = c.data / "e2e_side" / t[:2] / f"{t}.npz"
             if p.is_file():
                 n_read += 1
@@ -499,12 +560,16 @@ def compare_gt(got: Dict[str, float], want: Dict[str, float]) -> List[str]:
 
 def check_gt_loader(c: Ctx, fix: str) -> None:
     from multiprocessing import get_context
-    toks = c.tokens("navtrain_train").token.tolist()
+    toks = c.train_tokens().token.tolist()
     chunks = [(str(c.data), toks[i:i + 500]) for i in range(0, len(toks), 500)]
     with get_context("fork").Pool(max(1, c.workers)) as p:
         rows = [r for rr in p.imap_unordered(_gt_chunk, chunks) for r in rr]
     got = gt_stats(rows)
-    c.verdict("gt.loader_all_tokens", compare_gt(got, GT_EXPECT), json.dumps(got), fix)
+    if c.data_key == TVSIM:     # no reference statistics: every row loads, with a finite p_pdm, a centerline, an sdf
+        want = dict(gt_n=len(toks), gt_ok=len(toks), p_pdm_nonfinite=0, cl_n_lt2=0, sdf_absmax_zero=0)
+    else:
+        want = GT_EXPECT
+    c.verdict("gt.loader_all_tokens", compare_gt(got, want), json.dumps(got), fix)
 
 
 def check_packed(c: Ctx, split: str = "navtrain_train", soft: bool = False) -> None:
@@ -520,7 +585,7 @@ def check_packed(c: Ctx, split: str = "navtrain_train", soft: bool = False) -> N
     import pandas as pd
     toks = pd.read_parquet(d / "tokens.parquet", columns=["token"]).token.astype(str).tolist()
     bad = []
-    got = sha16_array(np.array(toks, "U16"))
+    got = token_sha16(toks)
     if got != pins["token_sha16"]:
         bad.append(f"token_sha16 {got} != {pins['token_sha16']}")
     if npy_header(d / "gt_traj.npy") != ((N_TOKENS[split], 8, 3), "float32"):
@@ -587,7 +652,7 @@ def check_teacher_retrain_inputs(c: Ctx) -> None:
 def check_bev_per_token(c: Ctx, role: str, name: str, e: dict) -> None:
     root = Path(e["cache_train"])
     tag = f"teacher.{role}.{name}.cache"
-    fix = f"{SETUP}/60_teacher_bev.sh"
+    fix = f"{SETUP}/60_teacher_bev.sh" if c.data_key != TVSIM else f"{SETUP}/65_cam_teacher_bev.sh (real + SimScale rows)"
     mf = root / "manifest.json"
     if not mf.is_file():
         c.verdict(tag, [f"{mf} missing"], "", fix)
@@ -602,9 +667,9 @@ def check_bev_per_token(c: Ctx, role: str, name: str, e: dict) -> None:
         bad.append("a *_future cache holds future-frame teacher runs")
     h, w = m.get("target_bev_shape", [0, 0])
     ch = int(m.get("bev_channels", 0))
-    if int(m.get("num_samples_written", -1)) < N_TOKENS["navtrain_train"]:
+    if int(m.get("num_samples_written", -1)) < len(c.train_tokens()):
         bad.append(f"num_samples_written {m.get('num_samples_written')}")
-    toks = c.coverage("navtrain_train")
+    toks = c.train_coverage()
     paths = [root / "samples" / t[:2] / f"{t}.npz" for t, _ in toks]
     lost = missing_paths(paths, c.workers)
     if lost:
@@ -627,7 +692,7 @@ def check_bev_per_token(c: Ctx, role: str, name: str, e: dict) -> None:
 def check_bev_sharded(c: Ctx, role: str, name: str, e: dict) -> None:
     root = Path(e["cache_root"])
     tag = f"teacher.{role}.{name}.cache"
-    fix = f"{SETUP}/60_teacher_bev.sh"
+    fix = f"{SETUP}/60_teacher_bev.sh" if c.data_key != TVSIM else f"{SETUP}/65_cam_teacher_bev.sh (real + SimScale rows)"
     if not (root / "meta.json").is_file() or not (root / "index.json").is_file():
         c.verdict(tag, [f"{root}: meta.json or index.json missing"], "", fix)
         return
@@ -642,10 +707,10 @@ def check_bev_sharded(c: Ctx, role: str, name: str, e: dict) -> None:
     shape = tuple(t.get("shape", ()))
     if t.get("dtype") != "float16":
         bad.append(f"bev dtype {t.get('dtype')}")
-    lack = [tk for tk in c.tokens("navtrain_train").token if tk not in idx]
+    lack = [tk for tk in c.train_tokens().token if tk not in idx]
     if lack:
-        bad.append(f"{len(lack)} navtrain_train tokens not in index.json, e.g. {lack[0]}")
-    toks = c.coverage("navtrain_train")
+        bad.append(f"{len(lack)} {c.train_split} tokens not in index.json, e.g. {lack[0]}")
+    toks = c.train_coverage()
     need: Dict[str, int] = {}
     for tk, _ in toks:
         if tk in idx:
@@ -663,7 +728,7 @@ def check_bev_sharded(c: Ctx, role: str, name: str, e: dict) -> None:
             bad.append(f"{p}: {got} {dtype}, expected [N, {shape}] float16")
         elif top >= got[0]:
             bad.append(f"{p}: row {top} beyond its {got[0]} rows")
-    c.verdict(tag, bad, f"meta sha {str(m.get('checkpoint_sha256'))[:16]}; all {len(c.tokens('navtrain_train'))} tokens in "
+    c.verdict(tag, bad, f"meta sha {str(m.get('checkpoint_sha256'))[:16]}; all {len(c.train_tokens())} tokens in "
               f"the index; {n_read} shards fit", fix)
 
 
@@ -718,6 +783,292 @@ def check_refiner_teachers(c: Ctx) -> None:
             check_refiner_teacher(c, role, name, e)
 
 
+# ----------------------------------------------------------------------------------------------- checks: trainval_simscale
+SORTED_SHA16 = {"navtrain_train": "c3fa309cbde971e8", "navtrain_val": "05b78ec43b95d954"}   # = constants.SPLITS pins
+
+
+def _setup_module(name: str):
+    """A script of tools/release/setup as a module (that directory is not a package)."""
+    import importlib.util
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, ROOT / SETUP / f"{name}.py")
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[name] = m
+        spec.loader.exec_module(m)
+    return sys.modules[name]
+
+
+def _real_sim(df) -> Tuple[np.ndarray, np.ndarray]:
+    sim = (df.source == "simscale").to_numpy()
+    return ~sim, sim
+
+
+def check_table(c: Ctx) -> None:
+    fix = f"{SETUP}/16_trainval_simscale_table.sh"
+    p = c.data / "splits/trainval_simscale.parquet"
+    if not p.is_file():
+        c.verdict("tvsim.table", [f"{p} missing"], "", fix)
+        return
+    df = c.table()
+    bad: List[str] = []
+    if tuple(df.columns) != TABLE_COLUMNS:
+        c.verdict("tvsim.table", [f"columns {list(df.columns)} != {list(TABLE_COLUMNS)}"], "", fix)
+        return
+    real, sim = _real_sim(df)
+    if not (df.row.to_numpy() == np.arange(len(df))).all():
+        bad.append("row is not 0..N-1")
+    if df.token.duplicated().any():
+        bad.append(f"{int(df.token.duplicated().sum())} duplicate tokens")
+    blocks = [SOURCES.index(x) if x in SOURCES else -1 for x in df.source]
+    if min(blocks, default=0) < 0 or blocks != sorted(blocks):
+        bad.append(f"sources are not the blocks {SOURCES} in this order")
+    rnd = df["round"].to_numpy().astype(np.int64)
+    if (rnd[real] != -1).any() or (df.pkl[real] != "").any() or (df.token[real].str.len() != 16).any():
+        bad.append("a real row with a round, a pkl or a token that is not 16 characters")
+    st = df[sim]
+    rr = st.token.str.extract(r"^[0-9a-f]{16}-(\d{3})$")[0]
+    suffix_ok = rr.notna() & (rr.fillna("-1").astype(int) == st["round"].astype(int))
+    pkl_ok = st.pkl == [f"synthetic_reaction_pdm_v1.0-{int(r)}/meta_datas/{lg}.pkl" for r, lg in zip(st["round"], st.log)]
+    if not (suffix_ok.all() and pkl_ok.all()):
+        bad.append(f"{int((~(suffix_ok & pkl_ok)).sum())} SimScale rows whose token is not '<16 hex>-<round>' or whose "
+                   f"pkl is not their round's scene pickle")
+    if not (st.sort_values(["round", "token"], kind="stable").index == st.index).all():
+        bad.append("SimScale rows are not in round order, sorted by token")
+    T = _setup_module("build_trainval_simscale_table")
+    src_logs = [T.source_log(lg) if s_ else lg for lg, s_ in zip(df.log, sim)]
+    test = T.test_logs()
+    leak = {lg for lg in src_logs if lg in test}
+    if leak:
+        bad.append(f"{len(leak)} test / navtest logs are training rows, e.g. {sorted(leak)[0]}")
+    meta_p = p.with_suffix(".meta.json")
+    mode = json.loads(meta_p.read_text()).get("mode") if meta_p.is_file() else "unknown (no .meta.json)"
+    if mode == "full":
+        for part, want in SORTED_SHA16.items():
+            toks = df.token[df.source == part].tolist()
+            got = hashlib.sha256("\n".join(sorted(toks)).encode()).hexdigest()[:16]
+            if len(toks) != N_TOKENS[part] or got != want:
+                bad.append(f"{part}: {len(toks)} tokens, sorted sha16 {got} (pinned {N_TOKENS[part]}, {want})")
+    n = {s_: int((df.source == s_).sum()) for s_ in SOURCES}
+    c.verdict("tvsim.table", bad, f"{len(df)} rows {n}, rounds {sorted(set(rnd[sim].tolist()))}, token_sha16 "
+              f"{token_sha16(df.token.tolist())}", fix)
+    c.verdict("tvsim.table.mode", [] if mode == "full" else [f"mode {mode}: a development selection, not the full split"],
+              "full table, real parts equal the navtrain pins", f"{fix} without MINI=1 on the full download", soft=True)
+
+
+def _scene_images(a) -> List[str]:
+    """Runs in a worker: (sim_root, [pkl]) -> image paths (CAM_F0/L0/R0, frames 0..3) that are missing or unreadable."""
+    root, pkls = a
+    T = _setup_module("build_trainval_simscale_table")
+    out = []
+    for pk in pkls:
+        r = Path(root) / pk
+        try:
+            frames = T.load_scene_pickle(r)
+            files = [Path(root) / Path(pk).parts[0] / T.HIST_DIR / frames[i]["cams"][cam]["data_path"]
+                     for i in SIM_CAMERA_FRAMES for cam in CAMERAS]
+        except Exception as e:  # noqa: BLE001
+            out.append(f"{r}: {type(e).__name__}")
+            continue
+        out += [str(f) for f in files if not f.is_file()]
+    return out
+
+
+def check_dataset_simscale(c: Ctx) -> None:
+    fix = f"{SETUP}/12_download_simscale.sh (a table row whose scene is gone: rebuild the table with 16_*)"
+    df = c.table()
+    st = df[df.source == "simscale"]
+    root = Path(c.p["SSR_SIMSCALE_ROOT"])
+    bad = []
+    names: Dict[str, set] = {}               # every row, both modes: one listing per round directory, no stat per scene
+    for parent in sorted({os.path.dirname(pk) for pk in st.pkl}):
+        d = root / parent
+        names[parent] = {e.name for e in os.scandir(d)} if d.is_dir() else set()
+    lost = [root / pk for pk in st.pkl if os.path.basename(pk) not in names[os.path.dirname(pk)]]
+    if lost:
+        bad.append(f"{len(lost)} of {len(st)} scene pickles missing, e.g. {lost[0]}")
+    pick = st.pkl.tolist() if not c.quick else st.pkl.sample(min(N_SAMPLE, len(st)), random_state=0).tolist()
+    lost_set = set(lost)
+    pick = [pk for pk in pick if root / pk not in lost_set]
+    chunks = [(str(root), pick[i:i + 256]) for i in range(0, len(pick), 256)]
+    from multiprocessing import get_context
+    with get_context("fork").Pool(max(1, min(c.workers, len(chunks) or 1))) as pool:
+        miss = [x for xs in pool.imap_unordered(_scene_images, chunks) for x in xs]
+    if miss:
+        bad.append(f"{len(miss)} images of {len(pick)} scenes missing, e.g. {miss[0]}")
+    c.verdict("dataset.simscale", bad, f"{len(st)} scene pickles; {len(SIM_CAMERA_FRAMES) * len(CAMERAS) * len(pick)} "
+              f"images of {len(pick)} scenes present", fix)
+
+
+def check_metric_cache_window(c: Ctx) -> None:
+    """Full mode: a few metric caches unpickled; every one observes 5 s (51 maps): real ones the GT future, SimScale ones
+    4 s of it (maps 0-40) and constant velocity after it (extend_constant_velocity, maps 41-50)."""
+    if c.quick:
+        return
+    fix = f"{SETUP}/20_metric_cache_navtrain.sh SPLITS=trainval_simscale (move the wrong caches away first)"
+    os.environ.setdefault("NUPLAN_MAPS_ROOT", c.p["NUPLAN_MAPS_ROOT"])
+    os.environ.setdefault("NUPLAN_MAP_VERSION", "nuplan-maps-v1.0")
+    import lzma
+    df = c.table()
+    bad, n = [], 0
+    for kind, m in zip(("real", "simscale"), _real_sim(df)):
+        rows = df[m]
+        for t, lg in list(zip(rows.token, rows.log))[:: max(1, len(rows) // (N_READ // 2))][: N_READ // 2]:
+            p = c.data / "metric_cache" / lg / "unknown" / t / "metric_cache.pkl"
+            if not p.is_file():
+                continue
+            with lzma.open(p, "rb") as f:
+                obs = pickle.load(f).observation
+            n += 1
+            got = (len(obs._occupancy_maps), getattr(obs, "_extrapolated_from", None))
+            if got != (OBS_MAPS, OBS_EXTRAPOLATED_FROM[kind]):
+                bad.append(f"{p}: {got[0]} observation maps, extrapolated from {got[1]}; a {kind} cache has {OBS_MAPS}, "
+                           f"extrapolated from {OBS_EXTRAPOLATED_FROM[kind]}")
+    c.verdict("metric_cache.window", bad, f"{n} caches read: 51 maps, SimScale ones extrapolated from map 41", fix)
+
+
+def _rows_equal_by_token(tokens: Sequence[str], arrays: Dict[str, np.ndarray], other: Path, names) -> Tuple[int, int]:
+    """(shared rows, rows that differ) between this split's arrays and another packed-style directory, by token."""
+    import pandas as pd
+    o = pd.read_parquet(other / "tokens.parquet", columns=["token"]).token.astype(str).tolist()
+    row = {t: i for i, t in enumerate(tokens)}
+    pairs = [(i, row[t]) for i, t in enumerate(o) if t in row]
+    if not pairs:
+        return 0, 0
+    oi, ni = (np.array(x, np.int64) for x in zip(*pairs))
+    srt = np.argsort(oi)
+    n_bad = 0
+    for k in names:
+        theirs = np.asarray(np.load(other / f"{k}.npy", mmap_mode="r")[oi[srt]])
+        mine = np.asarray(arrays[k][ni[srt]])
+        n_bad = max(n_bad, int((theirs != mine).reshape(len(ni), -1).any(1).sum()))
+    return len(ni), n_bad
+
+
+def check_packed_tvsim(c: Ctx) -> None:
+    import pandas as pd
+    d = c.ck / "packed" / TVSIM
+    fix = f"{SETUP}/40_packed_from_dataset.sh (SPLITS=trainval_simscale)"
+    need = ["tokens.parquet", "gt_traj.npy", "ok.npy", "status.npy", "meta.json"]
+    lack = [f for f in need if not (d / f).is_file()]
+    if lack:
+        c.verdict(f"packed.{TVSIM}", [f"{d}: {lack} missing"], "", fix)
+        return
+    tab = c.table()
+    n = len(tab)
+    t = pd.read_parquet(d / "tokens.parquet")
+    bad = []
+    if t.token.astype(str).tolist() != tab.token.tolist() or t.log.astype(str).tolist() != tab.log.tolist():
+        bad.append("tokens.parquet token / log are not the table's (row order)")
+    if not (t["row"].to_numpy() == np.arange(len(t))).all():
+        bad.append("tokens.parquet row is not 0..N-1")
+    want = {"gt_traj": ((n, 8, 3), "float32"), "status": ((n, 8), "float32"), "ok": ((n,), "bool")}
+    for k, w in want.items():
+        if npy_header(d / f"{k}.npy") != w:
+            bad.append(f"{k}.npy {npy_header(d / f'{k}.npy')}, expected {w}")
+    m = json.loads((d / "meta.json").read_text())
+    if m.get("token_sha16") != token_sha16(tab.token.tolist()):
+        bad.append(f"meta.json token_sha16 {m.get('token_sha16')} != the table's")
+    if not bad:
+        ok = np.load(d / "ok.npy")
+        if not ok.all():
+            bad.append(f"{int((~ok).sum())} rows without a finite GT trajectory (the training would drop them)")
+        if not c.quick:
+            arrays = {k: np.load(d / f"{k}.npy", mmap_mode="r") for k in ("gt_traj", "status", "ok")}
+            for part in ("navtrain_train", "navtrain_val"):
+                if (c.ck / "packed" / part / "tokens.parquet").is_file():
+                    shared, diff = _rows_equal_by_token(tab.token.tolist(), arrays, c.ck / "packed" / part, arrays)
+                    if diff:
+                        bad.append(f"{diff} of {shared} rows differ from packed/{part} (same token, other values)")
+    c.verdict(f"packed.{TVSIM}", bad, f"{n} rows in table order, all ok; real rows {m.get('real_rows')}", fix)
+
+
+def check_labels_tvsim(c: Ctx) -> None:
+    fix = f"{SETUP}/50_warmup_labels.sh (SPLITS=trainval_simscale)"
+    tab = c.table()
+    n, sha = len(tab), token_sha16(tab.token.tolist())
+    d = c.ck / "labels" / TVSIM / "raw256"
+    bad = []
+    for a, shape in (("labels", (n, 256, 9)), ("ok", (n, 256))):
+        p = d / f"{a}.npy"
+        if not p.is_file():
+            bad.append(f"{p} missing")
+        elif npy_header(p)[0] != shape:
+            bad.append(f"{p}: shape {npy_header(p)[0]} != {shape}")
+    plan = d / "shards/_plan.json"
+    if not plan.is_file() or json.loads(plan.read_text()).get("token_sha16") != sha:
+        bad.append(f"{plan}: missing or token_sha16 is not the table's")
+    if not bad and not np.load(d / "ok.npy").all():
+        bad.append(f"{int((~np.load(d / 'ok.npy')).sum())} anchors not scored (the training keeps a row only with all 256)")
+    c.verdict(f"labels.raw256.{TVSIM}", bad, f"[{n}, 256, 9], every anchor scored, shard plan of this table", fix)
+    vd = c.ck / "ck2/labels" / TVSIM / VAR_NAME
+    bad = []
+    for a, shape in (("labels", (n, 96, 9)), ("ok", (n, 96)), ("traj", (n, 96, 8, 3))):
+        p = vd / f"{a}.npy"
+        if not p.is_file():
+            bad.append(f"{p} missing")
+        elif npy_header(p)[0] != shape:
+            bad.append(f"{p}: shape {npy_header(p)[0]} != {shape}")
+    if not (vd / "build.json").is_file() or not (vd / "index.npz").is_file():
+        bad.append(f"{vd}: build.json or index.npz missing")
+    else:
+        b = json.loads((vd / "build.json").read_text())
+        for k, want in (("token_sha16", sha), ("anchors_sha16", ANCHORS_SHA16), ("n_built", n), ("n_tokens", n),
+                        ("names", VAR_NAMES), ("n_anchors", 16)):
+            if b.get(k) != want:
+                bad.append(f"build.json {k} {b.get(k)} != {want}")
+        own = str((b.get("label_source") or {}).get("path", ""))
+        if not own.endswith(f"{TVSIM_SCORE}.npy"):
+            bad.append(f"build.json label_source {own or 'not recorded'} is not {TVSIM_SCORE}.npy")
+        sm = c.ck / "raw256" / f"{TVSIM_SCORE}.meta.json"
+        want = json.loads(sm.read_text()).get("npy_sha16") if sm.is_file() else "(no score meta)"
+        if (b.get("label_source") or {}).get("npy_sha16") != want:
+            bad.append(f"build.json label_source npy_sha16 {(b.get('label_source') or {}).get('npy_sha16')} != the "
+                       f"score file's {want}: the variants were built from another score file")
+        from navsim.agents.para_ssr.ck.anchor_sampler import AnchorSampler
+        drop = ("label_source",)
+        if {k: v for k, v in (b.get("sampler") or {}).items() if k not in drop} != \
+                {k: v for k, v in AnchorSampler(seed=int(b.get("seed", 0))).config().items() if k not in drop}:
+            bad.append("build.json sampler differs from the current AnchorSampler")
+        if not bad:
+            with np.load(vd / "index.npz", allow_pickle=False) as z:
+                if not z["built"].all():
+                    bad.append(f"{int((~z['built']).sum())} rows not built")
+            ok = np.load(vd / "ok.npy")
+            if not ok.any(1).all():
+                bad.append(f"{int((~ok.any(1)).sum())} rows without a scored variant (the training would drop them)")
+    c.verdict(f"labels.var.{TVSIM}", bad, f"[{n}, 96, ...], build.json of this table and sampler", fix)
+
+
+def check_score_tvsim(c: Ctx) -> None:
+    d = c.ck / "raw256"
+    fix = f"{SETUP}/assemble_trainval_simscale_score.py (50_warmup_labels.sh SPLITS=trainval_simscale)"
+    npy, tok, meta = (d / f"{TVSIM_SCORE}{x}" for x in (".npy", ".tokens.json", ".meta.json"))
+    tab = c.table()
+    bad = []
+    if not npy.is_file() or not tok.is_file():
+        c.verdict("official_ep.trainval_simscale", [f"{npy} or its .tokens.json missing"], "", fix)
+        return
+    if npy_header(npy) != ((len(tab), 5, 256), "float16"):
+        bad.append(f"{npy}: {npy_header(npy)}, expected [{len(tab)}, 5, 256] float16")
+    if json.loads(tok.read_text()) != tab.token.tolist():
+        bad.append(f"{tok}: not the table's tokens in row order")
+    m = json.loads(meta.read_text()) if meta.is_file() else {}
+    for k in ("real_vs_pinned_officialEP", "real_vs_wote_nc_dac_ttc_c"):
+        if isinstance(m.get(k), dict) and m[k].get("n_differ"):
+            bad.append(f"{meta.name}: {k} {m[k]}")
+    raw = c.ck / "labels" / TVSIM / "raw256" / "labels.npy"
+    if not c.quick and (not raw.is_file() or m.get("labels_sha16") != sha16_file(raw)):
+        bad.append(f"{meta.name}: made from raw256 labels sha16 {m.get('labels_sha16')}, {raw} is not those (a raw256 "
+                   f"rebuilt after it): move the score file away and rerun")
+    if not bad and not c.quick:
+        a = np.load(npy, mmap_mode="r")
+        if not np.isfinite(np.asarray(a[:, [0, 1, 3, 4]])).all():
+            bad.append("non-finite NC / DAC / TTC / C")
+    ref = m.get("real_vs_pinned_officialEP", "not recorded")
+    c.verdict("official_ep.trainval_simscale", bad, f"[{len(tab)}, 5, 256] in table order; real rows vs the pinned file: "
+              f"{ref}", fix)
+
+
 # ----------------------------------------------------------------------------------------------- profiles
 BASE_CHECKS: Sequence[Callable[[Ctx], None]] = (
     check_env, check_navsim_import,
@@ -734,16 +1085,37 @@ GROUPS: Dict[str, Sequence[Callable[[Ctx], None]]] = {
     "dataset": (check_tokens, check_dataset, check_dataset_test), "metric_cache": (check_metric_cache,),
     "gt": (check_gt_stores,), "packed": (check_packed,), "labels": (check_labels,),
     "teacher_cache": (check_teacher_caches,), "teachers": (check_refiner_teachers,)}
+# --data trainval_simscale: the table, the SimScale scenes and that split's assets; the navtrain_val retraining inputs
+# and the pinned 103,288-row score file are not read by that training
+TVSIM_BASE: Sequence[Callable[[Ctx], None]] = (
+    check_env, check_navsim_import,
+    lambda c: check_repo_files(c, REPO_FILES, "repo.pinned_files"),
+    check_anchors, check_tokens, check_dataset, check_table, check_dataset_simscale, check_score_tvsim, check_timm,
+    check_dataset_test, check_eval_assets)
+TVSIM_REFINER: Sequence[Callable[[Ctx], None]] = (
+    lambda c: check_repo_files(c, dict(REPO_FILES_REFINER, **REPO_FILES_TVSIM), "repo.pinned_files_refiner"),
+    check_scorer, check_metric_cache, check_metric_cache_window, check_gt_stores, check_packed_tvsim, check_labels_tvsim)
+TVSIM_TEACHER: Sequence[Callable[[Ctx], None]] = (check_teacher_caches, check_refiner_teachers)
+CHECKS_BY_DATA = {"navtrain": CHECKS, TVSIM: {
+    "base": TVSIM_BASE, "refiner_noteacher": tuple(TVSIM_BASE) + tuple(TVSIM_REFINER),
+    "full": tuple(TVSIM_BASE) + tuple(TVSIM_REFINER) + tuple(TVSIM_TEACHER)}}
+GROUPS_BY_DATA = {"navtrain": GROUPS, TVSIM: dict(
+    GROUPS, dataset=(check_tokens, check_dataset, check_dataset_test, check_table, check_dataset_simscale),
+    metric_cache=(check_metric_cache, check_metric_cache_window), packed=(check_packed_tvsim,),
+    labels=(check_labels_tvsim, check_score_tvsim))}
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", required=True, choices=PROFILES)
+    ap.add_argument("--data", default="navtrain", choices=DATA, help="the training data the profile is for")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--strict", action="store_true", help="a WARN also gives exit code 1")
     ap.add_argument("--only", default="", choices=[""] + sorted(GROUPS), help="one group of checks of this profile")
-    ap.add_argument("--det-teacher", default=os.environ.get("DET_TEACHER") or "bevfusion")
-    ap.add_argument("--map-teacher", default=os.environ.get("MAP_TEACHER") or "resmap")
+    ap.add_argument("--det-teacher", default=os.environ.get("DET_TEACHER") or "",
+                    help="default bevfusion (--data trainval_simscale: bevformer)")
+    ap.add_argument("--map-teacher", default=os.environ.get("MAP_TEACHER") or "",
+                    help="default resmap (--data trainval_simscale: mask2map)")
     ap.add_argument("--registry", default=os.environ.get("SSR_RELEASE_REGISTRY") or str(ROOT / REGISTRY))
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--json", default="", help="also write the rows to this file")
@@ -751,10 +1123,14 @@ def main(argv=None) -> int:
     paths = SP.resolve()
     rep = Report()
     registry = load_registry(Path(a.registry), paths)
-    c = Ctx(paths, a.quick, a.workers, rep, a.det_teacher, a.map_teacher, registry)
+    tv = a.data == TVSIM
+    det = a.det_teacher or (TVSIM_TEACHERS["det"] if tv else "bevfusion")
+    mapt = a.map_teacher or (TVSIM_TEACHERS["map"] if tv else "resmap")
+    c = Ctx(paths, a.quick, a.workers, rep, det, mapt, registry, data=a.data)
     print(f"[verify_assets] profile {a.profile}, {'quick' if a.quick else 'full check'}, data {paths['SSR_DATA_ROOT']}, "
-          f"teachers {paths['SSR_TEACHER_CACHE']}", flush=True)
-    for fn in [f for f in CHECKS[a.profile] if not a.only or f in GROUPS[a.only]]:
+          f"teachers {paths['SSR_TEACHER_CACHE']}" + (f", --data {a.data}" if tv else ""), flush=True)
+    checks, groups = CHECKS_BY_DATA[a.data], GROUPS_BY_DATA[a.data]
+    for fn in [f for f in checks[a.profile] if not a.only or f in groups[a.only]]:
         try:
             fn(c)
         except Exception as e:      # one broken input must not hide the others
@@ -763,7 +1139,8 @@ def main(argv=None) -> int:
     code = 1 if rep.n("FAIL") or (a.strict and rep.n("WARN")) else 0
     print(f"[verify_assets] {rep.n('PASS')} pass, {rep.n('WARN')} warn, {rep.n('FAIL')} fail -> exit {code}", flush=True)
     if a.json:
-        Path(a.json).write_text(json.dumps(dict(profile=a.profile, quick=a.quick, exit=code, rows=rep.rows), indent=1))
+        Path(a.json).write_text(json.dumps(dict(profile=a.profile, quick=a.quick, exit=code, rows=rep.rows,
+                                                **({"data": a.data} if tv else {})), indent=1))
     return code
 
 

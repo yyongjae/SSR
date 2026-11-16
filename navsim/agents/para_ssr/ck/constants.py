@@ -84,6 +84,29 @@ SPLITS = {
         "role": "report once with settings fixed on navtrain_val; MAP/DET teacher rows descriptive only"},
 }
 
+# trainval + SimScale recipe (DATA=trainval_simscale).  One token table, tools/release/setup/
+# build_trainval_simscale_table.py, columns navsim/common/simscale.TABLE_COLUMNS: navtrain_train, navtrain_val, then the
+# SimScale rounds; its row order is the row order of every row-indexed asset of the split.  Real rows read the trainval
+# logs and sensors, synthetic rows the scene pickle of their 'pkl' column (relative to simscale_root, one scene per
+# pickle, 4 history + 8 future frames).  Metric cache and GT stores are the navtrain ones, keyed by the full token (a
+# SimScale token '<hex16>-<rrr>' is never truncated: its hex part is a real token).  n: set by the table (camera filter).
+SIMSCALE_ROUNDS = (0, 1, 2, 3, 4)                    # = navsim.common.simscale.ROUNDS (not imported: no navsim here)
+SPLITS["simscale"] = {
+    "tokens": str(DATA_ROOT / "splits/simscale.parquet"), "n": None, "logs": None, "sha16_sorted_tokens": None,
+    "simscale_root": _SP.SSR_SIMSCALE_ROOT, "rounds": SIMSCALE_ROUNDS, "scene_filter": None,
+    "teacher_subset": "navtrain", "gt_surrogate": False, "map_teacher": True,
+    "metric_cache": str(METRIC_CACHE["navtrain"]),
+    "role": "SimScale rows of trainval_simscale (same order, row = position here); teacher caching, inspection"}
+SPLITS["trainval_simscale"] = {
+    "tokens": str(DATA_ROOT / "splits/trainval_simscale.parquet"), "n": None, "logs": None,
+    "sha16_sorted_tokens": None, "parts": ("navtrain_train", "navtrain_val", "simscale"),
+    "navsim_logs": _TRAINVAL_LOGS, "sensor_blobs": _TRAINVAL_SENSORS, "scene_filter": f"{_SF}/navtrain.yaml",
+    "simscale_root": _SP.SSR_SIMSCALE_ROOT, "rounds": SIMSCALE_ROUNDS,
+    "teacher_subset": "navtrain", "gt_surrogate": True, "map_teacher": True,
+    "metric_cache": str(METRIC_CACHE["navtrain"]),
+    "label_source": str(CK_DATA / "raw256/pdm_score_256_officialEP_trainval_simscale"),     # + .npy / .tokens.json
+    "role": "training only (student, all losses and KD on every row); no held-out part"}
+
 # CK_BEV64=1: the ReSMap front64 root covers navtrain_val too (2026-10-27), so the MAP teacher can be evaluated on it.
 from ..refiner.adapters import BEV64 as _BEV64  # noqa: E402
 if _BEV64:

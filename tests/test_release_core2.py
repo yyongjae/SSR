@@ -66,6 +66,7 @@ TODAY = {
     "OPENSCENE_DATA_ROOT": DATASET_LITERAL,
     "NUPLAN_MAPS_ROOT": DATASET_LITERAL + "/maps",
     "SSR_TEST_DATA_ROOT": "/workspace/navsim_workspace/dataset",
+    "SSR_SIMSCALE_ROOT": "/home/external-user/ssd/simscale",
     "SSR_PLAN_DATA": "/home/external-user/kyungmin/SSR-v2/data/planning_vb",
     "SSR_NAVTEST_MC": "/home/external-user/yongjae/SSR/data/exp/metric_cache",
     "SSR_PY": "/venv/ssr/bin/python",
@@ -93,6 +94,7 @@ def test_env_wins_derived_defaults_follow_and_empty_counts_as_unset(tmp_path):
     assert r["NAVSIM_V11_CACHE"] == "/d/v7/eval/official_v11/exp/metric_cache_navtest_v11"
     assert r["NUPLAN_MAPS_ROOT"] == ds + "/maps" and r["OPENSCENE_DATA_ROOT"] == ds
     assert r["SSR_PY"] == TODAY["SSR_PY"] and r["SSR_TEACHER_CACHE"] == "/t"
+    assert r["SSR_SIMSCALE_ROOT"] == "/simscale" and SP.resolve({"SSR_DATA_ROOT": "/a/b/"})["SSR_SIMSCALE_ROOT"] == "/a/simscale"
     assert SP.resolve({"SSR_RUN_ROOT": "/r", "NUPLAN_MAPS_ROOT": "/m"})["SSR_RUN_ROOT"] == "/r"
     assert SP.resolve({"NUPLAN_MAPS_ROOT": "/m"})["NUPLAN_MAPS_ROOT"] == "/m"
 

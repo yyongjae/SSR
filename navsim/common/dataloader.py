@@ -4,7 +4,7 @@ import lzma
 import pickle
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Sequence
 from tqdm import tqdm
 
 from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SensorConfig
@@ -22,10 +22,11 @@ def filter_scenes(data_path: Path, scene_filter: SceneFilter) -> Dict[str, List[
     # filter logs
     log_files = sorted(data_path.iterdir())     # iterdir order is the filesystem's: scene order must not depend on it
     if scene_filter.log_names is not None:
+        log_names = set(scene_filter.log_names)     # a set: list membership is O(N) per log
         log_files = [
             log_file
             for log_file in log_files
-            if log_file.name.replace(".pkl", "") in scene_filter.log_names
+            if log_file.name.replace(".pkl", "") in log_names
         ]
 
     if scene_filter.tokens is not None:
@@ -103,7 +104,7 @@ class SceneLoader:
         return self.tokens[idx]
 
     def get_scene_from_token(self, token: str) -> Scene:
-        assert token in self.tokens
+        assert token in self.scene_frames_dicts
         return Scene.from_scene_dict_list(
             self.scene_frames_dicts[token],
             self._sensor_blobs_path,
@@ -113,7 +114,7 @@ class SceneLoader:
         )
 
     def get_agent_input_from_token(self, token: str, use_fut_frames=False) -> AgentInput:
-        assert token in self.tokens
+        assert token in self.scene_frames_dicts
         return AgentInput.from_scene_dict_list(
             self.scene_frames_dicts[token],
             self._sensor_blobs_path,
@@ -132,6 +133,74 @@ class SceneLoader:
             else:
                 tokens_per_logs.update({log_name: [token]})
         return tokens_per_logs
+
+
+class MultiSceneLoader:
+    """SceneLoader interface over several scene loaders, in one fixed token order (run_training's table-driven training
+    set: a SceneLoader of the real rows and the navsim.common.simscale.SimScaleSceneLoader of the synthetic rows of one
+    token table, tokens in table row order).
+
+    Every token of `tokens` must be served by exactly one loader: a token that its loader's filter dropped (a SimScale
+    scene under the 4 + 10 navtrain window, a real token without a route, ...) raises here instead of shrinking the
+    training set.  Scenes come from the owning loader per call, so a lazy loader stays lazy.  tokens is one cached
+    list (Dataset.__getitem__ indexes it per sample).  restrict_tokens is the teacher-cache filter's way in (this class
+    has no scene_frames_dicts: the synthetic scenes are not in memory).  Picklable when its loaders are."""
+
+    def __init__(self, tokens: Sequence[str], loaders: Sequence[Any]):
+        self._loaders = list(loaders)
+        owner: Dict[str, int] = {}
+        for i, loader in enumerate(self._loaders):
+            for token in loader.tokens:
+                if token in owner:
+                    raise ValueError(f"token {token} is served by loader {owner[token]} and loader {i}")
+                owner[token] = i
+        self._tokens = [str(t) for t in tokens]
+        if len(set(self._tokens)) != len(self._tokens):
+            raise ValueError(f"{len(self._tokens) - len(set(self._tokens))} duplicate tokens")
+        missing = [t for t in self._tokens if t not in owner]
+        if missing:
+            raise ValueError(f"{len(missing)} of {len(self._tokens)} tokens are served by no loader (dropped by a "
+                             f"scene filter?), e.g. {missing[:3]}")
+        self._owner = {t: owner[t] for t in self._tokens}
+
+    @property
+    def tokens(self) -> List[str]:
+        return self._tokens
+
+    def __len__(self) -> int:
+        return len(self._tokens)
+
+    def __getitem__(self, idx) -> str:
+        return self._tokens[idx]
+
+    def __contains__(self, token: str) -> bool:
+        return token in self._owner
+
+    def loader_of(self, token: str) -> Any:
+        return self._loaders[self._owner[token]]
+
+    def get_scene_from_token(self, token: str) -> Scene:
+        return self.loader_of(token).get_scene_from_token(token)
+
+    def get_agent_input_from_token(self, token: str, use_fut_frames=False) -> AgentInput:
+        return self.loader_of(token).get_agent_input_from_token(token, use_fut_frames=use_fut_frames)
+
+    def get_tokens_list_per_log(self) -> Dict[str, List[str]]:
+        tokens_per_logs: Dict[str, List[str]] = {}
+        for loader in self._loaders:
+            for log_name, tokens in loader.get_tokens_list_per_log().items():
+                tokens = [t for t in tokens if t in self._owner]
+                if tokens:
+                    tokens_per_logs.setdefault(log_name, []).extend(tokens)
+        return tokens_per_logs
+
+    def restrict_tokens(self, keep: Callable[[str], bool]) -> int:
+        """Keep the tokens with keep(token) true, in order -> how many were dropped."""
+        before = len(self._tokens)
+        self._tokens = [t for t in self._tokens if keep(t)]
+        self._owner = {t: self._owner[t] for t in self._tokens}
+        return before - len(self._tokens)
+
 
 class MetricCacheLoader:
 

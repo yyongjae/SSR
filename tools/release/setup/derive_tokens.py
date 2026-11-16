@@ -38,7 +38,7 @@ LOG_SPLIT = ROOT / "navsim/planning/script/config/training/default_train_val_tes
 TRACKED = ROOT / "resources/km_corridor/packed/{split}/tokens.parquet"
 SPLITS = {"navtrain_train": ("navtrain.yaml", "train_logs"), "navtrain_val": ("navtrain.yaml", "val_logs"),
           "navtest": ("navtest.yaml", None)}
-# n, sha256("\n".join(sorted(tokens)))[:16], sha256(np.array(tokens, "U16"))[:16]
+# n, sha256("\n".join(sorted(tokens)))[:16], tokens.token_sha16 (= sha256(np.array(tokens, "U16"))[:16] for these tokens)
 PINS = {"navtrain_train": (85109, "c3fa309cbde971e8", "0b56b9aecbe1f094"),
         "navtrain_val": (18179, "05b78ec43b95d954", "0fea22c41a4106b0"),
         "navtest": (12146, None, None)}
@@ -89,7 +89,8 @@ def compare(split: str, df: pd.DataFrame, pins: Optional[tuple] = None, tracked:
         if got != sorted_sha:
             bad.append(f"sorted token sha16 {got} != {sorted_sha}")
     if order_sha is not None:
-        got = hashlib.sha256(np.ascontiguousarray(np.array(toks, "U16")).tobytes()).hexdigest()[:16]
+        from navsim.agents.para_ssr.ck.tokens import token_sha16
+        got = token_sha16(toks)
         if got != order_sha:
             bad.append(f"token_sha16 {got} != {order_sha}")
     t = Path(str(TRACKED).format(split=split)) if tracked is None else tracked

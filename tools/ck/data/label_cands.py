@@ -48,6 +48,7 @@ import pandas as pd  # noqa: E402
 import score_trajectories as ST  # noqa: E402
 
 import navsim  # noqa: E402
+from navsim.agents.para_ssr.ck.tokens import token_sha16  # noqa: E402  (full-length tokens; U16 for 16-char ones)
 
 assert navsim.__file__.startswith(CM.CK), navsim.__file__
 LABEL_COLS = CM.LABEL_COLS
@@ -158,6 +159,17 @@ def check_plan(shard_dir: Path, plan: dict, fresh: bool):
 
 
 # ----------------------------------------------------------------------------------------------- assembly
+ASSEMBLY_COLS = ("token", "k", "crc", "rec_ok", "sec_load", "sec_score") + tuple(LABEL_COLS)    # what assemble reads
+
+
+def read_shard(f) -> pd.DataFrame:
+    """The columns of a shard that the assembly reads (the track / type / error strings stay on disk: at 340k tokens
+    they would be most of the memory).  A shard of error rows only lacks the score columns; concat fills them NaN."""
+    import pyarrow.parquet as pq
+    names = set(pq.read_schema(f).names)
+    return pd.read_parquet(f, columns=[c for c in ASSEMBLY_COLS if c in names])
+
+
 def assemble(split_name: str, name: str, root, src: TrajSource, k: int, meta_extra: dict,
              out_dir=None) -> Optional[dict]:
     out = Path(out_dir) if out_dir else CM.labels_dir(split_name, name, root)
@@ -168,7 +180,7 @@ def assemble(split_name: str, name: str, root, src: TrajSource, k: int, meta_ext
     toks = pd.read_parquet(pk)
     n = len(toks)
     rowmap = {t: i for i, t in enumerate(toks.token)}
-    parts = [pd.read_parquet(f) for f in sorted((out / "shards").glob("c*.parquet"))]
+    parts = [read_shard(f) for f in sorted((out / "shards").glob("c*.parquet"))]
     df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["token", "k"])
     lab = np.full((n, k, len(LABEL_COLS)), np.nan, np.float32)
     ok = np.zeros((n, k), bool)
@@ -247,7 +259,7 @@ def run(split_name: str, name: str, traj: str = "", rows: str = "", root=None, w
     # --from-dump run and a packed run of 'cand' share shards; any other source is identified by its path
     pc = str(CM.packed_dir(split_name, root) / "cand.npy")
     source_id = f"v2cand:{split_name}:k{k}" if (name == "cand" and (kind == "dump" or path == pc)) else path
-    plan = dict(split=split_name, name=name, token_sha16=CM.sha16_array(np.array(toks, "U16")), chunk=chunk, k=k,
+    plan = dict(split=split_name, name=name, token_sha16=token_sha16(toks), chunk=chunk, k=k,
                 source_id=source_id, traj_kind=kind, traj_path=path, rows=rows, n_rows=int(len(sel)))
     if not assemble_only:
         check_plan(shard_dir, plan, fresh)

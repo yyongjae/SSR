@@ -67,6 +67,7 @@ import torch  # noqa: E402
 
 from navsim.agents.para_ssr.ck import anchor_sampler as AS  # noqa: E402
 from navsim.agents.para_ssr.ck import variants as VV  # noqa: E402
+from navsim.agents.para_ssr.ck.tokens import token_sha16  # noqa: E402  (full-length tokens; U16 for 16-char ones)
 
 CM = LC.CM
 VERSION = "ck2_label_variants_v1"
@@ -112,7 +113,7 @@ def make_config(split: str, combine: str = "separate", subset: str = "sampler", 
                n_variants=len(tab), names=[VV.variant_name(a, d) for a, d in tab], compute_dtype="torch.float64",
                anchors_file=str(AS.ANCHORS_FILE), anchors_sha16=AS.ANCHORS_SHA16, sampler=smp.config(),
                packed=str(CM.packed_dir(split, root)), n_tokens=len(toks),
-               token_sha16=CM.sha16_array(np.array(toks.tolist(), "U16")), v0="hypot(status[4], status[5]), NaN -> 0")
+               token_sha16=token_sha16(toks.tolist()), v0="hypot(status[4], status[5]), NaN -> 0")
     if ext != "const_curv":   # accel path extension (variants.make_variants ext); default keeps old cfg_sha16
         if ext not in VV.EXT_MODES:
             raise ValueError(f"ext must be one of {VV.EXT_MODES}")
@@ -126,6 +127,18 @@ def make_config(split: str, combine: str = "separate", subset: str = "sampler", 
 _B: Dict[str, object] = {}
 
 
+def label_source(split: str) -> "AS.LabelSource":
+    """The raw-anchor labels the sampler reads: the split's own score file when constants.SPLITS names one
+    (trainval_simscale: pdm_score_256_officialEP_trainval_simscale, 50_warmup_labels.sh assembles it from the raw256
+    labels first), else AS.LabelSource() (official-EP file, WoTE fallback) as before."""
+    own = CM.SPLITS[split].get("label_source")
+    if not own:
+        return AS.LabelSource()
+    if not (Path(own + ".npy").is_file() and Path(own + ".tokens.json").is_file()):
+        raise SystemExit(f"{split}: {own}.npy / .tokens.json missing (tools/release/setup/assemble_trainval_simscale_score.py)")
+    return AS.LabelSource(official=own)
+
+
 def _binit(cfg: Dict, root):
     os.environ["OMP_NUM_THREADS"] = "1"
     torch.set_num_threads(1)
@@ -134,7 +147,7 @@ def _binit(cfg: Dict, root):
     _B["tokens"] = pd.read_parquet(pk / "tokens.parquet", columns=["token"]).token.astype(str).tolist()
     _B["gt"] = np.load(pk / "gt_traj.npy", mmap_mode="r")
     _B["status"] = np.load(pk / "status.npy", mmap_mode="r")
-    _B["labels"] = AS.LabelSource()
+    _B["labels"] = label_source(cfg["split"])
     _B["sampler"] = AS.AnchorSampler(anchors=AS.load_anchors(), label_source=_B["labels"], seed=cfg["seed"])
     _B["idx_file"] = np.load(cfg["idx_file"], mmap_mode="r") if cfg["subset"] == "file" else None
 
@@ -228,6 +241,10 @@ def build(cfg: Dict, out: Path, root=None, build_workers: int = 8, rows_per_task
                 build_workers=nw, built=time.strftime("%F %T"),
                 n_invalid=int((~ix["valid"][ix["built"]]).sum()),
                 traj_sha16=CM.sha16_array(np.load(out / "traj.npy", mmap_mode="r")))
+    if CM.SPLITS[cfg["split"]].get("label_source"):           # the split's own score file (navtrain: unchanged)
+        info["label_source"] = label_source(cfg["split"]).describe()
+        meta_f = Path(str(CM.SPLITS[cfg["split"]]["label_source"]) + ".meta.json")   # its npy_sha16 (verify_assets)
+        info["label_source"]["npy_sha16"] = json.loads(meta_f.read_text()).get("npy_sha16") if meta_f.is_file() else None
     CM.atomic_write_json(out / "build.json", info)
     print(f"built {out}/traj.npy: {info['n_built']} rows x {K * V} trajectories, {info['build_wall_s']}s wall "
           f"({info['build_cpu_s_per_token'] * 1e3:.1f} ms CPU / token), invalid {info['n_invalid']}", flush=True)

@@ -4,7 +4,9 @@
   make_parts.py --tables A.parquet [B.parquet ...] --k K --out-prefix PREFIX [--skip-mc METRIC_CACHE_ROOT]
 
 Whole logs stay together and go to the smallest part so far (a metric cache chunk is per log).  Output <PREFIX><i>.parquet with
-token, log, i = 1..K.  --skip-mc leaves out tokens whose metric cache exists, so RESUME=1 needs no second pass over them.
+token, log, i = 1..K, and pkl when a table has it (trainval_simscale: the SimScale scene pickle; '' on a real row), which
+the builders read to find a SimScale scene.  --skip-mc leaves out tokens whose metric cache exists, so RESUME=1 needs no
+second pass over them.
 """
 from __future__ import annotations
 
@@ -24,11 +26,20 @@ def split_parts(df: pd.DataFrame, k: int) -> List[pd.DataFrame]:
         i = int(np.argmin(n))
         parts[i].append(log)
         n[i] += int(c)
-    return [df[df.log.isin(p)][["token", "log"]].reset_index(drop=True) for p in parts]
+    cols = ["token", "log"] + (["pkl"] if "pkl" in df.columns else [])
+    return [df[df.log.isin(p)][cols].reset_index(drop=True) for p in parts]
+
+
+def _read(table: str) -> pd.DataFrame:
+    import pyarrow.parquet as pq
+    cols = ["token", "log"] + (["pkl"] if "pkl" in pq.read_schema(table).names else [])
+    return pd.read_parquet(table, columns=cols)
 
 
 def load_tables(tables: Sequence[str], skip_mc: Optional[str] = None) -> pd.DataFrame:
-    df = pd.concat([pd.read_parquet(t, columns=["token", "log"]) for t in tables], ignore_index=True)
+    df = pd.concat([_read(t) for t in tables], ignore_index=True)
+    if "pkl" in df.columns:
+        df["pkl"] = df["pkl"].fillna("").astype(str)
     if df.token.duplicated().any():
         raise SystemExit("the tables share tokens")
     if skip_mc:

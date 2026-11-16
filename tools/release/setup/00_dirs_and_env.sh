@@ -10,8 +10,9 @@ if [ ! -f "$REPO/tools/release/paths.env" ] && [ -z "$_given" ] && [ ! -d "$SSR_
   die "no tools/release/paths.env and $SSR_DATA_ROOT does not exist: copy tools/release/paths.env.example first"
 fi
 say "repo $REPO"
-for v in SSR_DATA_ROOT SSR_TEACHER_CACHE OPENSCENE_DATA_ROOT NUPLAN_MAPS_ROOT SSR_TEST_DATA_ROOT SSR_PLAN_DATA SSR_NAVTEST_MC \
-         SSR_PY SSR_TORCHRUN SSR_RUN_ROOT NAVSIM_V11 NAVSIM_V11_CACHE NAVSIM_V22_POST NAVSIM_V22_PRE NAVSIM_V22_CACHE; do
+# SSR_SIMSCALE_ROOT is only read by DATA=trainval_simscale; 12_download_simscale.sh makes it
+for v in SSR_DATA_ROOT SSR_TEACHER_CACHE OPENSCENE_DATA_ROOT NUPLAN_MAPS_ROOT SSR_TEST_DATA_ROOT SSR_SIMSCALE_ROOT SSR_PLAN_DATA \
+         SSR_NAVTEST_MC SSR_PY SSR_TORCHRUN SSR_RUN_ROOT NAVSIM_V11 NAVSIM_V11_CACHE NAVSIM_V22_POST NAVSIM_V22_PRE NAVSIM_V22_CACHE; do
   printf '  %-20s %s\n' "$v" "${!v}"
 done
 run_mkdir "$SSR_DATA_ROOT/splits" "$SSR_DATA_ROOT/metric_cache/logs" "$SSR_DATA_ROOT/objects/logs" "$SSR_DATA_ROOT/sdf/logs" \

@@ -26,6 +26,7 @@ NAMES = {
     "OPENSCENE_DATA_ROOT": "dataset, with navsim_logs/{trainval,test}, sensor_blobs/{trainval,test}",
     "NUPLAN_MAPS_ROOT": "maps",
     "SSR_TEST_DATA_ROOT": "test logs and sensors, <root>/{navsim_logs,sensor_blobs}/test/test",
+    "SSR_SIMSCALE_ROOT": "SimScale synthetic scenes, <root>/synthetic_reaction_pdm_v1.0-<r>/{meta_datas,sensor_blobs_hist}",
     "SSR_PLAN_DATA": "pdm_score_256 (the anchors come from the repo, resources/planning_vb/)",
     "SSR_NAVTEST_MC": "fork navtest metric cache, research only",
     "SSR_PY": "python interpreter",
@@ -74,6 +75,7 @@ def resolve(env=None) -> dict:
         "OPENSCENE_DATA_ROOT": dataset,
         "NUPLAN_MAPS_ROOT": maps or dataset + "/maps",
         "SSR_TEST_DATA_ROOT": get("SSR_TEST_DATA_ROOT", "/workspace/navsim_workspace/dataset"),
+        "SSR_SIMSCALE_ROOT": get("SSR_SIMSCALE_ROOT", os.path.normpath(os.path.join(data, "..", "simscale"))),
         "SSR_PLAN_DATA": get("SSR_PLAN_DATA", "/home/external-user/kyungmin/SSR-v2/data/planning_vb"),
         "SSR_NAVTEST_MC": get("SSR_NAVTEST_MC", "/home/external-user/yongjae/SSR/data/exp/metric_cache"),
         "SSR_PY": get("SSR_PY", "/venv/ssr/bin/python"),
@@ -96,6 +98,7 @@ SSR_TEACHER_CACHE = _R["SSR_TEACHER_CACHE"]
 OPENSCENE_DATA_ROOT = _R["OPENSCENE_DATA_ROOT"]
 NUPLAN_MAPS_ROOT = _R["NUPLAN_MAPS_ROOT"]
 SSR_TEST_DATA_ROOT = _R["SSR_TEST_DATA_ROOT"]
+SSR_SIMSCALE_ROOT = _R["SSR_SIMSCALE_ROOT"]
 SSR_PLAN_DATA = _R["SSR_PLAN_DATA"]
 SSR_NAVTEST_MC = _R["SSR_NAVTEST_MC"]
 SSR_PY = _R["SSR_PY"]

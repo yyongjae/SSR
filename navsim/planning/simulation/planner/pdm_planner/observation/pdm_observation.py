@@ -38,6 +38,7 @@ class PDMObservation:
         proposal_sampling: TrajectorySampling,
         map_radius: float,
         observation_sample_res: int = 2,
+        extend_observation_for_ttc: bool = True,
     ):
         """
         Constructor of PDMObservation
@@ -45,6 +46,9 @@ class PDMObservation:
         :param proposal_sampling: Sampling parameters for proposals
         :param map_radius: radius around ego to consider, defaults to 50
         :param observation_sample_res: sample resolution of forecast, defaults to 2
+        :param extend_observation_for_ttc: observe the proposal horizon + 1 s (TTC look-ahead), defaults to True.
+            False (NAVSIM v2 name): the longer of the two horizons only, for a GT future that ends there (SimScale
+            metric cache, 4 s); extend_constant_velocity then adds the TTC look-ahead past it.
         """
         assert (
             trajectory_sampling.interval_length == proposal_sampling.interval_length
@@ -53,12 +57,15 @@ class PDMObservation:
         # observation needs length of trajectory horizon or proposal horizon +1s (for TTC metric)
         self._sample_interval: float = trajectory_sampling.interval_length  # [s]
 
-        self._observation_samples: int = (
-            proposal_sampling.num_poses + int(1 / self._sample_interval)
-            if proposal_sampling.num_poses + int(1 / self._sample_interval)
-            > trajectory_sampling.num_poses
-            else trajectory_sampling.num_poses
-        )
+        if extend_observation_for_ttc:
+            self._observation_samples: int = (
+                proposal_sampling.num_poses + int(1 / self._sample_interval)
+                if proposal_sampling.num_poses + int(1 / self._sample_interval)
+                > trajectory_sampling.num_poses
+                else trajectory_sampling.num_poses
+            )
+        else:
+            self._observation_samples: int = max(trajectory_sampling.num_poses, proposal_sampling.num_poses)
 
         self._map_radius: float = map_radius
         self._observation_sample_res: int = observation_sample_res
@@ -90,6 +97,57 @@ class PDMObservation:
 
         local_idx = self._global_to_local_idcs[time_idx]
         return self._occupancy_maps[local_idx]
+
+    def __len__(self) -> int:
+        """
+        Number of 10Hz time indices __getitem__ serves (0 .. len - 1): 51 for a metric cache (a SimScale one after
+        extend_constant_velocity too), 41 for a 4 s one before it.
+        Computed from attributes that every pickled observation has, so older metric caches answer it too.
+        :return: number of time indices
+        """
+        return len(self._global_to_local_idcs)
+
+    @property
+    def extrapolated_from(self) -> Optional[int]:
+        """
+        First time index that extend_constant_velocity forecast rather than the GT future gave, None for an observation
+        it did not extend (every 5 s metric cache, and caches pickled before the method existed).
+        :return: time index or None
+        """
+        return getattr(self, "_extrapolated_from", None)
+
+    def extend_constant_velocity(self, observation_samples: int) -> int:
+        """
+        Extends a GT observation that ends before observation_samples, i.e. a GT future shorter than the proposal
+        horizon + 1 s of TTC look-ahead (SimScale metric cache, 4 s): every object of the last occupancy map moves on at
+        its velocity over the last interval (its polygon centroid since the map before; the GT is interpolated linearly,
+        so the velocity of the last GT interval), and an object not in the map before keeps its place.  PDMScorer then
+        scores the TTC look-ahead with the same rule as for a 5 s cache.  Only for observation_sample_res 1.
+        :param observation_samples: number of 10Hz samples after the current one to observe
+        :return: number of occupancy maps added, 0 when the observation reaches observation_samples already
+        """
+        assert self._initialized, "PDMObservation: Has not been updated yet!"
+        assert self._observation_sample_res == 1, "PDMObservation: extension needs observation_sample_res 1"
+        n_add = observation_samples - self._observation_samples
+        if n_add <= 0:
+            return 0
+        last, before = self._occupancy_maps[-1], self._occupancy_maps[-2]
+        tokens = list(last.tokens)
+        geometries = np.array([last[token] for token in tokens], dtype=np.object_)
+        dxy = np.zeros((len(tokens), 2), dtype=np.float64)
+        for idx, token in enumerate(tokens):
+            if token in before.token_to_idx:
+                now, then = geometries[idx].centroid, before[token].centroid
+                dxy[idx] = (now.x - then.x, now.y - then.y)
+        _, owner = shapely.get_coordinates(geometries, return_index=True)
+        step_xy = dxy[owner]                                    # per coordinate, in get_coordinates order
+        for step in range(1, n_add + 1):
+            moved = shapely.transform(geometries, lambda xy, offset=step_xy * step: xy + offset)
+            self._occupancy_maps.append(PDMOccupancyMap(tokens, moved))
+        self._extrapolated_from = self._observation_samples + 1
+        self._observation_samples = observation_samples
+        self._global_to_local_idcs = list(range(observation_samples + 1))
+        return n_add
 
     @property
     def collided_track_ids(self) -> List[str]:

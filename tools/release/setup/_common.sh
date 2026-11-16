@@ -72,7 +72,8 @@ refuse_unless_resume() {
   return 0
 }
 
-# verify GROUP PROFILE: the checks of tools/release/verify_assets.py for what this step built
+# verify GROUP PROFILE [DATA]: the checks of tools/release/verify_assets.py for what this step built (DATA: --data, e.g.
+# trainval_simscale; without it today's navtrain checks)
 verify() {
-  run "${CPU[@]}" "$SSR_PY" "$REPO/tools/release/verify_assets.py" --profile "$2" --only "$1"
+  run "${CPU[@]}" "$SSR_PY" "$REPO/tools/release/verify_assets.py" --profile "$2" --only "$1" ${3:+--data "$3"}
 }

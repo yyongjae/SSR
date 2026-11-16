@@ -10,6 +10,8 @@ What it does (conventions: navsim/agents/para_ssr/refiner/gt_future.py docstring
   * one task per log: the log pickle is read once; each token is located by its ``token`` (list position in the log;
     the table's ``frame_idx`` is the frame dict's own ``frame_idx`` field -- NOT the list position -- and is only
     cross-checked); frames log[i : i + 17] -> gt_future.build_from_frames -> <out>/<token>.npz (atomic write).
+  * a token table with a 'pkl' column (trainval_simscale): a row with a pkl is a SimScale scene, its log pickle is
+    <--sim-root>/<pkl> (one scene of 12 frames: log[3 : 20] are 9 frames, n_kf 9, objects up to 4 s).
   * resumable: an existing npz is not rebuilt (``--overwrite`` to rebuild); with ``--mc-root`` the existing npz is
     loaded and validated.  <out>/index.parquet is rewritten at the end (rows of this run merged over older rows).
   * validation (``--mc-root``; per token, npz as stored, i.e. float32):
@@ -82,6 +84,8 @@ def validate_mc(obj, mc):
     p0 = obj["pose0"]
     r = dict(pose0_err=float(max(abs(p0[0] - x0), abs(p0[1] - y0), abs(G.wrap(p0[2] - h0)))))
     maps = obs._occupancy_maps
+    if obs.extrapolated_from:           # SimScale: the maps past the 4 s GT future are a constant-velocity forecast
+        maps = maps[: obs.extrapolated_from]
     r["mc_n_maps"] = len(maps)
     t = np.arange(len(maps)) * 0.1                      # same float grid as the metric cache
     boxes, state = G.query(obj, t, dtype=np.float64)
@@ -217,7 +221,8 @@ def unknown_stats(obj, frames):
 
 # ------------------------------------------------------------------------------------------------ worker
 def process_log(task):
-    log, rows, cfg = task
+    log, rows, cfg = task[:3]
+    pkl = task[3] if len(task) > 3 else ""        # a SimScale scene pickle, else <logs>/<log>.pkl
     out = Path(cfg["out"])
     res = []
     todo = [(t, fi) for t, fi in rows if cfg["overwrite"] or cfg["mc_root"] or not (out / f"{t}.npz").exists()]
@@ -225,7 +230,7 @@ def process_log(task):
         return [dict(token=t, log=log, status="exists") for t, _ in rows]
     t_load = time.perf_counter()
     try:
-        with open(Path(cfg["logs"]) / f"{log}.pkl", "rb") as f:
+        with open(Path(pkl) if pkl else Path(cfg["logs"]) / f"{log}.pkl", "rb") as f:
             d = pickle.load(f)
     except Exception as e:  # noqa: BLE001
         return [dict(token=t, log=log, status="error", error=f"log load: {e!r}") for t, _ in rows]
@@ -331,6 +336,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tokens", required=True, help="parquet with columns token, log[, frame_idx]")
     ap.add_argument("--logs", required=True, help="dir with <log>.pkl raw NAVSIM logs")
+    ap.add_argument("--sim-root", default=_SP.SSR_SIMSCALE_ROOT, help="root of the 'pkl' column (SimScale rows)")
     ap.add_argument("--out", required=True, help="output dir (<token>.npz, index.parquet)")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--limit", type=int, default=0, help="only the first N tokens (after --sample)")
@@ -350,7 +356,11 @@ def main(argv=None):
         tk = tk.iloc[: a.limit]
     has_fi = "frame_idx" in tk
     cfg = dict(out=str(out), logs=a.logs, overwrite=a.overwrite, mc_root=a.mc_root)
-    tasks = [(log, [(r.token, int(r.frame_idx) if has_fi else None) for r in g.itertuples()], cfg)
+    def scene_pickle(g) -> tuple:
+        """(path,) of a SimScale log's scene pickle; () for a real log (<logs>/<log>.pkl)."""
+        v = g.pkl.iloc[0] if "pkl" in g else ""
+        return (str(Path(a.sim_root) / v),) if isinstance(v, str) and v else ()
+    tasks = [(log, [(r.token, int(r.frame_idx) if has_fi else None) for r in g.itertuples()], cfg) + scene_pickle(g)
              for log, g in tk.groupby("log", sort=True)]
     tasks.sort(key=lambda x: -len(x[1]))
     t0 = time.time()

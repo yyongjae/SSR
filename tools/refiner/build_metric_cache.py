@@ -14,6 +14,14 @@ What is cached and how (same definition as report/cause_and_correction_tests/E_t
 Layout (repo MetricCacheProcessor layout): <out>/<log>/unknown/<token>/metric_cache.pkl  (lzma pickle of MetricCache).
   Default <out> = $SSR_DATA_ROOT/metric_cache.  Loaders: mc_path(), load_mc().
 
+SimScale scenes (token-table rows with a 'pkl' column, tools/release/setup/build_trainval_simscale_table.py): the same
+  cache_scenarios() with SAVED_CFG_SIM, the byte copy above with the scene window 4 + 8 frames (one line differs; its own
+  sha256 is asserted), on the scene pickles of the row's round (<SSR_SIMSCALE_ROOT>/<round>/meta_datas; log = the
+  pickle stem).  cache_scenarios derives the processor horizon from that window: 4 s GT future, 40 poses, 41 GT
+  maps, which the processor extends at constant velocity to the 51 of a 5 s cache (TTC look-ahead, scored as for real
+  scenes).  Same <out> and layout.
+  A chunk holds up to --chunk scenes (one per pickle), so the scene loader lists the round's directory once per chunk.
+
 Reuse of E's 9,000 navtrain caches ("seed"): split tokens that have E's cache are COPIED (not symlinked: E's folder
   lives in the repo report tree; a copy on the ssd is robust to clean-ups and faster to read) with an atomic
   tmp-file + os.replace.  E built them with the same e2_cache.py / SAVED_CFG, so they are the same cache by
@@ -26,7 +34,8 @@ Resumability: the repo processor skips tokens whose metric_cache.pkl exists.  Be
   re-cached.  Failed / missing tokens -> <out>/_state/failed_tokens.tsv.
 
 Subcommands (all CPU; run with CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 nice -n 10):
-  build          [--splits train,dev] [--workers 4] [--chunk 16]  seed from E, then cache all missing split tokens.
+  build          [--splits train,dev | --table T] [--workers 4] [--chunk 16]  seed from E, then cache all missing split
+                 (or table) tokens.  --splits reads <splits-dir>/<split>.parquet; either keeps a 'pkl' column.
                  Chunks = (log, <= chunk tokens); logs processed in a seeded random order (a partial build covers a
                  random subset of logs of both splits).  Progress log: one line per chunk with rate and ETA.
   verify-navtest [--n 20] [--workers 2]  re-cache n navtest tokens into VERIFY_ROOT/navtest and compare with
@@ -68,8 +77,11 @@ from navsim.common import ssr_paths as _SP  # noqa: E402
 RESEARCH = Path(_SP.SSR_RESEARCH_TREE)          # verify-* only (E's caches, report tables)
 SAVED_CFG = ROOT / "resources/metric_cache_saved_config.yaml"
 SAVED_CFG_SHA256 = "92d42853253622b29eabf8e488a97741e350eb3d5a360cb45f69cb0a4b444f84"
+SAVED_CFG_SIM = ROOT / "resources/metric_cache_saved_config_simscale.yaml"     # SAVED_CFG with num_future_frames 8
+SAVED_CFG_SIM_SHA256 = "12c573f170b3aa7133c24cc90f0a01cb52f2d15c46eacf4a57cf8ad0e0d59931"
 E2_CACHE_SHA256 = "9e19488582622282a58c4b801f624578640d8b966926de00a769d5ad181cdd9e"
 TRAIN_LOGS = Path(_SP.OPENSCENE_DATA_ROOT) / "navsim_logs/trainval"
+SIM_ROOT = Path(_SP.SSR_SIMSCALE_ROOT)          # a table row's 'pkl' is relative to it
 TEST_LOGS = Path(_SP.SSR_TEST_DATA_ROOT) / "navsim_logs/test/test"
 NAVTEST_MC = Path(_SP.SSR_NAVTEST_MC)
 E_DIR = RESEARCH / "report/cause_and_correction_tests/E_train_split_feasibility"
@@ -112,10 +124,33 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def _read_rows(path: Path) -> pd.DataFrame:
+    """token, log of a token table, and its pkl column when it has one ('' = a real row; else the SimScale scene
+    pickle relative to SIM_ROOT)."""
+    import pyarrow.parquet as pq
+    cols = ["token", "log"] + (["pkl"] if "pkl" in pq.read_schema(path).names else [])
+    df = pd.read_parquet(path, columns=cols)
+    if "pkl" in df:
+        df["pkl"] = df["pkl"].fillna("").astype(str)
+    return df
+
+
+def sim_rows(df: pd.DataFrame) -> np.ndarray:
+    """bool [len(df)]: rows that are SimScale scenes."""
+    return (df["pkl"] != "").to_numpy() if "pkl" in df else np.zeros(len(df), bool)
+
+
 def read_splits(splits: Sequence[str], root: Path = SPLITS) -> pd.DataFrame:
-    df = pd.concat([pd.read_parquet(root / f"{s}.parquet", columns=["token", "log"]).assign(split=s) for s in splits])
+    df = pd.concat([_read_rows(root / f"{s}.parquet").assign(split=s) for s in splits])
     assert not df.token.duplicated().any()
     return df.reset_index(drop=True)
+
+
+def read_input(a) -> pd.DataFrame:
+    """The rows of --table (split = its file stem) or of --splits."""
+    if getattr(a, "table", ""):
+        return read_splits([Path(a.table).stem], Path(a.table).parent)
+    return read_splits(a.splits.split(","), Path(a.splits_dir))
 
 
 # ----------------------------------------------------------------------------------------------- worker (from e2_cache)
@@ -137,6 +172,47 @@ def _init(out, logs):
     cfg.scene_filter.tokens = []
     cfg.scene_filter.log_names = []
     W["cfg"] = cfg
+
+
+def _sim_cfg(out, logs):
+    """SAVED_CFG_SIM with the same overrides as _init, per round directory (loaded once per worker and round)."""
+    key = ("cfg_sim", str(logs))
+    if key not in W:
+        from omegaconf import OmegaConf
+        cfg = OmegaConf.load(SAVED_CFG_SIM)
+        cfg.cache.cache_path = str(out)
+        cfg.navsim_log_path = str(logs)
+        cfg.output_dir = str(Path(out) / "metadata")
+        cfg.scene_filter.tokens = []
+        cfg.scene_filter.log_names = []
+        W[key] = cfg
+    return W[key]
+
+
+def run_sim_chunk(a):
+    """a = (pairs [(log, token)], out, logs): SimScale scenes of one round directory, one scene per log pickle; one
+    cache_scenarios call over all of them (one listing of the directory).  -> (pairs, ok, bad, seconds, error)."""
+    pairs, out, logs = a
+    from navsim.planning.metric_caching.caching import cache_scenarios
+    t0 = time.time()
+    todo = [(lg, t) for lg, t in pairs if not mc_path(Path(out), lg, t).exists()]
+    if not todo:
+        return pairs, len(pairs), 0, 0.0, "cached"
+    try:
+        res = cache_scenarios([{"cfg": _sim_cfg(out, logs), "log_file": lg, "tokens": [t]} for lg, t in todo])
+        return pairs, sum(r.successes for r in res), sum(r.failures for r in res), time.time() - t0, ""
+    except Exception:  # pragma: no cover
+        return pairs, 0, len(todo), time.time() - t0, traceback.format_exc()[-600:]
+
+
+def run_task(task):
+    """('real', log, tokens, out, logs) -> run_chunk; ('sim', pairs, out, logs) -> run_sim_chunk.
+    -> (label, [(log, token)], ok, bad, seconds, error)"""
+    if task[0] == "sim":
+        pairs, ok, bad, dt, msg = run_sim_chunk(task[1:])
+        return Path(task[3]).parent.name, pairs, ok, bad, dt, msg
+    log, toks, ok, bad, dt, msg = run_chunk(task[1:])
+    return log, [(log, t) for t in toks], ok, bad, dt, msg
 
 
 def run_chunk(a):
@@ -169,6 +245,19 @@ def make_chunks(df: pd.DataFrame, out: Path, logs: Path, chunk: int, seed: int =
         for s in range(0, len(tk), chunk):
             chunks.append((lg, tk[s:s + chunk], str(out), str(logs)))
     return chunks
+
+
+def make_sim_chunks(df: pd.DataFrame, out: Path, sim_root: Path, chunk: int, seed: int = 0) -> List[tuple]:
+    """('sim', [(log, token)] <= chunk, out, logs) tuples over SimScale rows (pkl set): per round directory, rows sorted
+    by token, chunks in a seeded random order (a partial build covers a random subset of every round)."""
+    chunks = []
+    for d, g in df.groupby(df.pkl.map(lambda p: str(Path(p).parent)), sort=True):
+        g = g.sort_values("token", kind="stable")
+        pairs = list(zip(g.log, g.token))
+        for s in range(0, len(pairs), chunk):
+            chunks.append(("sim", pairs[s:s + chunk], str(out), str(Path(sim_root) / d)))
+    rng = np.random.default_rng(seed)
+    return [chunks[i] for i in rng.permutation(len(chunks))]
 
 
 # ----------------------------------------------------------------------------------------------- state
@@ -240,39 +329,44 @@ def cmd_build(a):
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     assert sha256(SAVED_CFG) == SAVED_CFG_SHA256, "saved caching config changed"
-    df = read_splits(a.splits.split(","), Path(a.splits_dir))
+    df = read_input(a)
     if a.limit:
         df = df.iloc[: a.limit]
+    sim = sim_rows(df)
+    if sim.any():
+        assert sha256(SAVED_CFG_SIM) == SAVED_CFG_SIM_SHA256, "saved SimScale caching config changed"
     st = State(out)
     t0 = time.time()
-    n_seed = 0 if a.no_seed else seed_from_e(df, out, Path(a.e_mc), st)
+    n_seed = 0 if a.no_seed else seed_from_e(df[~sim], out, Path(a.e_mc), st)
     checked, deleted = repair(df, out, st)
-    pend = df[[not mc_path(out, lg, t).exists() for t, lg in zip(df.token, df.log)]]
-    chunks = make_chunks(pend, out, TRAIN_LOGS, a.chunk, a.seed)
-    print(f"[{time.strftime('%F %T')}] split tokens {len(df)} | seeded from E {n_seed} | repair checked {checked} "
-          f"deleted {deleted} | pending {len(pend)} tokens in {len(chunks)} chunks | workers {a.workers} -> {out}",
-          flush=True)
+    pend_m = np.array([not mc_path(out, lg, t).exists() for t, lg in zip(df.token, df.log)], bool)
+    pend = df[pend_m]
+    chunks = [("real",) + c for c in make_chunks(df[pend_m & ~sim], out, TRAIN_LOGS, a.chunk, a.seed)] + \
+        make_sim_chunks(df[pend_m & sim], out, SIM_ROOT, a.chunk, a.seed)
+    print(f"[{time.strftime('%F %T')}] split tokens {len(df)} (SimScale {int(sim.sum())}) | seeded from E {n_seed} | "
+          f"repair checked {checked} deleted {deleted} | pending {len(pend)} tokens in {len(chunks)} chunks | workers "
+          f"{a.workers} -> {out}", flush=True)
     n_ok = n_bad = 0
     t1 = time.time()
     if chunks:
         with Pool(a.workers, initializer=_init, initargs=(str(out), str(TRAIN_LOGS)), maxtasksperchild=50) as p:
-            for log, toks, ok, bad, dt, msg in p.imap_unordered(run_chunk, chunks):
-                have = [t for t in toks if mc_path(out, log, t).exists()]
-                miss = [t for t in toks if t not in set(have)]
-                st.add_done(have)
+            for label, pairs, ok, bad, dt, msg in p.imap_unordered(run_task, chunks):
+                have = [(lg, t) for lg, t in pairs if mc_path(out, lg, t).exists()]
+                miss = [(lg, t) for lg, t in pairs if (lg, t) not in set(have)]
+                st.add_done([t for _, t in have])
                 if miss:
-                    st.add_failed([(t, log, msg[-300:] or "not cached") for t in miss])
+                    st.add_failed([(t, lg, msg[-300:] or "not cached") for lg, t in miss])
                 n_ok += len(have)
                 n_bad += len(miss)
                 el = time.time() - t1
                 rate = n_ok / max(el, 1e-6)
                 left = len(pend) - n_ok - n_bad
-                print(f"[{time.strftime('%T')}] {log} ok {len(have)}/{len(toks)} {dt:.0f}s {msg[:200]} | total ok {n_ok} "
-                      f"bad {n_bad} left {left} | {el:.0f}s {rate:.3f} tok/s ETA {left / max(rate, 1e-6) / 3600:.2f} h",
-                      flush=True)
+                print(f"[{time.strftime('%T')}] {label} ok {len(have)}/{len(pairs)} {dt:.0f}s {msg[:200]} | total ok "
+                      f"{n_ok} bad {n_bad} left {left} | {el:.0f}s {rate:.3f} tok/s ETA "
+                      f"{left / max(rate, 1e-6) / 3600:.2f} h", flush=True)
     summ = dict(split_tokens=len(df), seeded_from_e=n_seed, repair_checked=checked, repair_deleted=deleted,
                 pending_at_start=len(pend), ok=n_ok, bad=n_bad, seconds=time.time() - t0, workers=a.workers,
-                finished=time.strftime("%F %T"))
+                finished=time.strftime("%F %T"), **({"simscale_tokens": int(sim.sum())} if sim.any() else {}))
     json.dump(summ, open(st.dir / "build_summary.json", "w"), indent=1)
     print("done", summ, flush=True)
     if n_bad == 0 and not a.limit and not a.no_final_check:
@@ -454,7 +548,7 @@ def _verify(a, which: str):
 
 def cmd_check(a):
     out = Path(a.out)
-    df = read_splits(a.splits.split(","), Path(a.splits_dir))
+    df = read_input(a)
     ex, ok = [], []
     for tok, lg in zip(df.token, df.log):
         p = mc_path(out, lg, tok)
@@ -473,7 +567,7 @@ def cmd_check(a):
 
 def cmd_status(a):
     out = Path(a.out)
-    df = read_splits(a.splits.split(","), Path(a.splits_dir))
+    df = read_input(a)
     st = State(out)
     done = st.done() & set(df.token)
     nf = len(st.fail_f.read_text().splitlines()) if st.fail_f.exists() else 0
@@ -486,6 +580,7 @@ def main():
     ap.add_argument("--out", default=str(OUT))
     ap.add_argument("--splits", default="train,dev")
     ap.add_argument("--splits-dir", default=str(SPLITS))
+    ap.add_argument("--table", default="", help="a token table (token, log[, pkl]) instead of --splits")
     ap.add_argument("--e-mc", default=str(E_MC))
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--chunk", type=int, default=16)

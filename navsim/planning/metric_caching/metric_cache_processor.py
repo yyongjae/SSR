@@ -227,14 +227,19 @@ class MetricCacheProcessor:
                 DetectionsTracks(TrackedObjects(interpolated_tracks))
             )
 
-        # convert to pdm observation
+        # convert to pdm observation.  The GT observation ends with the GT future: with 5 s (50 poses, navtrain and
+        # navtest) it covers the proposals + 1 s of TTC look-ahead, as before; a shorter future (SimScale: 4 s, 40
+        # poses, 41 maps) gets the look-ahead past it at constant velocity, so PDMScorer scores TTC as for 5 s.
+        ttc_samples = self.proposal_traj_num_poses + int(1 / self._proposal_sampling.interval_length)
         pdm_observation = PDMObservation(
             self._future_sampling,
             self._proposal_sampling,
             self._map_radius,
             observation_sample_res=1,
+            extend_observation_for_ttc=self.future_traj_num_poses >= ttc_samples,
         )
         pdm_observation.update_detections_tracks(interpolated_detection_tracks)
+        pdm_observation.extend_constant_velocity(ttc_samples)
         return pdm_observation
 
     def compute_metric_cache(self, scenario: AbstractScenario) -> Optional[CacheMetadataEntry]:

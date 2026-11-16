@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Build ck/packed/<split> from the dataset alone: no planner checkpoint and no dump directory.
 
-  repack_dataset.py --split {navtrain_train,navtrain_val} [--root R | --out DIR] [--tokens PARQUET] [--logs DIR]
-                    [--workers 2] [--expect-from OLD_PACKED_DIR]
+  repack_dataset.py --split {navtrain_train,navtrain_val,trainval_simscale} [--root R | --out DIR] [--tokens PARQUET]
+                    [--logs DIR] [--workers 2] [--expect-from OLD_PACKED_DIR] [--skip-done]
 
 The refiner reads only tokens, ok, gt_traj (student) and status (teachers, label builders) from this directory.  These
 are ground truth and ego state from the logs, so tools/refiner/extract_human.py gives them directly.
@@ -16,7 +16,14 @@ Output <root>/packed/<split>/ (default root = $SSR_DATA_ROOT/ck), or --out as is
 
 The arrays are compared with the pins below before the directory appears: it is written to <out>.tmp<pid> and renamed at
 the end, so a failed run leaves no usable directory (the temp directory stays, for diagnosis).  An existing output is
-never overwritten.  --expect-from also compares row by row with an existing packed directory.  CPU only, ~1 min.
+never overwritten (--skip-done: one whose meta.json token_sha16 is that of the token table is kept as finished).
+--expect-from also compares row by row with an existing packed directory.  CPU only, ~1 min.
+
+trainval_simscale (no pins): the rows of its token table (build_trainval_simscale_table.py); a SimScale row is its scene
+pickle, whose 8 future frames are the scene window (extract_human min_future 8; gt_traj = frames 4..11).  Instead of
+pins, its real rows must equal the packed navtrain_train / navtrain_val rows token by token where those directories
+exist (<root>/packed/<split>), which meta.json records.  token_sha16 = navsim/agents/para_ssr/ck/tokens.token_sha16
+(full-length tokens; U16 for 16-character tokens, so the navtrain pins are unchanged).
 """
 from __future__ import annotations
 
@@ -44,13 +51,15 @@ from navsim.common import ssr_paths as SP  # noqa: E402
 os.environ.setdefault("NUPLAN_MAPS_ROOT", SP.NUPLAN_MAPS_ROOT)        # read when nuplan is imported
 os.environ.setdefault("NUPLAN_MAP_VERSION", "nuplan-maps-v1.0")
 
-# sha256(array bytes)[:16]; tokens = np.array(tokens, "U16"), the value e2e_data2 compares with meta.json token_sha16
+# sha256(array bytes)[:16]; tokens = tokens.token_array (U16 here), the value e2e_data2 compares with meta.json token_sha16
 PINS = {
     "navtrain_train": {"n": 85109, "token_sha16": "0b56b9aecbe1f094", "gt_traj_sha16": "ad3654bd81bdb82f",
                        "status_sha16": "d0d6f908e8be4f3c", "ok_sha16": "1f8f6dbc2f6c7496"},
     "navtrain_val": {"n": 18179, "token_sha16": "0fea22c41a4106b0", "gt_traj_sha16": "adb06837415973fd",
                      "status_sha16": "2309a38c18a61c48", "ok_sha16": "0bcf0f7a51703e00"},
 }
+UNPINNED = ("trainval_simscale",)            # table-driven splits, checked against the navtrain parts instead
+REAL_PARTS = ("navtrain_train", "navtrain_val")
 ANCHORS = ROOT / "resources/planning_vb/trajectory_anchors_256.npy"
 TRACKED_TOKENS = ROOT / "resources/km_corridor/packed/{split}/tokens.parquet"
 ARRAYS = ("gt_traj", "status", "ok")
@@ -61,7 +70,8 @@ def sha16(a: np.ndarray) -> str:
 
 
 def token_sha16(tokens) -> str:
-    return sha16(np.array(list(tokens), "U16"))
+    from navsim.agents.para_ssr.ck.tokens import token_sha16 as _token_sha16
+    return _token_sha16(tokens)
 
 
 def read_tokens(split: str, path: Optional[str] = None) -> pd.DataFrame:
@@ -76,7 +86,7 @@ def read_tokens(split: str, path: Optional[str] = None) -> pd.DataFrame:
     df = pd.read_parquet(src)
     if "city" not in df.columns:
         df["city"] = df["map_location"] if "map_location" in df.columns else ""
-    df = df[["token", "log", "city"]].reset_index(drop=True)
+    df = df[["token", "log", "city"] + (["pkl"] if "pkl" in df.columns else [])].reset_index(drop=True)
     df["token"] = df.token.astype(str)
     if df.token.duplicated().any():
         raise SystemExit(f"{src}: duplicate tokens")
@@ -84,9 +94,9 @@ def read_tokens(split: str, path: Optional[str] = None) -> pd.DataFrame:
 
 
 def build_arrays(df: pd.DataFrame, logs_dir: Path, workers: int = 2) -> Dict[str, np.ndarray]:
-    """df: token, log -> gt_traj, status, ok, row aligned with df."""
+    """df: token, log[, pkl] -> gt_traj, status, ok, row aligned with df (pkl: a SimScale scene, under SSR_SIMSCALE_ROOT)."""
     import extract_human as H
-    d = H.extract_split(df, Path(logs_dir), workers)
+    d = H.extract_split(df, Path(logs_dir), workers, sim_root=Path(SP.SSR_SIMSCALE_ROOT))
     if not (d["tokens"] == df.token.to_numpy()).all():
         raise SystemExit("extract_human changed the row order")
     gt = d["traj"].astype(np.float32)
@@ -122,6 +132,32 @@ def compare_with_dir(df: pd.DataFrame, arrays: Dict[str, np.ndarray], old: Path)
     return bad
 
 
+def compare_real_parts(df: pd.DataFrame, arrays: Dict[str, np.ndarray], packed_root: Path):
+    """A table-driven split's rows against the packed navtrain parts, token by token, where a part exists.
+    -> (problems, {part: what was compared})."""
+    bad, seen = [], {}
+    row = {t: i for i, t in enumerate(df.token.tolist())}
+    for part in REAL_PARTS:
+        d = Path(packed_root) / part
+        if not (d / "tokens.parquet").is_file():
+            seen[part] = "not compared (no packed directory)"
+            continue
+        o = pd.read_parquet(d / "tokens.parquet", columns=["token"]).token.astype(str).tolist()
+        mine = [(i, row[t]) for i, t in enumerate(o) if t in row]
+        if not mine:
+            seen[part] = "not compared (no shared token)"
+            continue
+        oi, ni = (np.array(x, np.int64) for x in zip(*mine))
+        n_bad = 0
+        for k in ARRAYS:
+            a = np.asarray(np.load(d / f"{k}.npy", mmap_mode="r")[np.sort(oi)])[np.argsort(np.argsort(oi))]
+            n_bad = max(n_bad, int((a != arrays[k][ni]).reshape(len(ni), -1).any(1).sum()))
+        if n_bad:
+            bad.append(f"{n_bad} of {len(ni)} rows differ from {d} (the same token must give the same row)")
+        seen[part] = f"{len(ni) - n_bad} of {len(ni)} shared rows equal"
+    return bad, seen
+
+
 def write_dir(out: Path, df: pd.DataFrame, arrays: Dict[str, np.ndarray], meta: Dict[str, object]) -> None:
     out.mkdir(parents=True)
     d = df[["token", "log", "city"]].copy()
@@ -133,8 +169,9 @@ def write_dir(out: Path, df: pd.DataFrame, arrays: Dict[str, np.ndarray], meta: 
 
 
 def run(split: str, out: Path, df: pd.DataFrame, logs_dir: Path, workers: int = 2, expect_from: Optional[str] = None,
-        pins: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-    """Build, compare, publish.  SystemExit(1) when a comparison fails; nothing appears at `out` in that case."""
+        pins: Optional[Dict[str, object]] = None, packed_root: Optional[Path] = None) -> Dict[str, object]:
+    """Build, compare, publish.  SystemExit(1) when a comparison fails; nothing appears at `out` in that case.
+    An unpinned split is compared with the packed navtrain parts under packed_root (default: next to `out`)."""
     if out.exists():
         raise SystemExit(f"refusing to overwrite {out}: choose another --out or move it away first")
     t0 = time.time()
@@ -146,8 +183,12 @@ def run(split: str, out: Path, df: pd.DataFrame, logs_dir: Path, workers: int = 
         meta["anchors_sha16"] = ANCHORS_SHA16
     meta["created"] = time.strftime("%F %T")
     meta["seconds"] = round(time.time() - t0, 1)
-    pins = PINS[split] if pins is None else pins
+    pins = (PINS[split] if split not in UNPINNED else {}) if pins is None else pins
     bad = compare_pins(shas, pins)
+    if split in UNPINNED:
+        real_bad, meta["real_rows"] = compare_real_parts(df, arrays, packed_root or out.parent)
+        meta["n_simscale"] = int((df["pkl"].astype(str) != "").sum()) if "pkl" in df else 0
+        bad += real_bad
     if expect_from:
         bad += compare_with_dir(df, arrays, Path(expect_from))
     tmp = out.with_name(f"{out.name}.tmp{os.getpid()}")
@@ -156,24 +197,33 @@ def run(split: str, out: Path, df: pd.DataFrame, logs_dir: Path, workers: int = 
         print(json.dumps({"split": split, "result": "FAIL", "mismatch": bad, "kept_for_diagnosis": str(tmp)}, indent=1))
         raise SystemExit(1)
     os.replace(tmp, out)
-    report = dict(meta, result="PASS", pins="equal", expect_from=expect_from or "not given", out=str(out))
+    report = dict(meta, result="PASS", pins="equal" if split not in UNPINNED else "none (real rows compared)",
+                  expect_from=expect_from or "not given", out=str(out))
     print(json.dumps(report, indent=1))
     return report
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--split", required=True, choices=sorted(PINS))
+    ap.add_argument("--split", required=True, choices=sorted(PINS) + list(UNPINNED))
     ap.add_argument("--root", default="", help="CK data root (default $SSR_DATA_ROOT/ck); output <root>/packed/<split>")
     ap.add_argument("--out", default="", help="output directory, used as is")
     ap.add_argument("--tokens", default="", help="token table (default: the split table, else the tracked copy)")
     ap.add_argument("--logs", default="", help="log pickles (default $OPENSCENE_DATA_ROOT/navsim_logs/trainval)")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--expect-from", default="", help="existing packed directory to compare row by row")
+    ap.add_argument("--skip-done", action="store_true", help="an existing output of this token table is finished")
     a = ap.parse_args(argv)
     out = Path(a.out) if a.out else Path(a.root or Path(SP.SSR_DATA_ROOT) / "ck") / "packed" / a.split
     logs = Path(a.logs or Path(SP.OPENSCENE_DATA_ROOT) / "navsim_logs/trainval")
-    run(a.split, out, read_tokens(a.split, a.tokens or None), logs, a.workers, a.expect_from or None)
+    df = read_tokens(a.split, a.tokens or None)
+    if a.skip_done and (out / "meta.json").is_file():
+        got = json.loads((out / "meta.json").read_text()).get("token_sha16")
+        if got == token_sha16(df.token.tolist()):
+            print(f"{out}: finished for this token table (token_sha16 {got}), kept")
+            return 0
+        raise SystemExit(f"{out} was built from another token table (token_sha16 {got}): move it away first")
+    run(a.split, out, df, logs, a.workers, a.expect_from or None)
     return 0
 
 

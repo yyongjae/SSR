@@ -658,7 +658,8 @@ def script_env(tmp_path, download=False, **kw):
                SSR_TEST_DATA_ROOT=str(root / "dst"), SSR_PLAN_DATA=str(root / "plan"), SSR_NAVTEST_MC=str(root / "nmc"),
                SSR_PY=sys.executable, SSR_TORCHRUN="/bin/echo", SSR_RUN_ROOT=str(root / "runs"), NAVSIM_V11=str(root / "v11"),
                NAVSIM_V11_CACHE=str(root / "v11c"), NAVSIM_V22_POST=str(root / "a"), NAVSIM_V22_PRE=str(root / "b"),
-               NAVSIM_V22_CACHE=str(root / "c"), SETUP_DRY="1", PYTHONDONTWRITEBYTECODE="1")
+               NAVSIM_V22_CACHE=str(root / "c"), SETUP_DRY="1", PYTHONDONTWRITEBYTECODE="1",
+               SSR_PATHS_ENV=str(root / "no_paths.env"))   # a server's tools/release/paths.env stays out
     env.update(kw)
     return env
 
@@ -883,8 +884,8 @@ def test_teacher_script_guards(tmp_path):
     r = run_script("run_refiner_teachers.sh", dict(env, WHICH="map", GPUS_MAP="0,1,2"))
     assert r.returncode == 3 and "2 or 4" in r.stderr
     assert "--arm T" not in run_script("run_refiner_teachers.sh", dict(env, WHICH="map")).stdout
-    r = run_script("run_refiner_teachers.sh", dict(env, WHICH="map", DET_TEACHER="bevformer"))
-    assert r.returncode == 3 and "bevformer" in r.stderr
+    r = run_script("run_refiner_teachers.sh", dict(env, WHICH="map", DET_TEACHER="nosuchdet"))
+    assert r.returncode == 3 and "nosuchdet" in r.stderr
 
 
 def test_teacher_script_reads_a_registry_entry_for_a_new_teacher(tmp_path):

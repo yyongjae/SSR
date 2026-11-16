@@ -16,7 +16,8 @@ Per token (row i of the packed arrays; rows in the order of splits/<split>.parqu
                          NaN beyond the end of the log.  path[:8, :2] == traj[:, :2].
   path_s     [17]   f32  arc length (m) along the polyline [origin, path_1..path_16] at its vertices; path_s[0] = 0;
                          NaN beyond the log.  (chords between 0.5 s frames; a DraftPath/C2 fit is the consumer's job.)
-  n_avail    i1     number of future frames present in the log (0..16); scene tokens always have >= 10.
+  n_avail    i1     number of future frames present in the log (0..16); scene tokens always have >= 10 (a SimScale
+                    scene: exactly 8, its pickle ends there; extract_split takes those rows with min_future 8).
   n_reg      i1     number of leading future frames whose timestamp step is 0.5 s +- 0.1 s (regular grid, <= n_avail).
   dt         [16]   f32  timestamp step (s) of future frame k from frame k-1 (dt[0] = t(c+1) - t(c)); NaN beyond.
   frame_gap  bool   any |step - 0.5| > 0.1 s among future frames c+1..c+10 (the 5 s window used by the metric cache,
@@ -80,15 +81,16 @@ def ego_pose(frame: dict) -> np.ndarray:
     return np.array([t[0], t[1], Quaternion(*frame["ego2global_rotation"]).yaw_pitch_roll[0]], np.float64)
 
 
-def extract_token(frames: Sequence[dict], c: int, maxf: int = MAXF) -> Dict[str, np.ndarray]:
-    """All per-token fields for the t0 frame index c of a log frame list (see module docstring)."""
+def extract_token(frames: Sequence[dict], c: int, maxf: int = MAXF, min_future: int = NSCENE) -> Dict[str, np.ndarray]:
+    """All per-token fields for the t0 frame index c of a log frame list (see module docstring).  min_future: future
+    frames the scene window needs (NSCENE; a SimScale scene has 8, at least the NTRAJ of traj)."""
     from nuplan.common.actor_state.state_representation import StateSE2
     from navsim.planning.simulation.planner.pdm_planner.utils.pdm_geometry_utils import (
         convert_absolute_to_relative_se2_array,
     )
     n = len(frames)
     n_av = min(n - 1 - c, maxf)
-    if c < 3 or n_av < NSCENE:
+    if c < 3 or n_av < max(min_future, NTRAJ):
         raise ValueError(f"frame {c} has no full scene window ({n} frames)")
     g0 = ego_pose(frames[c])
     G = np.stack([ego_pose(frames[c + k]) for k in range(1, n_av + 1)])
@@ -117,14 +119,15 @@ def extract_token(frames: Sequence[dict], c: int, maxf: int = MAXF) -> Dict[str,
 
 
 def extract_log(a) -> List[tuple]:
-    """a = (log, tokens, logs_dir) -> [(token, fields | None, error)]"""
-    log, toks, logs_dir = a
+    """a = (log, tokens, logs_dir[, min_future]) -> [(token, fields | None, error)]"""
+    log, toks, logs_dir = a[:3]
+    min_future = a[3] if len(a) > 3 else NSCENE
     frames = pickle.load(open(Path(logs_dir) / f"{log}.pkl", "rb"))
     pos = {f["token"]: i for i, f in enumerate(frames)}
     out = []
     for t in toks:
         try:
-            out.append((t, extract_token(frames, pos[t]), ""))
+            out.append((t, extract_token(frames, pos[t], min_future=min_future), ""))
         except Exception as e:  # pragma: no cover
             out.append((t, None, repr(e)))
     return out
@@ -137,9 +140,20 @@ def pack(tokens: Sequence[str], logs: Sequence[str], rows: Dict[str, dict]) -> D
     return d
 
 
-def extract_split(df: pd.DataFrame, logs_dir: Path, workers: int = 2) -> Dict[str, np.ndarray]:
-    """df: token, log (row order kept)."""
-    jobs = [(lg, g.token.tolist(), str(logs_dir)) for lg, g in df.groupby("log", sort=True)]
+def extract_split(df: pd.DataFrame, logs_dir: Path, workers: int = 2, sim_root: Optional[Path] = None) -> Dict[str, np.ndarray]:
+    """df: token, log (row order kept).  A row with a non-empty 'pkl' column is a SimScale scene (a token table of
+    tools/release/setup/build_trainval_simscale_table.py): its log pickle is <sim_root>/<pkl>, a 12-frame scene whose
+    8 future frames are the scene window (min_future 8)."""
+    if "pkl" in df.columns and (df["pkl"].fillna("").astype(str) != "").any():
+        from navsim.common import simscale as SS
+        if sim_root is None:
+            raise ValueError("SimScale rows need sim_root (SSR_SIMSCALE_ROOT)")
+        pk = df["pkl"].fillna("").astype(str)
+        jobs = [(lg, g.token.tolist(), str(Path(sim_root) / Path(p).parent) if p else str(logs_dir),
+                 SS.NUM_FUTURE_FRAMES if p else NSCENE)
+                for (lg, p), g in df.assign(pkl=pk).groupby(["log", "pkl"], sort=True)]
+    else:
+        jobs = [(lg, g.token.tolist(), str(logs_dir)) for lg, g in df.groupby("log", sort=True)]
     rows, errs = {}, []
     with Pool(workers) as p:
         for res in p.imap_unordered(extract_log, jobs, chunksize=4):

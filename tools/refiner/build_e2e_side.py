@@ -2,14 +2,16 @@
 """Stage E side store: per token the route centerline crop and PDM-Closed's effective progress, so the E2E dataloader
 never unpickles a metric cache (0.05-0.7 s each).
 
-  python tools/refiner/build_e2e_side.py build  [--tokens <parquet>] [--workers 6] [--limit N]
+  python tools/refiner/build_e2e_side.py build  [--tokens <parquet>] [--workers 6] [--limit N] [--status FILE]
   python tools/refiner/build_e2e_side.py check  [--n 50]     # p_pdm / centerline vs scores/train.parquet / packed train
 
 Output <DATA_ROOT>/e2e_side/<tok[:2]>/<tok>.npz (atomic write; existing files are skipped, so it is resumable and can
 follow the metric-cache build): cl_xy [CL_MAX, 2] f32, cl_valid [CL_MAX] bool, cl_n i32 (= data.centerline_samples,
 identical to the packed 'centerline' part), p_pdm f64 (= score_trajectories.score_token(...)[0]['pdm_progress_eff'],
 PDM-Closed raw progress x PDM-Closed multiplier; it does not depend on the submitted trajectory, a standing-still
-trajectory is submitted).  Tokens without a metric cache are skipped (retried on the next run).
+trajectory is submitted).  Tokens without a metric cache are skipped (retried on the next run).  The run status goes to
+--status (default <out>/status.json), so a second token table (trainval_simscale) does not replace the first one's.
+SimScale tokens work as they are: their metric cache is found by (log, token) like any other.
 """
 from __future__ import annotations
 
@@ -97,7 +99,7 @@ def build(a) -> None:
     rec = dict(counts=counts, n_tokens=len(df), n_with_side=int(n_done), sec=round(time.time() - t0, 1),
                finished=time.strftime("%Y-%m-%dT%H:%M:%S"))
     Path(a.out).mkdir(parents=True, exist_ok=True)
-    (Path(a.out) / "status.json").write_text(json.dumps(rec, indent=1))
+    (Path(a.status) if a.status else Path(a.out) / "status.json").write_text(json.dumps(rec, indent=1))
     print(json.dumps(rec), flush=True)
 
 
@@ -135,6 +137,7 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--n", type=int, default=50)
+    ap.add_argument("--status", default="", help="run status file (default <out>/status.json)")
     a = ap.parse_args(argv)
     build(a) if a.cmd == "build" else check(a)
 

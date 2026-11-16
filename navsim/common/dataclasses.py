@@ -86,6 +86,11 @@ class Cameras:
         )
 
 
+def _opt_path(path) -> Optional[Path]:
+    """Path of a frame's lidar_path, or None for frames without LiDAR (SimScale)."""
+    return None if path is None else Path(path)
+
+
 @dataclass
 class Lidar:
 
@@ -103,12 +108,14 @@ class Lidar:
     def from_paths(
         cls,
         sensor_blobs_path: Path,
-        lidar_path: Path,
+        lidar_path: Optional[Path],
         sensor_names: List[str],
     ) -> Lidar:
 
         # NOTE: this could be extended to load specific LiDARs in the merged pc
         if "lidar_pc" in sensor_names:
+            if lidar_path is None:   # SimScale clips have no LiDAR (lidar_path None)
+                raise ValueError("lidar_pc requested for a frame without LiDAR (lidar_path is None)")
             global_lidar_path = sensor_blobs_path / lidar_path
             lidar_pc = LidarPointCloud.from_buffer(cls._load_bytes(global_lidar_path), "pcd").points
             return Lidar(lidar_pc)
@@ -190,7 +197,7 @@ class AgentInput:
             lidars.append(
                 Lidar.from_paths(
                     sensor_blobs_path=sensor_blobs_path,
-                    lidar_path=Path(scene_dict_list[frame_idx]["lidar_path"]),
+                    lidar_path=_opt_path(scene_dict_list[frame_idx]["lidar_path"]),
                     sensor_names=sensor_names,
                 )
             )
@@ -447,7 +454,7 @@ class Scene:
 
             lidar = Lidar.from_paths(
                 sensor_blobs_path=sensor_blobs_path,
-                lidar_path=Path(scene_dict_list[frame_idx]["lidar_path"]),
+                lidar_path=_opt_path(scene_dict_list[frame_idx]["lidar_path"]),
                 sensor_names=sensor_names,
             )
 

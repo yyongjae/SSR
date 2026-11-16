@@ -75,7 +75,8 @@ def test_ck_keys_follow_v2_sim_keys_and_label_cols():
     from navsim.agents.para_ssr.modules.anchor_planner import SIM_KEYS
     assert tuple(C.CK_KEY_TO_SIM[k] for k in C.CK_KEYS) == tuple(SIM_KEYS)
     assert C.LABEL_COLS[:5] == C.CK_KEYS and C.CK_LABEL_IDX == (0, 1, 2, 3, 4)
-    assert C.K_CAND == 16 and C.N_CTRL == 6 and set(C.SPLITS) == {"navtrain_train", "navtrain_val", "navtest"}
+    assert C.K_CAND == 16 and C.N_CTRL == 6
+    assert set(C.SPLITS) == {"navtrain_train", "navtrain_val", "navtest", "simscale", "trainval_simscale"}
 
 
 def test_ck_final_equals_anchor_planner_weighted_reward():

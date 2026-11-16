@@ -34,6 +34,8 @@ from tools.ck.data import common as CM  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
+from navsim.agents.para_ssr.ck.tokens import token_sha16  # noqa: E402
+
 ARRAYS = ("cand", "cand_idx", "v2_final", "v2_im", "v2_sim", "status", "gt_traj", "sub_traj", "ok")
 
 
@@ -133,7 +135,7 @@ def pack(split_name: str, root=None, k: int = CM.K_CAND, tokens: str = "split", 
     CM.atomic_to_parquet(tdf, out / "tokens.parquet")
     meta = dict(split=split_name, n=n, k=k, n_ok=int(ok.sum()), not_ok=reasons, tokens_spec=tokens,
                 v2_ckpt_sha16=CM.V2_CKPT_SHA16, dump_dir=str(dump), anchors_sha16=CM.sha16_array(anchors),
-                k_rebuilt_from_f16_offset=max(0, k - CM.K_CAND), token_sha16=CM.sha16_array(np.array(toks, "U16")),
+                k_rebuilt_from_f16_offset=max(0, k - CM.K_CAND), token_sha16=token_sha16(toks),
                 cand_sha16=CM.sha16_array(np.load(out / "cand.npy", mmap_mode="r")),
                 created=time.strftime("%F %T"), seconds=round(time.time() - t0, 1))
     CM.atomic_write_json(out / "meta.json", meta)

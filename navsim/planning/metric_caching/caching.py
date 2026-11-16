@@ -22,6 +22,20 @@ from navsim.common.dataclasses import SensorConfig, Scene
 
 logger = logging.getLogger(__name__)
 
+# MetricCacheProcessor interpolates the GT objects over its future horizon (future_traj_num_poses at 0.1 s), so the
+# scene window must hold that much GT future: 2 Hz frames give 5 poses each.  10 future frames (navtrain, navtest) are
+# the processor default of 5 s; SimScale scenes (4 + 8 frames) have 4 s.
+_DEFAULT_FUTURE_FRAMES = 10
+_POSES_PER_FRAME = 5
+
+
+def gt_horizon_kwargs(scene_filter) -> Dict[str, int]:
+    """MetricCacheProcessor kwargs for the GT future of a scene window: {} (the defaults) for 10 or more future frames,
+    else future_traj_num_poses = 5 per frame (4 + 8 frames: 40 poses, 41 GT maps that the processor extends at constant
+    velocity to the 51 of a 5 s cache)."""
+    n = int(scene_filter.num_future_frames)
+    return {} if n >= _DEFAULT_FUTURE_FRAMES else {"future_traj_num_poses": n * _POSES_PER_FRAME}
+
 
 def cache_scenarios(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[CacheResult]:
     """
@@ -81,6 +95,7 @@ def cache_scenarios(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List
         processor = MetricCacheProcessor(
             cache_path=cfg.cache.cache_path,
             force_feature_computation=cfg.cache.force_feature_computation,
+            **gt_horizon_kwargs(cfg.scene_filter),
         )
 
         logger.info(

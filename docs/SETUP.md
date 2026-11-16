@@ -140,7 +140,18 @@ python tools/release/verify_assets.py --profile {base,refiner_noteacher,full} [-
 
 **BEVFusion을 다시 만들면** 비트 단위로 같아지지 않는다(`deterministic: false`). 그래서 `registry.yaml`의 `sha_head`, `norm_v15`, DET refiner teacher를 모두 새 값으로 바꿔야 한다. 저장소 `yyongjae/bevfusion` @ `b939770`, 4 GPU 39.8시간 + 8 GPU 0.5시간이다. 절차는 `60_teacher_bev.sh` 맨 위에 있다.
 
-**새 teacher 추가:** 코드는 바꾸지 않는다. 같은 형식의 cache를 만들고 `tools/release/registry.yaml`에 항목을 넣는다. `bevformer`, `mask2map`은 `status: missing`으로 등록돼 있고, 고르면 부족한 것을 나열하며 거부한다. 형식은 [EXPERIMENTS.md](EXPERIMENTS.md)에 있다.
+**새 teacher 추가:** 코드는 바꾸지 않는다. 같은 형식의 cache를 만들고 `tools/release/registry.yaml`에 항목을 넣는다. `status: missing`인 항목은 고르면 부족한 것을 나열하며 거부한다. 카메라 teacher `bevformer`, `mask2map`은 `ready`다(아래 trainval + SimScale 절). 형식은 [EXPERIMENTS.md](EXPERIMENTS.md)에 있다.
+
+## 5a. trainval + SimScale 레시피
+
+`DATA=trainval_simscale`(navtrain_train + navtrain_val + SimScale round 0-4, DINOv2 ViT-S + LoRA, 카메라 teacher)의 준비와 학습은 [SIMSCALE.md](SIMSCALE.md)에 따로 있다. 위 0-4번(환경, 데이터, `15_token_lists.sh`, `pdm_score_256`)은 같고, 나머지는 다음 스크립트가 맡는다.
+
+- `prepare_trainval_simscale.sh`: 아래 단계를 차례로 돌린 뒤 `verify_assets.py --data trainval_simscale`로 끝낸다.
+  - `12_download_simscale.sh`: SimScale 2.23 TB, `DOWNLOAD=1`일 때만
+  - `16_trainval_simscale_table.sh`: 토큰 표
+  - `20`-`50`: `trainval_simscale` split
+  - `65_cam_teacher_bev.sh`: BEVFormer, Mask2Map cache 3.6 TB, GPU
+- `scripts/train_simscale.sh`: 학습 명령 하나
 
 ## 6. 조용한 실패와 잡는 장치
 

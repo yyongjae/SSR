@@ -45,7 +45,7 @@ E2E_ROOT = f"{CK_DATA}/phase2/e2e"
 SMOKE_ROOT = f"{CK_DATA}/phase2/e2e_smoke"
 PACKED_TRAIN = f"{CK_DATA}/packed/navtrain_train"
 ALLOWED_GPUS = ("0", "1", "2", "3")
-N_TRAIN_TOKENS = 85109
+N_TRAIN_TOKENS = 85109           # navtrain_train; a run of another DATA: launch_util2.train_tokens (its token table)
 TOKENS_PER_MB = 4
 
 TRAIN_ENV = {

@@ -19,8 +19,8 @@ data on disk.  scripts/experiment.sh is its one caller; the CLI below writes wha
   compose.py resume-check --composition J --settings-json F [--allow-commit-change]
 
 Run name: only what differs from the defaults, in a fixed order, joined with _, then the hash (main_<hash6> by default):
-  [<bb>] [<det>-<map>] [ref-off] [rkd-off|score|lat] [bkd-off] [detkd-off|offbev|offref] [mapkd-off|offbev|offref]
-  [f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
+  [<bb>] [<det>-<map>] [tvsim] [ref-off] [rkd-off|score|lat] [bkd-off] [detkd-off|offbev|offref]
+  [mapkd-off|offbev|offref] [f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [tf32] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 A setting implied by another one gets no part: REFINER=off is ref-off only, REFINER_KD=off BEV_KD=off is rkd-off_bkd-off.
 hash6 = sha256 over the resolved overrides, minus run-path and wandb lines, with data roots written as placeholders so
 one config has one name on every server, plus the registry pins of the teachers in use.  Never the commit.  A changed
@@ -57,19 +57,32 @@ ARM_EXTRA = REPO / "tools/ck/e2e2/v2_v15_v7_arm.extra"
 AGENT_YAML = REPO / "navsim/planning/script/config/common/agent/para_ssr_agent.yaml"
 ANCHORS_REL = "resources/planning_vb/trajectory_anchors_256.npy"
 
+# DATA -> the split the run's row-indexed assets are built on (ck/packed/<split> row order: the warm-up arrays, the
+# labeler's rows).  navtrain is the main recipe: navtrain_train (85,109 tokens) and the pinned files.  trainval_simscale
+# is navtrain_train + navtrain_val + SimScale rounds 0-4 in one token table (navsim/common/simscale.py), every loss and
+# KD on every token; run_training reads that table and its roots itself (+train_data), so none of its paths is a line.
+DATA_SPLIT = {"navtrain": "navtrain_train", "trainval_simscale": "trainval_simscale"}
+DATA_NAME = {"trainval_simscale": "tvsim"}          # the run name part of a DATA other than the default
+PLAN_SCORE_REL = "ck/raw256/pdm_score_256_officialEP"   # v2 head score file; a combined split has its own, + _<split>
+# SimScale scenes have no LiDAR (BEVFusion) and no satellite image (ReSMap): with such a DATA every teacher a KD reads is
+# a camera-only one, whose caches cover the SimScale tokens (tools/release/setup/65_cam_teacher_bev.sh)
+CAMERA_ONLY_DATA = ("trainval_simscale",)
+CAMERA_TEACHERS = {"det": ("bevformer",), "map": ("mask2map",)}
+
 # every setting and its default; scripts/experiment.sh has the same block at its top (a test compares them)
 DEFAULTS: Dict[str, str] = {
     "REFINER": "on", "REFINER_KD": "on", "BEV_KD": "on", "DET_KD": "on", "MAP_KD": "on",
-    "BACKBONE": "r34", "DET_TEACHER": "bevfusion", "MAP_TEACHER": "resmap",
+    "BACKBONE": "r34", "DET_TEACHER": "bevfusion", "MAP_TEACHER": "resmap", "DATA": "navtrain",
     "FRAMES": "2,3", "UNDISTORT": "on", "HEADING": "xy", "PILLAR_Z": "-1,3", "BEV_RANGE": "64", "BN": "moving",
-    "SEED": "0", "EPOCHS": "30", "GPUS": "0,1,2,3,4,5,6,7", "SAVE_EVERY": "1",
+    "TF32": "off", "SEED": "0", "EPOCHS": "30", "GPUS": "0,1,2,3,4,5,6,7", "SAVE_EVERY": "1",
     "RUN_ROOT": "", "TAG": "", "WANDB": "offline", "EXTRA": "", "DRY": "0",
 }
 CHOICES: Dict[str, Tuple[str, ...]] = {
     "REFINER": ("on", "off"), "REFINER_KD": ("on", "off", "score", "lat"), "BEV_KD": ("on", "off"),
     "DET_KD": ("on", "off", "off_bev", "off_ref"), "MAP_KD": ("on", "off", "off_bev", "off_ref"),
-    "FRAMES": ("2,3", "3", "0,1,2,3"), "UNDISTORT": ("on", "off"), "HEADING": ("xy", "free"),
-    "BEV_RANGE": ("64", "32"), "BN": ("moving", "frozen"), "WANDB": ("online", "offline", "disable"), "DRY": ("0", "1"),
+    "DATA": tuple(DATA_SPLIT), "FRAMES": ("2,3", "3", "0,1,2,3"), "UNDISTORT": ("on", "off"), "HEADING": ("xy", "free"),
+    "BEV_RANGE": ("64", "32"), "BN": ("moving", "frozen"), "TF32": ("off", "on"),
+    "WANDB": ("online", "offline", "disable"), "DRY": ("0", "1"),
 }
 # settings that describe where or how a run is launched, not what it trains
 NOT_RECIPE = ("GPUS", "SAVE_EVERY", "RUN_ROOT", "TAG", "WANDB", "DRY")
@@ -100,6 +113,7 @@ EXTRA_OWNED = {
     "agent.config.map_pc_range": "PILLAR_Z / BEV_RANGE", "agent.config.bev_h": "BEV_RANGE",
     "agent.config.bev_w": "BEV_RANGE", "agent.config.backbone_bn_mode": "BN", "agent.config.max_epochs": "EPOCHS",
     "trainer.params.max_epochs": "EPOCHS", "trainer.params.devices": "GPUS", "checkpoint.every_n_epochs": "SAVE_EVERY",
+    "agent.config.plan_score_file": "DATA", "train_data": "DATA", "tf32": "TF32",
 }
 # overrides that do not enter hash6: run paths, wandb, how often to save, and roots that are lines only on some servers
 HASH_SKIP = ("experiment_name", "output_dir", "agent.config.ck_e2e2.io_dir", "resume_checkpoint",
@@ -109,7 +123,7 @@ CONTROL_ENV = ("ARM", "RUN", "E2E_ROOT", "E2E_CK_SET", "E2E_EXTRA", "E2E_NO_LABE
                "E2E_SMOKE_PREFIX", "E2E_DRY_RUN", "E2E_WANDB", "E2E_NO_DEEP_TEACHER_CHECK", "MAX_EPOCHS",
                "LABELER_MAX_EPOCH", "TRAIN_WORKERS", "CK_BEV64", "CK_ALLOW_GPU45", "CK_ALLOW_GPU4567", "SSR_ALLOW_DIRECT",
                "SSR_EXPERIMENT_SHA", "SSR_GPU_POLICY", "SSR_ALLOW_FILE_CALIB", "SSR_DET_CACHE_TRAIN", "SSR_DET_CACHE_VAL",
-               "SSR_DET_SHA_HEAD", "SSR_MAP_CACHE_ROOT", "SSR_MAP_SHA256", "SSR_MAP_REQUIRE_SEG")
+               "SSR_DET_SHA_HEAD", "SSR_MAP_CACHE_ROOT", "SSR_MAP_SHA256", "SSR_MAP_REQUIRE_SEG", "SSR_TRAIN_SPLIT")
 
 
 class Refused(ValueError):
@@ -276,6 +290,9 @@ def canonicalize(raw: Mapping[str, str], reg: Optional[Mapping[str, Any]] = None
     for role, tk, kd in (("det", "DET_TEACHER", "DET_KD"), ("map", "MAP_TEACHER", "MAP_KD")):
         if not teacher_read(s, kd):
             s[tk] = default_teacher(role)
+        elif s["DATA"] in CAMERA_ONLY_DATA and s[tk] not in CAMERA_TEACHERS[role]:
+            raise Refused(f"DATA={s['DATA']} with {tk}={s[tk]}: SimScale scenes have no LiDAR or satellite input, so "
+                          f"{tk} is a camera-only teacher ({', '.join(CAMERA_TEACHERS[role])})")
 
     # student
     if s["BEV_RANGE"] == "32" and (s["REFINER"] == "on" or s["BEV_KD"] == "on"):
@@ -339,6 +356,8 @@ def run_name(s: Mapping[str, str], hash6: str) -> str:
         parts.append(s["BACKBONE"])
     if s["DET_TEACHER"] != DEFAULTS["DET_TEACHER"] or s["MAP_TEACHER"] != DEFAULTS["MAP_TEACHER"]:
         parts.append(f"{s['DET_TEACHER']}-{s['MAP_TEACHER']}")
+    if s["DATA"] != DEFAULTS["DATA"]:
+        parts.append(DATA_NAME[s["DATA"]])
     if s["REFINER"] == "off":
         parts.append("ref-off")           # the refiner KD goes with it
     elif s["REFINER_KD"] != "on":
@@ -349,6 +368,8 @@ def run_name(s: Mapping[str, str], hash6: str) -> str:
     parts += _st_parts(s)
     if s["BN"] != DEFAULTS["BN"]:
         parts.append(f"bn-{s['BN']}")
+    if s["TF32"] == "on":
+        parts.append("tf32")
     if s["EPOCHS"] != DEFAULTS["EPOCHS"]:
         parts.append(f"e{s['EPOCHS']}")
     if len(s["GPUS"].split(",")) != len(DEFAULTS["GPUS"].split(",")):
@@ -375,13 +396,17 @@ def _kd_lists(s: Mapping[str, str]) -> Tuple[List[str], List[str]]:
     return bev_off, src
 
 
+def warmup_dirs(data_root: str, split: str) -> Tuple[str, str, str]:
+    """The warm-up sources of a split (packed, raw256 labels, variant labels), row-indexed in packed tokens.parquet order."""
+    return (f"{data_root}/ck/packed/{split}", f"{data_root}/ck/labels/{split}/raw256",
+            f"{data_root}/ck/ck2/labels/{split}/var_separate_sampler16_accstraight")
+
+
 def set_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mapping[str, Dict[str, Any]],
               smoke: bool = False) -> List[str]:
     """Lines of the merged set file (ck_e2e2 key=value)."""
-    data = roots["SSR_DATA_ROOT"]
-    lines = [f"warmup.packed={data}/ck/packed/navtrain_train", f"warmup.raw_labels={data}/ck/labels/navtrain_train/raw256",
-             f"warmup.var_dir={data}/ck/ck2/labels/navtrain_train/var_separate_sampler16_accstraight",
-             f"seed={s['SEED']}"]
+    packed, raw, var = warmup_dirs(roots["SSR_DATA_ROOT"], DATA_SPLIT[s["DATA"]])
+    lines = [f"warmup.packed={packed}", f"warmup.raw_labels={raw}", f"warmup.var_dir={var}", f"seed={s['SEED']}"]
     if s["REFINER"] == "off":
         return ["enabled=false"] + lines
     if s["REFINER_KD"] == "off":     # tools/ck/e2e2/v2_nokd.set
@@ -447,6 +472,12 @@ def extra_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mappin
         put(f"agent.config.image_architecture={bb['timm']}")
     for k, v in (bb.get("flags") or {}).items():
         put(f"++agent.config.{k}={LU.hydra_value(v)}")
+    if s["DATA"] != DEFAULTS["DATA"]:
+        # the split's own v2 head scores ([N,5,256] in table order); the pinned 103,288-token file stays the main one's
+        put(f"agent.config.plan_score_file={roots['SSR_DATA_ROOT']}/{PLAN_SCORE_REL}_{DATA_SPLIT[s['DATA']]}")
+        put(f"+train_data={s['DATA']}")
+    if s["TF32"] == "on":           # run_training: TF32 matmul and cuDNN before the model is built
+        put("+tf32=true")
     if s["SAVE_EVERY"] != "1" and not smoke:
         put(f"checkpoint.every_n_epochs={s['SAVE_EVERY']}")
     put(f"seed={s['SEED']}")
@@ -494,6 +525,8 @@ def _env_lines(s: Mapping[str, str], teachers: Mapping[str, Dict[str, Any]], run
     env = {"RUN": run, "E2E_ROOT": run_root, "ARM": "main", "CK_BEV64": "0" if s["BEV_RANGE"] == "32" else "1",
            "SSR_EXPERIMENT_SHA": hash6, "CK2_E2E_APPROVED": "1", "SSR_GPU_POLICY": "any",
            "MAX_EPOCHS": "2" if smoke else s["EPOCHS"], "E2E_WANDB": s["WANDB"]}
+    if s["DATA"] != DEFAULTS["DATA"]:   # tools/ck/e2e2/train_e2e2.sh: the labeler's split (unset: navtrain_train)
+        env["SSR_TRAIN_SPLIT"] = DATA_SPLIT[s["DATA"]]
     if s["REFINER"] == "off":
         env["E2E_NO_LABELER"] = "1"
     if smoke:

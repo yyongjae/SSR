@@ -499,6 +499,55 @@ def labeler_health2(run_dir: str, state_path: str, stall_s: float = 1200.0, now:
 
 # ----------------------------------------------------------------------------------------------- status
 PHASES2 = {0: "warmup", 1: "warmup_record", 2: "onpolicy"}
+# DATA of scripts/experiment.sh -> its token table under SSR_DATA_ROOT (navsim/common/simscale.py TABLE_COLUMNS): one row
+# per training token, real and SimScale, so one epoch is its rows.  navtrain: navtrain_train, LU.N_TRAIN_TOKENS.
+DATA_TABLE = {"trainval_simscale": "splits/trainval_simscale.parquet"}
+
+
+def _run_json(run_dir: str, rel: str) -> Dict[str, Any]:
+    try:
+        d = json.loads((Path(run_dir) / rel).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def run_data(run_dir: str) -> str:
+    """DATA of a run of scripts/experiment.sh (launch/settings.json); navtrain for a run without the setting."""
+    return str((_run_json(run_dir, "launch/settings.json").get("settings") or {}).get("DATA") or "navtrain")
+
+
+def token_table(run_dir: str) -> Optional[Path]:
+    """The token table of the run's DATA, under the SSR_DATA_ROOT it was composed with (launch/gen/composition.json),
+    else this environment's; None for navtrain."""
+    data = run_data(run_dir)
+    if data not in DATA_TABLE:
+        return None
+    root = (_run_json(run_dir, "launch/gen/composition.json").get("roots") or {}).get("SSR_DATA_ROOT")
+    return Path(root or LU.SP.SSR_DATA_ROOT) / DATA_TABLE[data]
+
+
+def table_rows(path) -> int:
+    """Row count of a parquet table, from its footer."""
+    import pyarrow.parquet as pq
+    return int(pq.ParquetFile(str(path)).metadata.num_rows)
+
+
+def train_tokens(run_dir: str) -> Tuple[Optional[int], str]:
+    """(tokens of one training epoch, where the number comes from): LU.N_TRAIN_TOKENS for DATA=navtrain; for another
+    DATA the rows of its token table, else the count of the run's train/train_tokens.json, else None."""
+    table = token_table(run_dir)
+    if table is None:
+        return LU.N_TRAIN_TOKENS, "navtrain_train"
+    try:
+        return table_rows(table), f"rows of {table}"
+    except Exception as e:      # noqa: BLE001  (absent, unreadable, no pyarrow)
+        why = f"{table}: {type(e).__name__}"
+    tt = Path(run_dir) / "train/train_tokens.json"
+    n = _run_json(run_dir, "train/train_tokens.json").get("count")
+    if isinstance(n, int) and n > 0:
+        return n, f"count of {tt} ({why})"
+    return None, f"no token count ({why}; no {tt})"
 
 
 def run_status2(run_dir: str, max_epochs: int = 30) -> Dict[str, Any]:
@@ -544,12 +593,16 @@ def run_status2(run_dir: str, max_epochs: int = 30) -> Dict[str, Any]:
                             "warn": bool(sum(gs) / len(gs) > GSHARE_WARN)}
         ws = next((int(r["world_size"]) for r in reversed(LU.read_jsonl(IO / "epochs.jsonl")) if r.get("world_size")),
                   NGPU)
-        mb_ep = LU.mb_per_epoch(ws)
-        if sec and frac is not None and st["train"]["alive"]:
+        n_tok, n_src = train_tokens(str(R))
+        if n_src != "navtrain_train":
+            st["epoch_tokens"] = {"n": n_tok, "source": n_src}
+        mb_ep = LU.mb_per_epoch(ws, n_tok) if n_tok else None
+        if mb_ep and sec and frac is not None and st["train"]["alive"]:
             remain = max(0.0, max_epochs - frac) * mb_ep * sec
             st["eta"] = {"hours_left": round(remain / 3600, 2), "finish": kst(time.time() + remain),
                          "basis": f"median sec_step of the last 300 mb x {mb_ep} mb/epoch x "
-                                  f"{max(0.0, max_epochs - frac):.2f} epochs left [추정]"}
+                                  f"{max(0.0, max_epochs - frac):.2f} epochs left [추정]"
+                                  + ("" if n_src == "navtrain_train" else f"; {n_tok} tokens per epoch: {n_src}")}
     ep_recs = LU.read_jsonl(IO / "epochs.jsonl")
     if ep_recs:
         st["last_epoch_record"] = ep_recs[-1]
@@ -575,6 +628,8 @@ def run_status2(run_dir: str, max_epochs: int = 30) -> Dict[str, Any]:
     if (st.get("gshare") or {}).get("warn"):
         w.append(f"CK2 share of the BEV gradient mean {st['gshare']['mean']:.2f} > {GSHARE_WARN} (last "
                  f"{st['gshare']['n']} records)")
+    if (st.get("epoch_tokens") or {}).get("n", 0) is None:
+        w.append(f"no ETA: {st['epoch_tokens']['source']}")
     st["warnings"] = w
     return st
 
@@ -664,9 +719,11 @@ def phase_timing2(recs: Sequence[Dict[str, Any]], skip_first: int = 20) -> Dict[
 
 
 def estimate_hours2(timing: Dict[str, Any], world_size: int = NGPU, max_epochs: int = 30, record_from: int = 4,
-                    onpolicy_from: int = 5, key: str = "wall_per_mb_mean") -> Dict[str, Any]:
-    """30-epoch wall time from the measured steady s/mb per phase (epoch fixed costs not included) [추정]."""
-    mb = LU.mb_per_epoch(world_size)
+                    onpolicy_from: int = 5, key: str = "wall_per_mb_mean", n_tokens: int = LU.N_TRAIN_TOKENS
+                    ) -> Dict[str, Any]:
+    """30-epoch wall time from the measured steady s/mb per phase (epoch fixed costs not included) [추정]; n_tokens per
+    epoch (train_tokens of the run)."""
+    mb = LU.mb_per_epoch(world_size, n_tokens)
     rows, tot = [], 0.0
     for ph in ("warmup", "warmup_record", "onpolicy"):
         n_ep = sum(1 for e in range(max_epochs) if (("onpolicy" if e >= onpolicy_from else "warmup_record"
@@ -739,7 +796,8 @@ def smoke_check2(run_dir: str, ngpu: int = NGPU, onpolicy_epochs: Sequence[int] 
     s = IO / "lab/status.json"
     res["labeler_status"] = json.loads(s.read_text()) if s.is_file() else None
     res["train_exit"] = LU._exit_code(R / "launch/train.exit")
-    res["estimate_30ep_2gpu"] = estimate_hours2(res["phase_timing"], ngpu)
+    res["estimate_30ep_2gpu"] = estimate_hours2(res["phase_timing"], ngpu,
+                                                n_tokens=train_tokens(str(R))[0] or LU.N_TRAIN_TOKENS)
     mem = max([(v or {}).get("mem_gb_max") or 0.0 for v in res["phase_timing"].values()], default=0.0)
     checks = {"train_exit_0": res["train_exit"] == 0, "nonfinite_0": nonfin == 0,
               "skipped_steps_0": res["skipped_steps"] == 0,

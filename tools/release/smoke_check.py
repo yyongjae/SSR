@@ -8,6 +8,8 @@ covers refiner off, refiner KD off or partial, BEV KD off, and one teacher off.
 Writes <run>/launch/smoke_check.json, prints each check, exit 1 when one fails.  Peak memory: torch's peak per GPU from
 steps_rank0.jsonl when the refiner writes one; with the refiner off, the peak of nvidia-smi's memory.used sampled by
 scripts/experiment.sh into launch/gpu_mem.csv, which counts reserved memory too, so it reads higher.
+A DATA with a token table (trainval_simscale) must train on exactly that table: count and token sha of
+train/train_tokens.json equal the table's, SimScale rows included (a 4 + 10 frame filter would drop them silently).
 """
 from __future__ import annotations
 
@@ -87,6 +89,30 @@ def _calib_checks(run: Path, s: Dict[str, str], steps, teachers, checks, info) -
     info["kd_calib_warmup_refits"] = len(wu)
 
 
+def _data_checks(run: Path, tokens: Dict[str, Any], checks: Dict[str, bool], info: Dict[str, Any]) -> None:
+    """The training tokens (run_training.check_and_record_train_tokens: count, sha256 of the sorted tokens) against the
+    token table of the run's DATA: the same count, and the same set with its SimScale rows in it."""
+    import hashlib
+
+    import pandas as pd
+    from navsim.common.simscale import SOURCE_SIM
+    from tools.ck.e2e2 import launch_util2 as L2
+    table = L2.token_table(str(run))
+    info["token_table"] = str(table)
+    try:
+        t = pd.read_parquet(table, columns=["token", "source"])
+    except Exception as e:      # noqa: BLE001  (absent or not a token table)
+        info["token_table_error"] = f"{type(e).__name__}: {e}"
+        checks["train_tokens_eq_table_rows"] = checks["simscale_tokens_trained"] = False
+        return
+    toks = t["token"].astype(str).tolist()
+    n_sim = int((t["source"].astype(str) == SOURCE_SIM).sum())
+    info.update(table_rows=len(toks), table_simscale_rows=n_sim, train_tokens_count=tokens.get("count"))
+    checks["train_tokens_eq_table_rows"] = tokens.get("count") == len(toks)
+    sha = hashlib.sha256("\n".join(sorted(toks)).encode()).hexdigest()
+    checks["simscale_tokens_trained"] = n_sim > 0 and tokens.get("train_token_sha256") == sha
+
+
 def _refiner_checks(run: Path, s: Dict[str, str], checks: Dict[str, bool], info: Dict[str, Any]) -> List[Dict[str, Any]]:
     io = run / "refiner"
     ep = read_jsonl(io / "epochs.jsonl")
@@ -140,6 +166,8 @@ def check_run(run_dir: str, mem_limit_gb: float = 22.5) -> Dict[str, Any]:
     checks["train_exit_0"] = ex.is_file() and ex.read_text().strip() == "0"
     tt = run / "train/train_tokens.json"
     checks["train_tokens_recorded"] = tt.is_file() and json.loads(tt.read_text()).get("count", 0) > 0
+    if s.get("DATA", "navtrain") != "navtrain":
+        _data_checks(run, json.loads(tt.read_text()) if tt.is_file() else {}, checks, info)
     tm = run / "train/train_time.json"
     sess = (json.loads(tm.read_text()).get("sessions") or [{}])[-1] if tm.is_file() else {}
     checks["two_epochs_completed"] = sess.get("status") == "completed" and sess.get("epochs_completed") == 2

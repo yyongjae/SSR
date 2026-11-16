@@ -23,6 +23,15 @@ bash scripts/experiment.sh eval   RUN=<이름> GPUS=0,1,2,3   # 약 15분 GPU + 
 bash scripts/experiment.sh table                            # 모든 run의 결과표
 ```
 
+trainval + SimScale 레시피는 `scripts/train_simscale.sh` 하나로 돌립니다. `DATA=trainval_simscale BACKBONE=dino_vits14_1148 DET_TEACHER=bevformer MAP_TEACHER=mask2map TF32=on`을 고정하고 나머지는 기준 레시피 그대로입니다. 명령을 생략하면 `train`이고, `train`은 `check`를 먼저 돌려 실패하면 멈춥니다. run 폴더는 `RUN_ROOT`를 주지 않으면 `$SSR_RUN_ROOT`(paths.env) 아래입니다. 고정된 다섯 설정을 다른 값으로 주면 거부합니다.
+
+```
+bash scripts/train_simscale.sh check  NGPU=8                # CPU. 이름, launcher 드라이런, agent 생성
+bash scripts/train_simscale.sh smoke  GPUS=0,1              # GPU 2장. MEM_LIMIT_GB 기본 30
+bash scripts/train_simscale.sh NGPU=8                       # 학습 (8 × H100 권장; 4, 2장도 됨)
+bash scripts/train_simscale.sh status NGPU=8                # 같은 키로 상태 보기 (stop, resume도 같음)
+```
+
 ## 2. 명령
 
 | 명령 | 하는 일 | 필요한 것 |
@@ -30,7 +39,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `name` | 폴더 이름을 출력합니다. 아무것도 만들지 않습니다. | 없음 |
 | `check` | 설정 조합 확인 → launcher 드라이런 → CPU에서 실제 agent 생성. 파라미터 수, target builder, 거부 사유를 출력합니다. 기본 레시피면 기준 run과 비교해 PASS/FAIL을 출력합니다. `<RUN_ROOT>/_check/` 아래에만 씁니다 (`CHECK_ROOT=`로 변경). | teacher run, 캐시의 메타 파일 |
 | `smoke` | 같은 설정으로 2 epoch × 60 micro-batch, wandb 끔. `<RUN_ROOT>/_smoke/smoke_<이름>` 에 씁니다. 끝나면 `tools/release/smoke_check.py`로 확인합니다. `DRY=1`은 launcher 드라이런과 CPU 생성만 합니다. | GPU, 약 2.5 GiB |
-| `train` | 학습을 시작합니다. 아래 거부 조건을 먼저 봅니다. `DRY=1`은 출력만 합니다. | GPU, 70 GiB 이상 |
+| `train` | 학습을 시작합니다. 아래 거부 조건을 먼저 봅니다. `DRY=1`은 출력만 합니다. | GPU, 70 GiB 이상 (`DATA=trainval_simscale`는 300 GiB) |
 | `resume` | `RUN=<이름>`. `last.ckpt`에서 이어갑니다. 설정 hash, GPU 수, commit이 같아야 합니다. 이전 `overrides.txt`는 보관합니다. | 그 run의 `settings.json` |
 | `status`, `stop`, `wait` | 그 run의 상태 보기, 멈추기, 끝날 때까지 기다리기. | `RUN=<이름>` 또는 같은 설정 |
 | `eval` | `RUN=<이름> GPUS=... [EPOCH=<n>] [EPDMS=0|1]`. 평가의 유일한 경로입니다. 다른 인자는 받지 않습니다. | GPU, 채점 트리, 캐시 |
@@ -43,7 +52,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 
 - run 폴더가 이미 있음 → `resume`을 쓰세요.
 - 커밋하지 않은 변경이 있음 → 커밋하거나 `ALLOW_DIRTY=1`. 이때 `git_dirty: true`가 기록되고 diff가 run 폴더에 저장됩니다.
-- 디스크 여유가 `MIN_FREE_GB`(기본 70)보다 적음.
+- 디스크 여유가 `MIN_FREE_GB`(기본 70, `DATA=trainval_simscale`는 300)보다 적음.
 - 같은 `RUN_ROOT`에서 다른 학습이 돌고 있음 → `FORCE_CONCURRENT=1`. 메모리를 나눠 쓰게 됩니다.
 - GPU가 1 GiB 이상 사용 중이거나, 학습 전 파일 확인(`verify_assets --quick`)이 실패함.
 
@@ -58,9 +67,11 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `BEV_KD` | on off | on | `bkd-off` | BEV KD v15 (student BEV로 가는 KD). |
 | `DET_KD` | on off off_bev off_ref | on | `detkd-off` `detkd-offbev` `detkd-offref` | DET teacher에서 오는 KD. `off`는 두 경로 모두, `off_bev`는 BEV KD만, `off_ref`는 refiner KD만 끕니다. |
 | `MAP_KD` | on off off_bev off_ref | on | `mapkd-off` `mapkd-offbev` `mapkd-offref` | MAP teacher에서 오는 KD. 값의 뜻은 같습니다. |
-| `BACKBONE` | r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 | r34 | 이름 그대로 (`r50`), 맨 앞 | timm 이름과 필요한 플래그는 registry에 있습니다. swin, vit는 코드가 더 필요해서 거부합니다. |
-| `DET_TEACHER` | registry 이름 | bevfusion | `<det>-<map>` | DET teacher. `bevformer`는 등록만 되어 있고 없어서, 무엇이 부족한지 출력하고 거부합니다. |
-| `MAP_TEACHER` | registry 이름 | resmap | `<det>-<map>` | MAP teacher. `mask2map`도 같습니다. |
+| `BACKBONE` | r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 dino_vits14 dino_vits14_1148 | r34 | 이름 그대로 (`r50`), 맨 앞 | timm 이름과 필요한 플래그는 registry에 있습니다. swin, vit는 코드가 더 필요해서 거부합니다. dino 둘은 DINOv2 ViT-S, 가중치 동결 + q, v에 LoRA rank 32 (`modules/dinov2_lora.py`, DrivoR와 같음). `dino_vits14`는 770×436 (r34와 같은 구도), `dino_vits14_1148`은 1148×672 (DrivoR의 입력, `smoke`에 `MEM_LIMIT_GB=30`). BatchNorm이 없어 `BN`은 백본에 영향이 없습니다. |
+| `DET_TEACHER` | registry 이름 | bevfusion | `<det>-<map>` | DET teacher. `bevformer`(카메라만)도 등록되어 있습니다. 캐시가 없는 서버에서는 `assets`와 `check`가 멈춥니다. |
+| `MAP_TEACHER` | registry 이름 | resmap | `<det>-<map>` | MAP teacher. `mask2map`(카메라만)도 같습니다. |
+| `DATA` | navtrain trainval_simscale | navtrain | `tvsim` | 학습 데이터. `trainval_simscale`은 navtrain_train + navtrain_val + SimScale round 0-4를 토큰 표 하나(`$SSR_DATA_ROOT/splits/trainval_simscale.parquet`)로 묶고, 모든 loss와 KD를 모든 토큰에 씁니다. warm-up label, v2 head 점수 파일, labeler split(`SSR_TRAIN_SPLIT`)이 그 split 것으로 바뀝니다. epoch당 토큰이 약 4배라 시간과 디스크도 약 4배입니다. SimScale에는 LiDAR와 위성 영상이 없어서, KD가 읽는 teacher는 카메라 teacher(`DET_TEACHER=bevformer`, `MAP_TEACHER=mask2map`)여야 합니다(다른 teacher는 거부). |
+| `TF32` | off on | off | `tf32` | on이면 TF32 matmul과 cuDNN을 켭니다 (H100). 수치가 달라지므로 이름과 hash에 들어갑니다. |
 | `FRAMES` | `2,3` `3` `0,1,2,3` | `2,3` | `f1` `f4` | 입력 프레임. |
 | `UNDISTORT` | on off | on | `dist` | 렌즈 왜곡 보정. |
 | `HEADING` | xy free | xy | `headfree` | heading을 경로에서 계산(xy)하거나 별도 head로 예측(free)합니다. |
@@ -90,9 +101,9 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 기본값과 다른 것만 아래 순서대로 `_`로 잇고, 맨 뒤에 hash를 붙입니다. 다른 것이 없으면 `main_<hash6>`입니다.
 
 ```
-[backbone] [<det>-<map>] [ref-off] [rkd-off|rkd-score|rkd-lat] [bkd-off] [detkd-off|detkd-offbev|detkd-offref]
+[backbone] [<det>-<map>] [tvsim] [ref-off] [rkd-off|rkd-score|rkd-lat] [bkd-off] [detkd-off|detkd-offbev|detkd-offref]
 [mapkd-off|mapkd-offbev|mapkd-offref] [f1|f4 dist headfree z<a>_<b> r32]
-[bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
+[bn-frozen] [tf32] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 ```
 
 | 인자 | 이름 |
@@ -103,6 +114,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `REFINER_KD=off BEV_KD=off` | `rkd-off_bkd-off_<hash6>` |
 | `REFINER=off BEV_KD=off` | `ref-off_bkd-off_<hash6>` |
 | `BACKBONE=r50 REFINER_KD=score MAP_KD=off_ref SEED=1 TAG=try1` | `r50_rkd-score_mapkd-offref_s1_try1_<hash6>` |
+| `scripts/train_simscale.sh` (8장 / `NGPU=4`) | `dino_vits14_1148_bevformer-mask2map_tvsim_tf32_<hash6>` / `..._tvsim_tf32_g4_<hash6>` |
 
 - 기본값은 이름에 쓰지 않습니다. 기본값이 코드에서 바뀌면 override가 바뀌므로 hash가 바뀌어 다른 이름이 됩니다.
 - `hash6`는 실제 Hydra override 전체(run 경로, wandb 줄 제외, 데이터 경로는 자리표시자로 바꿈)와 쓰는 teacher의 sha 고정값으로 계산합니다. commit은 넣지 않습니다. 그래서 같은 설정은 어느 서버에서든 같은 이름이고, 레시피 기본값이 코드에서 바뀌면 이름이 바뀝니다.
@@ -172,6 +184,10 @@ run 폴더 안의 이름:
 | backbone ConvNeXt | `BACKBONE=convnext_tiny` | full | 측정 안 됨. 단계 동결이 ResNet과 다름 |
 | backbone RegNetY | `BACKBONE=regnety_032` | full | 측정 안 됨. 단계 동결이 ResNet과 다름 |
 | backbone EfficientNet | `BACKBONE=efficientnet_b0` | full | 측정 안 됨. 단계 동결이 ResNet과 다름 |
+| backbone DINOv2 ViT-S, r34와 같은 구도 | `BACKBONE=dino_vits14` | full | 실데이터 시간 측정 안 됨. 메모리 smoke 필수 |
+| backbone DINOv2 ViT-S, DrivoR 입력 크기 | `BACKBONE=dino_vits14_1148` | full | 실데이터 시간 측정 안 됨. `smoke`에 `MEM_LIMIT_GB=30` 필요 |
+| 카메라 teacher (BEVFormer, Mask2Map) | `DET_TEACHER=bevformer MAP_TEACHER=mask2map` | full | 20 h. 캐시 494 + 585 GiB 필요 |
+| trainval + SimScale (`scripts/train_simscale.sh`) | `DATA=trainval_simscale BACKBONE=dino_vits14_1148 DET_TEACHER=bevformer MAP_TEACHER=mask2map TF32=on` | full | 측정 안 됨. 토큰 약 4.0배 + dino 1148. 디스크 `MIN_FREE_GB` 300 |
 | 렌즈 보정 끔 | `UNDISTORT=off` | full | 20 h |
 | pillar 높이 | `PILLAR_Z=-2,2` | full | 20 h |
 | 프레임 1장 | `FRAMES=3` | full | 20 h 아래 |
@@ -192,7 +208,6 @@ run 폴더 안의 이름:
 
 | 실험 | 이유 |
 |---|---|
-| `DET_TEACHER=bevformer`, `MAP_TEACHER=mask2map` | teacher 모델, 캐시(≥ 436 GB), refiner teacher가 없습니다. 아래 6절. |
 | `BACKBONE=swin`, `BACKBONE=vit` | 코드 수정이 필요합니다 (입력 크기, 채널 순서, stride, 이미지 정규화). |
 | `BEV_RANGE=32`와 KD 또는 refiner | 32 m teacher 캐시가 없습니다. |
 
@@ -225,6 +240,7 @@ run 폴더 안의 이름:
 이 스크립트는 CPU에서만 검증했습니다. 다음은 GPU 없이 확인할 수 없어서 아직 돌려 보지 않았습니다:
 
 - 실제 `smoke`와 `train` (DDP 포함). 온라인 calibration을 켠 학습은 이 서버에서 GPU로 돈 적이 없습니다.
-- ResNet34 외 backbone의 GPU 메모리. r50 이상은 `smoke`로 `MEM_LIMIT_GB` 확인이 먼저입니다.
+- ResNet34 외 backbone의 GPU 메모리. r50 이상과 dino_vits14는 `smoke`로 `MEM_LIMIT_GB` 확인이 먼저입니다.
+- `DATA=trainval_simscale`, `TF32=on`, `scripts/train_simscale.sh`의 GPU 학습(smoke 포함). CPU에서 이름, override, Hydra 구성, launcher 드라이런의 teacher 확인까지만 확인했습니다.
 - DET 또는 MAP을 끈 arm의 DDP와 resume.
 - 다른 서버에서의 전체 실행.

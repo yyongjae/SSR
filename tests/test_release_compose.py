@@ -57,7 +57,7 @@ def sh(*args, timeout=600, **extra):
 def test_script_block_equals_the_compose_defaults():
     block, seen = SH.read_text().split("end of settings")[0], {}
     for line in block.splitlines():
-        m = re.match(r"^([A-Z_]+)=(\S*)\s*(#.*)?$", line)
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=(\S*)\s*(#.*)?$", line)
         if m:
             seen[m.group(1)] = m.group(2)
             assert m.group(3), f"{m.group(1)}: the block says what each key does"
@@ -103,11 +103,23 @@ ARMS = {
     "headfree": {"HEADING": "free"}, "bn-frozen": {"BN": "frozen"}, "s1": {"SEED": "1"}, "e20": {"EPOCHS": "20"},
     "g4": {"GPUS": "0,1,2,3"}, "g2": {"GPUS": "4,5"}, "a.1-b": {"TAG": "a.1-b"}, "x": {"EXTRA": "agent.lr=2e-4"},
     "ref-off_bkd-off_x": {"REFINER": "off", "BEV_KD": "off", "EXTRA": "agent.config.plan_anchor=false"},
+    "bevformer-mask2map": {"DET_TEACHER": "bevformer", "MAP_TEACHER": "mask2map"},
+    "bevformer-mask2map_tvsim": {"DATA": "trainval_simscale", "DET_TEACHER": "bevformer", "MAP_TEACHER": "mask2map"},
+    "tvsim_ref-off_bkd-off": {"DATA": "trainval_simscale", "REFINER": "off", "BEV_KD": "off"},   # no KD: no teacher
+    "tf32": {"TF32": "on"},
+    # scripts/train_simscale.sh
+    "dino_vits14_1148_bevformer-mask2map_tvsim_tf32": {"DATA": "trainval_simscale", "BACKBONE": "dino_vits14_1148",
+                                                       "DET_TEACHER": "bevformer", "MAP_TEACHER": "mask2map", "TF32": "on"},
     # every part at once, in the fixed order
     "r50_rkd-score_bkd-off_detkd-offref_f4_dist_headfree_z-2_2_bn-frozen_e20_g4_s1_a1_x": {
         "BACKBONE": "r50", "REFINER_KD": "score", "BEV_KD": "off", "DET_KD": "off",
         "FRAMES": "0,1,2,3", "UNDISTORT": "off", "HEADING": "free", "PILLAR_Z": "-2,2", "BN": "frozen",
         "EPOCHS": "20", "GPUS": "0,1,2,3", "SEED": "1", "TAG": "a1", "EXTRA": "agent.lr=2e-4"},
+    "r50_bevformer-mask2map_tvsim_rkd-score_bkd-off_detkd-offref_f4_dist_headfree_z-2_2_bn-frozen_tf32_e20_g4_s1_a1_x": {
+        "BACKBONE": "r50", "DET_TEACHER": "bevformer", "MAP_TEACHER": "mask2map", "DATA": "trainval_simscale",
+        "REFINER_KD": "score", "BEV_KD": "off", "DET_KD": "off", "FRAMES": "0,1,2,3", "UNDISTORT": "off",
+        "HEADING": "free", "PILLAR_Z": "-2,2", "BN": "frozen", "TF32": "on", "EPOCHS": "20", "GPUS": "0,1,2,3",
+        "SEED": "1", "TAG": "a1", "EXTRA": "agent.lr=2e-4"},
 }
 
 
@@ -165,7 +177,7 @@ def test_one_config_one_name(a, b):
 
 @pytest.mark.parametrize("kw, msg", [
     ({"BACKBONE": "swin"}, "needs code"), ({"BACKBONE": "vit"}, "needs code"), ({"BACKBONE": "r200"}, "not in the registry"),
-    ({"DET_TEACHER": "bevformer"}, "Missing: a BEVFormer"), ({"MAP_TEACHER": "mask2map"}, "Missing: a Mask2Map"),
+    ({"DATA": "navtest"}, "one of"), ({"DATA": "simscale"}, "one of"), ({"TF32": "yes"}, "one of"),
     ({"MAP_TEACHER": "nope"}, "not in the registry"), ({"DET_KD": "off", "MAP_KD": "off"}, "use REFINER_KD=off BEV_KD=off"),
     ({"DET_KD": "off_ref", "REFINER_KD": "off"}, "means nothing"), ({"DET_KD": "off_ref", "REFINER": "off"}, "means nothing"),
     ({"MAP_KD": "off_bev", "BEV_KD": "off"}, "means nothing"), ({"DET_KD": "off_bev", "MAP_KD": "off_bev"}, "use BEV_KD=off"),
@@ -193,6 +205,19 @@ def test_refusals(kw, msg):
         C.compose(kw)
 
 
+@pytest.mark.parametrize("role, key, name", [("det", "DET_TEACHER", "bevformer"), ("map", "MAP_TEACHER", "mask2map")])
+def test_a_teacher_with_status_missing_is_refused_with_what_it_needs(tmp_path, role, key, name):
+    """bevformer and mask2map are ready since the v2_T_ablation entries; the refusal of a missing one stays."""
+    import yaml
+    reg = yaml.safe_load((REPO / "tools/release/registry.yaml").read_text())
+    reg["teachers"][role][name] = {"status": "missing", "needs": [f"a {name} cache"]}
+    p = tmp_path / "r.yaml"
+    p.write_text(yaml.safe_dump(reg))
+    with pytest.raises(C.Refused, match=f"status missing. Missing: a {name} cache"):
+        C.compose({key: name}, registry=str(p))
+    assert C.compose({key: name}).pins[role]["name"] == name
+
+
 @pytest.mark.parametrize("tag", ["ckpt", "v20", "v150", "check", "track", "v8"])
 def test_tag_guard_leaves_other_words_alone(tag):
     assert C.compose({"TAG": tag}).run.startswith(tag + "_")
@@ -216,6 +241,7 @@ def test_extra_refuses_the_locked_keys(line):
     ("agent.config.image_architecture=resnet50.a1_in1k", "BACKBONE"), ("++agent.config.image_size=[770,420]", "BACKBONE"),
     ("++agent.config.vit_lora_rank=8", "BACKBONE"), ("agent.config.frame_indices=[3]", "FRAMES"),
     ("agent.config.ck_e2e2.lat_kd.fixed=0.0", "REFINER_KD"), ("trainer.params.max_epochs=3", "EPOCHS"),
+    ("+train_data=trainval_simscale", "DATA"), ("agent.config.plan_score_file=/x", "DATA"), ("+tf32=true", "TF32"),
 ])
 def test_extra_cannot_contradict_the_run_name(line, setting):
     with pytest.raises(C.Refused, match=setting):
@@ -236,7 +262,9 @@ def test_hash_ignores_what_is_not_the_recipe(kw):
 
 
 @pytest.mark.parametrize("kw", [{"SEED": "1"}, {"EPOCHS": "20"}, {"GPUS": "0,1,2,3"}, {"BN": "frozen"}, {"BACKBONE": "r50"},
-                                {"REFINER_KD": "score"}, {"DET_KD": "off_bev"}])
+                                {"REFINER_KD": "score"}, {"DET_KD": "off_bev"},
+                                {"DATA": "trainval_simscale", "DET_TEACHER": "bevformer", "MAP_TEACHER": "mask2map"},
+                                {"TF32": "on"}])
 def test_hash_changes_with_the_recipe(kw):
     assert C.compose(kw).hash6 != C.compose({}).hash6
 
@@ -267,7 +295,8 @@ def test_one_config_one_name_on_any_server():
                    "agent.config.distill_feature_root=/mnt/b/tc", "agent.config.ref_data_root=/mnt/a/data",
                    "agent.config.distill_v7_root=/mnt/b/tc", "output_dir=/mnt/d/runs/"):
         assert needle in over, needle
-    assert "/home/external-user" not in over and "/workspace/" not in over.replace(str(REPO), "")
+    # the repo itself may sit under either prefix (this worktree is under /home/external-user)
+    assert "/home/external-user" not in over.replace(str(REPO), "") and "/workspace/" not in over.replace(str(REPO), "")
     assert d["env"]["SSR_DET_CACHE_TRAIN"] == "/mnt/b/tc/bevfusion/cache_train_100x100"
     assert d["env"]["SSR_MAP_CACHE_ROOT"] == "/mnt/b/tc/resmap/stage1_front64"
     assert d["env"]["E2E_ROOT"] == "/mnt/d/runs"
@@ -431,6 +460,7 @@ def test_launch_environment_of_the_main_recipe():
     assert c.env["CK_BEV64"] == "1" and c.env["ARM"] == "main" and c.env["E2E_ROOT"] == SP.SSR_RUN_ROOT
     assert c.env["SSR_DET_SHA_HEAD"] == "71ea94f672c89521" and c.env["SSR_MAP_SHA256"].startswith("e67cc78d")
     assert "SSR_MAP_REQUIRE_SEG" not in c.env and "E2E_SMOKE" not in c.env
+    assert "SSR_TRAIN_SPLIT" not in c.env and "SSR_TRAIN_SPLIT" in C.CONTROL_ENV    # an inherited value is unset
 
 
 def test_smoke_composition():

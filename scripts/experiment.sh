@@ -3,6 +3,7 @@
 # assets, teachers, purge.  docs/EXPERIMENTS.md has every setting and every arm as a one-line command.
 #
 #   bash scripts/experiment.sh <command> [KEY=VALUE ...]
+#   bash scripts/train_simscale.sh [command] [NGPU=8 | GPUS=...] [KEY=VALUE ...]    the trainval + SimScale recipe
 #
 # A KEY=VALUE on the command line wins over the block below.  Prefer the command line: editing this block makes the
 # working tree dirty, and train refuses a dirty tree.
@@ -16,15 +17,17 @@ MAP_KD=on                   # on | off (both KD paths) | off_bev | off_ref: KD f
 BACKBONE=r34                # r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 dino_vits14_1148 dino_vits14 (tools/release/registry.yaml)
 DET_TEACHER=bevfusion       # registry name
 MAP_TEACHER=resmap          # registry name
+DATA=navtrain               # navtrain | trainval_simscale (navtrain train + val + SimScale rounds 0-4, its own labels; MIN_FREE_GB 300)
 FRAMES=2,3                  # 2,3 | 3 | 0,1,2,3: history frames
 UNDISTORT=on                # on | off: lens undistortion
 HEADING=xy                  # xy (heading from the path) | free (own head)
 PILLAR_Z=-1,3               # a,b: camera pillar height range in metres
 BEV_RANGE=64                # 64 | 32 (32 only with REFINER=off BEV_KD=off)
 BN=moving                   # moving | frozen: backbone BatchNorm statistics in training
+TF32=off                    # off | on: TF32 matmul and cuDNN (H100); other numerics, so it is in the name and the hash
 SEED=0                      # global + ck_e2e2.seed + distill_probe_seed; warmup.sampler_seed stays 0
 EPOCHS=30                   # trainer + agent.max_epochs + labeler max
-GPUS=0,1,2,3,4,5,6,7        # 2, 4 or 8 distinct indices, each with < 1 GiB used; the reference recipe is 8
+GPUS=0,1,2,3,4,5,6,7        # 2, 4 or 8 distinct indices, each with < 1 GiB used; the reference recipe is 8 (one 8 x H100 node)
 SAVE_EVERY=1                # checkpoint every N epochs (must divide EPOCHS); not in the name, not in the hash
 RUN_ROOT=/home/external-user/experiments  # empty: $SSR_RUN_ROOT
 TAG=                        # [A-Za-z0-9.-]+, a letter or digit first; goes into the run name
@@ -48,12 +51,13 @@ if [ -n "${SSR_RELEASE_TEST_STUBS:-}" ]; then
   E2E_START=$SSR_RELEASE_TEST_STUBS/train_e2e2.sh; VERIFY_ASSETS=$SSR_RELEASE_TEST_STUBS/verify_assets.py
   EVAL_SH=$SSR_RELEASE_TEST_STUBS/eval.sh; SMOKE_CHECK=$SSR_RELEASE_TEST_STUBS/smoke_check.py
 fi
-SETTINGS=(REFINER REFINER_KD BEV_KD DET_KD MAP_KD BACKBONE DET_TEACHER MAP_TEACHER FRAMES
-          UNDISTORT HEADING PILLAR_Z BEV_RANGE BN SEED EPOCHS GPUS SAVE_EVERY RUN_ROOT TAG WANDB EXTRA DRY)
+SETTINGS=(REFINER REFINER_KD BEV_KD DET_KD MAP_KD BACKBONE DET_TEACHER MAP_TEACHER DATA FRAMES
+          UNDISTORT HEADING PILLAR_Z BEV_RANGE BN TF32 SEED EPOCHS GPUS SAVE_EVERY RUN_ROOT TAG WANDB EXTRA DRY)
 # options of single commands; these may also come from the environment
 RUN=""; EPOCH=""; EPDMS=""; CONFIRM=${CONFIRM:-0}; REGISTRY=${REGISTRY:-}; CHECK_ROOT=${CHECK_ROOT:-}
 ALLOW_DIRTY=${ALLOW_DIRTY:-0}; ALLOW_MIXED=${ALLOW_MIXED:-0}; ALLOW_COMMIT_CHANGE=${ALLOW_COMMIT_CHANGE:-0}
-FORCE_CONCURRENT=${FORCE_CONCURRENT:-0}; MIN_FREE_GB=${MIN_FREE_GB:-70}; MEM_LIMIT_GB=${MEM_LIMIT_GB:-22.5}
+# MIN_FREE_GB empty: the default of the run's DATA (min_free_gb below)
+FORCE_CONCURRENT=${FORCE_CONCURRENT:-0}; MIN_FREE_GB=${MIN_FREE_GB:-}; MEM_LIMIT_GB=${MEM_LIMIT_GB:-22.5}
 SMOKE_KEEP=${SMOKE_KEEP:-1}; QUICK=${QUICK:-0}; BASE=${BASE:-}; GPUS_DET=${GPUS_DET:-}; GPUS_MAP=${GPUS_MAP:-}; WHICH=${WHICH:-}
 OPTIONS=(RUN EPOCH EPDMS CONFIRM REGISTRY CHECK_ROOT ALLOW_DIRTY ALLOW_MIXED ALLOW_COMMIT_CHANGE FORCE_CONCURRENT MIN_FREE_GB
          MEM_LIMIT_GB SMOKE_KEEP QUICK BASE GPUS_DET GPUS_MAP WHICH)
@@ -125,9 +129,17 @@ guard_dirty() {
     else refuse_or_dry "uncommitted changes in $REPO: commit them, or ALLOW_DIRTY=1 to record the run as git_dirty"; fi
   fi
 }
+min_free_gb() {  # MIN_FREE_GB, else the default of DATA: trainval_simscale records 4x the rows of navtrain
+  if [ -n "$MIN_FREE_GB" ]; then echo "$MIN_FREE_GB"; elif [ "$DATA" = navtrain ]; then echo 70; else echo 300; fi
+}
 guard_disk() {
-  local f; f=$(free_gb "$RUN_ROOT")
-  [ "$f" -ge "$1" ] || refuse_or_dry "$f GiB free on $RUN_ROOT < $1 GiB (MIN_FREE_GB); a 30-epoch run peaks at ~60 GiB"
+  local f peak="60 GiB"; f=$(free_gb "$RUN_ROOT")
+  [ "$DATA" = navtrain ] || peak="200 GiB (estimate)"
+  [ "$f" -ge "$1" ] || refuse_or_dry "$f GiB free on $RUN_ROOT < $1 GiB (MIN_FREE_GB); a 30-epoch run peaks at ~$peak"
+}
+verify_assets() {  # verify_assets <args>: tools/release/verify_assets.py; --data only for a DATA other than navtrain
+  local d=(); [ "$DATA" = navtrain ] || d=(--data "$DATA")
+  py "$VERIFY_ASSETS" "$@" "${d[@]}"
 }
 guard_second_training() {
   local r; r=$(running_trainings)
@@ -184,7 +196,7 @@ do_train() {
   R=$RUN_ROOT/$name
   [ ! -e "$R" ] || refuse_or_dry "$R exists: use 'resume RUN=$name'"
   guard_dirty
-  guard_disk "$MIN_FREE_GB"
+  guard_disk "$(min_free_gb)"
   guard_second_training
   guard_gpus
   print_pressure
@@ -199,7 +211,7 @@ do_train() {
   local prof; prof=$CP_PROFILE
   local alog=$CHECK_DIR/gen/verify_assets.log arc=0
   [ -f "$VERIFY_ASSETS" ] || die "$VERIFY_ASSETS is missing"
-  py "$VERIFY_ASSETS" --profile "$prof" --quick --det-teacher "$DET_TEACHER" --map-teacher "$MAP_TEACHER" > "$alog" 2>&1 || arc=$?
+  verify_assets --profile "$prof" --quick --det-teacher "$DET_TEACHER" --map-teacher "$MAP_TEACHER" > "$alog" 2>&1 || arc=$?
   [ "$arc" = 0 ] || { tail -20 "$alog" >&2; die "assets of profile $prof are not ready (full log: $alog)"; }
   local gen=$R/launch/gen
   cp_emit "$gen"
@@ -233,7 +245,7 @@ do_resume() {
   [ -z "$given_wandb" ] || WANDB=$given_wandb
   [ -z "$given_save" ] || SAVE_EVERY=$given_save
   guard_dirty
-  guard_disk "$MIN_FREE_GB"
+  guard_disk "$(min_free_gb)"
   guard_second_training
   guard_gpus
   local tmp=$RUN_ROOT/_check/$RUN/gen_resume
@@ -315,14 +327,18 @@ do_table() {
 }
 
 do_assets() {
-  local prof
+  local prof rec
   if [ -n "$RUN" ]; then
     resolve_run
-    prof=$(py - "$R/launch/settings.json" <<'PY'
+    # what the run reads: its profile, data and teachers (a run from before DATA existed trained on navtrain)
+    rec=$(py - "$R/launch/settings.json" <<'PY'
 import json, sys
-print(json.load(open(sys.argv[1]))["profile"])
+d = json.load(open(sys.argv[1]))
+s = d["settings"]
+print(d["profile"], s.get("DATA", "navtrain"), s["DET_TEACHER"], s["MAP_TEACHER"])
 PY
     ) || die "no settings.json for $RUN"
+    read -r prof DATA DET_TEACHER MAP_TEACHER <<< "$rec"
   else
     local tmp; tmp=$(mktemp -d)
     cp_emit "$tmp"
@@ -331,7 +347,7 @@ PY
   fi
   [ -f "$VERIFY_ASSETS" ] || die "$VERIFY_ASSETS is missing"
   local q=(); [ "$QUICK" = 1 ] && q=(--quick)
-  py "$VERIFY_ASSETS" --profile "$prof" --det-teacher "$DET_TEACHER" --map-teacher "$MAP_TEACHER" "${q[@]}"
+  verify_assets --profile "$prof" --det-teacher "$DET_TEACHER" --map-teacher "$MAP_TEACHER" "${q[@]}"
 }
 
 do_teachers() {
@@ -370,5 +386,5 @@ case "$CMD" in
   assets) do_assets;;
   teachers) do_teachers;;
   purge) do_purge;;
-  *) sed -n '2,7p' "$0"; exit 2;;
+  *) sed -n '2,8p' "$0"; exit 2;;
 esac

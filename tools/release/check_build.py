@@ -57,6 +57,11 @@ def summarize(agent):
     return rec
 
 
+def run_keys(cfg):
+    """Root keys of the trainval + SimScale recipe the run gets (+train_data, +tf32 of compose); none in the main recipe."""
+    return {k: cfg[k] for k in ("train_data", "tf32") if k in cfg}
+
+
 def reader_shas(overrides, n):
     """sha16 of n teacher BEVs of each role through both readers; raises when the readers disagree."""
     from types import SimpleNamespace
@@ -106,6 +111,7 @@ def main(argv=None) -> int:
         rec = summarize(agent)
         rec["seed"] = cfg.seed
         rec["max_epochs"] = {"trainer": cfg.trainer.params.max_epochs, "agent": cfg.agent.config.max_epochs}
+        rec.update(run_keys(cfg))
         if a.reader_tokens:
             rec["reader_sha16"] = reader_shas(overrides, a.reader_tokens)
     except Exception as e:      # noqa: BLE001  (the agent's refusals are ValueError, KeyError, NotImplementedError, ...)
@@ -120,6 +126,8 @@ def main(argv=None) -> int:
           f"pc_range {rec['pc_range']}, seed {rec['seed']}, epochs {rec['max_epochs']}")
     print(f"[check_build] student interaction {rec['interaction']}, det head {rec['det_head']}, map head {rec['map_head']}, "
           f"undistort {rec['undistort']}, heading from xy {rec['heading_from_xy']}")
+    if "train_data" in rec or "tf32" in rec:
+        print(f"[check_build] train_data {rec.get('train_data', 'navtrain (default)')}, tf32 {rec.get('tf32', False)}")
     print(f"[check_build] BEV KD {rec['bev_kd']}")
     print(f"[check_build] refiner {rec['refiner']}")
     if a.reader_tokens:

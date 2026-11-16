@@ -826,7 +826,8 @@ def label_supply_warning(ck: "CKE2E", stats: Optional[Dict], min_frac: float = 0
     if n_rec <= 0:
         return {"warn": True, "src_epoch": src, "n_rec": 0, "n_labeled": n_src,
                 "msg": f"no rec DONE for epoch {src} (recording expected): GT labels fall back to older / Phase 1"}
-    frac = n_src / max(min(n_rec, N_ROWS), 1)
+    n_rows = int(stats.get("n_rows") or N_ROWS)        # the label store's row space (refresh stats), not a constant
+    frac = n_src / max(min(n_rec, n_rows), 1)
     out = {"warn": frac < min_frac, "src_epoch": src, "n_rec": n_rec, "n_labeled": n_src, "frac_labeled": frac}
     out["msg"] = (f"only {n_src}/{n_rec} rows recorded in epoch {src} have labels (frac {frac:.3f} < {min_frac}); "
                   f"labeler dead or slow? check 'train_e2e.sh status' / labeler/labeler.log" if out["warn"]

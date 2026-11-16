@@ -28,7 +28,10 @@ Exit    --once: after the current backlog (0).  --limit-chunks N: after N chunks
         Abnormal end (SIGTERM, exception, tasks in flight): the pool workers are SIGKILLed and the process ends with
         os._exit after the final writes -- never Pool.terminate()/join(): a worker that died while holding the pool's
         task-queue lock (e.g. a TERM to the whole process group) makes them deadlock (smoke S4, 2026-10-07).
-CPU only, OMP_NUM_THREADS=1, workers <= 48 (default 24), os.nice(5).
+Rows    --n-rows = the row space of the run (default: the rows of --tokens, the packed tokens.parquet of the run's
+        warm-up split); --split = the constants.SPLITS entry whose 'metric_cache' root holds
+        <log>/unknown/<token>/metric_cache.pkl.
+CPU only, OMP_NUM_THREADS=1, workers <= 48 (default 24; env LABELER_MAX_WORKERS raises the cap), os.nice(5).
 """
 from __future__ import annotations
 
@@ -59,7 +62,7 @@ LABEL_COLS = tuple(LCD.LABEL_COLS)
 SCORE_COLS = tuple(LCD.SCORE_COLS)
 PACKED_TOKENS = str(Path(ED.PHASE1_DEFAULT["packed"]) / "tokens.parquet")
 SPLIT = "navtrain_train"
-MAX_WORKERS = 48
+MAX_WORKERS = int(os.environ.get("LABELER_MAX_WORKERS") or 48)     # a many-core host raises it (train_e2e2.sh too)
 G_K = ED.G_K
 GEN_KEYS = ("traj", "labels", "cand_ok", "row_state")
 WRITE_BATCH, WRITE_AGE = 64, 2.0
@@ -167,24 +170,27 @@ def score_one(task) -> tuple:
 class Labeler:
     def __init__(self, io_dir, world_size: int, workers: int = 24, poll: float = 30, max_epoch: Optional[int] = 28,
                  exit_when_done: bool = False, train_pid_file: str = "", retry_errors: bool = False,
-                 once: bool = False, limit_chunks: int = 0, n_rows: int = ED.N_ROWS, tokens: str = PACKED_TOKENS,
+                 once: bool = False, limit_chunks: int = 0, n_rows: Optional[int] = None, tokens: str = PACKED_TOKENS,
                  split: str = SPLIT, scorer: str = "official", inflight: int = 0, pid_grace: float = 600,
                  task_timeout: float = 900, status_every: float = 30, log=print):
         self.io = Path(io_dir)
         assert self.io.is_absolute() and "=" not in str(self.io), f"io_dir must be absolute without '=': {io_dir}"
         assert 1 <= workers <= MAX_WORKERS, f"workers {workers} not in [1, {MAX_WORKERS}]"
         assert scorer in ("official", "fake"), scorer
+        assert split in CM.MC_ROOT, (f"split {split!r} has no metric cache root (constants.SPLITS[...]['metric_cache'])"
+                                     f": known {sorted(CM.MC_ROOT)}")
         self.world_size, self.workers, self.poll = int(world_size), int(workers), float(poll)
         self.max_epoch = max_epoch
         self.exit_when_done, self.train_pid_file = exit_when_done, train_pid_file
         self.retry_errors, self.once, self.limit_chunks = retry_errors, once, int(limit_chunks)
-        self.n_rows, self.split, self.scorer = int(n_rows), split, scorer
+        self.split, self.scorer = split, scorer
         self.inflight_max = int(inflight) or self.workers * 4
         self.pid_grace, self.task_timeout, self.status_every = pid_grace, task_timeout, status_every
         self.log = log
         tt = pd.read_parquet(tokens)
         if "row" in tt.columns:
             assert (tt["row"].to_numpy() == np.arange(len(tt))).all(), "tokens.parquet rows must be 0..N-1"
+        self.n_rows = len(tt) if n_rows is None else int(n_rows)     # row space: the table's rows unless given
         assert len(tt) >= self.n_rows, (len(tt), self.n_rows)
         self.tok = tt.token.astype(str).to_numpy()
         self.logs = tt.log.astype(str).to_numpy()
@@ -670,7 +676,7 @@ def main(argv=None) -> int:
     ap.add_argument("--inflight", type=int, default=0, help="max tasks in the pool (default 4 x workers)")
     ap.add_argument("--task-timeout", type=float, default=900)
     ap.add_argument("--status-every", type=float, default=30)
-    ap.add_argument("--n-rows", type=int, default=ED.N_ROWS)
+    ap.add_argument("--n-rows", type=int, default=None, help="row space (default: the rows of --tokens)")
     ap.add_argument("--tokens", default=PACKED_TOKENS, help="row -> token/log table (packed tokens.parquet)")
     ap.add_argument("--split", default=SPLIT, help="metric-cache split (common.mc_path)")
     ap.add_argument("--scorer", default="official", choices=("official", "fake"), help="'fake' = tests only")

@@ -15,7 +15,9 @@ Input   rec/ep{E}/r{R}/c_<attempt>_<seq>.npz written by e2e_data2.CandRecorder2 
 Output  lab/ep{E}/{traj, labels, cand_ok, valid, row_state}.npy + meta.json (format 'ck2_96') via
         e2e_data2.open_generation2 / write_generation_rows2: traj = the recorded trajectories (bitwise), valid = the
         recorded validity, labels / cand_ok from score_one (ok = SCORE_COLS finite), row_state 1 written last.
-Defaults --workers 32 (user), --world-size 2 (2-GPU run), --max-epoch 28.  CPU only, OMP_NUM_THREADS=1, os.nice(5).
+Defaults --workers 32 (user), --world-size 2 (2-GPU run), --max-epoch 28, --n-rows = the rows of --tokens, --split
+        navtrain_train (train_e2e2.sh passes $SSR_TRAIN_SPLIT: its constants.SPLITS 'metric_cache' root is read).
+        CPU only, OMP_NUM_THREADS=1, os.nice(5).
 """
 from __future__ import annotations
 
@@ -211,7 +213,8 @@ def main(argv=None) -> int:
     ap.add_argument("--inflight", type=int, default=0, help="max tasks in the pool (default 4 x workers)")
     ap.add_argument("--task-timeout", type=float, default=900)
     ap.add_argument("--status-every", type=float, default=30)
-    ap.add_argument("--n-rows", type=int, default=ED.N_ROWS)
+    ap.add_argument("--n-rows", type=int, default=None,
+                    help="row space (default: the rows of --tokens; train_e2e2.sh passes the warm-up packed rows)")
     ap.add_argument("--tokens", default=L1.PACKED_TOKENS, help="row -> token/log table (packed tokens.parquet)")
     ap.add_argument("--split", default=L1.SPLIT, help="metric-cache split (common.mc_path)")
     ap.add_argument("--scorer", default="official", choices=("official", "fake"), help="'fake' = tests only")

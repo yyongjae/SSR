@@ -433,7 +433,11 @@ def restrict_dataset_to_stores(dataset, stores: Sequence[TeacherFeatureStore], n
     def cached(token: str) -> bool:
         return all(store.has_token(token) for store in stores)
 
-    if hasattr(dataset, "_scene_loader"):
+    if hasattr(getattr(dataset, "_scene_loader", None), "restrict_tokens"):
+        # dataloader.MultiSceneLoader (run_training's token-table training set): its SimScale scenes are not in memory
+        dropped = dataset._scene_loader.restrict_tokens(cached)
+        remaining = len(dataset._scene_loader)
+    elif hasattr(dataset, "_scene_loader"):
         frames = dataset._scene_loader.scene_frames_dicts
         before = len(frames)
         dataset._scene_loader.scene_frames_dicts = {

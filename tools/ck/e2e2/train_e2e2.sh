@@ -33,10 +33,12 @@
 #   kd_calib.mode=online (user 2026-11-02, option B; det / map null): no file, fitted inside the run on its own
 #   labelled candidates (navsim ck/kd_calib.OnlineKDCalib; refits in <run>/refiner/kd_calib_online.jsonl).
 # -> training (setsid nohup; DDP ranks share its process group) -> labeler2 (min(16 x ngpu, 48) workers, --world-size ngpu, --max-epoch
-#   MAX_EPOCHS-2, --exit-when-done --train-pid-file) -> watchdog (restart a dead / hung labeler while training lives).
+#   MAX_EPOCHS-2, --exit-when-done --train-pid-file, --tokens / --n-rows = warmup.packed tokens.parquet and its rows, --split
+#   $SSR_TRAIN_SPLIT) -> watchdog (restart a dead / hung labeler while training lives).
 # ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
 #   after the arm file.  Never pkill / pgrep -f: processes are found through the pid files only.
-# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu, at most 48: 32 / 48), LABELER_POLL (30),
+# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu, at most 48: 32 / 48), LABELER_MAX_WORKERS
+#   (that cap, default 48), SSR_TRAIN_SPLIT (the labeler's metric-cache split, default navtrain_train), LABELER_POLL (30),
 #   LABELER_MAX_EPOCH (MAX_EPOCHS-2), E2E_NO_LABELER=1 (refused with the refiner on: training would silently stay on
 #   warm-up labels), E2E_WANDB=online|offline|disable, E2E_EXTRA=<Hydra override file>,
 #   E2E_SMOKE=1, E2E_WAIT_TIMEOUT, E2E_DRY_RUN=1, WATCHDOG_EVERY (120), LABELER_MAX_RESTARTS (20), LABELER_STALL_S (1200),
@@ -120,9 +122,16 @@ for k in sys.argv[2].split("."):
 print("" if d is None else d)' "$L/refiner_effective.json" "$1"
 }
 need_gpus() { [ -n "$GPUS" ] || die "--gpus <2 or 4 GPUs of 0-3> is required (e.g. --gpus 0,1 or 0,1,2,3)"; }
+table_rows() {  # table_rows <parquet>: its row count (status 1, nothing printed, when the file is absent / unreadable)
+  [ -f "$1" ] || return 1
+  "$PY" -c 'import sys, pyarrow.parquet as pq; print(pq.ParquetFile(sys.argv[1]).metadata.num_rows)' "$1" 2>/dev/null
+}
 
 case "$R" in *=*) die "run dir $R contains '='";; esac
 case "$ARM" in main|bevkd) ;; *) die "ARM must be main | bevkd (got $ARM)";; esac
+case "${LABELER_MAX_WORKERS:-48}" in
+  ''|*[!0-9]*|0) die "LABELER_MAX_WORKERS=${LABELER_MAX_WORKERS:-} is not a positive integer";;
+esac
 
 start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   if [ "${E2E_NO_LABELER:-0}" = 1 ]; then log "labeler disabled (E2E_NO_LABELER=1)"; return 0; fi
@@ -130,11 +139,20 @@ start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   need_gpus
   local ng me lw; ng=$(awk -F, '{print NF}' <<< "$GPUS"); me=${LABELER_MAX_EPOCH:-$(( ${MAX_EPOCHS:-30} - 2 ))}
   lw=${LABELER_WORKERS:-$((16 * ng))}; [ "$lw" -gt 48 ] && lw=48      # labeler MAX_WORKERS = 48 (tools/ck/e2e/labeler.py)
+  # LABELER_MAX_WORKERS (checked above) raises that cap, here and in the labeler (it reads the same variable)
+  if [ -n "${LABELER_MAX_WORKERS:-}" ]; then
+    lw=${LABELER_WORKERS:-$((16 * ng))}; [ "$lw" -gt "$LABELER_MAX_WORKERS" ] && lw=$LABELER_MAX_WORKERS
+  fi
   [ "$me" -lt 0 ] && me=0
   local LCMD=("$PY" "$REPO/tools/ck/e2e2/labeler2.py" --io-dir "$IO" --world-size "$ng" --workers "$lw"
               --poll "${LABELER_POLL:-30}" --max-epoch "$me" --exit-when-done --train-pid-file "$L/train.pid")
   local packed; packed=$(eff_field warmup.packed)     # same row -> token table as the training run's warm-up.packed
   [ -n "$packed" ] && LCMD+=(--tokens "$packed/tokens.parquet")
+  # row space = the rows of that table (N of every warm-up array and of LabelStore2 in training); metric cache root =
+  # constants.SPLITS[$SSR_TRAIN_SPLIT]['metric_cache'] (compose env.sh; unset = navtrain_train, the main recipe)
+  local nr; nr=$(table_rows "${packed:-$SSR_DATA_ROOT/ck/packed/navtrain_train}/tokens.parquet") \
+    && LCMD+=(--n-rows "$nr")
+  LCMD+=(--split "${SSR_TRAIN_SPLIT:-navtrain_train}")
   [ "${1:-}" = retry ] && LCMD+=(--retry-errors)
   if [ "${1:-}" = print ]; then echo "${LCMD[*]}"; return 0; fi
   mkdir -p "$LB"; rm -f "$LB/labeler.exit" "$LB/labeler.pid"

@@ -83,7 +83,7 @@ import torch
 
 from ....common import ssr_paths as _SP
 from .constants import CK_KEYS, SUR_MARGINS, SUR_TERMS, SUR_WEIGHTS
-from .online import N_ROWS, _sanitize_traj, bev_sgrid, label_supply_warning, student_topk
+from .online import _sanitize_traj, bev_sgrid, label_supply_warning, student_topk
 
 # ----------------------------------------------------------------------------------------------- constants
 # layout / stream / G_src constants and the variant-column draw, the online variants and the recorder are the data
@@ -990,7 +990,9 @@ class CKE2E2:
     def labels(self):
         if self._labels is None:
             from .e2e_data2 import LabelStore2
-            self._labels = LabelStore2(self.cfg.io_dir, n_rows=N_ROWS, packed=self.cfg.warmup["packed"],
+            # row space = the rows of warmup.packed/tokens.parquet (85,109 for navtrain_train; the labeler's
+            # generations are made with the same count, train_e2e2.sh --n-rows), read at the store's first use
+            self._labels = LabelStore2(self.cfg.io_dir, packed=self.cfg.warmup["packed"],
                                        var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target)
         return self._labels
 

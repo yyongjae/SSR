@@ -58,7 +58,7 @@ PathLike = Union[str, Path]
 K16, NV, G_K = 16, 6, 96                     # column c = k * NV + v (k = v2 top-16 rank, v = variant)
 VNAMES = ("id", "a-1.0", "a-0.5", "a+0.5", "l-0.5", "l+0.5")     # == variants.variant_table(SPEEDS, LATS, 'separate')
 N_TYPES = NV - 1                             # non-identity variant types 1..5
-N_ROWS = ED.N_ROWS                           # 85109 packed navtrain_train rows
+N_ROWS = ED.N_ROWS                           # 85109 packed navtrain_train rows (a run's: e2e_data.packed_rows)
 N_LAB = len(LABEL_COLS)                      # 9
 CK_IDX = list(CK_LABEL_IDX)
 N_WU_ANCHORS = 32                            # AnchorSampler K (8 near + 8 mid + 16 strat)
@@ -282,21 +282,21 @@ class _WUArrays:
 
     def provenance(self, b: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Cheap row-identity guard (report 48 S56-5; the shape checks above cannot see a re-pack that keeps N but
-        changes the token order): sha16 of the packed token list (U16, = label_variants / pack_v2 / label_cands) must
+        changes the token order): sha16 of the packed token list (ck/tokens.token_sha16: U16 for 16-character tokens,
+        = label_variants / pack_v2 / label_cands; never truncated, so SimScale rows count) must
         equal the variant build.json token_sha16, packed/meta.json token_sha16 and raw_labels/shards/_plan.json
         token_sha16 (each when recorded); build.json anchors_sha16 == anchor_sampler.ANCHORS_SHA16 (load_anchors
         enforces the same on the file); build.json sampler == AnchorSampler(seed = build seed).config() minus
         label_source (the anchor subset of every variant row came from that sampler).  WUSourceError on a mismatch;
         -> what was checked.  ~0.1 s (85k tokens + the anchors file)."""
-        import hashlib
-
         import pandas as pd
         from .anchor_sampler import ANCHORS_SHA16
+        from .tokens import token_sha16
         vd, pk, rl = Path(self.cfg["var_dir"]), Path(self.cfg["packed"]), Path(self.cfg["raw_labels"])
         if b is None:
             b = json.loads((vd / "build.json").read_text())
         toks = pd.read_parquet(pk / "tokens.parquet", columns=["token"]).token.astype(str).tolist()
-        sha = hashlib.sha256(np.ascontiguousarray(np.array(toks, "U16")).tobytes()).hexdigest()[:16]
+        sha = token_sha16(toks)
         out: Dict[str, Any] = {"token_sha16": sha, "n_tokens": len(toks)}
         refs = {"variant build.json": (vd / "build.json", b.get("token_sha16")),
                 "packed meta.json": (pk / "meta.json", None), "raw_labels shards/_plan.json":
@@ -698,9 +698,10 @@ def _gen2_meta_ok(meta: Dict[str, Any], d: Path) -> None:
                          f"{GEN2_FORMAT!r} / {G_K} (a CK1 generation in a CK2 io_dir?)")
 
 
-def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: str = "r") -> Dict[str, Any]:
+def open_generation2(io_dir: PathLike, epoch: int, n_rows: Optional[int] = None, mode: str = "r") -> Dict[str, Any]:
     """Generation memmaps {traj f32 [N,96,8,3], labels f32 [N,96,9] (LABEL_COLS), cand_ok bool [N,96], valid bool
-    [N,96], row_state uint8 [N], meta, dir} (as e2e_data.open_generation):
+    [N,96], row_state uint8 [N], meta, dir} (as e2e_data.open_generation; n_rows = the run's row space, the rows of
+    its warm-up packed tokens.parquet; None = the generation's meta.json n_rows, reading only):
       'w+' labeler: creates the files under a FileLock (NaN / False / 0 filled, flushed; meta.json written LAST =
            ready marker, format 'ck2_96'); an existing generation is reopened 'r+' (idempotent restart).
       'r+' labeler restart (must exist).   'r' reader (must exist).
@@ -710,6 +711,9 @@ def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: s
     d = ED.gen_dir(io_dir, epoch)
     meta_p = d / "meta.json"
     if mode == "w+":
+        if n_rows is None:
+            raise ValueError("open_generation2 'w+': n_rows (the rows of the run's warm-up packed tokens.parquet) is "
+                             "required")
         with ED._FileLock(d / ".lock"):
             if not meta_p.is_file():
                 d.mkdir(parents=True, exist_ok=True)
@@ -729,6 +733,8 @@ def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: s
         raise FileNotFoundError(f"generation {d} not ready (no meta.json)")
     meta = json.loads(meta_p.read_text())
     _gen2_meta_ok(meta, d)
+    if n_rows is None:
+        n_rows = int(meta["n_rows"])
     if int(meta["n_rows"]) != int(n_rows):
         raise ValueError(f"{d}: n_rows {meta['n_rows']} != {n_rows}")
     out: Dict[str, Any] = {"meta": meta, "dir": d}
@@ -790,16 +796,18 @@ class LabelStore2:
       token_rng(token, epoch, seed, 'ck2e2e.lab')) (NU11).  Rows without a generation (or row < 0, or out of range):
       has False, zeros, ok False -> the caller fills them (cands2.fill_fallback, NU12).  Non-finite values are zeroed
       (ok False).  tokens None -> taken from the packed RowMap.
+    n_rows None (default) = the rows of the packed tokens.parquet (read at first use), the row space the labeler's
+    generations have (train_e2e2.sh passes the same count as --n-rows).
     Lazy per-process memmaps; pickling drops them and the src index (re-read on first use after a pid change).
     """
 
-    def __init__(self, io_dir: PathLike, n_rows: int = N_ROWS, packed: PathLike = WARMUP_DEFAULT["packed"],
+    def __init__(self, io_dir: PathLike, n_rows: Optional[int] = None, packed: PathLike = WARMUP_DEFAULT["packed"],
                  var_sampling: str = "type_balanced", ep_target: str = EP_TARGET_DEFAULT):
         if var_sampling not in VAR_SAMPLING:
             raise ValueError(f"var_sampling must be one of {VAR_SAMPLING}")
         self.ep_target = check_ep_target(ep_target)
         self.io_dir = Path(io_dir)
-        self.n_rows = int(n_rows)
+        self._n_rows = None if n_rows is None else int(n_rows)
         self.packed = str(packed)
         self.var_sampling = var_sampling
         self.rowmap = ED.RowMap(self.packed)
@@ -818,6 +826,12 @@ class LabelStore2:
         d = self.__dict__.copy()
         d["_gens"], d["_pid"], d["src_epoch"] = {}, None, None
         return d
+
+    @property
+    def n_rows(self) -> int:
+        if self._n_rows is None:
+            self._n_rows = len(self.rowmap)
+        return self._n_rows
 
     def _proc(self):
         if self._pid != os.getpid():

@@ -12,6 +12,7 @@ Owned by data.  Contents
   LabelStore(io_dir, phase1_cfg)    refresh(max_epoch) / lookup(rows): per row the newest generation E <= max_epoch with
                                     row_state == 1, else the Phase 1 set (cand + kd_corr, official labels).
   RowMap / row_of / token_log       packed/navtrain_train/tokens.parquet row <-> token / log
+  packed_rows(packed)               a run's row space = rows of its packed tokens.parquet (N_ROWS = navtrain_train's)
   phase1_label_prior(n_max)         = tools/ck/train_ck.label_prior('navtrain_train')
 
 Every file / memmap / GTLoader is opened lazily per process (pid check); pickling drops them (DataLoader workers,
@@ -37,7 +38,9 @@ from .constants import CK_LABEL_IDX, LABEL_COLS
 PathLike = Union[str, Path]
 
 # ----------------------------------------------------------------------------------------------- constants
-N_ROWS = 85109                      # len(packed/navtrain_train/tokens.parquet)
+# rows of packed/navtrain_train (the main recipe's row space).  A run's row space is the rows of ITS packed
+# tokens.parquet (packed_rows; trainval_simscale: the rows of its token table): no default row count is this number.
+N_ROWS = 85109
 K = 16                              # recorded candidates (= ck_e2e.topk)
 G_K = 32                            # generation trajectories per row = cat(recorded cand 16, recorded tau'_KD 16)
 N_LAB = len(LABEL_COLS)             # 9
@@ -202,6 +205,12 @@ def row_of(token: str, packed: PathLike = PHASE1_DEFAULT["packed"]) -> int:
     return _rowmap(packed).row_of(token)
 
 
+def packed_rows(packed: PathLike = PHASE1_DEFAULT["packed"]) -> int:
+    """The row space of a packed split = rows of its tokens.parquet (every row-indexed asset and on-policy generation of
+    a run that reads it has this many rows)."""
+    return len(_rowmap(packed))
+
+
 def token_log(row: int, packed: PathLike = PHASE1_DEFAULT["packed"]) -> Tuple[str, str]:
     """(token, log) of a packed row (metric cache path = CM.mc_path('navtrain_train', log, token))."""
     return _rowmap(packed).token_log(row)
@@ -229,9 +238,11 @@ class _Phase1:
         d["_pid"], d["_mm"] = None, {}
         return d
 
-    def check(self, n_rows: int = N_ROWS) -> None:
-        """Shapes + kd_targets token order == packed (once, on open)."""
+    def check(self, n_rows: Optional[int] = None) -> None:
+        """Shapes + kd_targets token order == packed (once, on open); n_rows None = the packed tokens.parquet rows."""
         import pandas as pd
+        if n_rows is None:
+            n_rows = packed_rows(self.paths["packed"])
         for name in self.FILES:
             a = self.arr(name)
             if a.shape[0] != n_rows:
@@ -545,9 +556,10 @@ def list_generations(io_dir: PathLike) -> List[int]:
     return sorted(out)
 
 
-def open_generation(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: str = "r") -> Dict[str, Any]:
+def open_generation(io_dir: PathLike, epoch: int, n_rows: Optional[int] = None, mode: str = "r") -> Dict[str, Any]:
     """Generation memmaps {traj f32 [N,32,8,3], labels f32 [N,32,9] (LABEL_COLS), cand_ok bool [N,32],
-    row_state uint8 [N], meta, dir}.
+    row_state uint8 [N], meta, dir}.  n_rows = the run's row space (packed_rows of its packed split); None = the
+    generation's own meta.json n_rows (reading only: creating one needs n_rows).
       'w+' : labeler; creates the files under a FileLock (NaN / False / 0 filled, flushed; meta.json written LAST =
              ready marker).  If the generation already exists it is opened 'r+' (idempotent restart).
       'r+' : labeler restart (must exist).   'r' : reader (must exist)."""
@@ -556,6 +568,8 @@ def open_generation(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: st
     d = gen_dir(io_dir, epoch)
     meta_p = d / "meta.json"
     if mode == "w+":
+        if n_rows is None:
+            raise ValueError("open_generation 'w+': n_rows (the rows of the run's packed tokens.parquet) is required")
         with _FileLock(d / ".lock"):
             if not meta_p.is_file():
                 d.mkdir(parents=True, exist_ok=True)
@@ -576,6 +590,8 @@ def open_generation(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: st
     if not meta_p.is_file():
         raise FileNotFoundError(f"generation {d} not ready (no meta.json)")
     meta = json.loads(meta_p.read_text())
+    if n_rows is None:
+        n_rows = int(meta["n_rows"])
     if int(meta["n_rows"]) != int(n_rows):
         raise ValueError(f"{d}: n_rows {meta['n_rows']} != {n_rows}")
     out: Dict[str, Any] = {"meta": meta, "dir": d}
@@ -627,12 +643,13 @@ class LabelStore:
       G_src int8 [B] (0 Phase 1, 1 the max_epoch generation, 2 an older one), G_epoch int16 [B] (-1 Phase 1).
       row < 0 -> G_ok all False (G_src 0, G_epoch -1).  Non-finite values are zeroed (ok False).
     Files are opened lazily per process; pickling drops them and the src index (re-read on first use after a pid
-    change, with the same max_epoch).  No collectives.
+    change, with the same max_epoch).  No collectives.  n_rows None = the rows of the Phase 1 packed tokens.parquet
+    (read at first use).
     """
 
-    def __init__(self, io_dir: PathLike, phase1_cfg=None, n_rows: int = N_ROWS, k: int = K):
+    def __init__(self, io_dir: PathLike, phase1_cfg=None, n_rows: Optional[int] = None, k: int = K):
         self.io_dir = Path(io_dir)
-        self.n_rows, self.k = int(n_rows), int(k)
+        self._n_rows, self.k = (None if n_rows is None else int(n_rows)), int(k)
         self.p1 = _Phase1(phase1_cfg)
         self.max_epoch: Optional[int] = None
         self.src_epoch: Optional[np.ndarray] = None
@@ -645,6 +662,12 @@ class LabelStore:
         d = self.__dict__.copy()
         d["_gens"], d["_pid"], d["src_epoch"] = {}, None, None
         return d
+
+    @property
+    def n_rows(self) -> int:
+        if self._n_rows is None:
+            self._n_rows = packed_rows(self.p1.paths["packed"])
+        return self._n_rows
 
     def _proc(self):
         if self._pid != os.getpid():

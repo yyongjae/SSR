@@ -64,6 +64,9 @@ teachers:
       refiner_ckpt_sha16: "ad244538115275ee"
     # Camera-only BEVFormer (BEVFormer repo, bevformer_navsim_base, epoch_5.pth), cached 2026-11-10 over the navtrain
     # allow-list (103,288 tokens) with prev_bev along the real 0.5 s chain; axes measured (held-out box probe AUC 0.982).
+    # The root also takes the SimScale tokens of DATA=trainval_simscale (chain = the 4 history frames of a scene):
+    # tools/release/setup/65_cam_teacher_bev.sh, code from tools/release/teachers/ (rebuilt navtrain features match
+    # norm_v15 to float32 rounding).
     bevformer:
       status: ready
       layout: per_token_npz
@@ -86,6 +89,8 @@ teachers:
       refiner_ckpt_sha16: "78657859c9838024"
     # Camera-only Mask2Map (Mask2Map_navsim navsim-front64, ep18 + 1-epoch BN-frozen fine-tune), cached 2026-11-10 in the
     # ReSMap stage1_front64 layout (navtrain allow-list 103,288 + navtest/ 12,146); bev = LSS output post ReLU, with seg.
+    # DATA=trainval_simscale: one index.json over passes/<pass> (real, sim_r<r>; a copied reference cache is pass ref),
+    # 65_cam_teacher_bev.sh / tools/release/teachers/teacher_caches.py map-merge.
     mask2map:
       status: ready
       layout: sharded

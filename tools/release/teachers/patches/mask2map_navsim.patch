@@ -1,0 +1,3158 @@
+diff --git a/mmdetection3d/mmdet3d/__init__.py b/mmdetection3d/mmdet3d/__init__.py
+index ee89aa5..85ada72 100755
+--- a/mmdetection3d/mmdet3d/__init__.py
++++ b/mmdetection3d/mmdet3d/__init__.py
+@@ -19,7 +19,8 @@ def digit_version(version_str):
+ 
+ 
+ mmcv_minimum_version = '1.3.8'
+-mmcv_maximum_version = '1.4.0'
++# 1.7.2 is the last mmcv 1.x and the only one that builds against torch 2.x (RTX 5090 / sm_120 needs cu128)
++mmcv_maximum_version = '1.7.2'
+ mmcv_version = digit_version(mmcv.__version__)
+ 
+ 
+diff --git a/mmdetection3d/mmdet3d/datasets/pipelines/data_augment_utils.py b/mmdetection3d/mmdet3d/datasets/pipelines/data_augment_utils.py
+index 23b6aad..d58bda4 100755
+--- a/mmdetection3d/mmdet3d/datasets/pipelines/data_augment_utils.py
++++ b/mmdetection3d/mmdet3d/datasets/pipelines/data_augment_utils.py
+@@ -2,7 +2,10 @@
+ import numba
+ import numpy as np
+ import warnings
+-from numba.errors import NumbaPerformanceWarning
++try:
++    from numba.core.errors import NumbaPerformanceWarning  # numba >= 0.49
++except ImportError:
++    from numba.errors import NumbaPerformanceWarning
+ 
+ from mmdet3d.core.bbox import box_np_ops
+ 
+diff --git a/mmdetection3d/mmdet3d/ops/ball_query/src/ball_query.cpp b/mmdetection3d/mmdet3d/ops/ball_query/src/ball_query.cpp
+index 6e9d5f7..71b9ad4 100755
+--- a/mmdetection3d/mmdet3d/ops/ball_query/src/ball_query.cpp
++++ b/mmdetection3d/mmdet3d/ops/ball_query/src/ball_query.cpp
+@@ -1,7 +1,7 @@
+ // Modified from
+ // https://github.com/sshaoshuai/Pointnet2.PyTorch/tree/master/pointnet2/src/ball_query.cpp
+ 
+-#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>  // getCurrentCUDAStream; came in through THC.h before torch 1.11
+ #include <cuda.h>
+ #include <cuda_runtime_api.h>
+ #include <torch/extension.h>
+@@ -9,7 +9,6 @@
+ 
+ #include <vector>
+ 
+-extern THCState *state;
+ 
+ #define CHECK_CUDA(x) \
+   TORCH_CHECK(x.type().is_cuda(), #x, " must be a CUDAtensor ")
+diff --git a/mmdetection3d/mmdet3d/ops/furthest_point_sample/src/furthest_point_sample.cpp b/mmdetection3d/mmdet3d/ops/furthest_point_sample/src/furthest_point_sample.cpp
+index be05890..08db919 100755
+--- a/mmdetection3d/mmdet3d/ops/furthest_point_sample/src/furthest_point_sample.cpp
++++ b/mmdetection3d/mmdet3d/ops/furthest_point_sample/src/furthest_point_sample.cpp
+@@ -2,13 +2,11 @@
+ // https://github.com/sshaoshuai/Pointnet2.PyTorch/tree/master/pointnet2/src/sampling.cpp
+ 
+ #include <ATen/cuda/CUDAContext.h>
+-#include <THC/THC.h>
+ #include <torch/extension.h>
+ #include <torch/serialize/tensor.h>
+ 
+ #include <vector>
+ 
+-extern THCState *state;
+ 
+ int furthest_point_sampling_wrapper(int b, int n, int m,
+                                     at::Tensor points_tensor,
+@@ -47,9 +45,9 @@ int furthest_point_sampling_with_dist_wrapper(int b, int n, int m,
+                                               at::Tensor temp_tensor,
+                                               at::Tensor idx_tensor) {
+ 
+-  const float *points = points_tensor.data<float>();
+-  float *temp = temp_tensor.data<float>();
+-  int *idx = idx_tensor.data<int>();
++  const float *points = points_tensor.data_ptr<float>();
++  float *temp = temp_tensor.data_ptr<float>();
++  int *idx = idx_tensor.data_ptr<int>();
+ 
+   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+   furthest_point_sampling_with_dist_kernel_launcher(b, n, m, points, temp, idx, stream);
+diff --git a/mmdetection3d/mmdet3d/ops/gather_points/src/gather_points.cpp b/mmdetection3d/mmdet3d/ops/gather_points/src/gather_points.cpp
+index 01a3e40..538817e 100755
+--- a/mmdetection3d/mmdet3d/ops/gather_points/src/gather_points.cpp
++++ b/mmdetection3d/mmdet3d/ops/gather_points/src/gather_points.cpp
+@@ -1,11 +1,9 @@
+ #include <ATen/cuda/CUDAContext.h>
+-#include <THC/THC.h>
+ #include <torch/extension.h>
+ #include <torch/serialize/tensor.h>
+ 
+ #include <vector>
+ 
+-extern THCState *state;
+ 
+ int gather_points_wrapper(int b, int c, int n, int npoints,
+                           at::Tensor points_tensor, at::Tensor idx_tensor,
+diff --git a/mmdetection3d/mmdet3d/ops/group_points/src/group_points.cpp b/mmdetection3d/mmdet3d/ops/group_points/src/group_points.cpp
+index 3cd6fc8..ed5a3ad 100755
+--- a/mmdetection3d/mmdet3d/ops/group_points/src/group_points.cpp
++++ b/mmdetection3d/mmdet3d/ops/group_points/src/group_points.cpp
+@@ -1,7 +1,7 @@
+ // Modified from
+ // https://github.com/sshaoshuai/Pointnet2.PyTorch/tree/master/pointnet2/src/group_points.cpp
+ 
+-#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>  // getCurrentCUDAStream; came in through THC.h before torch 1.11
+ #include <cuda.h>
+ #include <cuda_runtime_api.h>
+ #include <torch/extension.h>
+@@ -9,7 +9,6 @@
+ 
+ #include <vector>
+ 
+-extern THCState *state;
+ 
+ int group_points_wrapper(int b, int c, int n, int npoints, int nsample,
+                          at::Tensor points_tensor, at::Tensor idx_tensor,
+diff --git a/mmdetection3d/mmdet3d/ops/interpolate/src/interpolate.cpp b/mmdetection3d/mmdet3d/ops/interpolate/src/interpolate.cpp
+index 6382579..b9f7aab 100755
+--- a/mmdetection3d/mmdet3d/ops/interpolate/src/interpolate.cpp
++++ b/mmdetection3d/mmdet3d/ops/interpolate/src/interpolate.cpp
+@@ -1,7 +1,7 @@
+ // Modified from
+ // https://github.com/sshaoshuai/Pointnet2.PyTorch/tree/master/pointnet2/src/interpolate.cpp
+ 
+-#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>  // getCurrentCUDAStream; came in through THC.h before torch 1.11
+ #include <cuda.h>
+ #include <cuda_runtime_api.h>
+ #include <math.h>
+@@ -12,7 +12,6 @@
+ 
+ #include <vector>
+ 
+-extern THCState *state;
+ 
+ void three_nn_wrapper(int b, int n, int m, at::Tensor unknown_tensor,
+                       at::Tensor known_tensor, at::Tensor dist2_tensor,
+diff --git a/mmdetection3d/mmdet3d/ops/knn/src/knn.cpp b/mmdetection3d/mmdet3d/ops/knn/src/knn.cpp
+index 84ddf4b..e739a50 100755
+--- a/mmdetection3d/mmdet3d/ops/knn/src/knn.cpp
++++ b/mmdetection3d/mmdet3d/ops/knn/src/knn.cpp
+@@ -3,10 +3,8 @@
+ #include <torch/serialize/tensor.h>
+ #include <torch/extension.h>
+ #include <vector>
+-#include <THC/THC.h>
+ #include <ATen/cuda/CUDAContext.h>
+ 
+-extern THCState *state;
+ 
+ #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x, " must be a CUDAtensor ")
+ #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x, " must be contiguous ")
+diff --git a/mmdetection3d/mmdet3d/ops/spconv/conv.py b/mmdetection3d/mmdet3d/ops/spconv/conv.py
+index 25f4e5e..91eaaad 100755
+--- a/mmdetection3d/mmdet3d/ops/spconv/conv.py
++++ b/mmdetection3d/mmdet3d/ops/spconv/conv.py
+@@ -223,7 +223,7 @@ class SparseConvolution(SparseModule):
+         return out_tensor
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SparseConv2d(SparseConvolution):
+     def __init__(
+         self,
+@@ -251,7 +251,7 @@ class SparseConv2d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SparseConv3d(SparseConvolution):
+     def __init__(
+         self,
+@@ -279,7 +279,7 @@ class SparseConv3d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SparseConv4d(SparseConvolution):
+     def __init__(
+         self,
+@@ -307,7 +307,7 @@ class SparseConv4d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SparseConvTranspose2d(SparseConvolution):
+     def __init__(
+         self,
+@@ -336,7 +336,7 @@ class SparseConvTranspose2d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SparseConvTranspose3d(SparseConvolution):
+     def __init__(
+         self,
+@@ -365,7 +365,7 @@ class SparseConvTranspose3d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SparseInverseConv2d(SparseConvolution):
+     def __init__(self, in_channels, out_channels, kernel_size, indice_key, bias=True):
+         super(SparseInverseConv2d, self).__init__(
+@@ -379,7 +379,7 @@ class SparseInverseConv2d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SparseInverseConv3d(SparseConvolution):
+     def __init__(self, in_channels, out_channels, kernel_size, indice_key, bias=True):
+         super(SparseInverseConv3d, self).__init__(
+@@ -393,7 +393,7 @@ class SparseInverseConv3d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SubMConv2d(SparseConvolution):
+     def __init__(
+         self,
+@@ -422,7 +422,7 @@ class SubMConv2d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SubMConv3d(SparseConvolution):
+     def __init__(
+         self,
+@@ -451,7 +451,7 @@ class SubMConv3d(SparseConvolution):
+         )
+ 
+ 
+-@CONV_LAYERS.register_module()
++@CONV_LAYERS.register_module(force=True)  # mmcv>=1.5 registers the same names
+ class SubMConv4d(SparseConvolution):
+     def __init__(
+         self,
+diff --git a/mmdetection3d/setup.py b/mmdetection3d/setup.py
+index a6c5be2..140d236 100755
+--- a/mmdetection3d/setup.py
++++ b/mmdetection3d/setup.py
+@@ -241,7 +241,7 @@ if __name__ == '__main__':
+                     'src/maxpool.cc',
+                     'src/maxpool_cuda.cu',
+                 ],
+-                extra_args=['-w', '-std=c++14']),
++                extra_args=['-w', '-std=c++17']),  # torch 2.x headers need C++17
+             make_cuda_ext(
+                 name='iou3d_cuda',
+                 module='mmdet3d.ops.iou3d',
+diff --git a/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep.py b/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep.py
+new file mode 100644
+index 0000000..21e1785
+--- /dev/null
++++ b/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep.py
+@@ -0,0 +1,329 @@
++# Mask2Map phase 1 on NAVSIM, trained as a drop-in replacement for the ReSMap front64 stage-1 map teacher:
++# BEV semantic segmentation only (semantic_only, as Mask2Map_b2d 547c0d3): seg_head on the LSS BEV with ReSMap's
++# focal x10 + dice x1, + LiDAR depth (training only) + PV seg.  The instance branch (pixel decoder, Mask2Former
++# queries, matching) is built but not run, so its loss_segm_* / assigner settings are unused.
++#
++# Matches resmap_navsim plugin/configs/resmap_nav_rideflux_front64/resmap_nav_stage1.py:
++#   cameras   CAM_L0, CAM_F0, CAM_R0; 1920x1080 -> 800x450 (PIL draft + LANCZOS, as ReSMap's mirror) -> pad to 480x800
++#   ROI       x [0, 64] m forward, y [-32, 32] m left (roi_size 64 x 64, roi_center (32, 0)); pc_range [0,-32,-3,64,32,5]
++#   BEV       100 x 100 at 0.64 m, 256 ch (LSS 200 x 200 at 0.32 m, stride-2 conv); rows = y from -32 m, cols = x
++#             from 0 m (ReSMap's cache layout is this flipped on rows; tools/navsim/cache_teacher_m2m.py flips it)
++#   seg       4 x 200 x 200 at 0.32 m (one nearest-x2 up block, ReSMap MapSegHead layout); road / walkway /
++#             centerline / crosswalk, multi-label sigmoid, GT rasterised exactly as ReSMap
++#   splits    train = navtrain logs in train_logs (978 logs, 126,032 frames); val = val_logs (214 logs, 26,463 frames)
++#   schedule  18 epochs, val every 3 epochs, pick the checkpoint by val mIoU (ReSMap's eval interval / length)
++# Mask2Map's own recipe is kept for the optimisation: AdamW lr 6e-4 x (global batch / 32), backbone x0.1,
++# weight decay 0.01, 500 warmup iters, cosine to 1e-3, grad clip 35, fp16 (loss scale 512); R50 from
++# sparsebev_resnet.pth with ImageNet RGB normalisation; PhotoMetricDistortion + GridMask(0.7).
++# LSS depth bins [1, 72) m in 0.5 m (142 bins) reach the far ROI corner (71.6 m); the nuScenes [1, 35) would leave
++# 35-64 m without depth supervision.
++#
++# Data: tools/navsim/prepare_data.sh (infos + map GT); launch: tools/navsim/train_front64.sh.
++_base_ = ["../_base_/default_runtime.py"]
++
++plugin = True
++plugin_dir = "projects/mmdet3d_plugin/"
++
++navsim_root = "/workspace/navsim_workspace/mask2map/"  # infos/, map_gt_navsim_front64x64/, ckpts/
++log_split_yaml = "/workspace/navsim/navsim/planning/script/config/training/default_train_val_test_log_split.yaml"
++
++point_cloud_range = [0.0, -32.0, -3.0, 64.0, 32.0, 5.0]  # true ego metres (rear axle), as ReSMap's pc_range
++voxel_size = [0.32, 0.32, 8.0]  # LSS grid 200 (x) x 200 (y) x 1 (z); downsample 2 -> BEV 100 x 100 at 0.64 m
++dbound = [1.0, 72.0, 0.5]
++roi_size = (64.0, 64.0)
++roi_center = (32.0, 0.0)
++canvas_size = (200, 200)  # (W forward, H lateral), 0.32 m
++
++grid_config = {
++    "x": [0.0, 64.0, 0.32],  # unused by LSSTransform (it builds its grid from pc_range / voxel_size)
++    "y": [-32.0, 32.0, 0.32],  # unused
++    "z": [-3.0, 5.0, 8.0],  # unused
++    "depth": [1.0, 72.0, 0.5],  # used: depth GT range and bins
++}
++
++img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
++
++# detection classes of the nuScenes base dataset class; unused
++class_names = ["car", "truck", "construction_vehicle", "bus", "trailer", "barrier", "motorcycle", "bicycle",
++               "pedestrian", "traffic_cone"]
++map_classes = ["road", "walkway", "centerline", "crosswalk"]  # ReSMap front64 cat2id order
++camera_names = ["CAM_L0", "CAM_F0", "CAM_R0"]
++num_vec = 100  # instance branch only (unused here)
++fixed_ptsnum_per_gt_line = 20
++fixed_ptsnum_per_pred_line = 20
++eval_use_same_gt_sample_num_flag = True
++num_map_classes = len(map_classes)
++
++input_modality = dict(use_lidar=False, use_camera=True, use_radar=False, use_map=False, use_external=True)
++
++_dim_ = 256
++_pos_dim_ = _dim_ // 2
++_ffn_dim_ = _dim_ * 2
++_num_levels_ = 1
++bev_h_ = 100
++bev_w_ = 100
++queue_length = 1  # single frame
++
++dn_enabled = False
++
++aux_seg_cfg = dict(
++    use_aux_seg=True,
++    bev_seg=True,  # 4-class BEV seg on the LSS BEV (the tensor to cache)
++    pv_seg=True,  # 4-class PV seg from the BEV GT by inverse perspective mapping (navsim_map_utils.pv_ground_labels)
++    seg_classes=num_map_classes,
++    feat_down_sample=32,
++    pv_thickness=1,
++)
++
++model = dict(
++    type="Mask2Map",
++    use_grid_mask=True,
++    video_test_mode=False,
++    pretrained=dict(img=navsim_root + "ckpts/sparsebev_resnet.pth"),
++    img_backbone=dict(
++        type="ResNet",
++        depth=50,
++        num_stages=4,
++        out_indices=(3,),
++        frozen_stages=1,
++        norm_cfg=dict(type="BN", requires_grad=False),
++        norm_eval=True,
++        style="pytorch",
++    ),
++    img_neck=dict(
++        type="FPN",
++        in_channels=[2048],
++        out_channels=_dim_,
++        start_level=0,
++        add_extra_convs="on_output",
++        num_outs=_num_levels_,
++        relu_before_extra_convs=True,
++    ),
++    pts_bbox_head=dict(
++        type="Mask2MapHead_1Phase",
++        semantic_only=True,
++        seg_upsample=1,  # BEV 100 x 100 -> seg 200 x 200
++        seg_score_thr=0.4,  # ReSMap's eval rule
++        bev_h=bev_h_,
++        bev_w=bev_w_,
++        num_vec_one2one=num_vec,
++        num_pts_per_vec=fixed_ptsnum_per_pred_line,
++        num_pts_per_gt_vec=fixed_ptsnum_per_gt_line,
++        dir_interval=1,
++        num_classes=num_map_classes,
++        in_channels=_dim_,
++        sync_cls_avg_factor=True,
++        with_box_refine=True,
++        as_two_stage=False,
++        code_size=2,
++        dn_enabled=dn_enabled,
++        dn_weight=1,
++        code_weights=[1.0, 1.0, 1.0, 1.0],
++        aux_seg=aux_seg_cfg,
++        pc_range=point_cloud_range,
++        transformer=dict(
++            type="Mask2Map_Transformer_1Phase",
++            num_cams=len(camera_names),
++            rotate_prev_bev=True,
++            use_can_bus=True,
++            dn_enabled=dn_enabled,
++            dn_group_num=5,
++            dn_noise_scale=0.01,
++            mask_noise_scale=0.2,
++            num_vec_one2one=num_vec,
++            embed_dims=_dim_,
++            num_classes=num_map_classes,  # the transformer's defaults are the 3 nuScenes classes
++            bev_h=bev_h_,  # ... and the nuScenes 200 x 100 / 60 x 30 m
++            bev_w=bev_w_,
++            patch_size=[point_cloud_range[4] - point_cloud_range[1], point_cloud_range[3] - point_cloud_range[0]],
++            bev_encoder=None,
++            bev_neck=dict(
++                type="MSDeformAttnPixelDecoder",
++                num_outs=4,
++                in_channels=[256, 256, 256, 256],
++                strides=[1, 2, 4, 8],
++                norm_cfg=dict(type="GN", num_groups=32),
++                act_cfg=dict(type="ReLU"),
++                encoder=dict(
++                    num_layers=6,
++                    layer_cfg=dict(
++                        self_attn_cfg=dict(embed_dims=256, num_heads=8, num_levels=3, num_points=4, dropout=0.0,
++                                           batch_first=True),
++                        ffn_cfg=dict(embed_dims=256, feedforward_channels=1024, num_fcs=2, ffn_drop=0.0,
++                                     act_cfg=dict(type="ReLU", inplace=True)),
++                    ),
++                ),
++                positional_encoding=dict(num_feats=128, normalize=True),
++            ),
++            encoder=dict(
++                type="LSSTransform",
++                in_channels=_dim_,
++                out_channels=_dim_,
++                feat_down_sample=32,
++                pc_range=point_cloud_range,
++                voxel_size=voxel_size,
++                dbound=dbound,
++                downsample=2,
++                loss_depth_weight=3.0,
++                depthnet_cfg=dict(use_dcn=False, with_cp=False, aspp_mid_channels=96),
++                grid_config=grid_config,
++            ),
++            segm_decoder=dict(
++                type="Mask2FormerTransformerDecoder",
++                return_intermediate=True,
++                num_layers=3,
++                layer_cfg=dict(
++                    self_attn_cfg=dict(embed_dims=256, num_heads=8, dropout=0.0, batch_first=True),
++                    cross_attn_cfg=dict(embed_dims=256, num_heads=8, dropout=0.0, batch_first=True),
++                    ffn_cfg=dict(embed_dims=256, feedforward_channels=2048, num_fcs=2, ffn_drop=0.0,
++                                 act_cfg=dict(type="ReLU", inplace=True)),
++                ),
++                init_cfg=None,
++            ),
++        ),
++        loss_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=2.0),  # unused
++        loss_bbox=dict(type="L1Loss", loss_weight=0.0),  # unused
++        loss_iou=dict(type="GIoULoss", loss_weight=0.0),  # unused
++        loss_seg=dict(type="ReSMapSegLoss", focal_weight=10.0, dice_weight=1.0),  # ReSMap stage 1
++        loss_pv_seg=dict(type="SimpleLoss", pos_weight=1.0, loss_weight=2.0),
++        loss_segm_cls=dict(type="CrossEntropyLoss", use_sigmoid=False, loss_weight=2.0, reduction="mean",
++                           class_weight=[1.0] * len(map_classes) + [0.1]),  # unused
++        loss_segm_mask=dict(type="CrossEntropyLoss", use_sigmoid=True, reduction="mean", loss_weight=5.0),  # unused
++        loss_segm_dice=dict(type="DiceLoss", use_sigmoid=True, activate=True, reduction="mean", naive_dice=True,
++                            eps=1.0, loss_weight=5.0),  # unused
++    ),
++    train_cfg=dict(
++        pts=dict(
++            grid_size=[512, 512, 1],
++            voxel_size=voxel_size,
++            point_cloud_range=point_cloud_range,
++            out_size_factor=4,
++            assigner=dict(
++                type="MapTRAssigner",
++                cls_cost=dict(type="FocalLossCost", weight=2.0),
++                reg_cost=dict(type="BBoxL1Cost", weight=0.0, box_format="xywh"),
++                iou_cost=dict(type="IoUCost", iou_mode="giou", weight=0.0),
++                pts_cost=dict(type="OrderedPtsL1Cost", weight=5),
++                pc_range=point_cloud_range,
++            ),
++            assigner_segm=dict(
++                type="MaskHungarianAssigner",
++                cls_cost=dict(type="ClassificationCost", weight=2.0),
++                mask_cost=dict(type="CrossEntropyLossCost", weight=5.0, use_sigmoid=True),
++                dice_cost=dict(type="DiceCost", weight=5.0, pred_act=True, eps=1.0),
++            ),
++        )
++    ),
++)
++
++dataset_type = "NavsimOfflineMapDataset"
++file_client_args = dict(backend="disk")
++
++# CustomCollect3D's default meta_keys also copy gt_depth (3 x 480 x 800 float32) into img_metas; leave it out
++meta_keys = ("filename", "ori_shape", "img_shape", "lidar2img", "pad_shape", "scale_factor", "flip",
++             "pcd_horizontal_flip", "pcd_vertical_flip", "box_mode_3d", "box_type_3d", "img_norm_cfg", "sample_idx",
++             "prev_idx", "next_idx", "pcd_scale_factor", "pts_filename", "scene_token", "camera_intrinsics", "can_bus",
++             "lidar2global", "lidar2cam", "camera2ego", "cam_intrinsic", "img_aug_matrix", "lidar2ego", "timestamp")
++
++train_pipeline = [
++    dict(type="LoadNavsimMultiViewImages", img_size=(800, 450), calib_size=(1920, 1080)),
++    dict(type="PhotoMetricDistortionMultiViewImage"),
++    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
++    dict(type="LoadNavsimPointsFromFile", coord_type="LIDAR", load_dim=5, use_dim=5),
++    dict(type="NavsimPointToMultiViewDepth", downsample=1, grid_config=grid_config),
++    dict(type="PadMultiViewImageDepth", size_divisor=32),
++    dict(type="DefaultFormatBundle3D", with_gt=False, with_label=False, class_names=map_classes),
++    dict(type="CustomCollect3D", keys=["img", "gt_depth"], meta_keys=meta_keys),
++]
++
++test_pipeline = [
++    dict(type="LoadNavsimMultiViewImages", img_size=(800, 450), calib_size=(1920, 1080)),
++    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
++    dict(
++        type="MultiScaleFlipAug3D",
++        img_scale=(800, 450),
++        pts_scale_ratio=1,
++        flip=False,
++        transforms=[
++            dict(type="PadMultiViewImage", size_divisor=32),
++            dict(type="DefaultFormatBundle3D", with_gt=False, with_label=False, class_names=map_classes),
++            dict(type="CustomCollect3D", keys=["img"], meta_keys=meta_keys),
++        ],
++    ),
++]
++
++navsim_common = dict(
++    type=dataset_type,
++    classes=class_names,
++    modality=input_modality,
++    aux_seg=aux_seg_cfg,
++    bev_size=(bev_h_, bev_w_),
++    pc_range=point_cloud_range,
++    fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
++    eval_use_same_gt_sample_num_flag=eval_use_same_gt_sample_num_flag,
++    padding_value=-10000,
++    map_classes=map_classes,
++    queue_length=queue_length,
++    camera_names=camera_names,
++    log_split_yaml=log_split_yaml,
++    roi_size=roi_size,
++    roi_center=roi_center,
++    canvas_size=canvas_size,
++    seg_thickness=3,
++    pv_ground_z=-0.33,  # ground height in the NAVSIM ego frame (rear axle), measured on MergedPointCloud
++    box_type_3d="LiDAR",
++)
++
++data = dict(
++    samples_per_gpu=16,  # x 4 GPUs = global 64 (tools/navsim/train_front64.sh sets it and the lr)
++    workers_per_gpu=8,
++    train=dict(
++        **navsim_common,
++        ann_file=navsim_root + "infos/navsim_map_infos_navtrain.pkl",
++        map_gt_file=navsim_root + "map_gt_navsim_front64x64/navtrain.npz",
++        log_split="train",
++        pipeline=train_pipeline,
++        test_mode=False,
++        dn_enabled=dn_enabled,
++    ),
++    val=dict(
++        **navsim_common,
++        ann_file=navsim_root + "infos/navsim_map_infos_navtrain.pkl",
++        map_gt_file=navsim_root + "map_gt_navsim_front64x64/navtrain.npz",
++        log_split="val",
++        pipeline=test_pipeline,
++        test_mode=True,
++        samples_per_gpu=1,
++    ),
++    test=dict(
++        **navsim_common,
++        ann_file=navsim_root + "infos/navsim_map_infos_navtrain.pkl",
++        map_gt_file=navsim_root + "map_gt_navsim_front64x64/navtrain.npz",
++        log_split="val",  # navtest: ann_file / map_gt_file = ...navtest..., log_split=None
++        pipeline=test_pipeline,
++        test_mode=True,
++    ),
++    shuffler_sampler=dict(type="DistributedGroupSampler"),
++    nonshuffler_sampler=dict(type="DistributedSampler"),
++)
++
++optimizer = dict(
++    type="AdamW",
++    lr=1.2e-3,  # = 6e-4 x (global batch 64 / 32); the launcher sets it from GPUs x samples_per_gpu
++    paramwise_cfg=dict(custom_keys={"img_backbone": dict(lr_mult=0.1)}),
++    weight_decay=0.01,
++)
++optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
++lr_config = dict(policy="CosineAnnealing", warmup="linear", warmup_iters=500, warmup_ratio=1.0 / 3, min_lr_ratio=1e-3)
++total_epochs = 18
++# Both metrics are logged.  ReSMap's rule (exclusive argmax, sigmoid >= 0.4) almost never labels centerline, which
++# lies on road (the ReSMap teacher's own cache scores centerline IoU 0.003 under it, 0.589 multi-label, on val), so the
++# best checkpoint is picked by the multi-label mIoU.  Every epoch is kept anyway (checkpoint_config).
++evaluation = dict(interval=3, pipeline=test_pipeline, save_best="NavsimSeg/mIoU_ml", rule="greater")
++
++runner = dict(type="EpochBasedRunner", max_epochs=total_epochs)
++
++log_config = dict(interval=50, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")])
++fp16 = dict(loss_scale=512.0)
++checkpoint_config = dict(interval=1, max_keep_ckpts=-1)
++find_unused_parameters = True
+diff --git a/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_bnft.py b/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_bnft.py
+new file mode 100644
+index 0000000..796bacd
+--- /dev/null
++++ b/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_bnft.py
+@@ -0,0 +1,20 @@
++# BN-calibration fine-tune of a finished M2M_navsim_front64_r50_sem_18ep run, launched by tools/navsim/bnft_front64.sh
++# (which sets load_from to the run's checkpoint): one short epoch over every 4th train frame (31,508 frames, 492
++# iterations at 4 GPUs x 16) with every BatchNorm frozen in eval mode (FreezeBNHook), AdamW lr 1e-4 (global batch
++# 64), 50 warmup iterations, then constant 1e-4 (the cosine policy steps per epoch and this is a single epoch);
++# augmentation (PhotoMetricDistortion, GridMask) as in training.
++#
++# Why: the LSS seg head comes to rely on the per-batch statistics of the last BEV BatchNorm, so the eval-mode
++# (running-statistics) prediction that the EvalHook scores and the teacher cache stores drifts from the train-mode
++# one (epoch 9: road IoU 0.41 eval mode vs 0.74 with batch statistics on the same val frames).  See FreezeBNHook.
++# The gap is a high-lr effect and had closed by itself at epochs 15/18 (eval mode >= batch statistics); on epoch 18
++# of the baseline run this fine-tune still added +0.008 full-val mIoU_ml (0.4528 -> 0.4612), i.e. extra training.
++_base_ = ["./M2M_navsim_front64_r50_sem_18ep.py"]
++
++data = dict(train=dict(load_interval=4))
++optimizer = dict(lr=1e-4)
++lr_config = dict(policy="CosineAnnealing", warmup="linear", warmup_iters=50, warmup_ratio=1.0 / 3, min_lr_ratio=1e-2)
++total_epochs = 1
++runner = dict(type="EpochBasedRunner", max_epochs=total_epochs)
++evaluation = dict(interval=1, save_best=None)
++custom_hooks = [dict(type="FreezeBNHook", priority="HIGHEST")]
+diff --git a/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_undist.py b/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_undist.py
+new file mode 100644
+index 0000000..46f3f75
+--- /dev/null
++++ b/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_undist.py
+@@ -0,0 +1,57 @@
++# M2M_navsim_front64_r50_sem_18ep.py with the camera images undistorted to the ideal pinhole camera of the same
++# intrinsics (LoadNavsimMultiViewImages(undistort=True)); everything else is identical.
++#
++# Why: NAVSIM's lenses have strong barrel distortion (k1 -0.356, k2 0.17).  LSS lifts every image feature along a fixed
++# pinhole ray, so without undistortion a feature at the image edge is placed 4.2 deg off its true direction (about
++# 2-5 m at 30-64 m).  BEVFormer (ReSMap) can absorb this with learned sampling offsets; LSS cannot.  At epoch 3 the
++# undistort=False run scored road IoU 0.72 at |azimuth| < 15 deg but ~0.53 at 15-90 deg on train frames, against
++# 0.977 / 0.962 for ReSMap, consistent with that.  This deviates from resmap_navsim's camera handling (it does not
++# undistort); SSR's own student undistorts by default.
++_base_ = ["./M2M_navsim_front64_r50_sem_18ep.py"]
++
++img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
++map_classes = ["road", "walkway", "centerline", "crosswalk"]
++grid_config = {
++    "x": [0.0, 64.0, 0.32],
++    "y": [-32.0, 32.0, 0.32],
++    "z": [-3.0, 5.0, 8.0],
++    "depth": [1.0, 72.0, 0.5],
++}
++meta_keys = ("filename", "ori_shape", "img_shape", "lidar2img", "pad_shape", "scale_factor", "flip",
++             "pcd_horizontal_flip", "pcd_vertical_flip", "box_mode_3d", "box_type_3d", "img_norm_cfg", "sample_idx",
++             "prev_idx", "next_idx", "pcd_scale_factor", "pts_filename", "scene_token", "camera_intrinsics", "can_bus",
++             "lidar2global", "lidar2cam", "camera2ego", "cam_intrinsic", "img_aug_matrix", "lidar2ego", "timestamp")
++
++train_pipeline = [
++    dict(type="LoadNavsimMultiViewImages", img_size=(800, 450), calib_size=(1920, 1080), undistort=True),
++    dict(type="PhotoMetricDistortionMultiViewImage"),
++    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
++    dict(type="LoadNavsimPointsFromFile", coord_type="LIDAR", load_dim=5, use_dim=5),
++    dict(type="NavsimPointToMultiViewDepth", downsample=1, grid_config=grid_config),
++    dict(type="PadMultiViewImageDepth", size_divisor=32),
++    dict(type="DefaultFormatBundle3D", with_gt=False, with_label=False, class_names=map_classes),
++    dict(type="CustomCollect3D", keys=["img", "gt_depth"], meta_keys=meta_keys),
++]
++
++test_pipeline = [
++    dict(type="LoadNavsimMultiViewImages", img_size=(800, 450), calib_size=(1920, 1080), undistort=True),
++    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
++    dict(
++        type="MultiScaleFlipAug3D",
++        img_scale=(800, 450),
++        pts_scale_ratio=1,
++        flip=False,
++        transforms=[
++            dict(type="PadMultiViewImage", size_divisor=32),
++            dict(type="DefaultFormatBundle3D", with_gt=False, with_label=False, class_names=map_classes),
++            dict(type="CustomCollect3D", keys=["img"], meta_keys=meta_keys),
++        ],
++    ),
++]
++
++data = dict(
++    train=dict(pipeline=train_pipeline),
++    val=dict(pipeline=test_pipeline),
++    test=dict(pipeline=test_pipeline),
++)
++evaluation = dict(pipeline=test_pipeline)
+diff --git a/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_undist_bnft.py b/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_undist_bnft.py
+new file mode 100644
+index 0000000..35636c0
+--- /dev/null
++++ b/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep_undist_bnft.py
+@@ -0,0 +1,12 @@
++# BN-calibration fine-tune of a finished M2M_navsim_front64_r50_sem_18ep_undist run; identical to
++# M2M_navsim_front64_r50_sem_18ep_bnft.py except for the base (undistorted images).  Launch with
++# tools/navsim/bnft_front64.sh.
++_base_ = ["./M2M_navsim_front64_r50_sem_18ep_undist.py"]
++
++data = dict(train=dict(load_interval=4))
++optimizer = dict(lr=1e-4)
++lr_config = dict(policy="CosineAnnealing", warmup="linear", warmup_iters=50, warmup_ratio=1.0 / 3, min_lr_ratio=1e-2)
++total_epochs = 1
++runner = dict(type="EpochBasedRunner", max_epochs=total_epochs)
++evaluation = dict(interval=1, save_best=None)
++custom_hooks = [dict(type="FreezeBNHook", priority="HIGHEST")]
+diff --git a/projects/mmdet3d_plugin/bevformer/apis/test.py b/projects/mmdet3d_plugin/bevformer/apis/test.py
+index 03acb14..d5a07bd 100755
+--- a/projects/mmdet3d_plugin/bevformer/apis/test.py
++++ b/projects/mmdet3d_plugin/bevformer/apis/test.py
+@@ -161,4 +161,4 @@ def collect_results_cpu(result_part, size, tmpdir=None):
+ 
+ 
+ def collect_results_gpu(result_part, size):
+-    collect_results_cpu(result_part, size)
+\ No newline at end of file
++    return collect_results_cpu(result_part, size)
+\ No newline at end of file
+diff --git a/projects/mmdet3d_plugin/bevformer/detectors/bevformer.py b/projects/mmdet3d_plugin/bevformer/detectors/bevformer.py
+index ea1e074..89ae234 100755
+--- a/projects/mmdet3d_plugin/bevformer/detectors/bevformer.py
++++ b/projects/mmdet3d_plugin/bevformer/detectors/bevformer.py
+@@ -4,7 +4,7 @@
+ #  Modified by Zhiqi Li
+ # ---------------------------------------------
+ 
+-from tkinter.messagebox import NO
++# from tkinter.messagebox import NO  (unused; no Tk in this env)
+ import torch
+ from mmcv.runner import force_fp32, auto_fp16
+ from mmdet.models import DETECTORS
+diff --git a/projects/mmdet3d_plugin/bevformer/detectors/bevformer_fp16.py b/projects/mmdet3d_plugin/bevformer/detectors/bevformer_fp16.py
+index 6f06281..39ba675 100755
+--- a/projects/mmdet3d_plugin/bevformer/detectors/bevformer_fp16.py
++++ b/projects/mmdet3d_plugin/bevformer/detectors/bevformer_fp16.py
+@@ -4,7 +4,7 @@
+ #  Modified by Zhiqi Li
+ # ---------------------------------------------
+ 
+-from tkinter.messagebox import NO
++# from tkinter.messagebox import NO  (unused; no Tk in this env)
+ import torch
+ from mmcv.runner import force_fp32, auto_fp16
+ from mmdet.models import DETECTORS
+diff --git a/projects/mmdet3d_plugin/bevformer/hooks/__init__.py b/projects/mmdet3d_plugin/bevformer/hooks/__init__.py
+index aa04ec1..32e5318 100755
+--- a/projects/mmdet3d_plugin/bevformer/hooks/__init__.py
++++ b/projects/mmdet3d_plugin/bevformer/hooks/__init__.py
+@@ -1 +1 @@
+-from .custom_hooks import TransferWeight
+\ No newline at end of file
++from .custom_hooks import FreezeBNHook, TransferWeight
+diff --git a/projects/mmdet3d_plugin/bevformer/hooks/custom_hooks.py b/projects/mmdet3d_plugin/bevformer/hooks/custom_hooks.py
+index a98ad1c..f95debc 100755
+--- a/projects/mmdet3d_plugin/bevformer/hooks/custom_hooks.py
++++ b/projects/mmdet3d_plugin/bevformer/hooks/custom_hooks.py
+@@ -1,7 +1,35 @@
+ from mmcv.runner.hooks.hook import HOOKS, Hook
++from torch.nn.modules.batchnorm import _BatchNorm
+ from projects.mmdet3d_plugin.models.utils import run_time
+ 
+ 
++@HOOKS.register_module(force=True)
++class FreezeBNHook(Hook):
++    """Keep every BatchNorm in eval mode while training: running statistics stay fixed (weight/bias still train),
++    so the network is trained with exactly the normalisation it is evaluated and cached with.
++
++    Why (NAVSIM front64 Mask2Map, LSS): after a few epochs the seg head relies on the per-batch statistics of the
++    last BEV BatchNorm (transformer.encoder.downsample.7).  At epoch 9 the same val frames scored road IoU 0.74 with
++    batch statistics but 0.41 in eval mode (road over-predicted 1.8x); re-estimating the running statistics (precise
++    BN, even on the val batches themselves) did not close the gap, a short fine-tune with this hook did (epoch 12:
++    eval-mode road 0.48 -> 0.78 after 300 iterations).  The image backbone's BNs are frozen already (norm_eval).
++    The gap is a high-lr effect: by epochs 15/18 of the cosine schedule it had closed by itself.
++    """
++
++    def __init__(self):
++        self._logged = False
++
++    def before_train_iter(self, runner):
++        n = 0
++        for m in runner.model.modules():
++            if isinstance(m, _BatchNorm):
++                m.eval()
++                n += 1
++        if not self._logged:
++            runner.logger.info(f'FreezeBNHook: {n} BatchNorm layers kept in eval mode')
++            self._logged = True
++
++
+ @HOOKS.register_module()
+ class TransferWeight(Hook):
+     
+diff --git a/projects/mmdet3d_plugin/datasets/__init__.py b/projects/mmdet3d_plugin/datasets/__init__.py
+index 0efe7e9..5fbdf97 100755
+--- a/projects/mmdet3d_plugin/datasets/__init__.py
++++ b/projects/mmdet3d_plugin/datasets/__init__.py
+@@ -2,9 +2,13 @@ from .nuscenes_dataset import CustomNuScenesDataset
+ from .builder import custom_build_dataset
+ 
+ from .nuscenes_map_dataset import CustomNuScenesLocalMapDataset
+-from .av2_map_dataset import CustomAV2LocalMapDataset
+ from .nuscenes_offlinemap_dataset import CustomNuScenesOfflineLocalMapDataset
+-from .av2_offlinemap_dataset import CustomAV2OfflineLocalMapDataset
++from .navsim_offlinemap_dataset import NavsimOfflineMapDataset
++try:  # Argoverse 2 datasets need the av2 package, which NAVSIM training does not
++    from .av2_map_dataset import CustomAV2LocalMapDataset
++    from .av2_offlinemap_dataset import CustomAV2OfflineLocalMapDataset
++except ImportError:
++    pass
+ __all__ = [
+     'CustomNuScenesDataset','CustomNuScenesLocalMapDataset'
+ ]
+diff --git a/projects/mmdet3d_plugin/datasets/navsim_map_utils.py b/projects/mmdet3d_plugin/datasets/navsim_map_utils.py
+new file mode 100644
+index 0000000..a0b2172
+--- /dev/null
++++ b/projects/mmdet3d_plugin/datasets/navsim_map_utils.py
+@@ -0,0 +1,305 @@
++"""NAVSIM helpers for the Mask2Map port: map GT store, ReSMap-identical BEV rasteriser, PV ground truth, PCD reader.
++
++Frames
++------
++* ego (E): NAVSIM / nuPlan rear-axle frame, x forward, y left, z up.  LiDAR == ego (lidar2ego is the identity) and
++  MergedPointCloud is stored in it.  The ground is at z ~= -0.33 m (median ground mode over 40 random navtrain
++  frames, p10 -0.35, p90 -0.31).
++* ROI-centred (C): x_c = x - roi_center[0], y_c = y - roi_center[1].  The packed map GT is stored in C
++  (tools/navsim/navsim_map_gt.py), exactly as resmap_navsim's.
++
++BEV raster (identical to resmap_navsim plugin/datasets/pipelines/rasterize.py, semantic mode)
++-------------------------------------------------------------------------------------------
++canvas_size = (W, H) = (200, 200) over roi_size = (64, 64) m, i.e. 3.125 px/m:
++    col = int(3.125 * x_c + 100) = int(3.125 * x)          col 0 = x in [0, 0.32) m (rear axle), col 199 = 63.7 m
++    row = int(3.125 * y_c + 100) = int(3.125 * y + 100)    row 0 = y in [-32, -31.68) m (RIGHT), row 199 = left
++Area classes (road / walkway / crosswalk) are filled with holes punched out, lines (centerline) are 3 px polylines,
++channels are multi-label in class order.  Mask2Map's LSS BEV has the same orientation (rows = y from y_min, cols =
++x from x_min, see LSSTransform: bev_pool -> (B, C, X, Y) -> permute -> (B, C, Y, X)), so the seg loss needs no flip.
++ReSMap's BEVFormer BEV is flipped on H instead (row 0 = y = +32), which is why its loss flips the GT and why a
++ReSMap-layout cache of this model needs exactly one H flip.
++"""
++import numpy as np
++from shapely import affinity
++from shapely.geometry import LineString, Polygon
++
++NAVSIM_MAP_CLASSES = ('road', 'walkway', 'centerline', 'crosswalk')
++
++
++class NavsimMapGT(object):
++    """Memory-mapped flat map GT (tools/navsim/pack_map_gt.py), shared read-only by every dataloader worker.
++
++    Port of resmap_navsim NavsimDataset._load_navsim_map_gt / _map_geoms_for.
++    """
++
++    def __init__(self, path, roi_size, roi_center, class_names):
++        assert str(path).endswith('.npz'), f'map GT must be the packed .npz, got {path}'
++        z = np.load(path, mmap_mode='r')
++        roi = tuple(float(v) for v in z['roi_size'])
++        ctr = tuple(float(v) for v in z['roi_center'])
++        assert roi == tuple(float(v) for v in roi_size), f'map GT roi {roi} != config roi {tuple(roi_size)}'
++        assert ctr == tuple(float(v) for v in roi_center), f'map GT centre {ctr} != config centre {tuple(roi_center)}'
++        classes = [c.decode() for c in z['classes']]
++        unknown = set(class_names) - set(classes)
++        assert not unknown, f'map classes {unknown} are not in the map GT {classes}'
++        self.path = path
++        self.class_names = list(class_names)
++        self.coords = z['coords']          # (N, 2) float32
++        self.ring_off = z['ring_off']      # (R + 1,)
++        self.ring_cls = z['ring_cls']      # (R,) index into `classes`
++        self.ring_poly = z['ring_poly']    # (R,) polygon id inside a token; holes share it
++        self.tok_off = z['tok_off']        # (T + 1,)
++        self.gt_classes = classes
++        self.area_classes = set(c.decode() for c in z['area_classes'])
++        self.row = {t.decode(): i for i, t in enumerate(z['tokens'])}
++
++    def __contains__(self, token):
++        return token in self.row
++
++    def geoms(self, token):
++        """{class_name: [Polygon | LineString]} in the ROI-centred frame, for the requested classes."""
++        row = self.row[token]
++        r0, r1 = int(self.tok_off[row]), int(self.tok_off[row + 1])
++        out = {name: [] for name in self.class_names}
++        r = r0
++        while r < r1:
++            ci = int(self.ring_cls[r])
++            name = self.gt_classes[ci]
++            poly_id = int(self.ring_poly[r])
++            rings = []
++            while r < r1 and int(self.ring_poly[r]) == poly_id and int(self.ring_cls[r]) == ci:
++                a, b = int(self.ring_off[r]), int(self.ring_off[r + 1])
++                rings.append(np.asarray(self.coords[a:b], dtype=np.float64))
++                r += 1
++            if name not in out:
++                continue
++            if name in self.area_classes:
++                if len(rings[0]) < 3:
++                    continue
++                g = Polygon(rings[0], [h for h in rings[1:] if len(h) >= 3])
++                if not g.is_valid:
++                    g = g.buffer(0)
++                if g.geom_type == 'Polygon' and not g.is_empty:
++                    out[name].append(g)
++                elif g.geom_type == 'MultiPolygon':
++                    out[name].extend(gg for gg in g.geoms if not gg.is_empty)
++            else:
++                for arr in rings:
++                    if len(arr) >= 2:
++                        out[name].append(LineString(arr))
++        return out
++
++
++class NavsimBEVRasterizer(object):
++    """ReSMap's RasterizeMap (semantic_mask=True, fill_line_classes=()) as a plain function object.
++
++    The arithmetic (shapely scale about the origin, shift by half the canvas, int32 truncation, cv2 fill / polylines)
++    is kept verbatim so the masks are byte-identical to the ones the ReSMap front64 teacher was trained on.
++    """
++
++    def __init__(self, roi_size=(64.0, 64.0), canvas_size=(200, 200), thickness=3):
++        self.roi_size = tuple(roi_size)
++        self.canvas_size = tuple(canvas_size)       # (W, H)
++        self.scale_x = self.canvas_size[0] / self.roi_size[0]
++        self.scale_y = self.canvas_size[1] / self.roi_size[1]
++        self.thickness = thickness
++
++    def _line(self, line, mask):
++        import cv2
++        line = affinity.scale(line, self.scale_x, self.scale_y, origin=(0, 0))
++        line = affinity.affine_transform(line, [1.0, 0.0, 0.0, 1.0, self.canvas_size[0] / 2, self.canvas_size[1] / 2])
++        coords = np.array(list(line.coords), dtype=np.int32)[:, :2].reshape((-1, 2))
++        assert len(coords) >= 2
++        cv2.polylines(mask, np.int32([coords]), False, color=1, thickness=self.thickness)
++
++    def _polygons(self, polygons):
++        import cv2
++        H, W = self.canvas_size[1], self.canvas_size[0]
++        out = np.zeros((H, W), dtype=np.uint8)
++        for polygon in polygons:
++            polygon = affinity.scale(polygon, self.scale_x, self.scale_y, origin=(0, 0))
++            polygon = affinity.affine_transform(
++                polygon, [1.0, 0.0, 0.0, 1.0, self.canvas_size[0] / 2, self.canvas_size[1] / 2])
++            m = np.zeros((H, W), dtype=np.uint8)
++            ext = np.array(polygon.exterior.coords)[:, :2].astype(np.int32)
++            if len(ext) >= 3:
++                cv2.fillPoly(m, [ext.reshape(-1, 1, 2)], color=1)
++            for hole in polygon.interiors:
++                h = np.array(hole.coords)[:, :2].astype(np.int32)
++                if len(h) >= 3:
++                    cv2.fillPoly(m, [h.reshape(-1, 1, 2)], color=0)
++            out = np.maximum(out, m)
++        return out
++
++    def __call__(self, geoms_by_label, num_classes):
++        """geoms_by_label: {label: [LineString | Polygon]} -> (num_classes, H, W) uint8."""
++        mask = np.zeros((num_classes, self.canvas_size[1], self.canvas_size[0]), dtype=np.uint8)
++        for label, geom_list in geoms_by_label.items():
++            if len(geom_list) == 0:
++                continue
++            if geom_list[0].geom_type == 'LineString':
++                for line in geom_list:
++                    self._line(line, mask[label])
++            elif geom_list[0].geom_type == 'Polygon':
++                mask[label] = np.maximum(mask[label], self._polygons(geom_list))
++            else:
++                raise ValueError('map geoms must be either LineString or Polygon')
++        return np.ascontiguousarray(mask)
++
++
++def pv_ground_labels(bev_mask, cam2ego, intrinsics, img_aug_matrix, pad_shape, img_shape, feat_down_sample=32,
++                     ground_z=-0.33, roi_size=(64.0, 64.0), roi_center=(32.0, 0.0), supersample=4, line_classes=(2,)):
++    """Perspective-view GT by inverse perspective mapping of the BEV raster.
++
++    Mask2Map's nuScenes code draws the map *polylines* into the stride-32 feature grid; NAVSIM's road / walkway /
++    crosswalk are areas, so here every PV sample casts its pinhole ray to the ground plane z = ground_z (ego frame)
++    and reads the BEV raster where it lands, at supersample x supersample sub-pixel rays per feature cell.  A cell is
++    positive for a line class (`line_classes`, e.g. centerline) if any of its rays is -- the "cell the line passes
++    through" rule of Mask2Map's thickness-1 polyline drawing -- and for an area class if at least half of its rays
++    are.  Rays that miss the ground, land outside the ROI, or start in the bottom / right padding are background.
++
++    Args:
++        bev_mask (ndarray): (C, H, W) uint8, the NavsimBEVRasterizer output.
++        cam2ego (ndarray): (N, 4, 4).
++        intrinsics (ndarray): (N, 4, 4) or (N, 3, 3), calibrated for the ORIGINAL image.
++        img_aug_matrix (ndarray): (N, 4, 4) original pixels -> network pixels (the pipeline resize).
++        pad_shape, img_shape: (H, W, ...) of the padded and of the unpadded network image.
++    Returns:
++        (N, C, pad_H // s, pad_W // s) uint8.
++    """
++    C, H, W = bev_mask.shape
++    N = len(cam2ego)
++    fH, fW = int(pad_shape[0]) // feat_down_sample, int(pad_shape[1]) // feat_down_sample
++    S = supersample
++    offs = (np.arange(S) + 0.5) * feat_down_sample / S
++    us = (np.arange(fW)[:, None] * feat_down_sample + offs[None, :]).reshape(-1)          # (fW * S,)
++    vs = (np.arange(fH)[:, None] * feat_down_sample + offs[None, :]).reshape(-1)          # (fH * S,)
++    uu, vv = np.meshgrid(us, vs)                                                         # (fH*S, fW*S)
++    in_img = (uu < img_shape[1]) & (vv < img_shape[0])
++    pix = np.stack([uu, vv, np.ones_like(uu)], -1).reshape(-1, 3).T                      # (3, M)
++    sx, sy = roi_size[0] / W, roi_size[1] / H                                            # m per px (forward, lateral)
++    out = np.zeros((N, C, fH, fW), dtype=np.uint8)
++    for n in range(N):
++        A = np.asarray(img_aug_matrix[n], dtype=np.float64)
++        K = np.asarray(intrinsics[n], dtype=np.float64)[:3, :3]
++        T = np.asarray(cam2ego[n], dtype=np.float64)
++        # network pixel -> original pixel (undo resize; img_aug is diag(sx, sy, 1, 1) + optional translation)
++        p = np.linalg.solve(A[:3, :3], pix - A[:3, 3:4])
++        d = T[:3, :3] @ np.linalg.solve(K, p)                                            # ray dirs in ego
++        o = T[:3, 3]
++        with np.errstate(divide='ignore', invalid='ignore'):
++            lam = (ground_z - o[2]) / d[2]
++        ok = (d[2] < -1e-6) & (lam > 0) & in_img.reshape(-1)
++        x = o[0] + lam * d[0] - roi_center[0]                                            # ROI-centred
++        y = o[1] + lam * d[1] - roi_center[1]
++        ok &= (np.abs(x) < roi_size[0] / 2) & (np.abs(y) < roi_size[1] / 2)
++        col = np.where(ok, (x / sx + W / 2), 0).astype(np.int32)                         # same truncation as the raster
++        row = np.where(ok, (y / sy + H / 2), 0).astype(np.int32)
++        ok &= (col >= 0) & (col < W) & (row >= 0) & (row < H)
++        lab = np.zeros((C, ok.size), dtype=np.uint8)
++        lab[:, ok] = bev_mask[:, row[ok], col[ok]]
++        lab = lab.reshape(C, fH, S, fW, S)
++        is_line = np.zeros(C, dtype=bool)
++        is_line[list(line_classes)] = True
++        out[n] = np.where(is_line[:, None, None], lab.max(axis=(2, 4)), lab.mean(axis=(2, 4)) >= 0.5)
++    return out
++
++
++# --------------------------------------------------------------------------------------------------------------- #
++# PCD reader (NAVSIM MergedPointCloud: FIELDS x y z intensity lidar_info ring, binary, 15 B / point).  Adapted from
++# yyongjae/bevfusion@navsim-100x100-cache mmdet3d/datasets/pipelines/loading_utils.py.
++# --------------------------------------------------------------------------------------------------------------- #
++_PCD_NUMPY_TYPE = {
++    ('F', 4): 'f4', ('F', 8): 'f8',
++    ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4', ('U', 8): 'u8',
++    ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4', ('I', 8): 'i8',
++}
++
++
++def _lzf_decompress(data, expected_len):
++    """Pure-python LZF decompression (fallback when python-lzf is absent)."""
++    out = bytearray()
++    i, n = 0, len(data)
++    while i < n:
++        ctrl = data[i]
++        i += 1
++        if ctrl < 32:
++            out += data[i:i + ctrl + 1]
++            i += ctrl + 1
++        else:
++            length = ctrl >> 5
++            if length == 7:
++                length += data[i]
++                i += 1
++            ref = len(out) - ((ctrl & 0x1F) << 8) - data[i] - 1
++            i += 1
++            if ref < 0:
++                raise ValueError('invalid LZF stream')
++            for _ in range(length + 2):
++                out.append(out[ref])
++                ref += 1
++    if len(out) != expected_len:
++        raise ValueError(f'LZF size mismatch: {len(out)} != {expected_len}')
++    return bytes(out)
++
++
++def read_pcd(path):
++    """Read a PCD file (binary, binary_compressed or ascii) into a structured numpy array."""
++    import struct
++    with open(path, 'rb') as f:
++        header = {}
++        while True:
++            line = f.readline()
++            if not line:
++                raise ValueError(f'truncated PCD header: {path}')
++            text = line.decode('utf-8', 'replace').strip()
++            if not text or text.startswith('#'):
++                continue
++            key, _, value = text.partition(' ')
++            header[key.upper()] = value.strip()
++            if key.upper() == 'DATA':
++                break
++        fields = header['FIELDS'].split()
++        sizes = [int(x) for x in header['SIZE'].split()]
++        types = header['TYPE'].split()
++        counts = [int(c) for c in header.get('COUNT', ' '.join(['1'] * len(fields))).split()]
++        n_points = int(header['POINTS']) if 'POINTS' in header else int(header['WIDTH']) * int(header['HEIGHT'])
++        kind = header['DATA'].lower()
++        names, formats = [], []
++        for name, size, typ, count in zip(fields, sizes, types, counts):
++            fmt = _PCD_NUMPY_TYPE[(typ.upper(), size)]
++            names.append(name)
++            formats.append(f'{count}{fmt}' if count > 1 else fmt)
++        dtype = np.dtype({'names': names, 'formats': formats})
++        if kind == 'binary':
++            return np.frombuffer(f.read(dtype.itemsize * n_points), dtype=dtype, count=n_points)
++        if kind == 'binary_compressed':
++            comp_len, uncomp_len = struct.unpack('II', f.read(8))
++            payload = f.read(comp_len)
++            try:
++                import lzf
++                raw = lzf.decompress(payload, uncomp_len)
++            except ImportError:
++                raw = _lzf_decompress(payload, uncomp_len)
++            out = np.empty(n_points, dtype=dtype)
++            offset = 0
++            for name in dtype.names:  # field-major
++                sub = dtype[name]
++                nbytes = sub.itemsize * n_points
++                out[name] = np.frombuffer(raw[offset:offset + nbytes], dtype=sub, count=n_points)
++                offset += nbytes
++            return out
++        if kind == 'ascii':
++            return np.loadtxt(f, dtype=dtype)
++        raise ValueError(f'unsupported PCD DATA type: {kind}')
++
++
++def load_pcd_points(path, load_dim=5):
++    """(N, load_dim) float32 [x, y, z, intensity, ring] (missing fields are zeros), in the ego frame for NAVSIM."""
++    arr = read_pcd(path)
++
++    def col(name):
++        return arr[name].astype(np.float32) if name in arr.dtype.names else np.zeros(len(arr), np.float32)
++
++    pts = np.stack([col('x'), col('y'), col('z'), col('intensity'), col('ring')], axis=-1)
++    return np.ascontiguousarray(pts[:, :load_dim], dtype=np.float32)
+diff --git a/projects/mmdet3d_plugin/datasets/navsim_offlinemap_dataset.py b/projects/mmdet3d_plugin/datasets/navsim_offlinemap_dataset.py
+new file mode 100644
+index 0000000..ea9d4e9
+--- /dev/null
++++ b/projects/mmdet3d_plugin/datasets/navsim_offlinemap_dataset.py
+@@ -0,0 +1,297 @@
++"""NAVSIM (openscene-v1.1) dataset for Mask2Map, set up as the ReSMap front64 stage-1 teacher.
++
++Everything that defines the data -- frames, splits, cameras, intrinsics handling, ROI, map classes, map GT and its
++raster -- follows resmap_navsim (plugin/datasets/navsim_dataset.py, pipelines/rasterize.py and the
++resmap_nav_rideflux_front64 stage-1 config), so this model sees the same inputs and targets as the ReSMap teacher:
++
++* infos: tools/navsim/create_navsim_infos.py (navtrain 152,495 frames; navtest 71,460).
++* log_split 'train' (978 navtrain logs, 126,032 frames) for training and 'val' (214 logs, 26,463 frames) for
++  validation, from NAVSIM's default_train_val_test_log_split.yaml.  navtest is a separate run.
++* cameras CAM_L0, CAM_F0, CAM_R0 in that order; intrinsics calibrated at 1920x1080 (cy = 560, distortion ignored,
++  as in ReSMap and BEVFusion); ego == lidar (lidar2ego = I).
++* ROI x in [0, 64] m forward, y in [-32, 32] m (roi_size 64 x 64, roi_center (32, 0)); pc_range
++  [0, -32, -3, 64, 32, 5] in true ego metres for the LSS grid.
++* classes road / walkway / centerline / crosswalk, GT from tools/navsim/navsim_map_gt.py + pack_map_gt.py,
++  rasterised to (4, 200, 200) exactly as ReSMap (navsim_map_utils.NavsimBEVRasterizer).
++
++Training is single-frame (queue_length 1) phase-1 semantic segmentation: the head's semantic_only mode reads
++`gt_seg_mask` (BEV, 4 x 200 x 200), `gt_pv_seg_mask` (PV, N x 4 x 15 x 25) and `gt_depth` (LiDAR, train only).
++evaluate() computes ReSMap's stage-1 metric (per-pixel argmax, kept if sigmoid >= 0.4, dataset-level IoU) plus a
++multi-label IoU (sigmoid >= 0.5 per class).
++"""
++import os
++from time import time
++
++import mmcv
++import numpy as np
++import torch
++from mmcv.parallel import DataContainer as DC
++from mmdet.datasets import DATASETS
++from nuscenes.eval.common.utils import Quaternion, quaternion_yaw
++
++from .navsim_map_utils import NAVSIM_MAP_CLASSES, NavsimBEVRasterizer, NavsimMapGT, pv_ground_labels
++from .nuscenes_offlinemap_dataset import CustomNuScenesOfflineLocalMapDataset
++
++DEFAULT_LOG_SPLIT_YAML = '/workspace/navsim/navsim/planning/script/config/training/default_train_val_test_log_split.yaml'
++
++
++@DATASETS.register_module()
++class NavsimOfflineMapDataset(CustomNuScenesOfflineLocalMapDataset):
++    """Args (on top of CustomNuScenesOfflineLocalMapDataset's):
++        camera_names (list[str]): cameras fed to the model, in order.
++        map_gt_file (str): packed map GT (.npz) covering every frame of ann_file.
++        log_split (str | None): 'train' | 'val' | None (every log in ann_file).
++        log_split_yaml (str): NAVSIM's default_train_val_test_log_split.yaml.
++        split_tokens_only (bool): keep only scene-filter allow-list frames (in_split_tokens).
++        token_list (str | None): optional text file (one token per line) restricting the frames, e.g. for caching.
++        sensor_root / sensor_src_root (str | None): read images from a mirror; the `sensor_src_root` prefix of every
++            img_fpath is replaced by `sensor_root` (e.g. a pre-resized 800x450 copy).
++        roi_size, roi_center: ROI-centred GT frame (must match the map GT file).
++        canvas_size (W, H), seg_thickness: BEV raster.
++        pv_ground_z, pv_supersample: PV GT (navsim_map_utils.pv_ground_labels).
++        eval_score_thr (float): ReSMap's single-label threshold.
++    """
++
++    MAPCLASSES = NAVSIM_MAP_CLASSES
++    LINE_CLASSES = ('centerline',)  # the others are areas (filled polygons)
++    CAMERA_NAMES = ('CAM_L0', 'CAM_F0', 'CAM_R0')
++
++    def __init__(self,
++                 camera_names=CAMERA_NAMES,
++                 map_gt_file=None,
++                 log_split=None,
++                 log_split_yaml=DEFAULT_LOG_SPLIT_YAML,
++                 split_tokens_only=False,
++                 token_list=None,
++                 sensor_root=None,
++                 sensor_src_root=None,
++                 roi_size=(64.0, 64.0),
++                 roi_center=(32.0, 0.0),
++                 canvas_size=(200, 200),
++                 seg_thickness=3,
++                 pv_ground_z=-0.33,
++                 pv_supersample=4,
++                 eval_score_thr=0.4,
++                 **kwargs):
++        # load_annotations() runs inside the base __init__, so everything it reads is set first
++        self.camera_names = list(camera_names)
++        self.log_split = log_split
++        self.split_tokens_only = split_tokens_only
++        self._log_allow = None
++        if log_split is not None:
++            import yaml
++            with open(log_split_yaml) as fh:
++                self._log_allow = set(yaml.safe_load(fh)[f'{log_split}_logs'])
++        self._token_allow = None
++        if token_list is not None:
++            with open(token_list) as fh:
++                self._token_allow = set(t.strip() for t in fh if t.strip())
++        self.sensor_root, self.sensor_src_root = sensor_root, sensor_src_root
++        assert (sensor_root is None) == (sensor_src_root is None), 'set both sensor_root and sensor_src_root'
++        kwargs.setdefault('filter_empty_gt', False)
++        super().__init__(**kwargs)
++        assert self.queue_length == 1, 'the NAVSIM port is single-frame (queue_length = 1)'
++        # inherited from mmdet3d NuScenesDataset for nuScenes detection eval; holds dict_keys, which cannot be pickled
++        # (a spawn-started DataLoader would fail), and nothing here uses it
++        self.eval_detection_configs = None
++
++        self.roi_size = tuple(float(v) for v in roi_size)
++        self.roi_center = tuple(float(v) for v in roi_center)
++        self.canvas_size = tuple(int(v) for v in canvas_size)
++        self.rasterizer = NavsimBEVRasterizer(self.roi_size, self.canvas_size, seg_thickness)
++        self.pv_ground_z = pv_ground_z
++        self.pv_supersample = pv_supersample
++        self.eval_score_thr = eval_score_thr
++        self.cat2label = {c: i for i, c in enumerate(self.MAPCLASSES)}
++
++        assert map_gt_file is not None, 'map_gt_file (tools/navsim/pack_map_gt.py output) is required'
++        self.map_gt = NavsimMapGT(map_gt_file, self.roi_size, self.roi_center, self.MAPCLASSES)
++        missing = sum(1 for info in self.data_infos if info['token'] not in self.map_gt)
++        print(f'[NavsimOfflineMapDataset] map GT {map_gt_file}: {len(self.map_gt.row)} tokens, '
++              f'{missing} of {len(self.data_infos)} frames missing')
++        assert missing == 0, f'{missing} frames have no map GT; regenerate it with tools/navsim/navsim_map_gt.py'
++
++    # ----------------------------------------------------------------------------------------------------------- #
++    # annotations
++    # ----------------------------------------------------------------------------------------------------------- #
++    def load_annotations(self, ann_file):
++        t0 = time()
++        infos = mmcv.load(ann_file, file_format='pkl')
++        n0 = len(infos)
++        if self._log_allow is not None:
++            infos = [s for s in infos if s['log_name'] in self._log_allow]
++        if self.split_tokens_only:
++            infos = [s for s in infos if s.get('in_split_tokens', True)]
++        if self._token_allow is not None:
++            infos = [s for s in infos if s['token'] in self._token_allow]
++        infos = infos[::self.load_interval]
++        # sample_idx / prev / next are global indices; filtering invalidates them, so renumber per scene run
++        prev_scene = None
++        for idx, s in enumerate(infos):
++            s['sample_idx'] = idx
++            s['prev'] = -1 if s['scene_name'] != prev_scene else idx - 1
++            prev_scene = s['scene_name']
++        for idx, s in enumerate(infos[:-1]):
++            s['next'] = -1 if infos[idx + 1]['scene_name'] != s['scene_name'] else idx + 1
++        if infos:
++            infos[-1]['next'] = -1
++        self.metadata = dict(version='navsim')
++        self.version = 'navsim'
++        print(f'[NavsimOfflineMapDataset] {ann_file}: log_split={self.log_split!r} '
++              f'split_tokens_only={self.split_tokens_only} -> {len(infos)} of {n0} frames ({time() - t0:.1f}s)')
++        return infos
++
++    def _set_group_flag(self):
++        self.flag = np.zeros(len(self), dtype=np.uint8)
++
++    def get_data_info(self, index):
++        info = self.data_infos[index]
++        input_dict = dict(
++            sample_idx=info['token'],
++            token=info['token'],
++            pts_filename=info['lidar_path'],
++            lidar_path=info['lidar_path'],
++            sweeps=[],
++            ego2global_translation=info['e2g_translation'],
++            ego2global_rotation=info['e2g_rotation'],
++            lidar2ego_translation=info['lidar2ego_translation'],
++            lidar2ego_rotation=info['lidar2ego_rotation'],
++            prev_idx=info['prev'],
++            next_idx=info['next'],
++            scene_token=info['scene_name'],
++            frame_idx=info['frame_idx'],
++            timestamp=info['timestamp'],
++            map_location=info['location'],
++        )
++        lidar2ego = np.eye(4)
++        lidar2ego[:3, :3] = Quaternion(info['lidar2ego_rotation']).rotation_matrix
++        lidar2ego[:3, 3] = info['lidar2ego_translation']
++        assert np.allclose(lidar2ego, np.eye(4)), 'NAVSIM stores lidar2ego as the identity; the GT assumes ego == lidar'
++        input_dict['lidar2ego'] = lidar2ego.astype(np.float32)
++
++        ego2global = np.eye(4)
++        ego2global[:3, :3] = Quaternion(info['e2g_rotation']).rotation_matrix
++        ego2global[:3, 3] = info['e2g_translation']
++        image_paths, lidar2img, lidar2cam, cam_intrinsic, camera2ego, camera_intrinsics = [], [], [], [], [], []
++        cam_distortion = []
++        for name in self.camera_names:
++            cam = info['cams'][name]
++            path = cam['img_fpath']
++            if self.sensor_root is not None:
++                assert path.startswith(self.sensor_src_root), f'{path} is not under {self.sensor_src_root}'
++                path = self.sensor_root + path[len(self.sensor_src_root):]
++            image_paths.append(path)
++            K = np.eye(4)
++            K[:3, :3] = np.asarray(cam['intrinsics'], dtype=np.float64)
++            ego2cam = np.asarray(cam['extrinsics'], dtype=np.float64)
++            lidar2img.append(K @ ego2cam)              # lidar == ego; the image loader applies the resize
++            lidar2cam.append(ego2cam)
++            cam_intrinsic.append(K)
++            camera2ego.append(np.linalg.inv(ego2cam).astype(np.float32))
++            camera_intrinsics.append(K.astype(np.float32))
++            cam_distortion.append(np.asarray(cam.get('distortion', np.zeros(5)), dtype=np.float64))
++        input_dict.update(
++            cam_distortion=cam_distortion,  # OpenCV (k1, k2, p1, p2, k3); used only by LoadNavsimMultiViewImages(undistort)
++            img_filename=image_paths,
++            lidar2img=lidar2img,
++            lidar2cam=lidar2cam,
++            cam_intrinsic=cam_intrinsic,
++            camera2ego=camera2ego,
++            camera_intrinsics=camera_intrinsics,
++            lidar2global=ego2global,
++        )
++        # Mask2Map's test path reads can_bus[:3] and [-1] (video mode only); the network never uses it.
++        can_bus = np.zeros(18)
++        rotation = Quaternion(info['e2g_rotation'])
++        can_bus[:3] = info['e2g_translation']
++        can_bus[3:7] = rotation
++        patch_angle = quaternion_yaw(rotation) / np.pi * 180
++        if patch_angle < 0:
++            patch_angle += 360
++        can_bus[-2] = patch_angle / 180 * np.pi
++        can_bus[-1] = patch_angle
++        input_dict['can_bus'] = can_bus
++        return input_dict
++
++    # ----------------------------------------------------------------------------------------------------------- #
++    # ground truth
++    # ----------------------------------------------------------------------------------------------------------- #
++    def get_bev_gt(self, token):
++        """(4, 200, 200) uint8 multi-label BEV raster in the raw frame (row 0 = y -32 m, col 0 = x 0 m)."""
++        geoms = self.map_gt.geoms(token)
++        by_label = {self.cat2label[c]: geoms[c] for c in self.MAPCLASSES}
++        return self.rasterizer(by_label, len(self.MAPCLASSES))
++
++    def navsim_gt_pipeline(self, example, input_dict):
++        bev = self.get_bev_gt(input_dict['token'])
++        example['gt_seg_mask'] = DC(torch.from_numpy(bev), cpu_only=False)
++        if self.aux_seg.get('pv_seg', False):
++            meta = example['img_metas'].data
++            pv = pv_ground_labels(
++                bev, np.stack(input_dict['camera2ego']), np.stack(input_dict['camera_intrinsics']),
++                np.stack(meta['img_aug_matrix']), meta['pad_shape'][0], meta['ori_shape'][0],
++                feat_down_sample=self.aux_seg['feat_down_sample'], ground_z=self.pv_ground_z,
++                roi_size=self.roi_size, roi_center=self.roi_center, supersample=self.pv_supersample,
++                line_classes=[self.cat2label[c] for c in self.LINE_CLASSES])
++            example['gt_pv_seg_mask'] = DC(torch.from_numpy(pv), cpu_only=False)
++        return example
++
++    def prepare_train_data(self, index):
++        input_dict = self.get_data_info(index)
++        self.pre_pipeline(input_dict)
++        example = self.pipeline(input_dict)
++        example = self.navsim_gt_pipeline(example, input_dict)
++        return self.union2one([example])
++
++    def prepare_test_data(self, index):
++        input_dict = self.get_data_info(index)
++        self.pre_pipeline(input_dict)
++        return self.pipeline(input_dict)
++
++    # ----------------------------------------------------------------------------------------------------------- #
++    # evaluation
++    # ----------------------------------------------------------------------------------------------------------- #
++    def evaluate(self, results, logger=None, **kwargs):
++        """ReSMap stage-1 BEV metric over the dataset (no visibility mask, whole 64 x 64 m canvas).
++
++        results: one dict per frame with 'pts_bbox' = {'token', 'seg_label' (H, W) uint8 with 0 = background and
++        k + 1 = class k (argmax, kept if sigmoid >= eval_score_thr), 'seg_bits' packed (C, H, W) sigmoid >= 0.5}.
++        """
++        from mmcv.utils import print_log
++        C = len(self.MAPCLASSES)
++        inter, union = np.zeros(C), np.zeros(C)
++        inter_ml, union_ml = np.zeros(C), np.zeros(C)
++        seen = set()
++        for res in results:
++            r = res['pts_bbox'] if 'pts_bbox' in res else res
++            token = r['token']
++            if token in seen:  # the distributed sampler pads the last batch with repeats
++                continue
++            seen.add(token)
++            gt = self.get_bev_gt(token).astype(bool)
++            label = np.asarray(r['seg_label'])
++            ml = np.unpackbits(np.asarray(r['seg_bits']))[:gt.size].reshape(gt.shape).astype(bool)
++            for c in range(C):
++                p, g = label == c + 1, gt[c]
++                inter[c] += np.logical_and(p, g).sum()
++                union[c] += np.logical_or(p, g).sum()
++                inter_ml[c] += np.logical_and(ml[c], g).sum()
++                union_ml[c] += np.logical_or(ml[c], g).sum()
++        iou = inter / (union + 1e-7)
++        iou_ml = inter_ml / (union_ml + 1e-7)
++        out = {}
++        for c, name in enumerate(self.MAPCLASSES):
++            out[f'NavsimSeg/{name}'] = float(iou[c])
++            out[f'NavsimSeg/{name}_ml'] = float(iou_ml[c])
++        out['NavsimSeg/mIoU'] = float(iou.mean())
++        out['NavsimSeg/mIoU_ml'] = float(iou_ml.mean())
++        out['NavsimSeg/num_frames'] = len(seen)
++        table = '  '.join(f'{n}={iou[c]:.4f}' for c, n in enumerate(self.MAPCLASSES))
++        print_log(f'[NavsimSeg] {len(seen)} frames, ReSMap rule (argmax, sigmoid>={self.eval_score_thr}): {table}  '
++                  f'mIoU={iou.mean():.4f}', logger=logger)
++        table = '  '.join(f'{n}={iou_ml[c]:.4f}' for c, n in enumerate(self.MAPCLASSES))
++        print_log(f'[NavsimSeg] multi-label (sigmoid>=0.5): {table}  mIoU={iou_ml.mean():.4f}', logger=logger)
++        if len(seen) != len(self):
++            print_log(f'[NavsimSeg] WARNING: {len(seen)} evaluated frames != {len(self)} in the dataset',
++                      logger=logger)
++        return out
+diff --git a/projects/mmdet3d_plugin/datasets/nuscenes_offlinemap_dataset.py b/projects/mmdet3d_plugin/datasets/nuscenes_offlinemap_dataset.py
+index 5ebb001..de60ec4 100755
+--- a/projects/mmdet3d_plugin/datasets/nuscenes_offlinemap_dataset.py
++++ b/projects/mmdet3d_plugin/datasets/nuscenes_offlinemap_dataset.py
+@@ -517,7 +517,7 @@ class LiDARInstanceLines(object):
+ 
+         assert len(self.instance_list) != 0
+         instance_points_list = []
+-        self.mask_size = [200, 100]
++        self.mask_size = list(self.canvas_size)  # was [200, 100] (nuScenes BEV) -- follow the configured BEV
+         self.scale_y = self.mask_size[0] / self.patch_size[0]
+         self.scale_x = self.mask_size[1] / self.patch_size[1]
+         instance_segm_list = []
+@@ -547,7 +547,7 @@ class LiDARInstanceLines(object):
+ 
+         assert len(self.instance_list) != 0
+         instance_points_list = []
+-        self.mask_size = [200, 100]
++        self.mask_size = list(self.canvas_size)  # was [200, 100] (nuScenes BEV) -- follow the configured BEV
+         self.scale_y = self.mask_size[0] / self.patch_size[0]
+         self.scale_x = self.mask_size[1] / self.patch_size[1]
+         instance_segm_list = []
+@@ -628,6 +628,7 @@ class VectorizedLocalMap(object):
+         self.scale_y = self.canvas_size[0] / self.patch_size[0]
+         # self.auxseg_use_sem = auxseg_use_sem
+         self.aux_seg = aux_seg
++        self.pv_ground_z = -1.6  # ground height in the lidar frame for the PV-seg GT (nuScenes); B2D sets -1.84
+ 
+     def gen_vectorized_samples(self, map_annotation, example=None, feat_down_sample=32):
+         """
+@@ -675,6 +676,7 @@ class VectorizedLocalMap(object):
+                                         lidar2feat[cam_index],
+                                         color=1,
+                                         thickness=self.aux_seg["pv_thickness"],
++                                        z=self.pv_ground_z,
+                                     )
+                         else:
+                             print(instance.geom_type)
+@@ -683,6 +685,7 @@ class VectorizedLocalMap(object):
+ 
+                 if self.aux_seg["pv_seg"]:
+                     num_cam = len(example["img_metas"].data["pad_shape"])
++                    img_shape = example["img_metas"].data["pad_shape"][0]  # was undefined in this (multi-class) branch
+                     gt_pv_semantic_mask = np.zeros(
+                         (num_cam, len(self.vec_classes), img_shape[0] // feat_down_sample, img_shape[1] // feat_down_sample), dtype=np.uint8
+                     )
+@@ -707,6 +710,7 @@ class VectorizedLocalMap(object):
+                                         lidar2feat[cam_index],
+                                         color=1,
+                                         thickness=self.aux_seg["pv_thickness"],
++                                        z=self.pv_ground_z,
+                                     )
+                         else:
+                             print(instance.geom_type)
+diff --git a/projects/mmdet3d_plugin/datasets/pipelines/__init__.py b/projects/mmdet3d_plugin/datasets/pipelines/__init__.py
+index cd77592..ef97c3f 100755
+--- a/projects/mmdet3d_plugin/datasets/pipelines/__init__.py
++++ b/projects/mmdet3d_plugin/datasets/pipelines/__init__.py
+@@ -4,6 +4,7 @@ from .transform_3d import (
+ from .formating import CustomDefaultFormatBundle3D
+ 
+ from .loading import CustomLoadPointsFromFile, CustomLoadPointsFromMultiSweeps, CustomLoadMultiViewImageFromFiles, CustomPointToMultiViewDepth
++from .navsim_loading import LoadNavsimMultiViewImages, LoadNavsimPointsFromFile, NavsimPointToMultiViewDepth
+ __all__ = [
+     'PadMultiViewImage', 'NormalizeMultiviewImage', 
+     'PhotoMetricDistortionMultiViewImage', 'CustomDefaultFormatBundle3D', 'CustomCollect3D', 'RandomScaleImageMultiViewImage'
+diff --git a/projects/mmdet3d_plugin/datasets/pipelines/navsim_loading.py b/projects/mmdet3d_plugin/datasets/pipelines/navsim_loading.py
+new file mode 100644
+index 0000000..d905f48
+--- /dev/null
++++ b/projects/mmdet3d_plugin/datasets/pipelines/navsim_loading.py
+@@ -0,0 +1,143 @@
++"""NAVSIM loading steps for the Mask2Map port.
++
++LoadNavsimMultiViewImages
++    Reads the NAVSIM 1920x1080 camera JPEGs and resizes them to the network size the way resmap_navsim's offline
++    mirror was made (tools/resize_navsim_images.py: PIL draft decode at 1/2 DCT scale, then LANCZOS to 800x450),
++    so no 54 GiB mirror is needed.  A pre-resized mirror (sensor_root) is read as is.  As Mask2Map's
++    RandomScaleImageMultiViewImage does, the intrinsics stay those of the original frame and the resize goes into
++    `img_aug_matrix` and is pre-multiplied into `lidar2img`.
++    undistort=True additionally remaps each image to the ideal pinhole camera with the same (scaled) intrinsics, so
++    the pinhole geometry every downstream step assumes (LSS lift, depth GT, PV GT) is exact.  NAVSIM's lenses have
++    k1 = -0.356, k2 = 0.17: without it a feature at the image edge is lifted along a ray 4.2 deg off its true one
++    (0.6 deg at u = 600 of 800).  The remap keeps the full output valid (it reads source x 46..754 of 800, i.e.
++    drops the outer periphery) and costs ~1 ms per image.  resmap_navsim does not undistort (undistort=False).
++LoadNavsimPointsFromFile
++    MergedPointCloud .pcd (already in the ego frame, lidar2ego = I) -> LiDARPoints (N, 5).  Training only: the
++    points supervise the LSS depth, the model never sees them.
++NavsimPointToMultiViewDepth
++    Mask2Map's CustomPointToMultiViewDepth with the ego -> image matrix taken directly (float64) instead of the
++    float32 global chain, which loses ~0.25 m at UTM northings of ~4e6 m.
++"""
++import mmcv
++import numpy as np
++import torch
++from mmdet.datasets.builder import PIPELINES
++from mmdet3d.core.points import get_points_type
++from PIL import Image
++
++from ..navsim_map_utils import load_pcd_points
++from .loading import CustomPointToMultiViewDepth
++
++
++@PIPELINES.register_module()
++class LoadNavsimMultiViewImages(object):
++    """Load the cameras of `results['img_filename']`, resized to `img_size` = (W, H) (default 800 x 450).
++
++    Args:
++        img_size (tuple): network image size (W, H) before padding.
++        calib_size (tuple): (W, H) the intrinsics in the infos are calibrated at (NAVSIM: 1920 x 1080).
++        to_float32 (bool): output float32 BGR (Mask2Map's LoadMultiViewImageFromFiles convention).
++    """
++
++    def __init__(self, img_size=(800, 450), calib_size=(1920, 1080), to_float32=True, undistort=False):
++        self.img_size = tuple(int(v) for v in img_size)
++        self.calib_size = tuple(int(v) for v in calib_size)
++        self.to_float32 = to_float32
++        self.undistort = undistort
++        self._maps = {}
++
++    def _undistort(self, img, K, dist):
++        import cv2
++        sx = self.img_size[0] / self.calib_size[0]
++        sy = self.img_size[1] / self.calib_size[1]
++        Ks = np.diag([sx, sy, 1.0]) @ np.asarray(K, dtype=np.float64)[:3, :3]
++        d = np.asarray(dist, dtype=np.float64).reshape(-1)
++        key = (Ks.tobytes(), d.tobytes())
++        if key not in self._maps:
++            self._maps[key] = cv2.initUndistortRectifyMap(Ks, d, None, Ks, self.img_size, cv2.CV_32FC1)
++        m1, m2 = self._maps[key]
++        return cv2.remap(img, m1, m2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
++
++    def _load(self, path):
++        with Image.open(path) as im:
++            if im.size != self.img_size:
++                if im.size != self.calib_size:
++                    raise ValueError(f'{path}: {im.size} is neither the calibration size {self.calib_size} nor the '
++                                     f'network size {self.img_size}; a cropped mirror needs a shifted principal point')
++                im.draft('RGB', self.img_size)  # libjpeg-level 1/2 scale decode (960 x 540), as resmap_navsim
++                im = im.convert('RGB').resize(self.img_size, Image.Resampling.LANCZOS)
++            else:
++                im = im.convert('RGB')
++            img = np.asarray(im)[:, :, ::-1]  # RGB -> BGR (mmcv.imread convention)
++        return np.ascontiguousarray(img, dtype=np.float32 if self.to_float32 else np.uint8)
++
++    def __call__(self, results):
++        filename = results['img_filename']
++        imgs = [self._load(p) for p in filename]
++        if self.undistort:
++            imgs = [self._undistort(img, K, d)
++                    for img, K, d in zip(imgs, results['camera_intrinsics'], results['cam_distortion'])]
++        sx = self.img_size[0] / self.calib_size[0]
++        sy = self.img_size[1] / self.calib_size[1]
++        scale = np.eye(4)
++        scale[0, 0], scale[1, 1] = sx, sy
++        results['filename'] = filename
++        results['img'] = imgs
++        results['img_shape'] = [img.shape for img in imgs]
++        results['ori_shape'] = [img.shape for img in imgs]
++        results['pad_shape'] = [img.shape for img in imgs]
++        results['scale_factor'] = 1.0
++        results['img_norm_cfg'] = dict(mean=np.zeros(3, dtype=np.float32), std=np.ones(3, dtype=np.float32),
++                                       to_rgb=False)
++        results['lidar2img'] = [scale @ l2i for l2i in results['lidar2img']]
++        results['img_aug_matrix'] = [scale.copy() for _ in results['lidar2img']]
++        return results
++
++    def __repr__(self):
++        return (f'{self.__class__.__name__}(img_size={self.img_size}, calib_size={self.calib_size}, '
++                f'undistort={self.undistort})')
++
++
++@PIPELINES.register_module()
++class LoadNavsimPointsFromFile(object):
++    """MergedPointCloud .pcd -> results['points'] (LiDARPoints, (N, use_dim)), in the ego (= lidar) frame."""
++
++    def __init__(self, coord_type='LIDAR', load_dim=5, use_dim=5):
++        self.coord_type = coord_type
++        self.load_dim = load_dim
++        self.use_dim = use_dim if isinstance(use_dim, (list, tuple)) else list(range(use_dim))
++
++    def __call__(self, results):
++        path = results['pts_filename']
++        assert path is not None, f'no lidar_path for token {results.get("sample_idx")}'
++        pts = load_pcd_points(path, self.load_dim)[:, self.use_dim]
++        points_class = get_points_type(self.coord_type)
++        results['points'] = points_class(pts, points_dim=pts.shape[-1], attribute_dims=None)
++        return results
++
++    def __repr__(self):
++        return f'{self.__class__.__name__}(load_dim={self.load_dim}, use_dim={self.use_dim})'
++
++
++@PIPELINES.register_module()
++class NavsimPointToMultiViewDepth(CustomPointToMultiViewDepth):
++    """Sparse per-pixel depth GT (nearest LiDAR return per pixel, depth in grid_config['depth'][:2]).
++
++    Uses results['lidar2img'] (K @ ego2cam with the pipeline resize already applied), in float64.  Equivalent to
++    Mask2Map's CustomPointToMultiViewDepth when lidar2ego = I, minus its float32 UTM round trip.
++    """
++
++    def __call__(self, results):
++        pts = results['points'].tensor[:, :3].numpy().astype(np.float64)
++        imgs = results['img']
++        depth_maps = []
++        for cid, l2i in enumerate(results['lidar2img']):
++            l2i = np.asarray(l2i, dtype=np.float64)
++            p = pts @ l2i[:3, :3].T + l2i[:3, 3]
++            z = p[:, 2]
++            front = z > 1e-3
++            uvd = np.stack([p[front, 0] / z[front], p[front, 1] / z[front], z[front]], 1)
++            h, w = imgs[cid].shape[:2]
++            depth_maps.append(self.points2depthmap(torch.from_numpy(uvd).float(), h, w))
++        results['gt_depth'] = torch.stack(depth_maps)
++        return results
+diff --git a/projects/mmdet3d_plugin/datasets/samplers/group_sampler.py b/projects/mmdet3d_plugin/datasets/samplers/group_sampler.py
+index 16c59e5..ff16cfc 100755
+--- a/projects/mmdet3d_plugin/datasets/samplers/group_sampler.py
++++ b/projects/mmdet3d_plugin/datasets/samplers/group_sampler.py
+@@ -8,7 +8,7 @@ from mmcv.runner import get_dist_info
+ from torch.utils.data import Sampler
+ from .sampler import SAMPLER
+ import random
+-from IPython import embed
++# from IPython import embed  (debug only; IPython not installed)
+ 
+ 
+ @SAMPLER.register_module()
+diff --git a/projects/mmdet3d_plugin/mask2map/assigners/mask_hungarian_assigner.py b/projects/mmdet3d_plugin/mask2map/assigners/mask_hungarian_assigner.py
+index af8539d..d05a5b1 100755
+--- a/projects/mmdet3d_plugin/mask2map/assigners/mask_hungarian_assigner.py
++++ b/projects/mmdet3d_plugin/mask2map/assigners/mask_hungarian_assigner.py
+@@ -10,7 +10,7 @@ except ImportError:
+     linear_sum_assignment = None
+ 
+ 
+-@BBOX_ASSIGNERS.register_module()
++@BBOX_ASSIGNERS.register_module(force=True)
+ class MaskHungarianAssigner(BaseAssigner):
+     """Computes one-to-one matching between predictions and ground truth for
+     mask.
+diff --git a/projects/mmdet3d_plugin/mask2map/dense_heads/mask2map_head_1p.py b/projects/mmdet3d_plugin/mask2map/dense_heads/mask2map_head_1p.py
+index fdb77bd..c6619cb 100755
+--- a/projects/mmdet3d_plugin/mask2map/dense_heads/mask2map_head_1p.py
++++ b/projects/mmdet3d_plugin/mask2map/dense_heads/mask2map_head_1p.py
+@@ -47,8 +47,19 @@ class Mask2MapHead_1Phase(DETRHead):
+         dn_enabled=False,
+         dn_weight=1,
+         pv_seg_dim=None,
++        semantic_only=False,
++        seg_upsample=0,
++        seg_score_thr=0.4,
+         **kwargs,
+     ):
++        # semantic_only (B2D, ReSMap stage 1 style): train only BEV semantic segmentation (seg_head on the LSS BEV,
++        # loss_seg) + depth + PV seg; the instance branch (pixel decoder, Mask2Former queries, matching) is not run.
++        self.semantic_only = semantic_only
++        # NAVSIM: number of nearest-x2 + conv3x3 + ReLU blocks in the BEV seg head (ReSMap MapSegHead layout), e.g. 1
++        # for a 100 x 100 BEV and a 200 x 200 seg canvas.  0 keeps the upstream head (same parameter names).
++        self.seg_upsample = int(seg_upsample)
++        # NAVSIM semantic_only test output: per-pixel argmax kept if sigmoid >= seg_score_thr (ReSMap's rule)
++        self.seg_score_thr = seg_score_thr
+         self.bev_h = bev_h
+         self.bev_w = bev_w
+         self.fp16_enabled = False
+@@ -101,7 +112,8 @@ class Mask2MapHead_1Phase(DETRHead):
+         self.dn_enabled = dn_enabled
+         self.dn_weight = dn_weight
+ 
+-        self.assigner_segm = build_assigner(self.train_cfg["assigner_segm"])
++        # tools/test.py and the cache writer build the model with train_cfg=None
++        self.assigner_segm = build_assigner(self.train_cfg["assigner_segm"]) if self.train_cfg else None
+ 
+     def _init_layers(self):
+         """Initialize classification branch and regression branch of head."""
+@@ -129,12 +141,19 @@ class Mask2MapHead_1Phase(DETRHead):
+             if not (self.aux_seg["bev_seg"] or self.aux_seg["pv_seg"]):
+                 raise ValueError("aux_seg must have bev_seg or pv_seg")
+             if self.aux_seg["bev_seg"]:
+-                self.seg_head = nn.Sequential(
++                seg_layers = [
+                     nn.Conv2d(self.embed_dims, self.embed_dims, kernel_size=3, padding=1, bias=False),
+                     # nn.BatchNorm2d(128),
+                     nn.ReLU(inplace=True),
+-                    nn.Conv2d(self.embed_dims, self.aux_seg["seg_classes"], kernel_size=1, padding=0),
+-                )
++                ]
++                for _ in range(getattr(self, "seg_upsample", 0)):  # NAVSIM: ReSMap MapSegHead up-blocks
++                    seg_layers += [
++                        nn.Upsample(scale_factor=2, mode="nearest"),
++                        nn.Conv2d(self.embed_dims, self.embed_dims, kernel_size=3, padding=1),
++                        nn.ReLU(inplace=True),
++                    ]
++                seg_layers.append(nn.Conv2d(self.embed_dims, self.aux_seg["seg_classes"], kernel_size=1, padding=0))
++                self.seg_head = nn.Sequential(*seg_layers)
+             if self.aux_seg["pv_seg"]:
+                 if self.pv_seg_dim is None:
+                     self.pv_seg_dim = self.embed_dims
+@@ -153,6 +172,9 @@ class Mask2MapHead_1Phase(DETRHead):
+     def init_weights(self):
+         """Initialize weights of the DeformDETR head."""
+         self.transformer.init_weights()
++        if self.semantic_only and self.aux_seg["bev_seg"]:
++            from mmcv.cnn import bias_init_with_prob
++            nn.init.constant_(self.seg_head[-1].bias, bias_init_with_prob(0.01))  # as ReSMap MapSegHead.conv_out
+ 
+     # @auto_fp16(apply_to=('mlvl_feats'))
+     @force_fp32(apply_to=("mlvl_feats", "prev_bev"))
+@@ -177,6 +199,21 @@ class Mask2MapHead_1Phase(DETRHead):
+         bs, num_cam, _, _, _ = mlvl_feats[0].shape
+         dtype = mlvl_feats[0].dtype
+ 
++        if self.semantic_only:
++            ret = self.transformer.get_bev_features(
++                mlvl_feats, lidar_feat, None, self.bev_h, self.bev_w,
++                grid_length=(self.real_h / self.bev_h, self.real_w / self.bev_w), bev_pos=None,
++                img_metas=img_metas, prev_bev=prev_bev)
++            bev_embed = ret["bev"]                                           # (bs, bev_h * bev_w, C), row = y
++            if only_bev:
++                return bev_embed
++            seg_bev = bev_embed.view(bs, self.bev_h, self.bev_w, -1).permute(0, 3, 1, 2).contiguous()
++            outs = dict(bev_embed=bev_embed, depth=ret["depth"], seg=self.seg_head(seg_bev), pv_seg=None)
++            if self.aux_seg["pv_seg"]:
++                _, _, _, feat_h, feat_w = mlvl_feats[-1].shape
++                outs["pv_seg"] = self.pv_seg_head(mlvl_feats[-1].flatten(0, 1)).view(bs, num_cam, -1, feat_h, feat_w)
++            return outs
++
+         pts_embeds = self.pts_embedding.weight.unsqueeze(0)
+ 
+         bev_queries = None
+@@ -255,7 +292,7 @@ class Mask2MapHead_1Phase(DETRHead):
+         outputs_seg = None
+         outputs_pv_seg = None
+         if self.aux_seg["use_aux_seg"]:
+-            seg_bev_embed = bev_embed.permute(1, 0, 2).reshape(bs, self.bev_h, self.bev_w, -1).permute(0, 3, 1, 2).contiguous()
++            seg_bev_embed = bev_embed.view(bs, self.bev_h, self.bev_w, -1).permute(0, 3, 1, 2).contiguous()  # LSS: (bs, HW, C)
+             if self.aux_seg["bev_seg"]:
+                 outputs_seg = self.seg_head(seg_bev_embed)
+             bs, num_cam, embed_dims, feat_h, feat_w = mlvl_feats[-1].shape
+@@ -575,6 +612,12 @@ class Mask2MapHead_1Phase(DETRHead):
+     ):
+         assert gt_bboxes_ignore is None, f"{self.__class__.__name__} only supports " f"for gt_bboxes_ignore setting to None."
+ 
++        if self.semantic_only:
++            loss_dict = dict(loss_seg=self.loss_seg(preds_dicts["seg"], torch.stack(list(gt_seg_mask)).float()))
++            if preds_dicts["pv_seg"] is not None:
++                loss_dict["loss_pv_seg"] = self.loss_pv_seg(preds_dicts["pv_seg"], torch.stack(list(gt_pv_seg_mask)).float())
++            return loss_dict
++
+         enc_cls_scores = preds_dicts["enc_cls_scores"]
+         enc_bbox_preds = preds_dicts["enc_bbox_preds"]
+         enc_pts_preds = preds_dicts["enc_pts_preds"]
+diff --git a/projects/mmdet3d_plugin/mask2map/detectors/mask2map.py b/projects/mmdet3d_plugin/mask2map/detectors/mask2map.py
+index 9aae3f0..14e2d07 100755
+--- a/projects/mmdet3d_plugin/mask2map/detectors/mask2map.py
++++ b/projects/mmdet3d_plugin/mask2map/detectors/mask2map.py
+@@ -1,4 +1,5 @@
+ import copy
++import numpy as np
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -149,6 +150,10 @@ class Mask2Map(MVXTwoStageDetector):
+                 loss_depth = torch.nan_to_num(loss_depth)
+             losses.update(loss_depth=loss_depth)
+ 
++        if getattr(self.pts_bbox_head, "semantic_only", False):  # BEV semantic seg only: no vector / instance GT
++            losses.update(self.pts_bbox_head.loss(None, None, None, gt_seg_mask, gt_pv_seg_mask, None, None, outs, img_metas=img_metas))
++            return losses
++
+         gt_vecs_list = copy.deepcopy(gt_bboxes_3d)
+         device = gt_labels_3d[0].device
+ 
+@@ -411,6 +416,24 @@ class Mask2Map(MVXTwoStageDetector):
+         """Test function"""
+         outs = self.pts_bbox_head(x, lidar_feat, img_metas, prev_bev=prev_bev)
+ 
++        if getattr(self.pts_bbox_head, "semantic_only", False):
++            # Compact per-frame output, so a distributed eval over ~26k frames gathers ~60 kB/frame instead of the
++            # float probabilities: seg_label (H, W) uint8 = ReSMap's rule (argmax class + 1 where its sigmoid >=
++            # seg_score_thr, else 0) and seg_bits = np.packbits of the (C, H, W) multi-label mask sigmoid >= 0.5.
++            thr = getattr(self.pts_bbox_head, "seg_score_thr", 0.4)
++            results = []
++            for b, logits in enumerate(outs["seg"]):
++                logits = logits.float()
++                prob = logits.sigmoid()
++                top, label = logits.max(0)  # argmax on the logits, as ReSMap (sigmoid saturates and would tie)
++                seg_label = torch.where(top.sigmoid() >= thr, label + 1, torch.zeros_like(label)).to(torch.uint8)
++                results.append(dict(
++                    token=img_metas[b].get("sample_idx"),
++                    seg_label=seg_label.cpu().numpy(),
++                    seg_bits=np.packbits((prob >= 0.5).cpu().numpy()),
++                ))
++            return outs["bev_embed"], results
++
+         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas, rescale=rescale)
+         if len(bbox_list[0]) == 5:
+             bbox_results = [self.pred2result_dist(bboxes, scores, labels, pts, pts_cls) for bboxes, scores, labels, pts, pts_cls in bbox_list]
+diff --git a/projects/mmdet3d_plugin/mask2map/losses/__init__.py b/projects/mmdet3d_plugin/mask2map/losses/__init__.py
+index f39038b..ffd869c 100755
+--- a/projects/mmdet3d_plugin/mask2map/losses/__init__.py
++++ b/projects/mmdet3d_plugin/mask2map/losses/__init__.py
+@@ -1,3 +1,4 @@
+ from .map_loss import OrderedPtsL1Cost, PtsL1Cost, OrderedPtsSmoothL1Cost, OrderedPtsL1Loss
+ from .map_loss import PtsDirCosLoss, DiceLoss, DiceCost, CrossEntropyLossCost, dice_loss, weight_reduce_loss
+-from .simple_loss import SimpleLoss
+\ No newline at end of file
++from .simple_loss import SimpleLoss
++from .sem_seg_loss import ReSMapSegLoss
+diff --git a/projects/mmdet3d_plugin/mask2map/losses/map_loss.py b/projects/mmdet3d_plugin/mask2map/losses/map_loss.py
+index de7d278..72f8709 100755
+--- a/projects/mmdet3d_plugin/mask2map/losses/map_loss.py
++++ b/projects/mmdet3d_plugin/mask2map/losses/map_loss.py
+@@ -805,7 +805,7 @@ def dice_loss(pred,
+     return loss
+ 
+ 
+-@LOSSES.register_module()
++@LOSSES.register_module(force=True)
+ class DiceLoss(nn.Module):
+ 
+     def __init__(self,
+@@ -889,7 +889,7 @@ class DiceLoss(nn.Module):
+         return loss
+ 
+ 
+-@MATCH_COST.register_module()
++@MATCH_COST.register_module(force=True)
+ class CrossEntropyLossCost:
+     """CrossEntropyLossCost.
+ 
+@@ -953,7 +953,7 @@ class CrossEntropyLossCost:
+         return cls_cost * self.weight
+ 
+ 
+-@MATCH_COST.register_module()
++@MATCH_COST.register_module(force=True)
+ class DiceCost:
+     """Cost of mask assignments based on dice losses.
+ 
+diff --git a/projects/mmdet3d_plugin/mask2map/losses/sem_seg_loss.py b/projects/mmdet3d_plugin/mask2map/losses/sem_seg_loss.py
+new file mode 100644
+index 0000000..2922840
+--- /dev/null
++++ b/projects/mmdet3d_plugin/mask2map/losses/sem_seg_loss.py
+@@ -0,0 +1,37 @@
++"""ReSMap stage-1 BEV semantic segmentation loss (ReSMap plugin/models/losses/seg_loss.py: MaskFocalLoss + MaskDiceLoss),
++as one loss module for the Mask2Map head's `loss_seg` slot.
++
++pred (B, C, H, W) logits, target (B, C, H, W) {0, 1}: sigmoid focal loss averaged over classes x focal_weight
+++ (1 - mean dice over batch and classes) x dice_weight.
++"""
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from mmdet.models import LOSSES
++
++
++def sigmoid_focal_loss(pred, target, gamma=2.0, alpha=0.25):
++    p = pred.sigmoid()
++    target = target.type_as(pred)
++    pt = (1 - p) * target + p * (1 - target)
++    w = (alpha * target + (1 - alpha) * (1 - target)) * pt.pow(gamma)
++    return (F.binary_cross_entropy_with_logits(pred, target, reduction='none') * w).mean()
++
++
++@LOSSES.register_module()
++class ReSMapSegLoss(nn.Module):
++
++    def __init__(self, focal_weight=10.0, dice_weight=1.0, gamma=2.0, alpha=0.25, loss_weight=1.0):
++        super().__init__()
++        self.focal_weight, self.dice_weight = focal_weight, dice_weight
++        self.gamma, self.alpha = gamma, alpha
++        self.loss_weight = loss_weight
++        self.smooth = 1e-5
++
++    def forward(self, pred, target):
++        pred, target = pred.float(), target.float()
++        focal = sum(sigmoid_focal_loss(pred[:, c], target[:, c], self.gamma, self.alpha)
++                    for c in range(pred.size(1))) / pred.size(1)
++        p, t = pred.sigmoid().flatten(2), target.flatten(2)
++        dice = 1 - ((2 * (p * t).sum(2) + self.smooth) / ((p * p).sum(2) + t.sum(2) + self.smooth)).mean()
++        return self.loss_weight * (self.focal_weight * focal + self.dice_weight * dice)
+diff --git a/projects/mmdet3d_plugin/mask2map/modules/bev_pool_torch.py b/projects/mmdet3d_plugin/mask2map/modules/bev_pool_torch.py
+new file mode 100644
+index 0000000..b7a2e68
+--- /dev/null
++++ b/projects/mmdet3d_plugin/mask2map/modules/bev_pool_torch.py
+@@ -0,0 +1,16 @@
++"""Pure-PyTorch stand-in for mmdet3d.ops.bev_pool (BEVFusion's QuickCumsum CUDA op), used when that op is not built.
++
++bev_pool(feats, coords, B, D, H, W): feats (N, C), coords (N, 4) long = (x in [0, H), y in [0, W), z in [0, D), batch);
++returns (B, C, D, H, W) with the features of each voxel summed, as the CUDA op does.
++"""
++import torch
++
++
++def bev_pool(feats, coords, B, D, H, W):
++    assert feats.shape[0] == coords.shape[0]
++    B, D, H, W = int(B), int(D), int(H), int(W)
++    c = coords.long()
++    idx = ((c[:, 3] * D + c[:, 2]) * H + c[:, 0]) * W + c[:, 1]
++    out = feats.new_zeros((B * D * H * W, feats.shape[1]))
++    out.index_add_(0, idx, feats)
++    return out.view(B, D, H, W, -1).permute(0, 4, 1, 2, 3).contiguous()
+diff --git a/projects/mmdet3d_plugin/mask2map/modules/encoder.py b/projects/mmdet3d_plugin/mask2map/modules/encoder.py
+index 33e08a6..fd281c1 100755
+--- a/projects/mmdet3d_plugin/mask2map/modules/encoder.py
++++ b/projects/mmdet3d_plugin/mask2map/modules/encoder.py
+@@ -2,13 +2,19 @@ import torch
+ import numpy as np
+ import torch.nn as nn
+ import torch.nn.functional as F
+-from mmdet3d.ops import bev_pool
++try:
++    from mmdet3d.ops import bev_pool
++except ImportError:  # mmdet3d without the BEVFusion CUDA ops (e.g. 1.0.0rc6)
++    from .bev_pool_torch import bev_pool
+ from mmcv.cnn import build_conv_layer
+ from mmcv.runner import force_fp32, auto_fp16
+ from mmcv.runner.base_module import BaseModule
+ from torch.cuda.amp.autocast_mode import autocast
+ from mmdet.models.backbones.resnet import BasicBlock
+-from mmdet3d.ops.bev_pool_v2.bev_pool import bev_pool_v2
++try:
++    from mmdet3d.ops.bev_pool_v2.bev_pool import bev_pool_v2
++except ImportError:  # only LSSTransformV2 needs it
++    bev_pool_v2 = None
+ from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
+ 
+ from projects.mmdet3d_plugin.bevformer.modules.encoder import BEVFormerEncoder
+diff --git a/projects/mmdet3d_plugin/mask2map/modules/mask2former.py b/projects/mmdet3d_plugin/mask2map/modules/mask2former.py
+index 3e665f7..615dd81 100755
+--- a/projects/mmdet3d_plugin/mask2map/modules/mask2former.py
++++ b/projects/mmdet3d_plugin/mask2map/modules/mask2former.py
+@@ -636,7 +636,7 @@ class MSDeformAttnPixelDecoder(BaseModule):
+         num_queries_per_level = [e[0] * e[1] for e in spatial_shapes]
+         spatial_shapes = torch.cat(spatial_shapes).view(-1, 2)
+         # shape (0, h_0*w_0, h_0*w_0+h_1*w_1, ...)
+-        level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
++        level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), (spatial_shapes[:, 0] * spatial_shapes[:, 1]).cumsum(0)[:-1]))  # h * w: int64 .prod() is NVRTC-jitted in torch 1.12, which cannot target sm_89 (L40S)
+         reference_points = torch.cat(reference_points_list, dim=0)
+         reference_points = reference_points[None, :, None].repeat(batch_size, 1, self.num_encoder_levels, 1)
+         valid_radios = reference_points.new_ones((batch_size, self.num_encoder_levels, 2))
+diff --git a/projects/mmdet3d_plugin/mask2map/modules/ops/geometric_kernel_attn/function/geometric_kernel_attn_func.py b/projects/mmdet3d_plugin/mask2map/modules/ops/geometric_kernel_attn/function/geometric_kernel_attn_func.py
+index 6c44a7e..1daa730 100755
+--- a/projects/mmdet3d_plugin/mask2map/modules/ops/geometric_kernel_attn/function/geometric_kernel_attn_func.py
++++ b/projects/mmdet3d_plugin/mask2map/modules/ops/geometric_kernel_attn/function/geometric_kernel_attn_func.py
+@@ -7,7 +7,10 @@ import torch.nn.functional as F
+ from torch.autograd import Function
+ from torch.autograd.function import once_differentiable
+ 
+-import GeometricKernelAttention as GKA
++try:
++    import GeometricKernelAttention as GKA
++except ImportError:  # extension not built; only GKT configs need it
++    GKA = None
+ 
+ 
+ class GeometricKernelAttentionFunc(Function):
+diff --git a/projects/mmdet3d_plugin/models/backbones/efficientnet.py b/projects/mmdet3d_plugin/models/backbones/efficientnet.py
+index 82556ec..ccc3520 100755
+--- a/projects/mmdet3d_plugin/models/backbones/efficientnet.py
++++ b/projects/mmdet3d_plugin/models/backbones/efficientnet.py
+@@ -153,7 +153,7 @@ def model_scaling(layer_setting, arch_setting):
+     return merge_layer_setting
+ 
+ 
+-@BACKBONES.register_module()
++@BACKBONES.register_module(force=True)  # mmdet>=2.2x ships its own EfficientNet
+ class EfficientNet(BaseModule):
+     """EfficientNet backbone.
+     Args:
+diff --git a/tools/navsim/bnft_front64.sh b/tools/navsim/bnft_front64.sh
+new file mode 100755
+index 0000000..ee80f19
+--- /dev/null
++++ b/tools/navsim/bnft_front64.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++# BN-calibration fine-tune of a finished front64 run: one short epoch (every 4th train frame) with every BatchNorm
++# frozen in eval mode, so eval-mode predictions / cached BEV features match the train-mode network (FreezeBNHook).
++#
++#   GPUS=0,1,2,3 bash tools/navsim/bnft_front64.sh <run_work_dir>/epoch_18.pth
++#
++# The config is <run config>_bnft.py, picked from the config tools/train.py dumped into the run's work_dir (baseline
++# or undist); the result goes to <run_work_dir>_bnft/epoch_1.pth and is evaluated on val at the end.  lr defaults to
++# 1e-4 at global batch 64, scaled linearly.  Extra config overrides go in CFG_OPTIONS.
++set -euo pipefail
++CKPT=${1:?usage: bnft_front64.sh <ckpt> [extra tools/train.py args]}
++shift
++[ -f "$CKPT" ] || { echo "bnft_front64.sh: no such checkpoint: $CKPT" >&2; exit 2; }
++CKPT=$(readlink -f "$CKPT")
++REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++RUN_DIR=$(dirname "$CKPT")
++RUN_CFG=$(ls "$RUN_DIR"/M2M_navsim_*.py | head -1)
++export CFG=${CFG:-$REPO/projects/configs/mask2map_navsim/$(basename "$RUN_CFG" .py)_bnft.py}
++[ -f "$CFG" ] || { echo "bnft_front64.sh: no fine-tune config $CFG" >&2; exit 2; }
++GPUS=${GPUS:-0,1,2,3}
++SPG=${SPG:-16}
++NGPU=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
++export GPUS SPG
++export LR=${LR:-$(python3 -c "print(1e-4 * $NGPU * $SPG / 64)")}
++export WORK_DIR=${WORK_DIR:-${RUN_DIR}_bnft}
++export PORT=${PORT:-$((29660 + ${GPUS%%,*}))}  # per first GPU, so runs on disjoint GPU sets do not collide
++export CFG_OPTIONS="load_from=$CKPT ${CFG_OPTIONS:-}"
++echo "[bnft_front64] from $CKPT"
++exec bash "$REPO/tools/navsim/train_front64.sh" "$@"
+diff --git a/tools/navsim/cache_teacher_m2m.py b/tools/navsim/cache_teacher_m2m.py
+new file mode 100644
+index 0000000..d4883bc
+--- /dev/null
++++ b/tools/navsim/cache_teacher_m2m.py
+@@ -0,0 +1,299 @@
++"""Dump the trained Mask2Map NAVSIM teacher's BEV (and seg logits) in the ReSMap stage-1 cache layout.
++
++Layout (the one SSR's ResmapCache / TeacherFeatureStore read, = resmap_navsim tools/cache_teacher_kd_seg.py):
++    <out>/meta.json, <out>/index.json {token: [shard, row]}, <out>/index_r{rank}.json
++    <out>/bev/r{rank}_s{NNNN}.npy   (N, 256, 100, 100) float16
++    <out>/seg/r{rank}_s{NNNN}.npy   (N, 4, 200, 200)   float16 logits (not thresholded)
++Axes: (C, lateral, forward) with row 0 = y_left +32 m and column 0 = x 0 m (rear axle), 0.64 m (bev) / 0.32 m (seg)
++cells, i.e. ReSMap's.  Mask2Map's LSS BEV and seg logits have row 0 = y -32 m (see navsim_map_utils), so both are
++flipped once on rows here; nothing else changes (no transpose, no W flip).
++
++`bev` is the tensor the seg head reads: the LSS output after its stride-2 block (post BN + ReLU, so about half the
++values are exactly 0; ReSMap's BEVFormer output is not rectified).  `--bev-tap pre_relu` caches the same block's BN
++output before the last ReLU instead.  Either way SSR needs a new norm file and a refiner MAP teacher trained on it.
++
++The model is single-frame, so frames are independent: each rank takes every world-th frame and can resume.
++An output directory belongs to one checkpoint / config / world size (provenance.json): a new run refuses a non-empty
++directory, and --resume refuses a different checkpoint, settings or world size.  Before writing, the free space is
++checked against the remaining frames x 5.44 MB (bev 5.12 MB + seg 0.32 MB per frame).  Ranks only meet in one gloo
++barrier at the end, so no NCCL setup is needed.
++
++    torchrun --nproc_per_node=4 tools/navsim/cache_teacher_m2m.py \
++        --cfg <work_dir>/M2M_navsim_front64_r50_sem_18ep.py --ckpt <work_dir>/epoch_18.pth \
++        --split none --out /path/teacher_cache/mask2map/front64
++    # navtest (allow-list tokens only):
++    torchrun ... --split none --only-split-tokens \
++        --ann-file .../infos/navsim_map_infos_navtest.pkl --map-gt-file .../map_gt_navsim_front64x64/navtest.npz \
++        --out /path/teacher_cache/mask2map/front64/navtest
++"""
++import argparse
++import glob
++import hashlib
++import json
++import os
++import os.path as osp
++import sys
++import time
++from datetime import timedelta
++
++import numpy as np
++import torch
++import torch.distributed as dist
++from mmcv import Config
++from mmcv.parallel import MMDataParallel, collate
++from mmcv.runner import get_dist_info, init_dist, load_checkpoint
++
++sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))
++import projects.mmdet3d_plugin  # noqa: F401,E402  registers the plugin modules
++from mmdet3d.datasets import build_dataset  # noqa: E402
++from mmdet3d.models import build_model  # noqa: E402
++
++TENSORS = ('bev', 'seg')
++
++
++def parse_args():
++    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    p.add_argument('--cfg', required=True)
++    p.add_argument('--ckpt', required=True)
++    p.add_argument('--out', required=True)
++    p.add_argument('--split', default='none', help='log_split to cache: train | val | none (every frame of ann_file)')
++    p.add_argument('--ann-file', default=None, help='override data.test.ann_file (e.g. the navtest infos)')
++    p.add_argument('--map-gt-file', default=None, help='override data.test.map_gt_file (must cover --ann-file)')
++    p.add_argument('--only-split-tokens', action='store_true', help='only scene-filter allow-list frames')
++    p.add_argument('--token-list', default=None, help='text file of tokens to cache (one per line)')
++    p.add_argument('--bev-tap', choices=['post_relu', 'pre_relu'], default='post_relu')
++    p.add_argument('--shard', type=int, default=2000, help='frames per shard')
++    p.add_argument('--workers', type=int, default=6)
++    p.add_argument('--limit', type=int, default=0, help='stop after N frames per rank (dry run)')
++    p.add_argument('--resume', action='store_true', help="skip tokens already in this rank's index_r{rank}.json")
++    p.add_argument('--skip-space-check', action='store_true', help='write even if the disk looks too small')
++    return p.parse_args()
++
++
++FRAME_BYTES = 256 * 100 * 100 * 2 + 4 * 200 * 200 * 2  # bev + seg, float16
++
++
++def check_provenance(out, prov, resume):
++    """Rank 0: one output directory = one checkpoint, config, split selection, bev tap and world size."""
++    path = osp.join(out, 'provenance.json')
++    existing = [f for f in ('index.json', 'meta.json') if osp.exists(osp.join(out, f))] + \
++        glob.glob(osp.join(out, 'index_r*.json')) + glob.glob(osp.join(out, '*', 'r*_s*.npy'))
++    if osp.exists(path):
++        with open(path) as f:
++            old = json.load(f)
++        if not resume:
++            raise SystemExit(f'{out} already holds a cache (provenance.json); use --resume or a new --out')
++        diff = {k: (old.get(k), v) for k, v in prov.items() if old.get(k) != v}
++        if diff:
++            raise SystemExit(f'--resume into {out} with different settings: {diff}')
++        return
++    if existing:
++        raise SystemExit(f'{out} is not empty and has no provenance.json ({existing[:3]}...); use a new --out')
++    os.makedirs(out, exist_ok=True)
++    with open(path, 'w') as f:
++        json.dump(prov, f, indent=2)
++
++
++def sha256_file(path, chunk=1 << 20):
++    h = hashlib.sha256()
++    with open(path, 'rb') as f:
++        for block in iter(lambda: f.read(chunk), b''):
++            h.update(block)
++    return h.hexdigest()
++
++
++class ShardWriter(object):
++    """Buffers frames and writes one .npy per tensor per shard; index_r{rank}.json is rewritten after every shard."""
++
++    def __init__(self, out, rank, shard_frames):
++        self.out, self.rank, self.shard_frames = out, rank, shard_frames
++        self.buf = {k: [] for k in TENSORS}
++        self.tokens = []
++        self.index_path = osp.join(out, f'index_r{rank}.json')
++        self.index = {}
++        self.shard_id = 0
++        for k in TENSORS:
++            os.makedirs(osp.join(out, k), exist_ok=True)
++
++    def resume(self):
++        if osp.exists(self.index_path):
++            with open(self.index_path) as f:
++                self.index = json.load(f)
++        names = {v[0] for v in self.index.values()}
++        # drop shard files a crash left without an index entry
++        for k in TENSORS:
++            for f in glob.glob(osp.join(self.out, k, f'r{self.rank}_s*.npy')):
++                if osp.basename(f)[:-4] not in names:
++                    os.remove(f)
++        if names:
++            self.shard_id = max(int(n.split('_s')[1]) for n in names) + 1
++        return set(self.index)
++
++    def add(self, token, tensors):
++        self.tokens.append(token)
++        for k in TENSORS:
++            self.buf[k].append(tensors[k])
++        if len(self.tokens) >= self.shard_frames:
++            self.flush()
++
++    def flush(self):
++        if not self.tokens:
++            return
++        name = f'r{self.rank}_s{self.shard_id:04d}'
++        for k in TENSORS:
++            tmp = osp.join(self.out, k, name + '.tmp.npy')
++            np.save(tmp, np.stack(self.buf[k]))
++            os.replace(tmp, osp.join(self.out, k, name + '.npy'))
++            self.buf[k] = []
++        for row, tok in enumerate(self.tokens):
++            self.index[tok] = [name, row]
++        with open(self.index_path + '.tmp', 'w') as f:
++            json.dump(self.index, f)
++        os.replace(self.index_path + '.tmp', self.index_path)
++        self.tokens = []
++        self.shard_id += 1
++
++
++def main():
++    args = parse_args()
++    # as tools/train.py: something in the import chain switches multiprocessing to 'spawn', and the dataset holds
++    # unpicklable objects (dict_keys), so the dataloader workers must fork
++    torch.multiprocessing.set_start_method('fork', force=True)
++    torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', 0)))
++    init_dist('pytorch', backend='gloo', timeout=timedelta(hours=6))  # only a final barrier; avoids NCCL NIC setup
++    rank, world = get_dist_info()
++
++    cfg = Config.fromfile(args.cfg)
++    test = cfg.data.test
++    test.log_split = None if args.split.lower() == 'none' else args.split
++    test.test_mode = True
++    if args.ann_file:
++        test.ann_file = args.ann_file
++    if args.map_gt_file:
++        test.map_gt_file = args.map_gt_file
++    test.split_tokens_only = bool(args.only_split_tokens)
++    if args.token_list:
++        test.token_list = args.token_list
++    cfg.model.train_cfg = None
++    cfg.model.pretrained = None  # the checkpoint holds every weight
++    dataset = build_dataset(test)
++
++    ckpt_sha = sha256_file(args.ckpt) if rank == 0 else None  # hashed before the weights are loaded
++    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
++    if cfg.get('fp16', None) is not None:  # as tools/test.py: the backbone + neck run in fp16, like in training
++        from mmcv.runner import wrap_fp16_model
++        wrap_fp16_model(model)
++    load_checkpoint(model, args.ckpt, map_location='cpu', strict=True)
++    model = MMDataParallel(model.cuda(), device_ids=[torch.cuda.current_device()]).eval()
++    core = model.module
++    head = core.pts_bbox_head
++    assert getattr(head, 'semantic_only', False) and head.aux_seg['bev_seg'], 'expects the semantic_only NAVSIM model'
++
++    cap = {}
++    head.seg_head.register_forward_hook(lambda m, i, o: cap.update(seg=o, bev_post=i[0]))
++    if args.bev_tap == 'pre_relu':
++        ds = head.transformer.encoder.downsample  # conv-BN-ReLU, conv(s2)-BN-ReLU, conv-BN-ReLU
++        assert isinstance(ds[-1], torch.nn.ReLU) and isinstance(ds[-2], torch.nn.BatchNorm2d)
++        # clone: the block's last ReLU runs in place and would rectify the captured tensor
++        ds[-2].register_forward_hook(lambda m, i, o: cap.update(bev_pre=o.clone()))
++
++    # provenance (rank 0's checkpoint hash from before loading; meta.json reuses it)
++    prov = None
++    if rank == 0:
++        prov = dict(checkpoint_sha256=ckpt_sha, cfg=osp.abspath(args.cfg), world_size=world,
++                    split=args.split, ann_file=test.ann_file, map_gt_file=test.get('map_gt_file'),
++                    only_split_tokens=bool(args.only_split_tokens), token_list=args.token_list,
++                    bev_tap=args.bev_tap)
++        check_provenance(args.out, prov, args.resume)
++    dist.barrier()
++    with open(osp.join(args.out, 'provenance.json')) as f:
++        prov = json.load(f)
++
++    writer = ShardWriter(args.out, rank, args.shard)
++    done = writer.resume() if args.resume else set()
++    todo = [i for i in range(rank, len(dataset), world) if dataset.data_infos[i]['token'] not in done]
++    if not args.skip_space_check:
++        need = len(todo) * FRAME_BYTES * world  # every rank has about the same share
++        free = __import__('shutil').disk_usage(args.out).free
++        if need > free * 0.98:
++            raise SystemExit(f'[rank {rank}] about {need / 2**30:.0f} GiB still to write but only {free / 2**30:.0f} '
++                             f'GiB free on {args.out}; free space or pass --skip-space-check')
++    loader = torch.utils.data.DataLoader(
++        torch.utils.data.Subset(dataset, todo), batch_size=1, shuffle=False, num_workers=args.workers,
++        collate_fn=lambda b: collate(b, samples_per_gpu=1), pin_memory=False)
++    if rank == 0:
++        print(f'[cache] {len(dataset)} frames, split={args.split}, {world} ranks, bev tap {args.bev_tap}', flush=True)
++    print(f'[rank {rank}] {len(todo)} frames to write ({len(done)} already cached)', flush=True)
++
++    t0, n = time.time(), 0
++    with torch.no_grad():
++        for data in loader:
++            token = data['img_metas'][0].data[0][0]['sample_idx']
++            model(return_loss=False, rescale=True, **data)
++            bev = cap['bev_pre'] if args.bev_tap == 'pre_relu' else cap['bev_post']
++            tensors = {
++                'bev': bev[0].flip(-2).float().to(torch.float16).cpu().numpy(),   # row 0 = y +32 m (ReSMap layout)
++                'seg': cap['seg'][0].flip(-2).float().to(torch.float16).cpu().numpy(),
++            }
++            if n == 0 and rank == 0:
++                for k, v in tensors.items():
++                    print(f'    {k:4s} {tuple(v.shape)} {v.dtype} range [{float(v.min()):.3f}, {float(v.max()):.3f}] '
++                          f'zero frac {float((v == 0).mean()):.3f}', flush=True)
++            writer.add(token, tensors)
++            n += 1
++            if rank == 0 and n % 500 == 0:
++                rate = n / (time.time() - t0)
++                print(f'[cache] rank0 {n}/{len(todo)} {rate:.1f} frames/s, '
++                      f'eta {timedelta(seconds=int((len(todo) - n) / max(rate, 1e-6)))}', flush=True)
++            if args.limit and n >= args.limit:
++                break
++    writer.flush()
++    print(f'[rank {rank}] done: {n} new frames, {len(writer.index)} in index_r{rank}, {time.time() - t0:.0f}s',
++          flush=True)
++
++    dist.barrier()
++    if rank == 0:
++        index = {}
++        for r in range(world):  # only this run's ranks (provenance pins the world size)
++            with open(osp.join(args.out, f'index_r{r}.json')) as fh:
++                part = json.load(fh)
++            dup = set(part) & set(index)
++            assert not dup, f'{len(dup)} tokens written by two ranks, e.g. {sorted(dup)[:3]}'
++            index.update(part)
++        with open(osp.join(args.out, 'index.json'), 'w') as f:
++            json.dump(index, f)
++        bev_h, bev_w = head.bev_h, head.bev_w
++        n_cls = head.aux_seg['seg_classes']
++        seg_h, seg_w = bev_h * 2 ** head.seg_upsample, bev_w * 2 ** head.seg_upsample
++        meta = {
++            'teacher_config': osp.abspath(args.cfg),
++            'teacher_checkpoint': osp.abspath(args.ckpt),
++            'checkpoint_sha256': prov['checkpoint_sha256'],  # hashed before the weights were loaded
++            'split': args.split,
++            'ann_file': test.ann_file,
++            'map_gt_file': test.get('map_gt_file'),
++            'only_split_tokens': bool(args.only_split_tokens),
++            'token_list': args.token_list,
++            'num_frames': len(index),
++            'classes': list(cfg.map_classes),
++            'roi_size_m': list(cfg.roi_size),
++            'roi_center_m': list(cfg.roi_center),
++            'pc_range': list(cfg.point_cloud_range),
++            'bev_grid': [bev_h, bev_w],
++            'canvas_size': list(cfg.canvas_size),
++            'tensors': {
++                'bev': {'shape': [int(head.embed_dims), bev_h, bev_w], 'dtype': 'float16',
++                        'note': f'Mask2Map LSS BEV ({args.bev_tap}), the seg head input; axes (C, lateral, forward), '
++                                f'row 0 = y +32 m, col 0 = x 0 m, 0.64 m cells'},
++                'seg': {'shape': [n_cls, seg_h, seg_w], 'dtype': 'float16',
++                        'note': 'camera seg logits (seg_head), not thresholded; same axes at 0.32 m'},
++            },
++            'teacher_stage': 'Mask2Map phase-1 semantic_only (LSS BEV + segmentation, no instance / vector head)',
++        }
++        with open(osp.join(args.out, 'meta.json'), 'w') as f:
++            json.dump(meta, f, indent=2)
++        print(f'[cache] index.json: {len(index)} frames; meta.json written', flush=True)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/navsim/create_navsim_infos.py b/tools/navsim/create_navsim_infos.py
+new file mode 100644
+index 0000000..d7d5fdc
+--- /dev/null
++++ b/tools/navsim/create_navsim_infos.py
+@@ -0,0 +1,161 @@
++#!/usr/bin/env python
++"""Build the NAVSIM (openscene-v1.1) frame infos used by the Mask2Map NAVSIM port.
++
++This is resmap_navsim/tools/create_navsim_infos.py with its hard-coded roots turned into arguments; the frame
++selection and every stored field are unchanged, so the frame set is the one the ReSMap front64 teacher was trained and
++cached on (navtrain: 152,495 frames = 126,032 on train logs + 26,463 on val logs).
++
++Per frame:
++    token, cams{CAM: {img_fpath, intrinsics (3x3, calibrated at 1920x1080), extrinsics (4x4 ego2cam), distortion}},
++    lidar2ego_translation/rotation (identity in nuPlan), e2g_translation (UTM) / e2g_rotation (wxyz),
++    timestamp, location, scene_name, log_name, scene_token, frame_idx, in_split_tokens, sample_idx, prev, next,
++    lidar_path (MergedPointCloud .pcd, in the ego frame)
++
++NAVSIM / nuPlan specifics:
++  * ego == lidar: nuPlan stores lidar2ego as the identity, so cam2ego == cam2lidar and ego2cam = inv(sensor2lidar).
++  * `sensor2lidar_rotation` already uses the optical camera convention (x right, y down, z forward).
++  * The log pkls list every 2 Hz frame, but NAVSIM only ships sensor blobs for the frames its scene filters touch.
++    Those form contiguous runs; each run becomes its own `scene_name` (`{log}#{k}`).
++  * `in_split_tokens` flags the scene-filter allow-list (the current frame of each 4 + 1 + 10 window).
++
++Usage (this server's layout):
++    python tools/navsim/create_navsim_infos.py --filter navtrain \
++        --logs-root /workspace/navsim/download/trainval_navsim_logs/trainval \
++        --blobs-root /workspace/navsim/download/trainval_sensor_blobs/trainval \
++        --out /workspace/navsim_workspace/mask2map/infos/navsim_map_infos_navtrain.pkl
++"""
++import argparse
++import os
++import pickle
++from collections import Counter
++from multiprocessing import Pool
++
++import numpy as np
++import yaml
++
++DEFAULT_SCENE_FILTER_DIR = '/workspace/navsim/navsim/planning/script/config/common/train_test_split/scene_filter'
++
++# NAVSIM ships 8 cameras. A frame is kept only if all of them exist on disk, as in resmap_navsim, so both repos see
++# the same frames; the dataset then selects and orders the cameras that reach the model.
++CAMERA_NAMES = ['CAM_F0', 'CAM_L0', 'CAM_R0', 'CAM_L1', 'CAM_R1', 'CAM_L2', 'CAM_R2', 'CAM_B0']
++
++
++def load_scene_filter(scene_filter_dir, filt):
++    with open(os.path.join(scene_filter_dir, f'{filt}.yaml')) as fh:
++        cfg = yaml.safe_load(fh)
++    return cfg['log_names'], set(cfg['tokens'] or [])
++
++
++def scan_log(job):
++    """-> (log, list of contiguous runs); each run is a list of per-frame dicts."""
++    logs_root, blobs_root, log, cams, min_len, allow = job
++    blob_dir = os.path.join(blobs_root, log)
++    try:
++        have = {c: set(os.listdir(os.path.join(blob_dir, c))) for c in cams}
++    except OSError:
++        return log, []
++    with open(os.path.join(logs_root, f'{log}.pkl'), 'rb') as fh:
++        frames = pickle.load(fh)
++
++    runs, cur, prev_i = [], [], None
++    for i, f in enumerate(frames):
++        cam_meta = f.get('cams') or {}
++        if any(c not in cam_meta or os.path.basename(cam_meta[c]['data_path']) not in have[c] for c in cams):
++            continue
++        if prev_i is not None and i != prev_i + 1:
++            runs.append(cur)
++            cur = []
++        cur.append((i, f))
++        prev_i = i
++    if cur:
++        runs.append(cur)
++
++    out = []
++    for k, run in enumerate(runs):
++        if len(run) < min_len:
++            continue
++        scene_name = f'{log}#{k}'
++        samples = []
++        for local_idx, (_, f) in enumerate(run):
++            cam_dict = {}
++            for c in cams:
++                cm = f['cams'][c]
++                cam2ego = np.eye(4)  # lidar2ego is the identity in nuPlan
++                cam2ego[:3, :3] = np.asarray(cm['sensor2lidar_rotation'], dtype=np.float64)
++                cam2ego[:3, 3] = np.asarray(cm['sensor2lidar_translation'], dtype=np.float64)
++                cam_dict[c] = dict(
++                    img_fpath=os.path.join(blob_dir, cm['data_path'].split('/', 1)[1]),
++                    intrinsics=np.asarray(cm['cam_intrinsic'], dtype=np.float64),
++                    extrinsics=np.linalg.inv(cam2ego),  # ego2cam
++                    distortion=np.asarray(cm['distortion'], dtype=np.float64),
++                )
++            samples.append(dict(
++                token=str(f['token']),
++                cams=cam_dict,
++                lidar2ego_translation=list(map(float, f['lidar2ego_translation'])),
++                lidar2ego_rotation=list(map(float, f['lidar2ego_rotation'])),
++                e2g_translation=list(map(float, f['ego2global_translation'])),
++                e2g_rotation=list(map(float, f['ego2global_rotation'])),
++                timestamp=int(f['timestamp']),
++                location=str(f['map_location']),
++                scene_name=scene_name,
++                log_name=str(f['log_name']),
++                scene_token=str(f['scene_token']),
++                frame_idx=int(f['frame_idx']),
++                in_split_tokens=(not allow) or (str(f['token']) in allow),
++                sample_idx=local_idx,  # renumbered to a global index below
++                prev=-1 if local_idx == 0 else 0,
++                next=-1 if local_idx == len(run) - 1 else 0,
++                lidar_path=os.path.join(blob_dir, f['lidar_path'].split('/', 1)[1]) if f.get('lidar_path') else None,
++            ))
++        out.append(samples)
++    return log, out
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument('--filter', required=True, help='scene filter name, e.g. navtrain or navtest')
++    ap.add_argument('--logs-root', required=True, help='dir with the {log}.pkl navsim logs of this split')
++    ap.add_argument('--blobs-root', required=True, help='dir with the {log}/{CAM}/*.jpg sensor blobs of this split')
++    ap.add_argument('--scene-filter-dir', default=DEFAULT_SCENE_FILTER_DIR)
++    ap.add_argument('--out', required=True)
++    ap.add_argument('--cams', nargs='+', default=CAMERA_NAMES)
++    ap.add_argument('--min-seq', type=int, default=2, help='drop contiguous runs shorter than this')
++    ap.add_argument('--workers', type=int, default=12)
++    args = ap.parse_args()
++
++    logs, allow_tokens = load_scene_filter(args.scene_filter_dir, args.filter)
++    print(f'[info] {args.filter}: {len(logs)} logs, {len(allow_tokens)} allow-list tokens, cams={args.cams}', flush=True)
++
++    jobs = [(args.logs_root, args.blobs_root, log, args.cams, args.min_seq, allow_tokens) for log in logs]
++    all_scenes = []
++    with Pool(args.workers) as pool:
++        for i, (log, runs) in enumerate(pool.imap(scan_log, jobs, chunksize=4)):
++            all_scenes.extend(runs)
++            if (i + 1) % 100 == 0:
++                print(f'[info]   {i + 1}/{len(logs)} logs, {len(all_scenes)} scenes so far', flush=True)
++
++    samples = [s for scene in all_scenes for s in scene]
++    # sample_idx / prev / next are GLOBAL indices (nuScenes info convention).
++    for gi, s in enumerate(samples):
++        s['sample_idx'] = gi
++        s['prev'] = -1 if s['prev'] == -1 else gi - 1
++        s['next'] = -1 if s['next'] == -1 else gi + 1
++
++    lens = [len(s) for s in all_scenes]
++    loc = Counter(s['location'] for s in samples)
++    print(f'[info] scenes={len(all_scenes)} samples={len(samples)}')
++    print(f'[info] scene length: min={min(lens)} med={int(np.median(lens))} mean={np.mean(lens):.1f} max={max(lens)}')
++    print(f'[info] per-city samples: {dict(loc)}')
++    n_allow = sum(1 for s in samples if s['in_split_tokens'])
++    print(f'[info] in scene-filter allow-list: {n_allow} / {len(samples)} (allow-list size {len(allow_tokens)}, '
++          f'missing {len(allow_tokens - {s["token"] for s in samples})})')
++
++    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
++    with open(args.out, 'wb') as fh:
++        pickle.dump(samples, fh)
++    print(f'[info] wrote {args.out}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/navsim/navsim_map_gt.py b/tools/navsim/navsim_map_gt.py
+new file mode 100644
+index 0000000..d5b4826
+--- /dev/null
++++ b/tools/navsim/navsim_map_gt.py
+@@ -0,0 +1,213 @@
++#!/usr/bin/env python
++"""NAVSIM map ground truth (road / walkway / centerline / crosswalk) from nuPlan's own map API.
++
++This is resmap_navsim/tools/navsim_map_gt.py with its hard-coded paths turned into arguments and the front64 ROI as
++the default; the geometry code is unchanged, so the GT is the one the ReSMap front64 teacher was trained on
++(resmap_navsim tools/derive_front64_config.py: --roi-x 64 --roi-y 64 --roi-cx 32 --radius 72).
++
++Classes (one cat2id for every head), the layers NAVSIM's TransFuser rasterises plus CROSSWALK:
++    road        LANE + INTERSECTION polygons, unioned  -> seg: fill
++    walkway     WALKWAYS polygons                      -> seg: fill
++    centerline  LANE + LANE_CONNECTOR baseline paths   -> seg: line
++    crosswalk   CROSSWALK polygons                     -> seg: fill
++Area classes are stored as rings, [exterior, *holes], so medians and islands stay unpainted.
++
++Geometry is stored in the ROI-CENTRED ego frame: x_c = x_ego - roi_cx (forward), y_c = y_ego - roi_cy (left), clipped
++to [-roi_x / 2, roi_x / 2] x [-roi_y / 2, roi_y / 2]. Needs nuplan-devkit (e.g. /venv/theme, read-only use); the
++training env only reads the packed .npz (tools/navsim/pack_map_gt.py).
++
++    python tools/navsim/navsim_map_gt.py --infos .../navsim_map_infos_navtrain.pkl --out .../navtrain.pkl --workers 32
++"""
++import argparse
++import os
++import pickle
++import time
++from multiprocessing import Pool
++
++import numpy as np
++from shapely import affinity
++from shapely.geometry import box
++from shapely.ops import unary_union
++
++CLASSES = ('road', 'walkway', 'centerline', 'crosswalk')
++# Set from the CLI in main() (forked workers inherit them).
++MAP_ROOT = '/workspace/navsim/download/maps'
++MAP_VERSION = 'nuplan-maps-v1.0'
++RADIUS = 72.0             # reaches the far corner of the 64 x 64 box (sqrt(64^2 + 32^2) = 71.6 m)
++ROI = (64.0, 64.0)        # (forward, lateral) extent
++ROI_CENTRE = (32.0, 0.0)  # x in [0, 64] ahead of the rear axle, y in [-32, 32]
++
++
++def _local(geom, x, y, heading):
++    """Global -> ego, verbatim navsim._geometry_local_coords."""
++    a, b = np.cos(heading), np.sin(heading)
++    g = affinity.translate(geom, -x, -y)
++    return affinity.affine_transform(g, [a, b, -b, a, 0.0, 0.0])
++
++
++def _shift(geom):
++    """Ego -> ROI-centred frame (subtract the ROI centre)."""
++    return affinity.translate(geom, -ROI_CENTRE[0], -ROI_CENTRE[1])
++
++
++def _polys(geom):
++    if geom.is_empty:
++        return []
++    if geom.geom_type == 'Polygon':
++        return [geom]
++    if geom.geom_type in ('MultiPolygon', 'GeometryCollection'):
++        out = []
++        for g in geom.geoms:
++            out.extend(_polys(g))
++        return out
++    return []
++
++
++def _lines(geom):
++    if geom.is_empty:
++        return []
++    if geom.geom_type == 'LineString':
++        return [geom] if len(geom.coords) >= 2 else []
++    if geom.geom_type in ('MultiLineString', 'GeometryCollection'):
++        out = []
++        for g in geom.geoms:
++            out.extend(_lines(g))
++        return out
++    return []
++
++
++def _line(g):
++    return np.asarray(g.coords, dtype=np.float32)[:, :2]
++
++
++def _rings(p):
++    """Polygon -> [exterior, hole, hole, ...] as float32 (N, 2) arrays."""
++    return [_line(p.exterior)] + [_line(h) for h in p.interiors]
++
++
++class Extractor(object):
++    """One per city; holds the map API."""
++
++    def __init__(self, city):
++        from nuplan.common.maps.maps_datatypes import SemanticMapLayer as L
++        from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
++        self.L = L
++        self.api = get_maps_api(MAP_ROOT, MAP_VERSION, city)
++        self.layers = [L.LANE, L.LANE_CONNECTOR, L.INTERSECTION, L.WALKWAYS, L.CROSSWALK]
++        hx, hy = ROI[0] / 2, ROI[1] / 2
++        self.patch = box(-hx, -hy, hx, hy)
++
++    def __call__(self, x, y, heading):
++        from nuplan.common.actor_state.state_representation import Point2D
++        L = self.L
++        objs = self.api.get_proximal_map_objects(Point2D(x, y), RADIUS, self.layers)
++
++        def to_roi(g):
++            return _shift(_local(g, x, y, heading)).intersection(self.patch)
++
++        out = {c: [] for c in CLASSES}
++        # road: union first, so adjacent lanes do not leave seams
++        road = [o.polygon for k in (L.LANE, L.INTERSECTION) for o in objs.get(k, [])]
++        if road:
++            for p in _polys(to_roi(unary_union(road))):
++                out['road'].append(_rings(p))
++        for o in objs.get(L.WALKWAYS, []):
++            for p in _polys(to_roi(o.polygon)):
++                out['walkway'].append(_rings(p))
++        for k in (L.LANE, L.LANE_CONNECTOR):
++            for o in objs.get(k, []):
++                for ls in _lines(to_roi(o.baseline_path.linestring)):
++                    out['centerline'].append(_line(ls))
++        for o in objs.get(L.CROSSWALK, []):
++            for p in _polys(to_roi(o.polygon)):
++                out['crosswalk'].append(_rings(p))
++        return out
++
++
++_EX = None
++
++
++def _init(city):
++    global _EX
++    _EX = Extractor(city)
++
++
++def _work(job):
++    tok, x, y, heading = job
++    try:
++        return tok, _EX(x, y, heading), None
++    except Exception as exc:  # keep the pool alive; report at the end
++        return tok, None, repr(exc)
++
++
++def heading_of(q):
++    """wxyz quaternion -> yaw, matching what the infos store."""
++    from pyquaternion import Quaternion
++    R = Quaternion(q).rotation_matrix
++    return float(np.arctan2(R[1, 0], R[0, 0]))
++
++
++def main():
++    global MAP_ROOT, MAP_VERSION, ROI, ROI_CENTRE, RADIUS
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument('--infos', required=True, help='navsim_map_infos_{split}.pkl from create_navsim_infos.py')
++    ap.add_argument('--out', required=True, help='output .pkl ({meta, gt: {token: {class: [...]}}, errors})')
++    ap.add_argument('--map-root', default=MAP_ROOT, help='dir with {city}/{version}/map.gpkg and nuplan-maps-v1.0.json')
++    ap.add_argument('--map-version', default=MAP_VERSION)
++    ap.add_argument('--workers', type=int, default=32)
++    ap.add_argument('--limit', type=int, default=0, help='debug: first N tokens')
++    ap.add_argument('--roi-x', type=float, default=ROI[0], help='forward extent (m)')
++    ap.add_argument('--roi-y', type=float, default=ROI[1], help='lateral extent (m)')
++    ap.add_argument('--roi-cx', type=float, default=ROI_CENTRE[0], help='ROI centre forward (m)')
++    ap.add_argument('--roi-cy', type=float, default=ROI_CENTRE[1])
++    ap.add_argument('--radius', type=float, default=RADIUS, help='map query radius around the ego (m)')
++    a = ap.parse_args()
++    MAP_ROOT, MAP_VERSION = a.map_root, a.map_version
++    ROI, ROI_CENTRE, RADIUS = (a.roi_x, a.roi_y), (a.roi_cx, a.roi_cy), a.radius
++    far = np.hypot(abs(ROI_CENTRE[0]) + ROI[0] / 2, abs(ROI_CENTRE[1]) + ROI[1] / 2)
++    if RADIUS < far:
++        print(f'[gt] WARNING: radius {RADIUS} m < distance to the far ROI corner {far:.1f} m; '
++              f'the far part of the box comes out empty', flush=True)
++
++    with open(a.infos, 'rb') as fh:
++        infos = pickle.load(fh)
++    if a.limit:
++        infos = infos[:a.limit]
++    by_city = {}
++    for s in infos:
++        t = s['e2g_translation']
++        by_city.setdefault(s['location'], []).append((s['token'], float(t[0]), float(t[1]), heading_of(s['e2g_rotation'])))
++    print(f'[gt] {a.infos}: {len(infos)} tokens, ' + ', '.join(f'{c}={len(v)}' for c, v in by_city.items()), flush=True)
++
++    result, errors = {}, {}
++    t0 = time.time()
++    for city, jobs in by_city.items():
++        n = min(a.workers, len(jobs))
++        with Pool(n, initializer=_init, initargs=(city,)) as pool:
++            for i, (tok, geoms, err) in enumerate(pool.imap_unordered(_work, jobs, chunksize=16)):
++                if err is not None:
++                    errors[tok] = err
++                else:
++                    result[tok] = geoms
++                if (i + 1) % 5000 == 0:
++                    print(f'  [{city}] {i + 1}/{len(jobs)}  {time.time() - t0:.0f}s', flush=True)
++        print(f'[gt] {city}: done {len(jobs)}  ({time.time() - t0:.0f}s)', flush=True)
++
++    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
++    meta = dict(classes=CLASSES, area_classes=('road', 'walkway', 'crosswalk'),
++                storage='area classes: list of polygons, each [exterior, *holes] (N,2) f32; '
++                        'centerline: list of (N,2) f32 polylines',
++                roi_size=ROI, roi_center=ROI_CENTRE, radius=RADIUS,
++                frame='roi-centred ego (x forward, y left)', map_version=MAP_VERSION,
++                source='nuplan map_api.get_proximal_map_objects, NAVSIM TransFuser layers')
++    with open(a.out, 'wb') as fh:
++        pickle.dump(dict(meta=meta, gt=result, errors=errors), fh, protocol=4)
++    per = {c: np.mean([len(g[c]) for g in result.values()]) for c in CLASSES} if result else {}
++    print(f'[gt] wrote {a.out}  ({os.path.getsize(a.out) / 2 ** 20:.0f} MiB)  tokens={len(result)} '
++          f'errors={len(errors)}  mean/frame ' + ' '.join(f'{c}={v:.1f}' for c, v in per.items()))
++    for tok, e in list(errors.items())[:5]:
++        print('   err', tok, e)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/navsim/pack_map_gt.py b/tools/navsim/pack_map_gt.py
+new file mode 100644
+index 0000000..3013dc9
+--- /dev/null
++++ b/tools/navsim/pack_map_gt.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python
++"""Repack the map GT from per-token python objects (navsim_map_gt.py) into flat, memory-mappable arrays.
++
++Verbatim from resmap_navsim/tools/pack_map_gt.py, with explicit --src / --dst. The pickle form unpickles into
++millions of small numpy arrays that every dataloader worker copies (copy-on-write breaks on refcounts); the .npz is a
++handful of large arrays that workers share as one read-only mapping. Rings are contiguous; a token's rings are one
++slice, and area classes carry a polygon id so exterior + holes regroup into Polygon(shell, holes).
++
++    python tools/navsim/pack_map_gt.py --src .../navtrain.pkl --dst .../navtrain.npz
++"""
++import argparse
++import os
++import pickle
++
++import numpy as np
++
++
++def pack(src, dst):
++    with open(src, 'rb') as fh:
++        data = pickle.load(fh)
++    meta, gt = data['meta'], data['gt']
++    classes = list(meta['classes'])
++    area = set(meta.get('area_classes', ()))
++    cls_id = {c: i for i, c in enumerate(classes)}
++
++    tokens = sorted(gt)
++    coords, ring_len, ring_cls, ring_poly, tok_off = [], [], [], [], [0]
++    for tok in tokens:
++        g = gt[tok]
++        poly_counter = 0
++        for c in classes:
++            for item in g.get(c, []):
++                # area classes: item is [exterior, *holes]; line classes: (N, 2)
++                rings = item if c in area else [item]
++                for r in rings:
++                    r = np.asarray(r, dtype=np.float32).reshape(-1, 2)
++                    if len(r) < 2:
++                        continue
++                    coords.append(r)
++                    ring_len.append(len(r))
++                    ring_cls.append(cls_id[c])
++                    ring_poly.append(poly_counter)
++                poly_counter += 1
++        tok_off.append(len(ring_len))
++
++    out = dict(
++        coords=np.concatenate(coords, 0) if coords else np.zeros((0, 2), np.float32),
++        ring_off=np.concatenate([[0], np.cumsum(ring_len)]).astype(np.int64),
++        ring_cls=np.asarray(ring_cls, np.int8),
++        ring_poly=np.asarray(ring_poly, np.int32),
++        tok_off=np.asarray(tok_off, np.int64),
++        tokens=np.asarray(tokens, dtype='S32'),
++        classes=np.asarray(classes, dtype='S16'),
++        area_classes=np.asarray(sorted(area), dtype='S16'),
++        roi_size=np.asarray(meta['roi_size'], np.float64),
++        roi_center=np.asarray(meta['roi_center'], np.float64),
++    )
++    np.savez(dst, **out)
++    print(f'{os.path.basename(dst)}: {len(tokens):,} tokens, {len(ring_len):,} rings, {len(out["coords"]):,} points, '
++          f'{os.path.getsize(dst) / 2 ** 30:.2f} GiB')
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument('--src', required=True, help='navsim_map_gt.py output (.pkl)')
++    ap.add_argument('--dst', required=True, help='packed output (.npz)')
++    a = ap.parse_args()
++    pack(a.src, a.dst)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/navsim/patch_mmcv_for_torch2.py b/tools/navsim/patch_mmcv_for_torch2.py
+new file mode 100644
+index 0000000..9ca34c5
+--- /dev/null
++++ b/tools/navsim/patch_mmcv_for_torch2.py
+@@ -0,0 +1,60 @@
++"""Make mmcv-full 1.7.2 work with torch >= 2.1.
++
++Copied from yyongjae/bevfusion (navsim-100x100-cache). Older stacks pin torch 1.x, which has no sm_120 kernels, so on
++Blackwell cards (RTX 5090) the stack has to move to cu128 / torch 2.8.  mmcv
++1.7.2 is the newest 1.x and builds fine from source against it, but two of its
++DataParallel helpers still use torch APIs that 2.x changed.  Both edits are
++in site-packages, so re-run this after any mmcv reinstall.
++
++    python tools/navsim/patch_mmcv_for_torch2.py
++
++The script is idempotent and reports what it changed.
++"""
++
++import os
++import sys
++
++import mmcv
++
++PATCHES = [
++    (
++        os.path.join("parallel", "_functions.py"),
++        "            streams = [_get_stream(device) for device in target_gpus]",
++        "            # torch>=2.0 takes a torch.device here, mmcv 1.x passes an int.\n"
++        "            streams = [_get_stream(torch.device('cuda', device))\n"
++        "                       for device in target_gpus]",
++    ),
++    (
++        os.path.join("parallel", "distributed.py"),
++        "        module_to_run = self._replicated_tensor_module if \\\n"
++        "            self._use_replicated_tensor_module else self.module",
++        "        # torch>=2.1 dropped the replicated-tensor DDP path together with\n"
++        "        # these two attributes; fall back to the plain module when absent.\n"
++        "        if getattr(self, '_use_replicated_tensor_module', False):\n"
++        "            module_to_run = self._replicated_tensor_module\n"
++        "        else:\n"
++        "            module_to_run = self.module",
++    ),
++]
++
++
++def main() -> int:
++    root = os.path.dirname(mmcv.__file__)
++    print(f"mmcv {mmcv.__version__} at {root}")
++    failed = False
++    for rel, old, new in PATCHES:
++        path = os.path.join(root, rel)
++        source = open(path).read()
++        if new in source:
++            print(f"  already patched: {rel}")
++        elif source.count(old) == 1:
++            open(path, "w").write(source.replace(old, new, 1))
++            print(f"  patched:         {rel}")
++        else:
++            print(f"  FAILED, pattern not found ({source.count(old)} matches): {rel}")
++            failed = True
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/navsim/prepare_data.sh b/tools/navsim/prepare_data.sh
+new file mode 100755
+index 0000000..7642b4d
+--- /dev/null
++++ b/tools/navsim/prepare_data.sh
+@@ -0,0 +1,37 @@
++#!/usr/bin/env bash
++# Build the NAVSIM data the Mask2Map front64 config reads (CPU only):
++#   $OUT/infos/navsim_map_infos_{navtrain,navtest}.pkl           tools/navsim/create_navsim_infos.py
++#   $OUT/map_gt_navsim_front64x64/{navtrain,navtest}.{pkl,npz}   tools/navsim/navsim_map_gt.py + pack_map_gt.py
++# Camera images are resized on the fly (LoadNavsimMultiViewImages), so no image mirror is needed.
++#
++#   bash tools/navsim/prepare_data.sh
++#
++# NAVSIM_DL: the NAVSIM download root ({trainval,test}_{navsim_logs,sensor_blobs}/, maps/); NAVSIM_REPO: the navsim
++# checkout holding the scene filters; GT_PY: a python with nuplan-devkit (read-only use); PY: the training env.
++set -euo pipefail
++
++REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++OUT=${OUT:-/workspace/navsim_workspace/mask2map}
++NAVSIM_DL=${NAVSIM_DL:-/workspace/navsim/download}
++NAVSIM_REPO=${NAVSIM_REPO:-/workspace/navsim}
++PY=${PY:-/venv/m2m/bin/python}
++GT_PY=${GT_PY:-/venv/theme/bin/python}
++WORKERS=${WORKERS:-32}
++export OPENBLAS_CORETYPE=SkylakeX
++SF=$NAVSIM_REPO/navsim/planning/script/config/common/train_test_split/scene_filter
++G=$OUT/map_gt_navsim_front64x64
++mkdir -p "$OUT/infos" "$G"
++cd "$OUT"  # never run python from inside the data trees; scripts are passed by path with -I
++
++declare -A SPLIT=([navtrain]=trainval [navtest]=test)
++for f in navtrain navtest; do
++  s=${SPLIT[$f]}
++  "$PY" -I "$REPO/tools/navsim/create_navsim_infos.py" --filter "$f" --scene-filter-dir "$SF" \
++      --logs-root "$NAVSIM_DL/${s}_navsim_logs/$s" --blobs-root "$NAVSIM_DL/${s}_sensor_blobs/$s" \
++      --out "$OUT/infos/navsim_map_infos_$f.pkl" --workers 24
++  # front64 box: x [0, 64] m, y [-32, 32] m; radius 72 m reaches its far corner (resmap derive_front64_config.py)
++  "$GT_PY" -I "$REPO/tools/navsim/navsim_map_gt.py" --infos "$OUT/infos/navsim_map_infos_$f.pkl" --out "$G/$f.pkl" \
++      --map-root "$NAVSIM_DL/maps" --roi-x 64 --roi-y 64 --roi-cx 32 --roi-cy 0 --radius 72 --workers "$WORKERS"
++  "$PY" -I "$REPO/tools/navsim/pack_map_gt.py" --src "$G/$f.pkl" --dst "$G/$f.npz"
++done
++echo "[prepare_data] done: $OUT"
+diff --git a/tools/navsim/setup_env.sh b/tools/navsim/setup_env.sh
+new file mode 100755
+index 0000000..f6fe621
+--- /dev/null
++++ b/tools/navsim/setup_env.sh
+@@ -0,0 +1,98 @@
++#!/usr/bin/env bash
++# Build the Mask2Map-NAVSIM env for RTX 5090 (sm_120): python 3.9, torch 2.8.0+cu128, mmcv-full 1.7.2 built from
++# source, mmdet 2.28.2, mmseg 0.30.0, and the vendored mmdetection3d (0.17.2, patched for torch 2.x and mmcv 1.7).
++# The recipe follows yyongjae/bevfusion@navsim-100x100-cache setup_fix.md, which was verified on RTX 5090.
++#
++#   bash tools/navsim/setup_env.sh base   # conda env, torch, mmcv-full (about 10-20 min of nvcc), mmdet, mmseg, deps
++#   bash tools/navsim/setup_env.sh repo   # vendored mmdet3d CUDA ops (bev_pool, voxel, ...) as an editable install
++#   bash tools/navsim/setup_env.sh check  # imports + the CUDA ops on one GPU
++#   bash tools/navsim/setup_env.sh all
++#
++# ENV (default /venv/m2m), CONDA, CUDA_HOME, MAX_JOBS and TORCH_CUDA_ARCH_LIST can be overridden.
++# Never point ENV at an env another job is using.
++set -euo pipefail
++
++STAGE=${1:-all}
++ENV=${ENV:-/venv/m2m}
++CONDA=${CONDA:-/opt/miniforge3/bin/conda}
++REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++
++export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
++export PATH=$CUDA_HOME/bin:$PATH
++export CC=${CC:-/usr/bin/gcc-13} CXX=${CXX:-/usr/bin/g++-13}
++export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-12.0}
++export MAX_JOBS=${MAX_JOBS:-32}
++# numpy 1.23's bundled OpenBLAS misdetects some Xeons (e.g. 8469C) and silently returns wrong linear algebra.
++export OPENBLAS_CORETYPE=${OPENBLAS_CORETYPE:-SkylakeX}
++
++PY=$ENV/bin/python
++PIP="$PY -m pip"
++step() { echo "[$(TZ=Asia/Seoul date '+%F %T KST')] $*"; }
++
++stage_base() {
++  if [ ! -x "$PY" ]; then
++    step "conda create $ENV (python 3.9, ninja)"
++    "$CONDA" create -y -p "$ENV" -c conda-forge --override-channels python=3.9 ninja
++  fi
++  $PIP install "pip<25.3"  # the repo stage needs the legacy setup.py-develop editable install
++  step "torch 2.8.0 + torchvision 0.23.0 (cu128)"
++  $PIP install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
++  # setuptools must be pinned after torch and before any extension build.
++  $PIP install setuptools==59.5.0 wheel==0.37.1 Pillow==9.5.0 tqdm numpy==1.23.5
++
++  if ! $PY -c "import mmcv, mmcv.ops; assert mmcv.__version__ == '1.7.2'" 2>/dev/null; then
++    step "mmcv-full 1.7.2 from source (TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST, MAX_JOBS=$MAX_JOBS)"
++    MMCV_WITH_OPS=1 FORCE_CUDA=1 $PIP install --no-build-isolation --no-binary mmcv-full "mmcv-full==1.7.2"
++  fi
++
++  step "mmdet, mmseg and the Mask2Map runtime deps"
++  $PIP install mmdet==2.28.2 mmsegmentation==0.30.0 timm==0.9.16 numba==0.56.4 "nuscenes-devkit==1.1.11" \
++      "shapely==1.8.5.post1" pyquaternion terminaltables prettytable descartes pycocotools tensorboard einops \
++      trimesh pandas scikit-image matplotlib
++  # mmdet3d 0.17.2 imports lyft_eval at module level; the SDK's own install_requires pin a dev toolchain.
++  $PIP install --no-deps lyft_dataset_sdk==0.0.8
++  $PIP install cachetools fire plotly scikit-learn
++  # The builds above pull numpy 2.x, opencv 5 and yapf 0.43; numba 0.56 needs numpy < 1.24 and mmcv 1.x needs yapf 0.40.
++  $PIP install numpy==1.23.5 opencv-python==4.9.0.80 yapf==0.40.1 setuptools==59.5.0
++
++  step "mmcv torch>=2.1 patch"
++  $PY "$REPO/tools/navsim/patch_mmcv_for_torch2.py"
++}
++
++stage_repo() {
++  step "vendored mmdetection3d ops (editable, no deps)"
++  (cd "$REPO/mmdetection3d" && FORCE_CUDA=1 $PIP install --no-build-isolation --no-deps -e .)
++}
++
++stage_check() {
++  step "import + CUDA op check (first free GPU only; set CUDA_VISIBLE_DEVICES to choose)"
++  (cd "$REPO" && PYTHONPATH="$REPO:${PYTHONPATH:-}" $PY - <<'EOF'
++import torch, mmcv, mmdet, mmseg, mmdet3d
++from mmcv.ops import MultiScaleDeformableAttention, nms
++from mmdet3d.ops import bev_pool
++print('torch', torch.__version__, 'cuda', torch.version.cuda, 'arch', torch.cuda.get_arch_list())
++print('mmcv', mmcv.__version__, 'mmdet', mmdet.__version__, 'mmseg', mmseg.__version__, 'mmdet3d', mmdet3d.__version__)
++import projects.mmdet3d_plugin  # registers the plugin modules
++assert torch.cuda.is_available()
++b = torch.rand(64, 4, device='cuda'); b[:, 2:] += b[:, :2]
++keep = nms(b, torch.rand(64, device='cuda'), 0.5)[1]
++assert 0 < keep.numel() <= 64
++print('mmcv nms on GPU:', keep.numel(), 'kept')
++feats = torch.rand(100, 8, device='cuda')
++coords = torch.stack([torch.randint(0, 10, (100,)), torch.randint(0, 10, (100,)), torch.zeros(100, dtype=torch.long),
++                      torch.zeros(100, dtype=torch.long)], 1).int().cuda()
++out = bev_pool(feats, coords, 1, 1, 10, 10)
++assert tuple(out.shape) == (1, 8, 1, 10, 10) and torch.allclose(out.sum(), feats.sum(), rtol=1e-4)
++print('bev_pool', tuple(out.shape), 'sum preserved')
++EOF
++  )
++}
++
++case "$STAGE" in
++  base) stage_base ;;
++  repo) stage_repo ;;
++  check) stage_check ;;
++  all) stage_base; stage_repo; stage_check ;;
++  *) echo "usage: $0 {base|repo|check|all}" >&2; exit 2 ;;
++esac
++step "done: $STAGE"
+diff --git a/tools/navsim/test_front64.sh b/tools/navsim/test_front64.sh
+new file mode 100755
+index 0000000..4e7fb73
+--- /dev/null
++++ b/tools/navsim/test_front64.sh
+@@ -0,0 +1,34 @@
++#!/usr/bin/env bash
++# Evaluate a Mask2Map NAVSIM checkpoint with ReSMap's BEV seg metric (+ multi-label IoU).
++#
++#   GPUS=0,1,2,3 bash tools/navsim/test_front64.sh <ckpt>            # val logs (26,463 frames)
++#   GPUS=0,1,2,3 bash tools/navsim/test_front64.sh <ckpt> navtest    # navtest allow-list (12,146 tokens)
++#
++# CFG defaults to the config dumped next to the checkpoint by tools/train.py.
++set -euo pipefail
++
++REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++CKPT=${1:?usage: test_front64.sh <ckpt> [val|navtest]}
++SPLIT=${2:-val}
++CFG=${CFG:-$(ls "$(dirname "$CKPT")"/M2M_navsim_*.py | head -1)}  # the config tools/train.py dumped next to it
++DATA=${DATA:-/workspace/navsim_workspace/mask2map}
++GPUS=${GPUS:-0,1,2,3}
++WORKERS=${WORKERS:-6}
++PY=${PY:-/venv/m2m/bin/python}
++PORT=${PORT:-29652}
++NGPU=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
++case "$SPLIT" in
++  val) OPTS="data.test.log_split=val" ;;
++  navtest) OPTS="data.test.ann_file=$DATA/infos/navsim_map_infos_navtest.pkl \
++data.test.map_gt_file=$DATA/map_gt_navsim_front64x64/navtest.npz data.test.log_split=None \
++data.test.split_tokens_only=True" ;;
++  *) echo "split must be val or navtest" >&2; exit 2 ;;
++esac
++
++export OPENBLAS_CORETYPE=SkylakeX NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-lo} OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
++export MPLBACKEND=Agg PYTHONPATH=$REPO:${PYTHONPATH:-}
++cd "$REPO"
++echo "[test_front64] $(TZ=Asia/Seoul date '+%F %T KST') ckpt=$CKPT split=$SPLIT gpus=$GPUS"
++CUDA_VISIBLE_DEVICES=$GPUS exec $PY -m torch.distributed.run --nproc_per_node="$NGPU" --master_port="$PORT" \
++    tools/test.py "$CFG" "$CKPT" --launcher pytorch --eval miou \
++    --cfg-options data.workers_per_gpu="$WORKERS" $OPTS
+diff --git a/tools/navsim/train_front64.sh b/tools/navsim/train_front64.sh
+new file mode 100755
+index 0000000..5489e1f
+--- /dev/null
++++ b/tools/navsim/train_front64.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++# Train Mask2Map phase-1 semantic-only on NAVSIM front64 (the ReSMap front64 stage-1 teacher setting).
++#
++#   GPUS=0,1,2,3 SPG=16 bash tools/navsim/train_front64.sh                 # 4 x 16 = global 64, lr 1.2e-3 (default)
++#   GPUS=0,1,2,3,4,5,6,7 SPG=8 bash tools/navsim/train_front64.sh          # 8 x 8 = global 64, lr 1.2e-3
++# RTX 5090 (32 GB), measured on one GPU: SPG 8 0.225 s/it 10.3 GB, SPG 16 0.385 s/it 17.1 GB (throughput saturates),
++# SPG 24 0.58 s/it 26.5 GB.
++#   GPUS=0 SPG=2 CFG_OPTIONS="data.train.token_list=/path/tokens.txt total_epochs=1 runner.max_epochs=1" \
++#       bash tools/navsim/train_front64.sh --no-validate                   # smoke run
++#
++# lr follows Mask2Map's linear rule, 6e-4 x (GPUs x SPG) / 32.  Extra arguments go to tools/train.py (e.g.
++# --resume-from <ckpt>, --no-validate); extra config overrides go in CFG_OPTIONS (space-separated key=value).
++set -euo pipefail
++for a in "$@"; do
++  if [ "$a" = "--cfg-options" ]; then
++    echo "train_front64.sh: pass config overrides in CFG_OPTIONS (a second --cfg-options would replace the batch/lr ones)" >&2
++    exit 2
++  fi
++done
++
++REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++CFG=${CFG:-$REPO/projects/configs/mask2map_navsim/M2M_navsim_front64_r50_sem_18ep.py}
++GPUS=${GPUS:-0,1,2,3}
++SPG=${SPG:-16}
++WORKERS=${WORKERS:-8}
++PY=${PY:-/venv/m2m/bin/python}
++PORT=${PORT:-29651}
++SEED=${SEED:-0}
++NGPU=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
++LR=${LR:-$($PY -c "print(6e-4 * $NGPU * $SPG / 32)")}
++WORK_DIR=${WORK_DIR:-/workspace/navsim_workspace/mask2map/work_dirs/$(basename "$CFG" .py)_g${NGPU}x${SPG}}
++
++# numpy 1.23's OpenBLAS returns wrong float64 linear algebra on this server's Xeon 8469C unless forced to SkylakeX;
++# NCCL picks a physical NIC and hangs without NCCL_SOCKET_IFNAME=lo (bevfusion setup_fix.md).
++export OPENBLAS_CORETYPE=SkylakeX NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-lo} OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
++export MPLBACKEND=Agg PYTHONPATH=$REPO:${PYTHONPATH:-}
++cd "$REPO"
++echo "[train_front64] $(TZ=Asia/Seoul date '+%F %T KST') cfg=$CFG gpus=$GPUS spg=$SPG lr=$LR work_dir=$WORK_DIR"
++CUDA_VISIBLE_DEVICES=$GPUS exec nice -n 5 $PY -m torch.distributed.run --nproc_per_node="$NGPU" --master_port="$PORT" \
++    tools/train.py "$CFG" --launcher pytorch --seed "$SEED" --work-dir "$WORK_DIR" "$@" \
++    --cfg-options data.samples_per_gpu="$SPG" data.workers_per_gpu="$WORKERS" optimizer.lr="$LR" ${CFG_OPTIONS:-}
+diff --git a/tools/test.py b/tools/test.py
+index 2441063..1414e08 100755
+--- a/tools/test.py
++++ b/tools/test.py
+@@ -97,7 +97,7 @@ def parse_args():
+         choices=['none', 'pytorch', 'slurm', 'mpi'],
+         default='none',
+         help='job launcher')
+-    parser.add_argument('--local_rank', type=int, default=0)
++    parser.add_argument('--local_rank', '--local-rank', type=int, default=0)  # torch>=2 launch passes --local-rank
+     args = parser.parse_args()
+     if 'LOCAL_RANK' not in os.environ:
+         os.environ['LOCAL_RANK'] = str(args.local_rank)
+@@ -114,6 +114,8 @@ def parse_args():
+ 
+ def main():
+     args = parse_args()
++    # as tools/train.py: mmcv's init_dist would switch to 'spawn', which pickles the dataset into every worker
++    torch.multiprocessing.set_start_method('fork', force=True)
+ 
+     assert args.out or args.eval or args.format_only or args.show \
+         or args.show_dir, \
+diff --git a/tools/train.py b/tools/train.py
+index caee7b7..3c543a0 100755
+--- a/tools/train.py
++++ b/tools/train.py
+@@ -79,7 +79,7 @@ def parse_args():
+         choices=['none', 'pytorch', 'slurm', 'mpi'],
+         default='none',
+         help='job launcher')
+-    parser.add_argument('--local_rank', type=int, default=0)
++    parser.add_argument('--local_rank', '--local-rank', type=int, default=0)  # torch>=2 launch passes --local-rank
+     parser.add_argument(
+         '--autoscale-lr',
+         action='store_true',
+@@ -101,6 +101,9 @@ def parse_args():
+ 
+ def main():
+     args = parse_args()
++    # something in the import chain switches multiprocessing to 'spawn'; the datasets hold dict_keys (unpicklable),
++    # so the dataloader workers must fork
++    torch.multiprocessing.set_start_method('fork', force=True)
+ 
+     cfg = Config.fromfile(args.config)
+     if args.cfg_options is not None:
+@@ -147,8 +150,9 @@ def main():
+         # use config filename as default work_dir if cfg.work_dir is None
+         cfg.work_dir = osp.join('./work_dirs',
+                                 osp.splitext(osp.basename(args.config))[0])
+-    # if args.resume_from is not None:
+-    if args.resume_from is not None and osp.isfile(args.resume_from):
++    if args.resume_from is not None:
++        if not osp.isfile(args.resume_from):  # was silently ignored, restarting the run in the same work_dir
++            raise FileNotFoundError(f'--resume-from {args.resume_from} does not exist')
+         cfg.resume_from = args.resume_from
+     if args.gpu_ids is not None:
+         cfg.gpu_ids = args.gpu_ids

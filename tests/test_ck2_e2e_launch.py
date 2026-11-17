@@ -379,14 +379,21 @@ def test_train_e2e2_dry_run(tmp_path):
               "++agent.config.use_distill=true", "++agent.config.distill_teacher_source=targets"):
         assert o in r.stdout.splitlines(), o
     assert _sh(dict(base, CK2_E2E_APPROVED="1"), "start", "--gpus", "0,1,2").returncode == 3
-    # labeler workers: 16 x ngpu capped at the labeler's MAX_WORKERS (48); 64 made labeler2 die at start on 4 GPUs
+    # labeler workers: default 16 x ngpu capped at 48 (the recipe; 64 made labeler2 die at start on 4 GPUs when the
+    # labeler's MAX_WORKERS was 48); an explicit LABELER_WORKERS is used up to the labeler's MAX_WORKERS = 96 (e.g. the
+    # 144 trajectories per token of the VARIANTS=v8 arm).  The rule is taken from train_e2e2.sh itself.
+    import re
     from tools.ck.e2e import labeler as L1
-    expr = 'ng=$1; lw=${LABELER_WORKERS:-$((16 * ng))}; [ "$lw" -gt 48 ] && lw=48; echo $lw'
-    got = {ng: subprocess.run(["bash", "-c", expr, "_", str(ng)], capture_output=True, text=True,
-                              env={k: v for k, v in os.environ.items() if k != "LABELER_WORKERS"}).stdout.strip()
-           for ng in (2, 4)}
-    assert got == {2: "32", 4: "48"} and L1.MAX_WORKERS == 48
-    assert expr.split("; echo")[0].split("ng=$1; ")[1] in SH.read_text()
+    m = re.search(r'^  if \[ -n "\$\{LABELER_WORKERS:-\}" \]; then.*?fi$', SH.read_text(), flags=re.M | re.S)
+    assert m, "the labeler worker rule of train_e2e2.sh moved"
+    expr = "ng=$1; " + m.group(0) + "; echo $lw"
+    env = {k: v for k, v in os.environ.items() if k != "LABELER_WORKERS"}
+
+    def lw(ng, explicit=None):
+        e = dict(env, LABELER_WORKERS=explicit) if explicit else env
+        return subprocess.run(["bash", "-c", expr, "_", str(ng)], capture_output=True, text=True, env=e).stdout.strip()
+    assert {ng: lw(ng) for ng in (2, 4, 8)} == {2: "32", 4: "48", 8: "48"} and L1.MAX_WORKERS == 96
+    assert (lw(8, "24"), lw(8, "72"), lw(8, "96"), lw(8, "200")) == ("24", "72", "96", "96")
 
 
 def test_hydra_compose_full_override_list(tmp_path):

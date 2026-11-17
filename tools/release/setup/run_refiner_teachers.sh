@@ -7,6 +7,12 @@
 #   DET_TEACHER, MAP_TEACHER   registry names (default bevfusion, resmap): the output run dir is the entry's refiner_run
 #   GPUS_DET, GPUS_MAP         default 0,1,2,3 and 4,5,6,7; 2 or 4 GPUs each (the global batch stays 16 tokens)
 #   WHICH                      both, det, map (default both)
+#   VAR_NAME, N_VAR            default unset: train_ck2's own defaults (var_separate_sampler16_accstraight, 80 = all 16 x 5
+#                              variants), i.e. the base recipe.  Only to retrain teachers on a VARIANTS arm's label set
+#                              (the ablation reuses the base teachers): VAR_NAME=var_separate_sampler16_accstraight_<arm> and
+#                              N_VAR=16 x (V - 1) = 128 (v8) or 64 (v4, spd4, lat4); VAR_NAME without N_VAR is refused.
+#                              Its output dir is still the registry entry's refiner_run: give the arm teachers their own
+#                              registry entries (DET_TEACHER=, MAP_TEACHER=), the base ones refuse an existing done.json.
 . "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 DET_TEACHER=${DET_TEACHER:-bevfusion}
 MAP_TEACHER=${MAP_TEACHER:-resmap}
@@ -22,8 +28,15 @@ eval "$_exports"
 export CK_BEV64=1 CK_ALLOW_GPU4567=1 CK_TEACHER_MAX_GPUS=4 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 RECIPE=(--epochs 10 --tokens-per-batch 16 --lr 6e-4 --sur-groups near_mid --val-split navtrain_val --eval-every 2 --best-metric none \
         --r34-evals 0 --resume)
+VAR_NAME=${VAR_NAME:-}
+N_VAR=${N_VAR:-}
+if [ -n "$VAR_NAME" ] && [ "$VAR_NAME" != var_separate_sampler16_accstraight ] && [ -z "$N_VAR" ]; then
+  die "VAR_NAME=$VAR_NAME needs N_VAR = 16 x (V - 1) of that label set (128 for v8, 64 for v4 / spd4 / lat4)"
+fi
+[ -z "$VAR_NAME" ] || RECIPE+=(--var-name "$VAR_NAME")
+[ -z "$N_VAR" ] || RECIPE+=(--n-var "$N_VAR")
 for s in navtrain_train navtrain_val; do
-  need "$CK/packed/$s/tokens.parquet" "$CK/labels/$s/raw256/labels.npy" "$CK/ck2/labels/$s/var_separate_sampler16_accstraight/labels.npy"
+  need "$CK/packed/$s/tokens.parquet" "$CK/labels/$s/raw256/labels.npy" "$CK/ck2/labels/$s/${VAR_NAME:-var_separate_sampler16_accstraight}/labels.npy"
 done
 
 # start ARM RUN_DIR GPUS SCORE_KEYS

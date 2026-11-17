@@ -36,7 +36,7 @@
 #   MAX_EPOCHS-2, --exit-when-done --train-pid-file) -> watchdog (restart a dead / hung labeler while training lives).
 # ARM=main (default) | bevkd (adds tools/ck/e2e2/bevkd_arm.set); E2E_CK_SET=<file of ck_e2e2 key=value lines> is applied
 #   after the arm file.  Never pkill / pgrep -f: processes are found through the pid files only.
-# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (16 x ngpu, at most 48: 32 / 48), LABELER_POLL (30),
+# Env knobs: E2E_ROOT, TRAIN_WORKERS (6), MAX_EPOCHS (30), LABELER_WORKERS (default 16 x ngpu, at most 48: 32 / 48; an explicit value up to 96), LABELER_POLL (30),
 #   LABELER_MAX_EPOCH (MAX_EPOCHS-2), E2E_NO_LABELER=1 (refused with the refiner on: training would silently stay on
 #   warm-up labels), E2E_WANDB=online|offline|disable, E2E_EXTRA=<Hydra override file>,
 #   E2E_SMOKE=1, E2E_WAIT_TIMEOUT, E2E_DRY_RUN=1, WATCHDOG_EVERY (120), LABELER_MAX_RESTARTS (20), LABELER_STALL_S (1200),
@@ -129,7 +129,10 @@ start_labeler() {  # [retry]: add --retry-errors (watchdog restarts)
   if p=$(alive "$LB/labeler.pid" labeler2); then log "labeler alive (pid $p): kept"; return 0; fi
   need_gpus
   local ng me lw; ng=$(awk -F, '{print NF}' <<< "$GPUS"); me=${LABELER_MAX_EPOCH:-$(( ${MAX_EPOCHS:-30} - 2 ))}
-  lw=${LABELER_WORKERS:-$((16 * ng))}; [ "$lw" -gt 48 ] && lw=48      # labeler MAX_WORKERS = 48 (tools/ck/e2e/labeler.py)
+  # default 16 x ngpu, at most 48 (the recipe: 48 on 8 GPUs); an explicit LABELER_WORKERS up to the labeler's MAX_WORKERS = 96
+  # (tools/ck/e2e/labeler.py), e.g. for the 144 trajectories per token of the VARIANTS=v8 arm
+  if [ -n "${LABELER_WORKERS:-}" ]; then lw=$LABELER_WORKERS; [ "$lw" -gt 96 ] && lw=96
+  else lw=$((16 * ng)); [ "$lw" -gt 48 ] && lw=48; fi
   [ "$me" -lt 0 ] && me=0
   local LCMD=("$PY" "$REPO/tools/ck/e2e2/labeler2.py" --io-dir "$IO" --world-size "$ng" --workers "$lw"
               --poll "${LABELER_POLL:-30}" --max-epoch "$me" --exit-when-done --train-pid-file "$L/train.pid")

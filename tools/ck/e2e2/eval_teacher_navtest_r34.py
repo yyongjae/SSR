@@ -35,6 +35,9 @@ Selection (no GT, no labels)
                   first, k ascending, then variants in c order = parent first)
   pool96_old_b1   select2.select96 with v2 im, beta 1 (descriptive context)
   each mode: _a = the selected trajectory, _b = its lateral correction (b-style); v2_lat = lateral of column 0.
+Variant layout: BASE only (variants.BASE_LAYOUT = the table the refiner teachers were trained on; every variant-set
+  ablation arm reuses these teachers): require_base refuses an edited SPEEDS / LATS table and an r34_variants dir built
+  with other variant names (an arm's student pool is evaluated by eval_e2e2 / eval_ck2 / eval_epdms instead).
 Outputs <out-root> (default CK_DATA/ck2/eval/navtest)
   r34_variants/  traj80.npy f32 [N,80,8,3], valid80.npy bool [N,80], v0.npy f32 [N], dec.npz (dev_xy, ds4, d_end,
                  alpha, beta, ext_m [N,16,6]), built.npy bool [N], meta.json
@@ -81,6 +84,21 @@ KST = 9 * 3600
 R34_MODES = (("r34_ck_noim", "noim", None), ("r34_old_b1", "old", 1.0), ("r34_old_b0.5", "old", 0.5))
 POOL_MODES = (("pool96_ck_noim", "noim", 1.0), ("pool96_old_b1", "old", 1.0))
 STAGES = ("variants", "infer", "select", "eval")
+
+
+def require_base(names=None, what: str = "") -> None:
+    """teacher-only diagnostic of the BASE variant layout (NV = 6 / NVAR = 5 shapes, select2's base constants): refuses
+    another table (SPEEDS / LATS edited) and inputs built with other variant names (SystemExit)."""
+    from navsim.agents.para_ssr.ck.variants import BASE_LAYOUT, VariantLayout
+    lay = VariantLayout(SPEEDS, LATS, COMBINE)
+    if lay != BASE_LAYOUT or (K16, NV, NVAR) != (16, BASE_LAYOUT.nv, BASE_LAYOUT.nv - 1):
+        raise SystemExit(f"eval_teacher_navtest_r34 supports only the base variant layout {list(BASE_LAYOUT.names)} "
+                         f"(the refiner teachers' training table); got {list(lay.names)}")
+    if names is not None and tuple(names) != BASE_LAYOUT.names:
+        raise SystemExit(f"{what}: built with the variant names {list(names)}; this teacher diagnostic supports only "
+                         f"the base layout {list(BASE_LAYOUT.names)} (variant-set arms reuse the base teachers; "
+                         f"evaluate "
+                         f"an arm's student pool with eval_e2e2 / eval_epdms)")
 
 
 def kst(t: Optional[float] = None) -> str:
@@ -131,6 +149,7 @@ def stage_variants(a) -> Dict:
     N = len(tdf)
     rows = todo_rows(a, N, pok)
     if (vd / "meta.json").is_file() and U.read_json(vd / "meta.json").get("complete"):
+        require_base(U.read_json(vd / "meta.json").get("names"), str(vd / "meta.json"))
         built = np.load(vd / "built.npy")
         if built[rows].all():
             print(f"[variants] {vd} complete, skipped", flush=True)
@@ -165,6 +184,7 @@ def stage_variants(a) -> Dict:
             print(f"[variants] {i + len(rr)}/{len(rows)} {time.time() - t0:.0f}s", flush=True)
     from navsim.agents.para_ssr.ck.select2 import VNAMES
     assert tuple(names) == tuple(VNAMES), (names, VNAMES)
+    require_base(names, "make_variants")
     assert n_bad_id == 0, "identity variant must be the candidate bytes"
     vd.mkdir(parents=True, exist_ok=True)
     save_npy(vd / "traj80.npy", traj80)
@@ -265,6 +285,7 @@ def stage_infer(a) -> Dict:
     N = len(tdf)
     rows = todo_rows(a, N, pok)
     vmeta = U.read_json(vd / "meta.json") or {}
+    require_base(vmeta.get("names"), str(vd / "meta.json"))
     built = np.load(vd / "built.npy")
     if not vmeta.get("complete") or not built[rows].all():
         raise SystemExit(f"{vd}: variants not built for every row (run --stage variants first)")
@@ -357,6 +378,7 @@ def select_modes(prob16, prob80, valid80, v2_final, v2_im) -> Dict[str, np.ndarr
     """GT-free picks -> {mode: idx [n]} (r34 modes 0..15, pool modes 0..95)."""
     from navsim.agents.para_ssr.ck import select2 as S2
     from navsim.agents.para_ssr.ck.select import ck_final, select_all
+    lay = S2.BASE_LAYOUT                                  # require_base: the teachers' (base) variant layout
     n = prob16.shape[0]
     ones16, zeros16 = np.ones((n, K16)), np.zeros((n, K16))
     picks = {}
@@ -371,15 +393,16 @@ def select_modes(prob16, prob80, valid80, v2_final, v2_im) -> Dict[str, np.ndarr
     valid96 = to_pool(np.ones((n, K16), bool), valid80)
     for name, kind, beta in POOL_MODES:
         if kind == "noim":
-            picks[name] = S2.select96(zeros16, ones16, prob96, valid96, beta=1.0, w=w_noim())
+            picks[name] = S2.select96(zeros16, ones16, prob96, valid96, beta=1.0, w=w_noim(), layout=lay)
         else:
-            picks[name] = S2.select96(v2_final, v2_im, prob96, valid96, beta=beta)
+            picks[name] = S2.select96(v2_final, v2_im, prob96, valid96, beta=beta, layout=lay)
     return picks
 
 
 def stage_select(a) -> Dict:
     t0 = time.time()
     root, vd, td = roots(a)
+    require_base((U.read_json(vd / "meta.json") or {}).get("names"), str(vd / "meta.json"))
     pdir, tdf, pok = packed()
     N = len(tdf)
     rows = todo_rows(a, N, pok)
@@ -635,6 +658,7 @@ def main(argv=None):
     ap.add_argument("--labels-var", default=None)
     ap.add_argument("--labels-stack", default=None)
     a = ap.parse_args(argv)
+    require_base()
     if a.workers > 16:
         raise SystemExit("--workers <= 16")
     stages = [s.strip() for s in a.stage.split(",") if s.strip()]

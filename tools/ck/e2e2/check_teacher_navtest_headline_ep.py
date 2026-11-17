@@ -26,6 +26,8 @@ COPY of check_teacher_navtest_headline.py for a fixed-epoch eval root (user 2026
   4 no GT / labels in the choice: (1) + an AST scan of the inference / selection code (file reads, dataset flags, batch
     keys) + file times (picks written before the labels of their own trajectories existed).
 -> <D>/check_headline.json; exit 1 if any assertion fails.
+  Base variant layout only (the teachers' training table, 16 x 6 pool): producer outputs whose meta.json names other
+  variants (r34_variants names, <t>/gtfree variants.names) are refused up front (require_base_layout).
 """
 import ast
 import hashlib
@@ -82,6 +84,23 @@ def score(p, im=None, beta=None, v2f=None):
     return np.where(np.isfinite(s), s, -np.inf)
 
 
+BASE_NAMES = ("id", "a-1.0", "a-0.5", "a+0.5", "l-0.5", "l+0.5")     # variants.BASE_LAYOUT (own copy, no repo import)
+
+
+def require_base_layout(d, teachers=("ck2T", "ck2M")):
+    """SystemExit unless every producer meta.json that names its variants names the base layout (pick96 / pool / the
+    lateral-variant rule c % 6 in (4, 5) below are the base layout's)."""
+    metas = [(Path(d) / "r34_variants" / "meta.json", lambda m: m.get("names"))]
+    metas += [(Path(d) / t / "gtfree" / "meta.json", lambda m: (m.get("variants") or {}).get("names"))
+              for t in teachers]
+    for p, get in metas:
+        if p.is_file():
+            names = get(json.loads(p.read_text()))
+            if names is not None and tuple(names) != BASE_NAMES:
+                raise SystemExit(f"{p}: variant names {list(names)}; this check supports only the base variant layout "
+                                 f"{list(BASE_NAMES)}")
+
+
 def pick96(s96, valid96):
     """identity columns (c % 6 == 0) always allowed, variants only if valid; ties: identities (k asc) then c order."""
     c = np.arange(96)
@@ -113,6 +132,7 @@ def main(argv=None):
     except ValueError:
         pass
     t0 = time.time()
+    require_base_layout(D)
     M = json.loads((D / "metrics.json").read_text())
     H = M["headline_pdms"]
     pk = CK / "packed" / "navtest"

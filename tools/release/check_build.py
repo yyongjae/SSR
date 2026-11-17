@@ -54,6 +54,12 @@ def summarize(agent):
         "lat_kd_fixed": ck.cfg.lat_kd["fixed"], "kd_calib_enabled": ck.cfg.kd_calib["enabled"],
         "kd_calib_mode": ck.cfg.kd_calib["mode"], "infer_select": ck.cfg.infer_select,
         "submit_selection": ck.cfg.submit_selection, "seed": ck.cfg.seed}
+    if ck is not None:
+        from navsim.agents.para_ssr.ck.variants import VariantLayout
+        lay = VariantLayout.from_cfg(ck.cfg.variants)
+        if not lay.is_base:          # a VARIANTS arm: its table and pool size (the base record stays as it was)
+            rec["refiner"]["variants"] = {"names": list(lay.names), "nv": lay.nv, "n_cand": 16 * lay.nv,
+                                          "var_dir": ck.cfg.warmup["var_dir"]}
     return rec
 
 

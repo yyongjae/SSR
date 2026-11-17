@@ -357,6 +357,6 @@ def test_rejects_bad_args(tmp_path):
     with pytest.raises(AssertionError):
         _lab(tmp_path / "x=y", tok)
     with pytest.raises(AssertionError):
-        _lab(tmp_path / "ok", tok, workers=49)
+        _lab(tmp_path / "ok", tok, workers=L.MAX_WORKERS + 1)          # labeler.MAX_WORKERS (48 -> 96 for v8)
     with pytest.raises(AssertionError):
         _lab(tmp_path / "ok", tok, n_rows=N_FAKE + 1)                    # token table shorter than n_rows

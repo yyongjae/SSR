@@ -23,6 +23,8 @@ Final trajectories final_traj [N, 5, 8, 3], FINAL_MODES order:
 Official scoring (tools/ck/data/label_cands.py, rows = packed/navtest/tokens.parquet):
   g2_var80_traj [N, 80, 8, 3] (the 5 non-identity variants of the own top-16, column k * 5 + v - 1; identities = raw
   anchors -> labels/navtest/raw256) and final_traj [N, 5, 8, 3].
+Variant layout: BASE only (variants.BASE_LAYOUT, the teachers' training table; variant-set ablation arms reuse these
+  teachers): an edited SPEEDS / LATS table and an output dir whose meta.json names other variants are refused.
 Outputs (--out, default CK_DATA/ck2/eval/navtest/<run>/gtfree): the arrays above + g2_top16 [N,16] (anchor ids),
   g2_valid96 [N,96], p256_idx [N], p96_col [N], bev_ok / done [N], tokens.parquet, meta.json (ckpt sha, settings,
   timings, counts, sanity), log in KST.  Resumable (done flags).
@@ -65,8 +67,20 @@ BEV_SHAPE = (256, 50, 100)
 W_NOIM = (0.0,) + tuple(Cn.SEL_W[1:])            # SEL_W minus the v2 imitation term
 SPEEDS, LATS, COMBINE, EXT = (-1.0, -0.5, 0.5), (-0.5, 0.5), "separate", "straight"
 K256, K16, NV = 256, 16, 6
+LAYOUT = S2.VariantLayout(SPEEDS, LATS, COMBINE)          # must be S2.BASE_LAYOUT (require_base)
 FINAL_MODES = ("P256", "P256_lat", "P96_off", "P96_on", "P96_onexl")
 KST = 9 * 3600
+
+
+def require_base(names=None, what: str = "") -> None:
+    """teacher-only diagnostic of the BASE variant layout (NV = 6 shapes, select2's base constants; SystemExit)."""
+    if LAYOUT != S2.BASE_LAYOUT or NV != S2.BASE_LAYOUT.nv:
+        raise SystemExit(f"eval_teacher_navtest_gtfree supports only the base variant layout "
+                         f"{list(S2.BASE_LAYOUT.names)} (the refiner teachers' training table); got "
+                         f"{list(LAYOUT.names)}")
+    if names is not None and tuple(names) != S2.BASE_LAYOUT.names:
+        raise SystemExit(f"{what}: written with the variant names {list(names)}; this teacher diagnostic supports only "
+                         f"the base layout {list(S2.BASE_LAYOUT.names)}")
 
 
 def kst(t: Optional[float] = None) -> str:
@@ -181,13 +195,13 @@ def infer_batch(net, bev, status, anchors: torch.Tensor, chunk: int, use_amp: bo
     prob96 = torch.sigmoid(g2["logit"]).cpu().numpy()
     sc96 = sel_score(prob96)
     col = S2.select96(np.zeros((T, K16)), np.ones((T, K16)), prob96, valid96, beta=1.0,
-                      types=S2.VARIANT_SETS["all"], w=W_NOIM)
+                      types=S2.VARIANT_SETS["all"], w=W_NOIM, layout=LAYOUT)
     # ---- G3: lateral head on the P96 pick
     ar = torch.arange(T, device=dev)
     ct = torch.as_tensor(col, device=dev)
     pick = traj96[ar, ct]                                                   # [T, 8, 3]
     pick_lat = lat_decode(pick[:, None], g2["w_lat"][ar, ct][:, None], v0)[:, 0]
-    is_latvar = torch.as_tensor(np.isin(col % NV, S2.LAT_TYPES), device=dev)
+    is_latvar = torch.as_tensor(np.isin(col % NV, LAYOUT.lat_types), device=dev)
     pt = torch.as_tensor(p256, device=dev)
     final = torch.stack([A[ar, pt], g1_lat[ar, pt], pick, pick_lat,
                          torch.where(is_latvar[:, None, None], pick, pick_lat)], 1)      # FINAL_MODES order
@@ -258,6 +272,7 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--no-amp", action="store_true")
     a = ap.parse_args(argv)
+    require_base()
 
     U.gpu_guard("cuda")
     run = Path(a.run) if "/" in a.run else TRAIN_ROOT / a.run
@@ -295,6 +310,7 @@ def main(argv=None) -> int:
             sub.to_parquet(out / "tokens.parquet", index=False)
     meta_p = out / "meta.json"
     meta = U.read_json(meta_p, {}) or {}
+    require_base((meta.get("variants") or {}).get("names"), str(meta_p))
     meta.update(script=str(Path(__file__).resolve()), run=str(run), which=a.which, arm=arm, split=SPLIT, n=N,
                 n_packed=Np, ckpt=str(ck_file), ckpt_sha16=U.sha256_file(ck_file, 16),
                 lon_head_absmax_weight_plus_bias=lon_w, anchors=str(Cn.ANCHORS), anchors_sha16=a_sha,

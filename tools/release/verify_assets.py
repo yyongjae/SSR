@@ -3,6 +3,7 @@
 
   verify_assets.py --profile {base,refiner_noteacher,full} [--quick] [--strict] [--only GROUP]
                    [--det-teacher NAME] [--map-teacher NAME] [--registry FILE] [--workers 12] [--json FILE]
+                   [--variants ARM]
 
 Profiles (docs/SETUP.md has the disk and hours of each):
   base               REFINER=off BEV_KD=off: dataset, maps, anchors, pdm_score_256_officialEP
@@ -14,6 +15,13 @@ index files, a fixed sample of tokens.  Without it every token of a coverage che
 and all 85,109 tokens go through the training GT loader, whose statistics must equal the reference (a few minutes, CPU).
 --only runs one group of the profile (dataset, metric_cache, gt, packed, labels, teacher_cache, teachers): the setup scripts
 use it to check their own step.
+--variants ARM (scripts/experiment.sh VARIANTS=<arm>, not base) also checks that arm's warm-up label dir
+(ck2/labels/<split>/<variants.arm_var_name(arm)>; navtrain_train always, navtrain_val when present).  No pins exist for
+an arm: build.json / check.json / index.npz must describe the arm's table (names, V, speeds, lats, 'separate', ext
+straight, sampler16, the anchors and tokens of the base build), the shapes are 16 x V, and the full check hashes the
+arrays (printed), requires traj.npy == build.json traj_sha16 and the base build's anchor_idx pin, and requires the
+columns of the variant types the arm shares with the base build (traj, valid) to equal the base arrays bitwise (shared
+label / ok columns that differ only WARN).
 
 Each line says PASS, WARN or FAIL, and a WARN or FAIL names the fix.
   FAIL  the training this profile describes would stop, or would silently run without the input.  Exit code 1.
@@ -74,6 +82,8 @@ PINS: Dict[str, Dict[str, str]] = {
 }
 SHAPES = {"raw256": {"labels": (256, 9), "ok": (256,)}, "var": {"labels": (96, 9), "ok": (96,), "traj": (96, 8, 3)}}
 VAR_NAME = "var_separate_sampler16_accstraight"
+VARIANTS_BASE = "base"         # the main recipe's variant set: VAR_NAME, checked against PINS
+ARM_K = 16                     # parents of every variant arm (variants.VARIANT_ARMS); columns c = k * V + v
 REPO_FILES = {                 # path -> file sha16
     "resources/planning_vb/trajectory_anchors_256.npy": "44f64a763473c3a8",
     "navsim/planning/script/config/common/scene_filter/navtrain.yaml": "c37fea567a0cfdbc",
@@ -118,9 +128,9 @@ class Report:
 
 class Ctx:
     def __init__(self, paths: Dict[str, str], quick: bool, workers: int, rep: Report, det: str, mapt: str,
-                 registry: Optional[dict]):
+                 registry: Optional[dict], variants: str = VARIANTS_BASE):
         self.p, self.quick, self.workers, self.rep = paths, quick, workers, rep
-        self.det, self.mapt, self.registry = det, mapt, registry
+        self.det, self.mapt, self.registry, self.variants = det, mapt, registry, variants
         self.data = Path(paths["SSR_DATA_ROOT"])
         self.ck = self.data / "ck"
         self._tokens: Dict[str, object] = {}
@@ -574,6 +584,115 @@ def check_labels(c: Ctx, split: str = "navtrain_train", soft: bool = False) -> N
                         if sha16_array(z[k]) != pins[k]:
                             bad.append(f"index.npz {k} differs from pin {pins[k]}")
         c.verdict(name, bad, "shapes and provenance fine" if c.quick else "arrays equal their pins", fix, soft)
+    if c.variants != VARIANTS_BASE:
+        check_arm_labels(c, split, soft)
+
+
+def _variants_module():
+    """navsim/agents/para_ssr/ck/variants.py (imports torch, CUDA is hidden above): only for --variants."""
+    from navsim.agents.para_ssr.ck import variants as VV
+    return VV
+
+
+def _rows_differ(pa: Path, pb: Path, ca: Sequence[int], cb: Sequence[int], axis: int = 1, chunk: int = 2048) -> int:
+    """Rows where columns ca of array file pa and cb of pb (on `axis`, 1 or 2) differ bitwise."""
+    A, B = np.load(pa, mmap_mode="r", allow_pickle=False), np.load(pb, mmap_mode="r", allow_pickle=False)
+    if len(A) != len(B):
+        return max(len(A), len(B))
+    n_bad = 0
+    for r0 in range(0, len(A), chunk):
+        a, b = np.take(np.asarray(A[r0:r0 + chunk]), ca, axis=axis), np.take(np.asarray(B[r0:r0 + chunk]), cb, axis=axis)
+        a, b = np.ascontiguousarray(a).reshape(len(a), -1), np.ascontiguousarray(b).reshape(len(b), -1)
+        n_bad += int((a.view(np.uint8) != b.view(np.uint8)).any(1).sum())
+    return n_bad
+
+
+def check_arm_labels(c: Ctx, split: str, soft: bool = False) -> None:
+    """Warm-up label dir of the VARIANTS arm c.variants (module docstring); navtrain_val only when present."""
+    VV = _variants_module()
+    lay, vname = VV.arm_layout(c.variants), VV.arm_var_name(c.variants)
+    d, base_d = c.ck / "ck2/labels" / split / vname, c.ck / "ck2/labels" / split / VAR_NAME
+    name = f"labels.var-{c.variants}.{split}"
+    fix = f"ARMS={c.variants} {SETUP}/50_warmup_labels.sh (label_variants.py --name {vname})"
+    if soft and not d.is_dir():
+        return                     # navtrain_val: only a refiner-teacher retrain on this arm's labels reads it
+    n, g = N_TOKENS[split], ARM_K * lay.nv
+    shapes = {"labels": (g, 9), "ok": (g,), "traj": (g, 8, 3)}
+    bad: List[str] = []
+    for a, sh in shapes.items():
+        p = d / f"{a}.npy"
+        if not p.is_file():
+            bad.append(f"{p} missing")
+        elif npy_header(p)[0] != (n,) + sh:
+            bad.append(f"{p}: shape {npy_header(p)[0]} != {(n,) + sh}")
+    files = {k: d / k for k in ("build.json", "check.json", "index.npz")}
+    lack = [k for k, p in files.items() if not p.is_file()]
+    j: Dict[str, object] = {}
+    if lack:
+        bad.append(f"{d}: {', '.join(lack)} missing")
+    else:
+        j = json.loads(files["build.json"].read_text())
+        want = {"names": list(lay.names), "n_variants": lay.nv, "speeds": list(lay.speeds), "lats": list(lay.lats),
+                "combine": "separate", "ext": "straight", "subset": "sampler", "n_anchors": ARM_K, "epoch": 0, "seed": 0,
+                "limit": 0, "s_on_frac": VV.S_ON_FRAC, "token_sha16": PINS[f"packed/{split}"]["token_sha16"],
+                "anchors_sha16": ANCHORS_SHA16, "n_built": n}
+        bad += [f"build.json {k} {j.get(k)!r} != {v!r}" for k, v in want.items() if j.get(k) != v]
+        r = json.loads(files["check.json"].read_text())
+        want = {"name": vname, "n_rows": n, "K": ARM_K, "V": lay.nv, "names": list(lay.names), "n_expected": n * g}
+        bad += [f"check.json {k} {r.get(k)!r} != {v!r}" for k, v in want.items() if r.get(k) != v]
+        if r.get("n_ok") != r.get("n_expected"):
+            bad.append(f"check.json n_ok {r.get('n_ok')} != n_expected {r.get('n_expected')}")
+        for k in ("identity_vs_raw256", "invalid_vs_parent"):
+            if (r.get(k) or {}).get("all_equal") is not True:
+                bad.append(f"check.json {k}.all_equal {(r.get(k) or {}).get('all_equal')!r}")
+        with np.load(files["index.npz"], allow_pickle=False) as z:
+            got = {k: z[k] for k in ("names", "col_k", "col_v") if k in z.files}
+            vshape = tuple(z["valid"].shape) if "valid" in z.files else None
+        cols = np.arange(g)
+        for k, v in (("names", np.array(lay.names)), ("col_k", cols // lay.nv), ("col_v", cols % lay.nv)):
+            if k not in got or got[k].shape != v.shape or not (got[k] == v).all():
+                bad.append(f"index.npz {k} is not the layout c = k * {lay.nv} + v of {list(lay.names)}")
+        if vshape != (n, ARM_K, lay.nv):
+            bad.append(f"index.npz valid shape {vshape} != {(n, ARM_K, lay.nv)}")
+    good = (f"{vname}: V {lay.nv} {list(lay.names)}, {g} columns; shapes, build.json, check.json, index layout fine; "
+            f"build traj_sha16 {j.get('traj_sha16')} (no pins for an arm)")
+    soft_bad: List[str] = []
+    if not c.quick and not bad:
+        shas = {a: sha16_array(np.load(d / f"{a}.npy", mmap_mode="r", allow_pickle=False)) for a in shapes}
+        if shas["traj"] != j.get("traj_sha16"):
+            bad.append(f"traj.npy sha16 {shas['traj']} != build.json traj_sha16 {j.get('traj_sha16')}")
+        with np.load(files["index.npz"], allow_pickle=False) as z:
+            shas["anchor_idx"], shas["valid"] = sha16_array(z["anchor_idx"]), sha16_array(z["valid"])
+        if shas["anchor_idx"] != PINS[f"var/{split}"]["anchor_idx"]:
+            bad.append(f"index.npz anchor_idx {shas['anchor_idx']} != the base build's pin {PINS[f'var/{split}']['anchor_idx']}")
+        # the variant types the arm shares with the base build are the same decode of the same anchors
+        base_names = list(VV.BASE_NAMES)
+        pairs = [(va, base_names.index(nm)) for va, nm in enumerate(lay.names) if nm in base_names]
+        ca = [k * lay.nv + va for k in range(ARM_K) for va, _ in pairs]
+        cb = [k * len(base_names) + vb for k in range(ARM_K) for _, vb in pairs]
+        lack = [f for f in ("traj.npy", "labels.npy", "ok.npy", "index.npz") if not (base_d / f).is_file()]
+        if lack:
+            bad.append(f"{base_d}: {', '.join(lack)} missing, the shared columns cannot be compared")
+        else:
+            nd = _rows_differ(d / "traj.npy", base_d / "traj.npy", ca, cb)
+            if nd:
+                bad.append(f"traj: {nd} rows of the shared columns {[lay.names[va] for va, _ in pairs]} differ from {base_d}")
+            with np.load(files["index.npz"], allow_pickle=False) as za, np.load(base_d / "index.npz", allow_pickle=False) as zb:
+                va_, vb_ = za["valid"][:, :, [p[0] for p in pairs]], zb["valid"][:, :, [p[1] for p in pairs]]
+                if va_.shape != vb_.shape or (va_ != vb_).any():
+                    bad.append(f"index.npz valid of the shared types differs from {base_d}")
+            for a in ("labels", "ok"):
+                nd = _rows_differ(d / f"{a}.npy", base_d / f"{a}.npy", ca, cb)
+                if nd:
+                    soft_bad.append(f"{a}: {nd} rows of the shared columns differ from the base build")
+        good = (f"{vname}: V {lay.nv}, {g} columns; sha16 " + ", ".join(f"{k} {v}" for k, v in shas.items())
+                + f" (no pins for an arm); traj == build.json, anchor_idx == base pin, {len(pairs)} shared types "
+                  f"{[lay.names[va] for va, _ in pairs]} equal the base traj / valid")
+    c.verdict(name, bad, good, fix, soft)
+    if not c.quick and not bad:
+        c.verdict(f"{name}.shared_labels", soft_bad, "labels / ok of the shared columns equal the base build",
+                  "the arm and the base labels were scored apart (another scorer or metric cache?): compare before "
+                  "reading the arms against the base run", soft=True)
 
 
 def check_teacher_retrain_inputs(c: Ctx) -> None:
@@ -747,13 +866,21 @@ def main(argv=None) -> int:
     ap.add_argument("--registry", default=os.environ.get("SSR_RELEASE_REGISTRY") or str(ROOT / REGISTRY))
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--json", default="", help="also write the rows to this file")
+    ap.add_argument("--variants", default=VARIANTS_BASE,
+                    help="VARIANTS arm of scripts/experiment.sh: also check its warm-up label dir (default base: none)")
     a = ap.parse_args(argv)
+    if a.variants != VARIANTS_BASE:
+        try:
+            _variants_module().arm_layout(a.variants)
+        except ValueError as e:
+            ap.error(f"--variants: {e}")
     paths = SP.resolve()
     rep = Report()
     registry = load_registry(Path(a.registry), paths)
-    c = Ctx(paths, a.quick, a.workers, rep, a.det_teacher, a.map_teacher, registry)
+    c = Ctx(paths, a.quick, a.workers, rep, a.det_teacher, a.map_teacher, registry, a.variants)
+    arm = "" if a.variants == VARIANTS_BASE else f", variants {a.variants}"
     print(f"[verify_assets] profile {a.profile}, {'quick' if a.quick else 'full check'}, data {paths['SSR_DATA_ROOT']}, "
-          f"teachers {paths['SSR_TEACHER_CACHE']}", flush=True)
+          f"teachers {paths['SSR_TEACHER_CACHE']}{arm}", flush=True)
     for fn in [f for f in CHECKS[a.profile] if not a.only or f in GROUPS[a.only]]:
         try:
             fn(c)

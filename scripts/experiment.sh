@@ -13,6 +13,7 @@ REFINER_KD=on               # on | off | score (lateral KD off) | lat (score KD 
 BEV_KD=on                   # on | off: BEV KD v15 from both teachers
 DET_KD=on                   # on | off (both KD paths) | off_bev | off_ref: KD from the DET teacher
 MAP_KD=on                   # on | off (both KD paths) | off_bev | off_ref: KD from the MAP teacher
+VARIANTS=base               # base | v8 | v4 | spd4 | lat4: kinematic variant set of the refiner candidates (16 x V; docs/EXPERIMENTS.md)
 BACKBONE=r34                # r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 dino_vits14_1148 dino_vits14 (tools/release/registry.yaml)
 DET_TEACHER=bevfusion       # registry name
 MAP_TEACHER=resmap          # registry name
@@ -48,7 +49,7 @@ if [ -n "${SSR_RELEASE_TEST_STUBS:-}" ]; then
   E2E_START=$SSR_RELEASE_TEST_STUBS/train_e2e2.sh; VERIFY_ASSETS=$SSR_RELEASE_TEST_STUBS/verify_assets.py
   EVAL_SH=$SSR_RELEASE_TEST_STUBS/eval.sh; SMOKE_CHECK=$SSR_RELEASE_TEST_STUBS/smoke_check.py
 fi
-SETTINGS=(REFINER REFINER_KD BEV_KD DET_KD MAP_KD BACKBONE DET_TEACHER MAP_TEACHER FRAMES
+SETTINGS=(REFINER REFINER_KD BEV_KD DET_KD MAP_KD VARIANTS BACKBONE DET_TEACHER MAP_TEACHER FRAMES
           UNDISTORT HEADING PILLAR_Z BEV_RANGE BN SEED EPOCHS GPUS SAVE_EVERY RUN_ROOT TAG WANDB EXTRA DRY)
 # options of single commands; these may also come from the environment
 RUN=""; EPOCH=""; EPDMS=""; CONFIRM=${CONFIRM:-0}; REGISTRY=${REGISTRY:-}; CHECK_ROOT=${CHECK_ROOT:-}
@@ -197,9 +198,11 @@ do_train() {
     return 0
   fi
   local prof; prof=$CP_PROFILE
-  local alog=$CHECK_DIR/gen/verify_assets.log arc=0
+  local alog=$CHECK_DIR/gen/verify_assets.log arc=0 va=()
   [ -f "$VERIFY_ASSETS" ] || die "$VERIFY_ASSETS is missing"
-  py "$VERIFY_ASSETS" --profile "$prof" --quick --det-teacher "$DET_TEACHER" --map-teacher "$MAP_TEACHER" > "$alog" 2>&1 || arc=$?
+  [ "$VARIANTS" = base ] || va=(--variants "$VARIANTS")     # also the arm's warm-up label dir
+  py "$VERIFY_ASSETS" --profile "$prof" --quick --det-teacher "$DET_TEACHER" --map-teacher "$MAP_TEACHER" "${va[@]}" \
+    > "$alog" 2>&1 || arc=$?
   [ "$arc" = 0 ] || { tail -20 "$alog" >&2; die "assets of profile $prof are not ready (full log: $alog)"; }
   local gen=$R/launch/gen
   cp_emit "$gen"
@@ -227,7 +230,17 @@ do_resume() {
   _in WANDB "${GIVEN[@]:-}" && given_wandb=$WANDB
   _in SAVE_EVERY "${GIVEN[@]:-}" && given_save=$SAVE_EVERY
   local keep_root=$RUN_ROOT
+  # settings recorded only off their default (compose RECORDED_ONLY_OFF_DEFAULT): a settings.json without the key (base,
+  # and every run recorded before it) was made at the default, whatever the block above says
+  VARIANTS=base
   while IFS= read -r line; do k=${line%%=*}; printf -v "$k" '%s' "${line#*=}"; done < <(py "$COMPOSE" settings-args --settings-json "$sj")
+  # LABELER_WORKERS is not a setting (not in the hash): a resume without it keeps the value the run was started with
+  # (settings.json 'labeler_workers'; null = the train_e2e2.sh default min(16 x GPUs, 48), so base runs are unchanged)
+  if [ -z "${LABELER_WORKERS:-}" ]; then
+    local rec_lw; rec_lw=$(py -c 'import json, sys; v = json.load(open(sys.argv[1])).get("labeler_workers"); print("" if v is None else v)' "$sj") \
+      || die "cannot read labeler_workers of $sj"
+    if [ -n "$rec_lw" ]; then export LABELER_WORKERS=$rec_lw; say "LABELER_WORKERS=$rec_lw (recorded at the start of $RUN)"; fi
+  fi
   RUN_ROOT=$keep_root
   [ -z "$given_gpus" ] || GPUS=$given_gpus
   [ -z "$given_wandb" ] || WANDB=$given_wandb
@@ -315,14 +328,16 @@ do_table() {
 }
 
 do_assets() {
-  local prof
+  local prof rec
   if [ -n "$RUN" ]; then
     resolve_run
-    prof=$(py - "$R/launch/settings.json" <<'PY'
+    rec=$(py - "$R/launch/settings.json" <<'PY'
 import json, sys
-print(json.load(open(sys.argv[1]))["profile"])
+d = json.load(open(sys.argv[1]))
+print(d["profile"], d["settings"].get("VARIANTS", "base"))
 PY
     ) || die "no settings.json for $RUN"
+    prof=${rec% *}; VARIANTS=${rec#* }
   else
     local tmp; tmp=$(mktemp -d)
     cp_emit "$tmp"
@@ -330,8 +345,9 @@ PY
     rm -rf "$tmp"
   fi
   [ -f "$VERIFY_ASSETS" ] || die "$VERIFY_ASSETS is missing"
-  local q=(); [ "$QUICK" = 1 ] && q=(--quick)
-  py "$VERIFY_ASSETS" --profile "$prof" --det-teacher "$DET_TEACHER" --map-teacher "$MAP_TEACHER" "${q[@]}"
+  local q=() va=(); [ "$QUICK" = 1 ] && q=(--quick)
+  [ "$VARIANTS" = base ] || va=(--variants "$VARIANTS")
+  py "$VERIFY_ASSETS" --profile "$prof" --det-teacher "$DET_TEACHER" --map-teacher "$MAP_TEACHER" "${q[@]}" "${va[@]}"
 }
 
 do_teachers() {

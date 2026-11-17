@@ -374,7 +374,7 @@ def main(argv=None):
     ap.add_argument("--epoch", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--idx-file", default="")
-    ap.add_argument("--speeds", type=float, nargs="+", default=list(VV.SPEEDS))
+    ap.add_argument("--speeds", type=float, nargs="*", default=list(VV.SPEEDS))
     ap.add_argument("--lats", type=float, nargs="*", default=list(VV.LATS))
     ap.add_argument("--ext", default="const_curv", choices=list(VV.EXT_MODES),
                     help="accel path extension beyond S_8 (variants.make_variants ext); 'straight' for CK2 (user 10-08)")

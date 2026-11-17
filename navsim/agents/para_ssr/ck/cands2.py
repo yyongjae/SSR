@@ -1,5 +1,12 @@
 """CK2 e2e per-step candidate assembly (SPEC ck2e2e §2-1, §2-2, §4-3 fallback).  New file; data side of CKE2E2.
 
+Variant layout: the numbers below are the base table (ck_e2e2.variants defaults: V = 6, 96 = 16 x 6, 80 non-identity
+variants, types 1..5).  Any 'separate' table of ck_e2e2.variants (ablation arms, ck/variants.VARIANT_ARMS) gives
+V = 1 + len(speeds) + len(lats), 16 V columns c = k * V + v and V - 1 types (layout_cfg); every function here takes V
+from that configuration / the data and refuses a mismatch between them.
+
+  variants_cfg(vcfg) / layout_cfg(vcfg)
+                                      validated ck_e2e2.variants dict / its ck/variants.VariantLayout
   v0_from_status(status)              ego speed hypot(vx, vy) in float64 (= tools/ck/data/label_variants v0)
   online_variants(cand16, v0, vcfg)   the 96 = 16 x 6 rule variants of the student's top-16 (variants.make_variants,
                                       combine 'separate', s_on_frac 0.2, float64 decode, ext 'straight'), no_grad,
@@ -36,10 +43,18 @@ _DTYPES = {"float64": torch.float64, "float32": torch.float32, "torch.float64": 
            "torch.float32": torch.float32}
 
 
+def _floats(v) -> list:
+    """[floats] of a list / tuple / '[a, b]' string (CLI / hydra strings, as CKE2E2Config._coerce)."""
+    if isinstance(v, str):
+        v = [x.strip() for x in v.strip().strip("[]").split(",") if x.strip()]
+    return [float(a) for a in v]
+
+
 def variants_cfg(vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """VARIANTS_DEFAULT merged with vcfg; validated: the table must be the 6-column 'separate' table in VNAMES order
-    (the generation / label-file layout)."""
-    from .variants import EXT_MODES, variant_name, variant_table
+    """VARIANTS_DEFAULT merged with vcfg; validated: a 'separate' table (c = k * V + v, the generation / label-file
+    layout; V = 1 + len(speeds) + len(lats) >= 2, names unique: ck/variants.VariantLayout), ext const_curv | straight,
+    compute dtype.  The default is the base 6-column table in VNAMES order.  Keys returned: those of VARIANTS_DEFAULT."""
+    from .variants import EXT_MODES, VariantLayout
 
     c = dict(VARIANTS_DEFAULT)
     if vcfg:
@@ -47,35 +62,54 @@ def variants_cfg(vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if bad:
             raise ValueError(f"variants: unknown key(s) {bad}")
         c.update({k: v for k, v in dict(vcfg).items() if v is not None})
-    c["speeds"] = [float(a) for a in c["speeds"]]
-    c["lats"] = [float(d) for d in c["lats"]]
+    c["speeds"] = _floats(c["speeds"])
+    c["lats"] = _floats(c["lats"])
     c["s_on_frac"] = float(c["s_on_frac"])
     c["combine"], c["ext"], c["compute_dtype"] = str(c["combine"]), str(c["ext"]), str(c["compute_dtype"])
     if c["ext"] not in EXT_MODES or c["ext"].startswith("centerline"):
         raise ValueError(f"variants.ext must be const_curv | straight (centerline needs per-token lines), got {c['ext']!r}")
     if c["compute_dtype"] not in _DTYPES:
         raise ValueError(f"variants.compute_dtype must be float64 | float32, got {c['compute_dtype']!r}")
-    names = tuple(variant_name(a, d) for a, d in variant_table(c["speeds"], c["lats"], c["combine"]))
-    if names != VNAMES:
-        raise ValueError(f"variant table {names} != {VNAMES} (generation layout c = k * 6 + v)")
+    if c["combine"] != "separate":
+        raise ValueError(f"variants.combine must be 'separate' (generation / label-file layout c = k * V + v), got "
+                         f"{c['combine']!r}")
+    lay = VariantLayout(c["speeds"], c["lats"], c["combine"])          # value / name checks (variants._check)
+    if lay.nv < 2:
+        raise ValueError("variants: the table has no variant (speeds and lats both empty)")
     return c
+
+
+def layout_cfg(vcfg: Optional[Dict[str, Any]] = None):
+    """ck/variants.VariantLayout of ck_e2e2.variants (validated by variants_cfg; None / {} = BASE_LAYOUT's table)."""
+    from .variants import VariantLayout
+
+    c = variants_cfg(vcfg)
+    return VariantLayout(c["speeds"], c["lats"], c["combine"])
 
 
 def check_variant_files(var_dir, vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The online variant definition must equal the warm-up variant label files' build (speeds, lats, combine,
-    s_on_frac, names, accel extension): the student sees the same family in warm-up and on-policy.  Raises
-    ValueError on a mismatch; returns the compared values."""
+    s_on_frac, names, n_variants, accel extension; index.npz names when stored): the student sees the same family in
+    warm-up and on-policy, and a label dir of another variant arm is refused.  Raises ValueError on a mismatch;
+    returns the compared values."""
     import json
     from pathlib import Path
 
     c = variants_cfg(vcfg)
+    lay = layout_cfg(c)
     b = json.loads((Path(var_dir) / "build.json").read_text())
     f_ext = b.get("ext") or (b.get("merged") or {}).get("ext_a+0.5") or "const_curv"
     got = {"speeds": [float(x) for x in b.get("speeds", [])], "lats": [float(x) for x in b.get("lats", [])],
            "combine": b.get("combine"), "s_on_frac": float(b.get("s_on_frac", -1)), "ext": f_ext,
-           "names": list(b.get("names", []))}
+           "names": list(b.get("names", [])), "n_variants": int(b.get("n_variants", len(b.get("names", []))))}
     want = {"speeds": c["speeds"], "lats": c["lats"], "combine": c["combine"], "s_on_frac": c["s_on_frac"],
-            "ext": c["ext"], "names": list(VNAMES)}
+            "ext": c["ext"], "names": list(lay.names), "n_variants": lay.nv}
+    idx = Path(var_dir) / "index.npz"
+    if idx.is_file():
+        with np.load(idx, allow_pickle=False) as z:
+            if "names" in z.files:
+                got["index_names"] = [str(x) for x in z["names"].tolist()]
+                want["index_names"] = list(lay.names)
     diff = {k: (want[k], got[k]) for k in want if want[k] != got[k]}
     if diff:
         raise ValueError(f"online variants != variant label files {var_dir}: {diff}")
@@ -96,6 +130,7 @@ def online_variants(cand16: torch.Tensor, v0, vcfg: Optional[Dict[str, Any]] = N
       valid96  bool [B, K*6]        False = lateral variant of a candidate with S_8 < 3 m (duplicate of the parent)
                                     or a non-finite parent (whose columns are NaN)
       vtype    int64 [K*6] (c % 6), parent int64 [K*6] (c // 6), dev_xy96 f32 [B, K*6], fin16 bool [B, K], S8 f32 [B, K]
+    (6 = V of vcfg's table, layout_cfg(vcfg).nv; the keys keep their '96' names for every layout.)
     v0 [B] ego speed (any float dtype; float64 = label_variants exactly: v0_from_status)."""
     from .variants import make_variants
 
@@ -145,9 +180,14 @@ def warmup_cands(targets: Dict[str, torch.Tensor], tokens: Sequence[str], epoch:
       parent_anchor int64 [B,64] (anchor id; for a variant its parent anchor), anc_idx [B,32], var_cols [B,n],
       var_pad_ok [B,n], sur_pos int64 [B,16] (slot positions of the 8 near + 8 mid anchors, slot order),
       lat_mask bool [B,64] (near / mid anchors and variants, NU16), teacher_ok bool [B,64] (finite & ck2_wu_ok &
-      (anchor | valid & not padding), NU25 / NU44), wu_ok bool [B], n_valid int64 [B]."""
+      (anchor | valid & not padding), NU25 / NU44), wu_ok bool [B], n_valid int64 [B].
+    Variant layout = sampler's (sampler.nv; types 1..V-1): the variant-file targets must be 16 V wide (ValueError)."""
     dev = torch.device(device) if device is not None else targets["ck2_raw_y"].device
     B = len(tokens)
+    nv = int(getattr(sampler, "nv", NV))
+    if int(targets["ck2_var_valid"].shape[-1]) != K16 * nv:
+        raise ValueError(f"warmup_cands: ck2_var_valid {tuple(targets['ck2_var_valid'].shape)} is not [B, {K16 * nv}]"
+                         f" (16 x {nv} variants of the sampler's layout)")
     S = sampler.sample(tokens, _wu_arrays_np(targets), epoch)
     ai = torch.from_numpy(S["anc_idx"]).to(dev)
     vc = torch.from_numpy(S["var_cols"]).to(dev)
@@ -169,8 +209,8 @@ def warmup_cands(targets: Dict[str, torch.Tensor], tokens: Sequence[str], epoch:
     n = vc.shape[1]
     grp_a = torch.from_numpy(S["group"].astype(np.int64)).to(dev)
     group = torch.cat([grp_a, torch.full((B, n), GROUP_VAR, dtype=torch.long, device=dev)], 1)
-    vtype = torch.cat([torch.zeros((B, N_WU_ANCHORS), dtype=torch.long, device=dev), vc % NV], 1)
-    par = torch.cat([ai, targets["ck2_var_anchor"].to(dev).long().gather(1, vc // NV)], 1)
+    vtype = torch.cat([torch.zeros((B, N_WU_ANCHORS), dtype=torch.long, device=dev), vc % nv], 1)
+    par = torch.cat([ai, targets["ck2_var_anchor"].to(dev).long().gather(1, vc // nv)], 1)
     sur_pos = torch.sort((grp_a > 1).long(), dim=1, stable=True).indices[:, :N_NEAR_MID]
     lat_mask = (group <= 1) | (group == GROUP_VAR)
     teacher_ok = fin & wu[:, None] & torch.cat([torch.ones_like(ok_a), val_v], 1)
@@ -187,15 +227,20 @@ def onpolicy_cands(top_cand: torch.Tensor, v0, tokens: Sequence[str], epoch: int
       cols       int64 [B,n] chosen variant columns (sample_cols, stream 'ck2e2e.now'), pad_ok bool [B,n]
       cand       f32 [B,16+n,8,3] = cat(top-16, traj96[cols]) (non-finite -> 0)
       ok         bool [B,16+n] finite & (identity | valid96[cols] & pad_ok)  (= now_ok: KD / teacher mask)
-      vtype      int64 [B,16+n] (0 identity, 1..5), parent int64 [B,16+n] (top-16 rank k of the parent)."""
+      vtype      int64 [B,16+n] (0 identity, 1..5), parent int64 [B,16+n] (top-16 rank k of the parent).
+    Variant layout = vcfg's (layout_cfg; 96 -> 16 V, types 1..V-1); a passed V must have its 16 V columns."""
     x = top_cand.detach().float()
     B, K = x.shape[:2]
     if K != K16:
         raise ValueError(f"onpolicy_cands: top_cand has {K} candidates, expected {K16}")
+    nv = layout_cfg(vcfg).nv
     if V is None:
         V = online_variants(x, v0, vcfg)
+    if int(V["traj96"].shape[1]) != K * nv or int(V["valid96"].shape[1]) != K * nv:
+        raise ValueError(f"onpolicy_cands: V has {tuple(V['traj96'].shape)} / {tuple(V['valid96'].shape)} columns, "
+                         f"the variant layout of vcfg {K} x {nv}")
     dev = x.device
-    cols, pad = D2.sample_cols(V["valid96"].cpu().numpy(), tokens, epoch, seed, stream, n_var, var_sampling)
+    cols, pad = D2.sample_cols(V["valid96"].cpu().numpy(), tokens, epoch, seed, stream, n_var, var_sampling, nv=nv)
     c = torch.from_numpy(cols).to(dev)
     p = torch.from_numpy(pad).to(dev)
     var = _gather_k(V["traj96"], c)
@@ -205,8 +250,8 @@ def onpolicy_cands(top_cand: torch.Tensor, v0, tokens: Sequence[str], epoch: int
     ok = fin & torch.cat([torch.ones((B, K), dtype=torch.bool, device=dev), V["valid96"].gather(1, c) & p], 1)
     ar = torch.arange(K, device=dev).expand(B, K)
     return {"V": V, "cols": c, "pad_ok": p, "cand": cand, "ok": ok,
-            "vtype": torch.cat([torch.zeros((B, K), dtype=torch.long, device=dev), c % NV], 1),
-            "parent": torch.cat([ar, c // NV], 1)}
+            "vtype": torch.cat([torch.zeros((B, K), dtype=torch.long, device=dev), c % nv], 1),
+            "parent": torch.cat([ar, c // nv], 1)}
 
 
 def fill_fallback(G: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], tokens: Sequence[str], epoch: int,
@@ -215,11 +260,15 @@ def fill_fallback(G: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
     mid anchors of this epoch's AnchorSampler draw (slot order) + n_var variants of the fixed variant files
     (sampler.var_sampling, stream 'ck2e2e.lab'), G_src 0; a token without warm-up data (ck2_wu_ok False, row -1):
     G_ok all False, G_src 3.  G (CPU tensors) is updated in place and returned; G_col = variant-file column for the
-    variant slots, -1 for the anchors."""
+    variant slots, -1 for the anchors.  Variant layout = sampler's (G_vtype = col % V; the files must be 16 V wide)."""
     has = G["has"].cpu().numpy().astype(bool)
     need = np.flatnonzero(~has)
     if len(need) == 0:
         return G
+    v_lay = int(getattr(sampler, "nv", NV))
+    if int(targets["ck2_var_valid"].shape[-1]) != K16 * v_lay:
+        raise ValueError(f"fill_fallback: ck2_var_valid {tuple(targets['ck2_var_valid'].shape)} is not [B, "
+                         f"{K16 * v_lay}] (16 x {v_lay} variants of the sampler's layout)")
     KG = G["G_traj"].shape[1]
     nv = KG - N_NEAR_MID if n_var is None else int(n_var)
     if N_NEAR_MID + nv != KG:
@@ -254,7 +303,7 @@ def fill_fallback(G: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
         G["G_traj"][b] = torch.where(fin_t[:, None, None], traj, torch.zeros_like(traj))
         G["G_y"][b] = torch.where(fin_y[:, None], y, torch.zeros_like(y))
         G["G_ok"][b] = ok & fin_t & fin_y
-        G["G_vtype"][b] = torch.cat([torch.zeros(N_NEAR_MID, dtype=torch.int8), (cols % NV).to(torch.int8)])
+        G["G_vtype"][b] = torch.cat([torch.zeros(N_NEAR_MID, dtype=torch.int8), (cols % v_lay).to(torch.int8)])
         G["G_col"][b] = torch.cat([torch.full((N_NEAR_MID,), -1, dtype=torch.int16), cols.to(torch.int16)])
         G["G_src"][b] = SRC_FALLBACK
     return G
@@ -272,5 +321,6 @@ def onpolicy_label_set(store: "D2.LabelStore2", targets: Dict[str, torch.Tensor]
     return G
 
 
-__all__ = ["VARIANTS_DEFAULT", "variants_cfg", "check_variant_files", "v0_from_status", "online_variants",
-           "warmup_cands", "onpolicy_cands", "fill_fallback", "onpolicy_label_set", "K16", "NV", "G_K", "VNAMES"]
+__all__ = ["VARIANTS_DEFAULT", "variants_cfg", "layout_cfg", "check_variant_files", "v0_from_status",
+           "online_variants", "warmup_cands", "onpolicy_cands", "fill_fallback", "onpolicy_label_set", "K16", "NV",
+           "G_K", "VNAMES"]

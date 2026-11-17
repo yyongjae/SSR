@@ -1,25 +1,38 @@
 #!/usr/bin/env python
-"""CK2 e2e evaluation over the 96-candidate pool with official labels (SPEC ck2e2e s5-2 / s5-3 'eval').
+"""CK2 e2e evaluation over the 16 x V candidate pool with official labels (SPEC ck2e2e s5-2 / s5-3 'eval').
 
   cd /workspace/yongjae/SSR-ck2 && PYTHONPATH=$PWD OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
     /venv/ssr/bin/python tools/ck/e2e2/eval_ck2.py --root <RUN>/eval/root --run <RUN name> --split navtrain_val
     [--fix-from <val metrics.json>] [--bootstrap 2000] [--calib-offset none|<json>] [--sel-w default|noim|plugin]
-    [--out DIR]
+    [--out DIR] [--tokens FILE [--tokens-allow-missing]]
 
-Inputs (eval root written by eval_e2e2.py dump / label):
-  packed/<split>/{tokens.parquet, valid96 [N,96], v2_final [N,16], v2_im [N,16], ok [N]}
-  infer/<run>/<split>/{score_logit [N,96,5], done [N]}
-  labels/<split>/pool96_<run>/{labels [N,96,9], ok [N,96]}   official labels of every pool column (c = k*6 + v)
+Inputs (eval root written by eval_e2e2.py dump / label; G = 16 x nv pool columns, 96 for the base variant set):
+  packed/<split>/{tokens.parquet, valid96 [N,G], v2_final [N,16], v2_im [N,16], ok [N], meta.json}
+  infer/<run>/<split>/{score_logit [N,G,5], done [N]}
+  labels/<split>/pool96_<run>/{labels [N,G,9], ok [N,G]}     official labels of every pool column (c = k*nv + v)
   labels/<split>/lat96_<run>/{labels, ok}                     the same columns with the learned lateral applied
+Variant layout (variants.VariantLayout): packed/<split>/meta.json 'variant_layout' (no key = base, a dump written before
+  layouts were recorded), cross-checked with infer/<run>/<split>/meta.json and <root>/../ck_run/config.json
+  ck_e2e2.variants; arrays whose column count != 16 x nv are refused (the three 80-column arms v4 / spd4 / lat4 are told
+  apart by the recorded layout, never by the shape).  Variant-set names (none / decel / speed / lat / all_noaccel / all)
+  resolve by meaning through layout.sets; metrics.json records 'variant_layout' (+ the resolved 'variant_sets' for a
+  non-base layout).
 Token set (NU43): packed ok & inference done & every column the selection can submit is labelled ok (identity columns
-  and valid variant columns, pool and lateral) -- every row below on the same tokens.
+  and valid variant columns, pool and lateral) -- every row below on the same tokens.  The rule depends on the pool
+  (more columns, more chances to miss a label), so arms differ in n_eval: --tokens FILE (one token per line, a JSON list
+  / {"tokens": [...]}, or a parquet with a 'token' column, e.g. the intersection of the arms' per_token.parquet)
+  restricts the evaluation to those tokens; every listed token must be in the split and evaluable here
+  (--tokens-allow-missing: evaluate the evaluable subset), the out dir gets __tok_<sha8 of the sorted list> and
+  metrics.json 'tokens' records the file / sha16 / counts.  n_eval is always reported.
 Rows
   v2            column 0 = v2's submitted trajectory (pool label)                         [reference of every delta]
   v2_lat        column 0 with the learned lateral applied (descriptive: lateral head alone)
   oracle16 / oracle96 / oracle96_lat   label-best of the 16 identities / the valid pool / pool U lateral (upper bounds)
-  sel           select2.select96: score_c = (1 - beta) v2_final[c // 6] + beta ck_final(p_c, im[c // 6]) over the
+  sel           select2.select96: score_c = (1 - beta) v2_final[c // nv] + beta ck_final(p_c, im[c // nv]) over the
                 allowed columns of the variant set, then final trajectory by lat_mode (on = laterally corrected,
-                on_except_latvar, off); beta x VARIANT_SETS x LAT_MODES (5 x 6 x 3 = 90) on navtrain_val.
+                on_except_latvar, off); beta x variant-set names x LAT_MODES (5 x 6 x 3 = 90) on navtrain_val (every
+                layout; a set that resolves to the same type ids as another, e.g. spd4 'lat' = 'none', gives an
+                identical row and ties are broken by SET_PREF).
 Choice (navtrain_val only): the 'sel' row with the highest mean PDMS among lat_mode 'on' rows (--choose-lat on, default:
   the user's "lateral applied after selection"; the other lateral modes are descriptive) -- or among all rows with
   --choose-lat any; ties -> set order all, all_noaccel, speed, decel, lat, none, then larger beta, then lat_mode on,
@@ -35,11 +48,13 @@ Frozen eval spec (report 48 F1-c / F3): the navtrain_val run stores ONE spec in 
   the chosen beta / variant set (name + type ids) / lateral mode, choose_lat, the selection weights (name + 4 values),
   the calibration offset VALUES applied (+ source path and sha16) and the model it was chosen on (run, ckpt path +
   sha16, effective ep_target of the extracted CK run, code / hydra sha16 and --limit of the dump; read from the eval root's
-  infer / packed meta.json and <root>/../ck_run/config.json), with spec_sha16.  navtest --fix-from restores it: an
-  unset --sel-w / --calib-offset inherits the val values, an explicitly given value must equal them; the run, the
-  checkpoint sha16 and the ep_target of the navtest dump must equal the spec's, and a --limit val choice cannot fix a
-  full navtest -- every mismatch is a SystemExit.  A calibrated run writes <split>[__selw_<name>]__cal_<sha8 of the
-  offset values>, so an offset ablation never overwrites the uncalibrated val result.
+  infer / packed meta.json and <root>/../ck_run/config.json), with spec_sha16; a non-base variant layout and a --tokens
+  restriction are part of the spec (keys 'variant_layout' / 'tokens', absent for the base layout / all tokens).
+  navtest --fix-from restores it: an unset --sel-w / --calib-offset inherits the val values, an explicitly given value
+  must equal them; the run, the checkpoint sha16 and the ep_target of the navtest dump must equal the spec's, a --limit
+  val choice cannot fix a full navtest, and the navtest dump must have the spec's variant layout -- every mismatch is
+  a SystemExit.  A calibrated run writes <split>[__selw_<name>]__cal_<sha8 of the offset values>, so an offset
+  ablation never overwrites the uncalibrated val result.
 """
 from __future__ import annotations
 
@@ -64,6 +79,7 @@ import pandas as pd  # noqa: E402
 
 from navsim.agents.para_ssr.ck import constants as Cn  # noqa: E402
 from navsim.agents.para_ssr.ck import select2 as S2  # noqa: E402
+from navsim.agents.para_ssr.ck.variants import BASE_LAYOUT, VariantLayout  # noqa: E402
 from tools.ck import ckutil as U  # noqa: E402
 from tools.ck.eval_ck import log_bootstrap, row_metrics  # noqa: E402
 
@@ -88,10 +104,11 @@ def combos_grid(betas: Sequence[float] = Cn.BETA_GRID, sets: Sequence[str] = tup
     return [(float(b), s, m) for b in betas for s in sets for m in lat_modes]
 
 
-def token_mask(packed_ok, done, valid96, ok_pool, ok_lat) -> np.ndarray:
+def token_mask(packed_ok, done, valid96, ok_pool, ok_lat, *, layout: VariantLayout = BASE_LAYOUT) -> np.ndarray:
     """packed ok & done & every submittable column (identity or valid variant) labelled ok in pool and lateral."""
     v = np.asarray(valid96, bool).copy()
-    v[:, ::S2.NV] = True
+    S2.check_cols("token_mask: valid96", v.shape[1], layout)
+    v[:, ::layout.nv] = True
     need_pool = (np.asarray(ok_pool, bool) | ~v).all(1)
     need_lat = (np.asarray(ok_lat, bool) | ~v).all(1)
     return np.asarray(packed_ok, bool) & np.asarray(done, bool) & need_pool & need_lat
@@ -106,12 +123,17 @@ def _key(r: Dict[str, Any]) -> str:
 def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray, valid96: np.ndarray,
                   v2_final16: np.ndarray, v2_im16: np.ndarray, logs: np.ndarray, lead_mask: Optional[np.ndarray],
                   combos: Sequence[Tuple[float, str, str]], n_boot: int = 2000, seed: int = 0,
-                  offset=None, extra_rows: bool = True, sel_w=DEFAULT_SEL_W) -> Dict[str, Any]:
-    """Arrays already restricted to the evaluation tokens.  lab_* [n, 96, 9] (LABEL_COLS), prob96 [n, 96, 5],
-    valid96 [n, 96], v2_final16 / v2_im16 [n, 16]; sel_w = select2.select96 weights (SEL_W_SETS name or 4 floats,
-    default 'plugin' = official PDMS without imitation).
+                  offset=None, extra_rows: bool = True, sel_w=DEFAULT_SEL_W, *,
+                  layout: VariantLayout = BASE_LAYOUT) -> Dict[str, Any]:
+    """Arrays already restricted to the evaluation tokens.  lab_* [n, G, 9] (LABEL_COLS), prob96 [n, G, 5],
+    valid96 [n, G], v2_final16 / v2_im16 [n, 16] (G = 16 x layout.nv); sel_w = select2.select96 weights (SEL_W_SETS
+    name or 4 floats, default 'plugin' = official PDMS without imitation); combos name the variant sets (resolved
+    through layout.sets).
     -> {'rows': [...], 'idx': {key: [n]}}."""
     w_sel = S2.resolve_w(DEFAULT_SEL_W if sel_w is None else sel_w)
+    nv = layout.nv
+    for what, arr in (("lab_pool", lab_pool), ("lab_lat", lab_lat), ("prob96", prob96), ("valid96", valid96)):
+        S2.check_cols(f"evaluate_pool: {what}", np.shape(arr)[1], layout)
     L = Cn.LBL
     P = L["pdms"]
     n = lab_pool.shape[0]
@@ -126,8 +148,8 @@ def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray,
         m.update(row)
         m["frac_changed"] = float(np.mean((idx != 0) | lat)) if n else float("nan")
         m["frac_lat"] = float(np.mean(lat)) if n else float("nan")
-        m["sel_share"] = {S2.VNAMES[t]: float(np.mean(idx % S2.NV == t)) if n else float("nan")
-                          for t in range(S2.NV)}
+        m["sel_share"] = {layout.names[t]: float(np.mean(idx % nv == t)) if n else float("nan")
+                          for t in range(nv)}
         if row["variant"] != "v2":
             m["d_pdms"] = log_bootstrap(chosen[:, P] - base[:, P], logs, n_boot, seed)
             if lead_mask is not None and lead_mask.any():
@@ -141,8 +163,8 @@ def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray,
     add({"variant": "v2", "beta": None, "set": None, "lat_mode": None}, zero, base, f0)
     if extra_rows:
         add({"variant": "v2_lat", "beta": None, "set": None, "lat_mode": "on"}, zero, lab_lat[:, 0], t0)
-        allow = S2.allowed_mask(valid96, S2.VARIANT_SETS["all"])
-        o16 = np.nan_to_num(lab_pool[:, ::S2.NV, P], nan=-1.0).argmax(1) * S2.NV
+        allow = S2.allowed_mask(valid96, "all", layout=layout)
+        o16 = np.nan_to_num(lab_pool[:, ::nv, P], nan=-1.0).argmax(1) * nv
         add({"variant": "oracle16", "beta": None, "set": "none", "lat_mode": "off"}, o16, lab_pool[ar, o16], f0)
         sp = np.where(allow, np.nan_to_num(lab_pool[..., P], nan=-1.0), -np.inf)
         o96 = sp.argmax(1)
@@ -150,25 +172,27 @@ def evaluate_pool(lab_pool: np.ndarray, lab_lat: np.ndarray, prob96: np.ndarray,
         sl = np.where(allow, np.nan_to_num(lab_lat[..., P], nan=-1.0), -np.inf)
         both = np.concatenate([sp, sl], 1)
         ob = both.argmax(1)
-        lat_b = ob >= S2.G_K
-        ib = ob % S2.G_K
+        G = lab_pool.shape[1]
+        lat_b = ob >= G
+        ib = ob % G
         chosen = np.where(lat_b[:, None], lab_lat[ar, ib], lab_pool[ar, ib])
         add({"variant": "oracle96_lat", "beta": None, "set": "all", "lat_mode": "best"}, ib, chosen, lat_b)
         p_cal = S2.apply_offset(prob96, offset)
         s_pdms = S2.exp_pdms96(p_cal)
         s_pdms = np.where(allow & np.isfinite(s_pdms), s_pdms, -np.inf)
-        idx_pdms = S2.TIE_ORDER[np.argmax(s_pdms[:, S2.TIE_ORDER], axis=1)].astype(np.int64)
+        tie = S2.tie_order(layout)
+        idx_pdms = tie[np.argmax(s_pdms[:, tie], axis=1)].astype(np.int64)
         add({"variant": "pdms", "beta": 1.0, "set": "all", "lat_mode": "on"}, idx_pdms,
-            S2.chosen_labels(lab_pool, lab_lat, idx_pdms, "on"), t0)
+            S2.chosen_labels(lab_pool, lab_lat, idx_pdms, "on", layout=layout), t0)
     cache: Dict[Tuple[float, str], np.ndarray] = {}
     for beta, sname, lat_mode in combos:
         k = (float(beta), sname)
         if k not in cache:
-            cache[k] = S2.select96(v2_final16, v2_im16, prob96, valid96, beta, S2.VARIANT_SETS[sname], offset,
-                                   w=w_sel)
+            cache[k] = S2.select96(v2_final16, v2_im16, prob96, valid96, beta, S2.set_types(sname, layout=layout),
+                                   offset, w=w_sel, layout=layout)
         idx = cache[k]
-        lat = S2.use_lat(idx, lat_mode)
-        chosen = S2.chosen_labels(lab_pool, lab_lat, idx, lat_mode)
+        lat = S2.use_lat(idx, lat_mode, layout=layout)
+        chosen = S2.chosen_labels(lab_pool, lab_lat, idx, lat_mode, layout=layout)
         add({"variant": "sel", "beta": float(beta), "set": sname, "lat_mode": lat_mode}, idx, chosen, lat)
     return {"rows": rows, "idx": idx_of}
 
@@ -198,12 +222,102 @@ def choose_best(rows: Sequence[Dict[str, Any]], choose_lat: str = "on") -> Optio
 
 
 # ----------------------------------------------------------------------------------------------- io
-def load_labels(d: Path, n: int) -> Tuple[np.ndarray, np.ndarray]:
+def load_labels(d: Path, n: int, g: int = S2.G_K) -> Tuple[np.ndarray, np.ndarray]:
+    """labels [n, g, 9] / ok [n, g] of a label dir (g = 16 x nv of the dump's variant layout)."""
     lab = np.load(d / "labels.npy", mmap_mode="r")
     ok = np.load(d / "ok.npy", mmap_mode="r")
-    if lab.shape[0] != n or lab.shape[1] != S2.G_K:
-        raise SystemExit(f"{d}: labels {lab.shape} != [{n}, {S2.G_K}, 9]")
+    if lab.shape[0] != n or lab.shape[1] != g:
+        raise SystemExit(f"{d}: labels {lab.shape} != [{n}, {g}, 9]")
+    if tuple(ok.shape) != (n, g):
+        raise SystemExit(f"{d}: ok {ok.shape} != [{n}, {g}]")
     return np.asarray(lab, np.float64), np.asarray(ok, bool)
+
+
+# ----------------------------------------------------------------------------------------------- variant layout
+def layout_of_cfg(vcfg) -> VariantLayout:
+    """layout of a ck_e2e2.variants dict (training / hydra config; None or missing keys = base)."""
+    try:
+        return S2.layout_from_cfg(vcfg)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+
+
+def layout_of_root(root, run: str, split: str) -> VariantLayout:
+    """the variant layout of an eval root split: packed/<split>/meta.json 'variant_layout' (no key = base: a dump
+    written before layouts were recorded); infer/<run>/<split>/meta.json and <root>/../ck_run/config.json
+    ck_e2e2.variants must agree when they record one (SystemExit otherwise)."""
+    root = Path(root)
+    srcs = [("packed", root / "packed" / split / "meta.json"), ("infer", root / "infer" / run / split / "meta.json")]
+    lays: Dict[str, VariantLayout] = {}
+    for what, p in srcs:
+        m = U.read_json(p) or {}
+        if what == "packed" or "variant_layout" in m:
+            try:
+                lays[what] = S2.layout_from_meta(m.get("variant_layout"), str(p))
+            except ValueError as e:
+                raise SystemExit(str(e)) from None
+    ck = U.read_json(root.parent / "ck_run" / "config.json") or {}
+    cke = ck.get("ck_e2e2")
+    if isinstance(cke, dict) and cke.get("variants") is not None:
+        lays["ck_run"] = layout_of_cfg(cke["variants"])
+    lay = lays["packed"]
+    bad = {k: list(v.names) for k, v in lays.items() if v != lay}
+    if bad:
+        raise SystemExit(f"{root} / {split}: variant layouts disagree: packed {list(lay.names)} vs {bad} (the eval "
+                         f"root "
+                         f"mixes dumps / configs of different variant sets); rerun eval_e2e2 with --fresh")
+    return lay
+
+
+def layout_info(layout: VariantLayout) -> Dict[str, Any]:
+    """metrics.json fields of the variant layout: 'variant_layout' (VariantLayout.meta()), + the resolved sets
+    'variant_sets' for a non-base layout only (the base sets are select2.VARIANT_SETS; base metrics.json = the v2_final
+    keys + 'variant_layout')."""
+    d: Dict[str, Any] = {"variant_layout": layout.meta()}
+    if not layout.is_base:
+        d["variant_sets"] = {k: list(v) for k, v in layout.sets.items()}
+    return d
+
+
+def per_token_cols(idx, layout: VariantLayout) -> Dict[str, np.ndarray]:
+    """sel_k (parent rank) / sel_v (type id) / sel_name of pool columns (per_token.parquet; select2.decode_cols)."""
+    k, v, nm = S2.decode_cols(idx, layout=layout)
+    return {"sel_k": k.astype(np.int64), "sel_v": v.astype(np.int64), "sel_name": nm.astype(str)}
+
+
+# ----------------------------------------------------------------------------------------------- token restriction
+def read_tokens(spec) -> List[str]:
+    """--tokens FILE: one token per line ('#' comments), a JSON list / {'tokens': [...]}, or a parquet 'token'
+    column."""
+    p = Path(spec)
+    if not p.is_file():
+        raise SystemExit(f"--tokens {spec}: no such file")
+    if p.suffix == ".parquet":
+        df = pd.read_parquet(p)
+        if "token" not in df.columns:
+            raise SystemExit(f"--tokens {spec}: parquet without a 'token' column")
+        toks = df.token.astype(str).tolist()
+    elif p.suffix == ".json":
+        d = json.loads(p.read_text())
+        toks = d.get("tokens") if isinstance(d, dict) else d
+        if not isinstance(toks, list):
+            raise SystemExit(f"--tokens {spec}: JSON must be a list or {{'tokens': [...]}}")
+        toks = [str(t) for t in toks]
+    else:
+        toks = [s.strip() for s in p.read_text().splitlines() if s.strip() and not s.strip().startswith("#")]
+    toks = sorted(set(toks))
+    if not toks:
+        raise SystemExit(f"--tokens {spec}: no tokens")
+    return toks
+
+
+def tokens_sha16(toks: Sequence[str]) -> str:
+    return hashlib.sha256("\n".join(sorted(set(str(t) for t in toks))).encode()).hexdigest()[:16]
+
+
+def tokens_tag(toks: Optional[Sequence[str]]) -> str:
+    """'' without a restriction; else '__tok_<sha8 of the sorted token list>' (output dir suffix)."""
+    return "" if not toks else "__tok_" + tokens_sha16(toks)[:8]
 
 
 def lead_mask_of(split: str, tokens: Sequence[str], lead_root: Path = CK_DATA / "lead"):
@@ -295,10 +409,12 @@ def frozen_spec(src: Dict[str, Any], fix_from: str) -> Dict[str, Any]:
     return spec
 
 
-def resolve_navtest(spec: Dict[str, Any], run: str, sel_w=None, calib_offset=None, cur: Optional[Dict] = None):
+def resolve_navtest(spec: Dict[str, Any], run: str, sel_w=None, calib_offset=None, cur: Optional[Dict] = None, *,
+                    layout: VariantLayout = BASE_LAYOUT):
     """navtest restores the frozen val spec: -> (weights, offset).  sel_w / calib_offset None or '' = inherit; a given
     value must equal the spec's (SystemExit otherwise).  cur: model_meta of the navtest split (run, ckpt sha16,
-    ep_target and limit must match the spec)."""
+    ep_target and limit must match the spec); layout: the navtest dump's variant layout (must equal the spec's, which
+    is base when the spec has no 'variant_layout')."""
     best = spec["best"]
     if spec.get("run") != run:
         raise SystemExit(f"--fix-from: the val choice was made for run {spec.get('run')!r}, this is {run!r} (every run "
@@ -319,8 +435,15 @@ def resolve_navtest(spec: Dict[str, Any], run: str, sel_w=None, calib_offset=Non
         if not same_offset(offset, spec_off):
             raise SystemExit(f"--fix-from: navtest calibration offset {offset} differs from the val choice {spec_off} "
                              f"(--calib-offset; omit it to inherit the val values)")
-    if tuple(S2.VARIANT_SETS.get(best["set"], ())) != tuple(spec.get("set_types") or ()):
-        raise SystemExit(f"--fix-from: variant set {best['set']!r} is {S2.VARIANT_SETS.get(best['set'])} now, "
+    try:
+        spec_lay = S2.layout_from_meta(spec.get("variant_layout"), "--fix-from eval_spec")
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    if spec_lay != layout:
+        raise SystemExit(f"--fix-from: chosen on val with the variant layout {list(spec_lay.names)}, this navtest dump "
+                         f"has {list(layout.names)}")
+    if tuple(layout.sets.get(best["set"], ())) != tuple(spec.get("set_types") or ()):
+        raise SystemExit(f"--fix-from: variant set {best['set']!r} is {layout.sets.get(best['set'])} now, "
                          f"{spec.get('set_types')} when chosen on val")
     cur = cur or {}
     m = spec.get("model") or {}
@@ -356,6 +479,14 @@ def table_md(res: Dict[str, Any]) -> str:
     if res.get("fixed_from_val"):
         f = res["fixed_from_val"]
         L += [f"val에서 고정: β={f['beta']:g}, {f['set']}, 측방 {f['lat_mode']} (출처 {res['fix_from']})", ""]
+    vl = res.get("variant_layout")
+    if vl and not S2.layout_from_meta(vl).is_base:
+        L += [f"변형 배치(variant layout): nv {vl['nv']}, {', '.join(vl['names'])} (열 c = k*{vl['nv']} + v); 집합 "
+              + "; ".join(f"{k}={tuple(v)}" for k, v in (res.get("variant_sets") or {}).items()), ""]
+    if res.get("tokens"):
+        t = res["tokens"]
+        L += [f"토큰 제한 --tokens {t['path']} (sha16 {t['sha16']}): 목록 {t['n_listed']}, 평가 가능 {t['n_evaluable']}, "
+              f"제외 {t['n_not_evaluable']}", ""]
     L += ["| 행 | PDMS | ΔPDMS [95% CI] | NC | DAC | EP | TTC | C | NC 실패 | DAC 실패 | TTC 실패 | 앞차 감속 NC/TTC 실패 (n) | "
           "Δ앞차 실패 [95% CI] | 바뀐 비율 | 측방 적용 | 변형 선택 비율 |", "|" + "---|" * 16]
     for r in res["rows"]:
@@ -370,21 +501,24 @@ def table_md(res: Dict[str, Any]) -> str:
     return "\n".join(L) + "\n"
 
 
-def out_name(split: str, sel_w=DEFAULT_SEL_W, offset=None) -> str:
+def out_name(split: str, sel_w=DEFAULT_SEL_W, offset=None, tokens: Optional[Sequence[str]] = None) -> str:
     """default out dir name: <split> for the default weights ('plugin'), <split>__selw_<name> otherwise, + __cal_<sha8>
-    when a calibration offset is applied (offset_tag)."""
+    when a calibration offset is applied (offset_tag), + __tok_<sha8> with a --tokens restriction (tokens_tag)."""
     n = S2.sel_w_name(DEFAULT_SEL_W if sel_w is None else sel_w)
     base = split if n == DEFAULT_SEL_W else f"{split}__selw_{n.replace(',', '_')}"
-    return base + offset_tag(offset)
+    return base + offset_tag(offset) + tokens_tag(tokens)
 
 
 def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: int = 2000,
              calib_offset: Optional[str] = None, lead_root: Path = CK_DATA / "lead", choose_lat: str = "on",
-             sel_w=None) -> Dict[str, Any]:
+             sel_w=None, tokens: Optional[str] = None, tokens_allow_missing: bool = False) -> Dict[str, Any]:
     """sel_w / calib_offset None (or ''): navtrain_val = 'plugin' (official PDMS without imitation) / OFF; navtest =
-    inherited from the frozen val spec (--fix-from), an explicit value must equal it."""
+    inherited from the frozen val spec (--fix-from), an explicit value must equal it.  tokens: --tokens FILE (None /
+    '' = every evaluable token); the variant layout comes from the eval root (layout_of_root)."""
     root = Path(root)
     cur = model_meta(root, run, split)
+    layout = layout_of_root(root, run, split)
+    tok_list = read_tokens(tokens) if tokens else None
     fixed = spec_in = None
     if split == "navtest":
         if not fix_from:
@@ -392,7 +526,7 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
                              "are chosen on navtrain_val only)")
         src = json.loads(Path(fix_from).read_text())
         spec_in = frozen_spec(src, fix_from)
-        w_sel, offset = resolve_navtest(spec_in, run, sel_w, calib_offset, cur)
+        w_sel, offset = resolve_navtest(spec_in, run, sel_w, calib_offset, cur, layout=layout)
         fixed = dict(spec_in["best"])
         cal_src = spec_in.get("calib_offset_src") if (calib_offset in (None, "")) else offset_source(calib_offset)
         cal_label = ("none (OFF)" if offset is None else
@@ -405,21 +539,46 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
         cal_src = offset_source(cal)
         cal_label = cal if offset is not None else "none (OFF)"
     w_name = S2.sel_w_name(w_sel)
-    out = Path(out) if out else root / "eval" / run / out_name(split, w_sel, offset)
+    out = Path(out) if out else root / "eval" / run / out_name(split, w_sel, offset, tok_list)
     pk = root / "packed" / split
     inf = root / "infer" / run / split
     lb = root / "labels" / split
     tdf = pd.read_parquet(pk / "tokens.parquet")
     n = len(tdf)
     valid96 = np.load(pk / "valid96.npy")
+    G = layout.g(S2.K16)
+    if valid96.ndim != 2 or valid96.shape[1] != G:
+        raise SystemExit(f"{pk}/valid96.npy {valid96.shape}: the eval root's variant layout {list(layout.names)} needs "
+                         f"[{n}, 16 x {layout.nv} = {G}] (a dump without a recorded 'variant_layout' is read as base)")
     v2f = np.load(pk / "v2_final.npy").astype(np.float64)
     v2im = np.load(pk / "v2_im.npy").astype(np.float64)
     pok = np.load(pk / "ok.npy")
     logit = np.load(inf / "score_logit.npy").astype(np.float64)
+    if logit.shape[:2] != (n, G):
+        raise SystemExit(f"{inf}/score_logit.npy {logit.shape} != [{n}, {G}, 5] (variant layout {list(layout.names)})")
     done = np.load(inf / "done.npy")
-    lab_p, ok_p = load_labels(lb / f"pool96_{run}", n)
-    lab_l, ok_l = load_labels(lb / f"lat96_{run}", n)
-    m = token_mask(pok, done, valid96, ok_p, ok_l)
+    lab_p, ok_p = load_labels(lb / f"pool96_{run}", n, G)
+    lab_l, ok_l = load_labels(lb / f"lat96_{run}", n, G)
+    m = token_mask(pok, done, valid96, ok_p, ok_l, layout=layout)
+    tok_info = None
+    if tok_list is not None:
+        split_toks = tdf.token.astype(str).to_numpy()
+        want = set(tok_list)
+        listed = np.fromiter((t in want for t in split_toks), bool, len(split_toks))
+        unknown = sorted(set(tok_list) - set(split_toks.tolist()))
+        if unknown:
+            raise SystemExit(f"--tokens {tokens}: {len(unknown)} of {len(tok_list)} tokens are not in {split} "
+                             f"(e.g. {unknown[:3]})")
+        not_eval = int((listed & ~m).sum())
+        if not_eval and not tokens_allow_missing:
+            ex = split_toks[listed & ~m][:3].tolist()
+            raise SystemExit(f"--tokens {tokens}: {not_eval} of {len(tok_list)} listed tokens are not evaluable in "
+                             f"{run}/{split} (packed / done / labels not ok, e.g. {ex}); the comparison would not be "
+                             f"on the common set (--tokens-allow-missing evaluates the evaluable subset)")
+        m = m & listed
+        tok_info = {"path": str(Path(tokens).resolve()), "sha16": tokens_sha16(tok_list), "n_listed": len(tok_list),
+                    "n_evaluable": int(m.sum()), "n_not_evaluable": not_eval,
+                    "allow_missing": bool(tokens_allow_missing)}
     sel = np.flatnonzero(m)
     toks = tdf.token.astype(str).to_numpy()[sel]
     logs = tdf.log.astype(str).to_numpy()[sel]
@@ -434,7 +593,7 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
             src = json.loads(Path(fix_from).read_text())
             fixed = src.get("best")
     res = evaluate_pool(lab_p[sel], lab_l[sel], sigmoid(logit[sel]), valid96[sel], v2f[sel], v2im[sel], logs, lead,
-                        combos, n_boot, 0, offset, sel_w=w_sel)
+                        combos, n_boot, 0, offset, sel_w=w_sel, layout=layout)
     rows = res["rows"]
     out_d: Dict[str, Any] = {"run": run, "split": split, "root": str(root), "n_total": int(n), "n_eval": int(len(sel)),
                              "n_logs": int(len(set(logs))), "n_boot": int(n_boot), "lead_src": lead_src,
@@ -456,13 +615,20 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
         if fixed:
             out_d["fixed_from_val"] = fixed
         b = out_d["best"]
-        spec = {"split": split, "run": run, "best": b, "set_types": list(S2.VARIANT_SETS[b["set"]]) if b else None,
+        spec = {"split": split, "run": run, "best": b, "set_types": list(layout.sets[b["set"]]) if b else None,
                 "choose_lat": choose_lat, "sel_w": w_name, "sel_w_values": [float(x) for x in w_sel],
                 "calib_offset_values": out_d["calib_offset_values"], "calib_offset_src": cal_src, "model": cur,
                 "n_eval": int(len(sel)), "n_total": int(n), "token_rule": out_d["token_rule"], "created": kst()}
+        if not layout.is_base:                 # base: no key, so the base spec (and its sha16) stays as before
+            spec["variant_layout"] = layout.meta()
+        if tok_info is not None:
+            spec["tokens"] = tok_info
         spec["spec_sha16"] = spec_sha16(spec)
         out_d["eval_spec"] = spec
         U.write_json(out / "eval_spec.json", spec)
+    out_d.update(layout_info(layout))          # added keys (after the historical ones)
+    if tok_info is not None:
+        out_d["tokens"] = tok_info
     U.write_json(out / "metrics.json", out_d)
     (out / "table.md").write_text(table_md(out_d))
     rep = out_d.get("representative")
@@ -473,10 +639,17 @@ def run_eval(root, run: str, split: str, out=None, fix_from: str = "", n_boot: i
         r = next(x for x in rows if x["key"] == rep)
         idx = res["idx"][rep]
         pt["sel_col"] = idx
-        pt["sel_lat"] = S2.use_lat(idx, r["lat_mode"])
-        pt["pdms_sel"] = S2.chosen_labels(lab_p[sel], lab_l[sel], idx, r["lat_mode"])[:, P]
+        if not layout.is_base:                 # sel_col = k * nv + v of THIS layout (base: c // 6, c % 6 as before)
+            for k, v in per_token_cols(idx, layout).items():
+                pt[k] = v
+        pt["sel_lat"] = S2.use_lat(idx, r["lat_mode"], layout=layout)
+        pt["pdms_sel"] = S2.chosen_labels(lab_p[sel], lab_l[sel], idx, r["lat_mode"], layout=layout)[:, P]
     pt.to_parquet(out / "per_token.parquet", index=False)
-    print(f"[{kst()}] eval_ck2 {run}/{split}: {len(sel)}/{n} tokens, {len(rows)} rows -> {out}", flush=True)
+    if layout.is_base and tok_info is None:     # the v2_final line
+        print(f"[{kst()}] eval_ck2 {run}/{split}: {len(sel)}/{n} tokens, {len(rows)} rows -> {out}", flush=True)
+    else:
+        print(f"[{kst()}] eval_ck2 {run}/{split}: n_eval {len(sel)}/{n} tokens, {len(rows)} rows, variant layout nv "
+              f"{layout.nv} -> {out}", flush=True)
     return out_d
 
 
@@ -498,9 +671,15 @@ def main(argv=None) -> int:
                     help="selection weight set (select.SEL_W_SETS): plugin (0, 1, 1, 1, official PDMS without imitation, "
                          "default) | default (= SEL_W) | noim; unset: 'plugin' on navtrain_val, inherited from the val "
                          "spec on navtest")
+    ap.add_argument("--tokens", default="",
+                    help="restrict the evaluation to these tokens (text: one per line | JSON list | parquet 'token' "
+                         "column), e.g. the tokens every arm evaluates; out dir <split>[...]__tok_<sha8>")
+    ap.add_argument("--tokens-allow-missing", action="store_true",
+                    help="with --tokens: evaluate the evaluable subset instead of refusing listed tokens that are not "
+                         "evaluable here")
     a = ap.parse_args(argv)
     run_eval(a.root, a.run, a.split, a.out or None, a.fix_from, a.bootstrap, a.calib_offset, choose_lat=a.choose_lat,
-             sel_w=a.sel_w)
+             sel_w=a.sel_w, tokens=a.tokens or None, tokens_allow_missing=a.tokens_allow_missing)
     return 0
 
 

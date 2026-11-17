@@ -209,11 +209,12 @@ def teacher_check(det_run: str, map_run: str, which: str = "last", mode: str = "
 def warmup_check(c) -> Dict[str, Any]:
     """Warm-up label sources of a CKE2E2Config (e2e_data2._WUArrays.check): structure, row counts, variant table and
     the provenance guard (packed token order == the variant build / packed meta / raw-label plan token_sha16, anchors
-    sha16, anchor-sampler config of the build; report 48 S56-5).  LaunchError on a mismatch; -> record (teachers.json
-    'warmup_sources')."""
+    sha16, anchor-sampler config of the build; report 48 S56-5).  The files are checked against the variant layout of
+    ck_e2e2.variants (e2e_data2.layout_of: the base table = the class SHAPES / VNAMES, as before; a VARIANTS arm = its
+    16 x V files and names).  LaunchError on a mismatch; -> record (teachers.json 'warmup_sources')."""
     from navsim.agents.para_ssr.ck import e2e_data2 as D2
     try:
-        return D2._WUArrays(D2.warmup_cfg(c.to_dict()), c.ep_target).check()
+        return D2._WUArrays(D2.warmup_cfg(c.to_dict()), c.ep_target, layout=D2.layout_of(c)).check()
     except (D2.WUSourceError, FileNotFoundError) as e:
         raise LaunchError(f"ck_e2e2.warmup sources: {e}") from None
 

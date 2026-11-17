@@ -83,7 +83,13 @@ def test_validate_rules(tmp_path):
            ({"onpolicy_label": {"n_orig": 8}}, "n_orig"), ({"onpolicy_label": {"fallback": "r34"}}, "fallback"),
            ({"var_sampling": "x"}, "var_sampling"), ({"warmup": {"sur_groups": "far"}}, "sur_groups"),
            ({"variants": {"combine": "cross"}}, "variants"), ({"variants": {"ext": "centerline_gt"}}, "variants"),
-           ({"variants": {"speeds": [-1.0, 0.5]}}, "variants"), ({"variants": {"ext": "const_curv"}}, "label files"),
+           # a legal 5-column table since the variant-set arms (ck/variants.VariantLayout): refused only because the
+           # default warm-up label files are the base table's (the test needs that var_dir/build.json)
+           ({"variants": {"speeds": [-1.0, 0.5]}}, "label files"), ({"variants": {"ext": "const_curv"}}, "label files"),
+           ({"variants": {"speeds": [], "lats": []}}, "variants"),           # no variant at all
+           ({"variants": {"speeds": [-1.0, -0.5, 0.5, 1.0], "lats": [-1.0, -0.5, 0.5, 1.0]}, "n_var_step": 129},
+            "n_var_step"),                                                     # v8: 16 x 8 = 128 non-identity columns
+           ({"variants": {"speeds": [-0.5, 0.5], "lats": [-0.5, 0.5]}, "n_var_step": 65}, "n_var_step"),   # v4: 64
            ({"lat_kd": {"balance": "grad"}}, "balance"), ({"lat_kd": {"m": 1.0}}, "lat_kd"),
            ({"teacher_map_run": ""}, "teacher_map_run"), ({"teacher_det_run": str(TL.SMOKE_M)}, "arm"),
            ({"bev_kd": {"enabled": True, "teachers": ["bev"]}}, "teachers"),

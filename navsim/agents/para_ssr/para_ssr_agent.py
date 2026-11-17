@@ -1160,7 +1160,8 @@ class ParaSSRAgent(AbstractAgent):
             predictions = dict(predictions)
             predictions.update(self._ck_e2e.infer(self.ck_student, features, predictions))
         if self._ck_e2e2 is not None and not self.training and self._ck_e2e2.cfg.infer_outputs:
-            # ck2_* outputs over the 96-candidate pool only; predictions['trajectory'] stays the v2 one
+            # ck2_* outputs over the 16 x V candidate pool only (96 for the base variant set, ck_e2e2.variants);
+            # predictions['trajectory'] stays the v2 one
             predictions = dict(predictions)
             predictions.update(self._ck_e2e2.infer(self.ck_student, features, predictions))
             if self._ck_e2e2.cfg.submit_selection:

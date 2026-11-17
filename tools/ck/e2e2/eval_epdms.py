@@ -10,14 +10,21 @@
     [--gpus 0,1,2,3] [--stage dump,eval,summary | all] [--workers 48] [--fresh]
 
 Stages (--stage all runs dump -> eval -> summary):
-  dump     Multi-GPU sharded forward pass (CKE2E2.infer over the 96-candidate pool with CK_BEV64=1)
-           producing {tokens.json, cand96.npy, lat_traj.npy, valid96.npy, v2_final.npy, v2_im.npy,
-           v2_sim.npy, score_logit.npy}. Automatically seeds original scenes on navhard from navtest
-           when available.
-  eval     Computes ego-kinematic comfort/corridor features (HC, CC, 2-frame EC) for the 96 candidates,
+  dump     Multi-GPU sharded forward pass (CKE2E2.infer over the G = 16 x nv candidate pool with CK_BEV64=1; 96 for
+           the base variant set) producing {tokens.json, cand96.npy, lat_traj.npy, valid96.npy, v2_final.npy,
+           v2_im.npy, v2_sim.npy, score_logit.npy} (file names keep '96' for every layout). Automatically seeds
+           original scenes on navhard from navtest when available.
+  eval     Computes ego-kinematic comfort/corridor features (HC, CC, 2-frame EC) for the G candidates,
            selects the trajectory per token via our Stage-1/Stage-2 risk-averse log-linear blend
            (beta=0.80, w_safe=2.0, w_cc=1.0), and runs official NAVSIM v2.2 EPDMS scoring.
   summary  Writes markdown and JSON summaries of all 9 EPDMS sub-metrics and composite EPDMS scores.
+
+Variant layout (variants.VariantLayout; column c = k * nv + v): the run's training config ck_e2e2.variants (base when
+CK2 is off: the 16-candidate Stage-1 pool repeated 6x).  A non-base pool dir records it in pool_meta.json
+('variant_layout'; no file = base, as every pool written before layouts were recorded); the dump agent, a reused or
+imported pool, a --seed-pool-dir and the kinematic cache must match it, and arrays whose width != 16 x nv are refused.
+The results JSON carry 'variant_layout'.  The EPDMS selector weights are layout-free (every valid column allowed,
+identity columns always); the PDMS selector's --pdms-set names resolve by meaning through layout.sets.
 """
 from __future__ import annotations
 
@@ -46,6 +53,7 @@ if CK not in sys.path:
     sys.path.insert(0, CK)
 from navsim.common import ssr_paths as SP  # noqa: E402
 from navsim.agents.para_ssr.ck import select2 as S2  # noqa: E402
+from navsim.agents.para_ssr.ck.variants import BASE_LAYOUT, VariantLayout  # noqa: E402
 
 NAVSIM22 = os.environ.get("NAVSIM22_ROOT") or SP.NAVSIM_V22_POST
 DATA_ROOT = Path(os.environ.get("SSR_TEST_DATA_ROOT") or SP.SSR_TEST_DATA_ROOT)
@@ -56,7 +64,8 @@ PY = SP.SSR_PY
 STAGES = ("dump", "eval", "summary")
 SPLITS = ("navtest", "navhard")
 METRICS = ("epdms", "pdms", "all")
-TIE_ORDER = np.concatenate([np.arange(0, 96, 6), np.array([c for c in range(96) if c % 6], np.int64)])
+TIE_ORDER = np.concatenate([np.arange(0, 96, 6), np.array([c for c in range(96) if c % 6], np.int64)])   # base
+POOL_META = "pool_meta.json"          # non-base pools only: {'variant_layout': VariantLayout.meta(), 'k': 16 * nv}
 
 
 def kst() -> str:
@@ -73,10 +82,123 @@ def _load_yaml(p: Path) -> Any:
         return yaml.load(f, Loader=Loader)
 
 
-def pick_1row(s_row: np.ndarray, ok_row: np.ndarray) -> int:
+def pick_1row(s_row: np.ndarray, ok_row: np.ndarray, tie_order: np.ndarray = TIE_ORDER) -> int:
+    """argmax in tie order (identity columns first; tie_order = select2.tie_order(layout), base TIE_ORDER)."""
+    if len(s_row) != len(tie_order):
+        raise ValueError(f"pick_1row: {len(s_row)} pool columns, the tie order has {len(tie_order)} (wrong layout)")
     s = np.where(ok_row & np.isfinite(s_row), s_row, -np.inf)
-    j = int(np.argmax(s[TIE_ORDER]))
-    return int(TIE_ORDER[j])
+    j = int(np.argmax(s[tie_order]))
+    return int(tie_order[j])
+
+
+# ----------------------------------------------------------------------------------------------- variant layout
+def layout_of_hydra(hydra_cfg: Path) -> VariantLayout:
+    """the pool layout a training config produces: ck_e2e2.variants when ck_e2e2 is enabled, else base (REFINER=off:
+    the Stage-1 top-16 repeated 6x, see run_dump_shard)."""
+    from omegaconf import OmegaConf
+    c = OmegaConf.load(hydra_cfg)
+    try:
+        ck = c.agent.config.get("ck_e2e2")
+    except Exception:       # noqa: BLE001
+        ck = None
+    d = OmegaConf.to_container(ck, resolve=False) if ck is not None else {}
+    if not d or str(d.get("enabled", "")).lower() not in ("true", "1"):
+        return BASE_LAYOUT
+    try:
+        return S2.layout_from_cfg(d.get("variants"))
+    except ValueError as e:
+        raise SystemExit(f"{hydra_cfg}: {e}") from None
+
+
+def layout_of_pool(pool_dir: Path, check_arrays: bool = True) -> VariantLayout:
+    """pool_dir/pool_meta.json 'variant_layout' (no file = base); with check_arrays the merged arrays' width must be
+    16 x nv (SystemExit otherwise: e.g. a non-base pool that lost its pool_meta.json)."""
+    mp = pool_dir / POOL_META
+    meta = json.loads(mp.read_text()) if mp.is_file() else {}
+    try:
+        lay = S2.layout_from_meta(meta.get("variant_layout"), str(mp))
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    if check_arrays:
+        g = lay.g(16)
+        for k in ("cand96", "lat_traj", "valid96", "score_logit"):
+            f = pool_dir / f"{k}.npy"
+            if f.is_file():
+                shp = np.load(f, mmap_mode="r").shape
+                if len(shp) < 2 or shp[1] != g:
+                    raise SystemExit(f"{f}: shape {shp}, the pool's variant layout {list(lay.names)} needs 16 x "
+                                     f"{lay.nv} "
+                                     f"= {g} columns ({mp} {'present' if mp.is_file() else 'absent = base'})")
+    return lay
+
+
+def has_pool_data(pool_dir: Path) -> bool:
+    """a pool dir that already holds rows (merged arrays or dump shards)."""
+    return pool_dir.is_dir() and ((pool_dir / "tokens.json").is_file() or (pool_dir / "cand96.npy").is_file()
+                                  or any(pool_dir.glob("pool96_part*.pkl")))
+
+
+def write_pool_layout(pool_dir: Path, layout: VariantLayout) -> None:
+    """record a non-base layout in pool_dir/pool_meta.json (base pools stay without the file, as before); a pool dir of
+    another layout (its pool_meta.json, or rows without one = base) is refused."""
+    if not (pool_dir / POOL_META).is_file() and not has_pool_data(pool_dir):
+        have = layout                                       # a new / empty pool dir
+    else:
+        have = layout_of_pool(pool_dir, check_arrays=False)
+    if have != layout:
+        raise SystemExit(f"{pool_dir}: a pool of the variant layout {list(have.names)}, this run's is "
+                         f"{list(layout.names)}; use another --out-dir or --fresh")
+    if not layout.is_base and not (pool_dir / POOL_META).is_file():
+        pool_dir.mkdir(parents=True, exist_ok=True)
+        tmp = pool_dir / f".{POOL_META}.tmp{os.getpid()}"
+        tmp.write_text(json.dumps({"variant_layout": layout.meta(), "k": layout.g(16), "created": kst()}, indent=1))
+        os.replace(tmp, pool_dir / POOL_META)
+
+
+def expect_layout(what: str, have: VariantLayout, want: VariantLayout) -> None:
+    if have != want:
+        raise SystemExit(f"{what}: variant layout {list(have.names)} != {list(want.names)} (pools of different variant "
+                         f"sets cannot be mixed)")
+
+
+def own_hydra_cfg(run_dir: Path) -> Optional[Path]:
+    """the run's own training config (no foreign / synthesized fallback)."""
+    for c in (run_dir / "train/code/hydra/config.yaml", run_dir / "code/hydra/config.yaml"):
+        if c.is_file():
+            return c
+    return None
+
+
+def recorded_arm(run_dir: Path) -> Optional[str]:
+    """the VARIANTS arm an experiment.sh run was started with (run_dir/launch/settings.json 'settings'; no key = base,
+    as compose records base runs); None without a readable settings.json (runs not started by experiment.sh)."""
+    p = run_dir / "launch/settings.json"
+    try:
+        s = json.loads(p.read_text()).get("settings")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return str(s.get("VARIANTS", "base")) if isinstance(s, dict) else None
+
+
+def recorded_layout(run_dir: Path) -> Optional[VariantLayout]:
+    """variants.arm_layout of recorded_arm (None without a record); an unknown arm is refused."""
+    arm = recorded_arm(run_dir)
+    if arm is None:
+        return None
+    from navsim.agents.para_ssr.ck.variants import arm_layout
+    try:
+        return arm_layout(arm)
+    except ValueError as e:
+        raise SystemExit(f"{run_dir}/launch/settings.json: {e}") from None
+
+
+def refuse_base_fallback(run_dir: Path, what: str) -> None:
+    """a foreign / synthesized training config gives the base variant layout: refused for a run recorded with a
+    non-base VARIANTS arm (its checkpoint would load and be scored on a base 96-column pool)."""
+    arm = recorded_arm(run_dir)
+    if arm not in (None, "base"):
+        raise SystemExit(f"{run_dir}: a VARIANTS={arm} run (launch/settings.json) without its own training config "
+                         f"(train/code/hydra/config.yaml); {what} would give the base variant layout: pass --hydra-cfg")
 
 
 # ----------------------------------------------------------------------------------------------- checkpoint & paths
@@ -166,9 +288,16 @@ def resolve_hydra_cfg(run_dir: Path, ckpt: Path, explicit_cfg: str = "") -> Path
     ]
     for c in cands:
         if c.is_file():
+            if c == cands[-1]:
+                refuse_base_fallback(run_dir, f"the foreign {c}")
+                log(f"warning: no training config of {run_dir}; using the foreign {c} (base variant layout): a "
+                    f"variant-set arm needs its own config (--hydra-cfg)")
             return c.resolve()
 
     # Synthesize config.yaml from repository defaults (v2_v15_v7 recipe)
+    refuse_base_fallback(run_dir, "a synthesized v2_v15_v7 config")
+    log(f"warning: no training config of {run_dir}; synthesizing the v2_v15_v7 recipe (base variant layout): a "
+        f"variant-set arm needs its own config (--hydra-cfg)")
     if CK not in sys.path:
         sys.path.insert(0, CK)
     from omegaconf import OmegaConf
@@ -336,14 +465,24 @@ def run_dump_shard(
 
     torch.set_num_threads(2)
     pool_dir.mkdir(parents=True, exist_ok=True)
+    layout = layout_of_pool(pool_dir, check_arrays=False)          # written by stage_dump (no file = base)
+    expect_layout(f"[{split}] shard {shard}: {pool_dir} vs the training config {hydra_cfg}", layout,
+                  layout_of_hydra(hydra_cfg))
+    G, NVL = layout.g(16), layout.nv
     orig, logs, synth, num_fut = split_tokens(split, pool_dir.parent)
     all_toks = orig + sorted(synth)
     toks = [t for i, t in enumerate(all_toks) if i % nshard == shard]
     fp = pool_dir / f"pool96_part{shard}.pkl"
     rows: Dict[str, Dict[str, np.ndarray]] = pickle.load(open(fp, "rb")) if fp.exists() else {}
+    bad_w = [t for t, r in rows.items() if np.shape(r["cand96"])[0] != G]
+    if bad_w:
+        raise SystemExit(f"{fp}: {len(bad_w)} rows with another pool width than 16 x {NVL} = {G} (variant layout "
+                         f"{list(layout.names)}); --fresh")
 
-    # Seed from an existing navtest pool96 directory if available (saves 450 original scenes on navhard)
+    # Seed from an existing navtest pool96 directory if available (saves 450 original scenes on navhard); the seed pool
+    # must have this pool's variant layout (no pool_meta.json = base), every seeded row this width
     if seed_pool_dir is not None and seed_pool_dir.is_dir():
+        expect_layout(f"[{split}] --seed-pool-dir {seed_pool_dir}", layout_of_pool(seed_pool_dir), layout)
         if (seed_pool_dir / "tokens.json").is_file() and (seed_pool_dir / "lat_traj.npy").is_file():
             stoks = json.loads((seed_pool_dir / "tokens.json").read_text())
             s2i = {t: i for i, t in enumerate(stoks)}
@@ -372,6 +511,9 @@ def run_dump_shard(
                 sdict = pickle.load(open(sf_pkl, "rb"))
                 for t in toks:
                     if t not in rows and t in sdict:
+                        if np.shape(sdict[t]["cand96"])[0] != G:
+                            raise SystemExit(f"--seed-pool-dir {sf_pkl}: row {t} has {np.shape(sdict[t]['cand96'])[0]} "
+                                             f"pool columns, this pool {G}")
                         rows[t] = sdict[t]
 
     todo = [t for t in toks if t not in rows]
@@ -386,6 +528,9 @@ def run_dump_shard(
     dev = torch.device("cuda:0" if vis.strip() != "" and torch.cuda.is_available() else "cpu")
     agent = RAE._build_agent(hydra_cfg, ckpt, dev, aux_protocol=False)
     agent.eval()
+    has_ck2 = getattr(agent, "_ck_e2e2", None) is not None and getattr(agent, "ck_student", None) is not None
+    lay_agent = S2.layout_from_cfg(agent._ck_e2e2.cfg.variants) if has_ck2 else BASE_LAYOUT
+    expect_layout(f"[{split}] shard {shard}: dump agent ({hydra_cfg}) vs {pool_dir}", lay_agent, layout)
 
     logs_path = DATA_ROOT / "navsim_logs/test/test"
     if not logs_path.is_dir():
@@ -482,6 +627,10 @@ def run_dump_shard(
                             "ck2_score_logit": logit96_t,
                         }
                     )
+        for k in ("ck2_cand96", "ck2_lat_traj", "ck2_valid96", "ck2_score_logit"):
+            if pr[k].shape[1] != G:
+                raise SystemExit(f"[{split}] shard {shard}: {k} {tuple(pr[k].shape)} != {G} pool columns (variant "
+                                 f"layout {list(layout.names)})")
         cand96 = pr["ck2_cand96"].detach().float().cpu().numpy()
         lat_traj = pr["ck2_lat_traj"].detach().float().cpu().numpy()
         v2_final = pr["ck2_v2_final"].detach().float().cpu().numpy()
@@ -521,6 +670,13 @@ def merge_pool(split: str, pool_dir: Path) -> None:
     miss = set(toks) - set(rows)
     if miss:
         raise SystemExit(f"[{split}] merge incomplete: missing {len(miss)} of {len(toks)} tokens in {pool_dir}")
+    layout = layout_of_pool(pool_dir, check_arrays=False)
+    G = layout.g(16)
+    bad = sorted({tuple(np.shape(rows[t][k])[:1]) for t in toks for k in ("cand96", "lat_traj", "score_logit",
+                                                                          "valid96")} - {(G,)})
+    if bad:
+        raise SystemExit(f"[{split}] merge: rows of widths {bad} in {pool_dir}, its variant layout "
+                         f"{list(layout.names)} needs {G}")
     json.dump(toks, open(pool_dir / "tokens.json", "w"))
     np.save(pool_dir / "cand96.npy", np.stack([rows[t]["cand96"] for t in toks], axis=0))
     np.save(pool_dir / "lat_traj.npy", np.stack([rows[t]["lat_traj"] for t in toks], axis=0))
@@ -529,11 +685,13 @@ def merge_pool(split: str, pool_dir: Path) -> None:
     np.save(pool_dir / "v2_sim.npy", np.stack([rows[t]["v2_sim"] for t in toks], axis=0))
     np.save(pool_dir / "score_logit.npy", np.stack([rows[t]["score_logit"] for t in toks], axis=0))
     np.save(pool_dir / "valid96.npy", np.stack([rows[t]["valid96"] for t in toks], axis=0))
-    log(f"[{split}] merged N={len(toks)} 96-candidate arrays in {pool_dir}")
+    log(f"[{split}] merged N={len(toks)} {G}-candidate arrays in {pool_dir}")
 
 
-def try_import_eval_e2e2_dump(run_dir: Path, pool_dir: Path, split: str) -> bool:
-    """If eval_e2e2 already dumped packed/navtest + infer/<run>/navtest, link/copy into pool_dir."""
+def try_import_eval_e2e2_dump(run_dir: Path, pool_dir: Path, split: str,
+                              layout: Optional[VariantLayout] = None) -> bool:
+    """If eval_e2e2 already dumped packed/navtest + infer/<run>/navtest, link/copy into pool_dir (its packed meta.json
+    'variant_layout', no key = base, must equal `layout` when given)."""
     if split != "navtest":
         return False
     pk = run_dir / "eval/root/packed/navtest"
@@ -543,9 +701,19 @@ def try_import_eval_e2e2_dump(run_dir: Path, pool_dir: Path, split: str) -> bool
     done = np.asarray(np.load(inf / "done.npy", mmap_mode="r"), bool)
     if not done.all():
         return False
+    pkm = json.loads((pk / "meta.json").read_text()) if (pk / "meta.json").is_file() else {}
+    try:
+        lay = S2.layout_from_meta(pkm.get("variant_layout"), str(pk / "meta.json"))
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    if layout is not None:
+        expect_layout(f"[navtest] eval_e2e2 dump {pk}", lay, layout)
+    if np.load(pk / "valid96.npy", mmap_mode="r").shape[1] != lay.g(16):
+        raise SystemExit(f"{pk}/valid96.npy: not 16 x {lay.nv} columns of the dump's variant layout {list(lay.names)}")
     tdf = pd.read_parquet(pk / "tokens.parquet")
     toks = [str(t) for t in tdf.token.to_numpy()]
     pool_dir.mkdir(parents=True, exist_ok=True)
+    write_pool_layout(pool_dir, lay)
     json.dump(toks, open(pool_dir / "tokens.json", "w"))
     for k in ("cand96", "v2_final", "v2_im", "v2_sim", "valid96"):
         src, dst = pk / f"{k}.npy", pool_dir / f"{k}.npy"
@@ -571,15 +739,19 @@ def stage_dump(
     workers: int,
 ) -> Path:
     pool_dir = resolve_pool_dir(run_dir, out_dir, tag, split)
+    layout = layout_of_hydra(hydra_cfg)
     if (pool_dir / "tokens.json").is_file() and (pool_dir / "lat_traj.npy").is_file():
-        log(f"[{split}] reusing existing 96-candidate pool in {pool_dir}")
+        expect_layout(f"[{split}] existing pool {pool_dir} vs the training config {hydra_cfg}",
+                      layout_of_pool(pool_dir), layout)
+        log(f"[{split}] reusing existing {layout.g(16)}-candidate pool in {pool_dir}")
         return pool_dir
-    if try_import_eval_e2e2_dump(run_dir, pool_dir, split):
+    if try_import_eval_e2e2_dump(run_dir, pool_dir, split, layout):
         return pool_dir
 
     seed_nt = resolve_pool_dir(run_dir, out_dir, tag, "navtest") if split == "navhard" else None
     nshard = max(1, len(gpus))
     pool_dir.mkdir(parents=True, exist_ok=True)
+    write_pool_layout(pool_dir, layout)
     procs = []
     for i in range(nshard):
         g = gpus[i] if gpus else ""
@@ -637,6 +809,8 @@ def stage_dump(
 
 
 def load_pool_arrays(pool_dir: Path):
+    """-> toks, cand96, lat96, v2_final, v2_im, v2_sim, logit96, valid96 (G = 16 x nv columns of layout_of_pool)."""
+    layout_of_pool(pool_dir)
     toks = json.loads((pool_dir / "tokens.json").read_text())
     cand96 = np.load(pool_dir / "cand96.npy").astype(np.float32)
     lat96 = np.load(pool_dir / "lat_traj.npy").astype(np.float32)
@@ -725,6 +899,7 @@ def _compute_kin_token(item: Tuple[int, str, np.ndarray]):
     from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import BBCoordsIndex
 
     idx, tok, lat96 = item
+    G = lat96.shape[0]                        # pool columns (16 x nv)
     mc = _KIN_MC_LOADER.get_from_token(tok)
     start_s = float(mc.ego_state.time_point.time_s)
     log_name = str(mc.log_name)
@@ -746,11 +921,11 @@ def _compute_kin_token(item: Tuple[int, str, np.ndarray]):
     gy = y0 + s0 * p64[..., 0] + c0 * p64[..., 1]
     gh = np.arctan2(np.sin(h0 + p64[..., 2]), np.cos(h0 + p64[..., 2]))
 
-    X9 = np.concatenate([np.full((96, 1), x0), gx], axis=1)
-    Y9 = np.concatenate([np.full((96, 1), y0), gy], axis=1)
-    H9 = np.unwrap(np.concatenate([np.full((96, 1), h0), gh], axis=1), axis=1)
+    X9 = np.concatenate([np.full((G, 1), x0), gx], axis=1)
+    Y9 = np.concatenate([np.full((G, 1), y0), gy], axis=1)
+    H9 = np.unwrap(np.concatenate([np.full((G, 1), h0), gh], axis=1), axis=1)
 
-    fast = np.zeros((96, 41, 11), dtype=np.float64)
+    fast = np.zeros((G, 41, 11), dtype=np.float64)
     fast[:, :, 0] = X9[:, seg] + (X9[:, seg + 1] - X9[:, seg]) * lam[None, :]
     fast[:, :, 1] = Y9[:, seg] + (Y9[:, seg + 1] - Y9[:, seg]) * lam[None, :]
     H_int = H9[:, seg] + (H9[:, seg + 1] - H9[:, seg]) * lam[None, :]
@@ -764,7 +939,7 @@ def _compute_kin_token(item: Tuple[int, str, np.ndarray]):
         h_start, h_end = hp.start_time.time_us, hp.end_time.time_us
         h_us = np.clip(np.arange(h_start, h_end, int(0.1 * 1e6), dtype=np.int64), h_start, h_end)
         h_states = ego_states_to_state_array(hp.get_state_at_times([TimePoint(u) for u in h_us[:-1]]))
-        padded = np.zeros((96, len(h_states) + 41, 11), dtype=np.float64)
+        padded = np.zeros((G, len(h_states) + 41, 11), dtype=np.float64)
         padded[:, : len(h_states)] = h_states
         padded[:, len(h_states) :] = sim_states
         tp_hc = np.arange(padded.shape[1], dtype=np.float64) * 0.1
@@ -779,7 +954,7 @@ def _compute_kin_token(item: Tuple[int, str, np.ndarray]):
     pts = shapely.points(centers[..., 0], centers[..., 1])
     dev_base = shapely.distance(pts, base_line)
     exc_base = (dev_base > 0.5).astype(np.int32)
-    cs_base = np.concatenate([np.zeros((96, 1), dtype=np.int32), np.cumsum(exc_base, axis=1)], axis=1)
+    cs_base = np.concatenate([np.zeros((G, 1), dtype=np.int32), np.cumsum(exc_base, axis=1)], axis=1)
     cc96 = (~((cs_base[:, 20:] - cs_base[:, :-20]).max(axis=1) >= 20)).astype(np.float32)
 
     # 3. Extended Comfort (EC) kinematic profiles (3.5s overlap window)
@@ -816,10 +991,21 @@ def get_or_build_kin_cache(
     kin_dir.mkdir(parents=True, exist_ok=True)
     cfile = kin_dir / f"kin_{split}_{tag}.npz"
     mfile = kin_dir / f"kin_{split}_{tag}_meta.json"
+    layout = layout_of_pool(pool_dir)
+    G = layout.g(16)
     if cfile.is_file() and mfile.is_file():
         log(f"[{split}] loading cached kinematic features from {cfile}")
         npz = np.load(cfile)
         meta = json.loads(mfile.read_text())
+        if npz["hc96"].shape[1] != G:
+            raise SystemExit(f"{cfile}: kinematic cache of {npz['hc96'].shape[1]} pool columns, the pool {pool_dir} "
+                             f"has "
+                             f"{G} (variant layout {list(layout.names)}); --fresh")
+        if "variant_layout" in meta:
+            try:
+                expect_layout(f"{mfile}", S2.layout_from_meta(meta["variant_layout"], str(mfile)), layout)
+            except ValueError as e:
+                raise SystemExit(str(e)) from None
         cc_arr = npz["cc96"] if "cc96" in npz else npz["lk_traj96"]
         return {
             "hc96": npz["hc96"].astype(np.float64),
@@ -836,11 +1022,11 @@ def get_or_build_kin_cache(
     N = len(toks)
     log(f"[{split}] computing ego-kinematic HC/CC/EC features (N={N}) with {workers} workers ...")
     t0 = time.time()
-    hc96 = np.zeros((N, 96), dtype=np.float32)
-    cc96 = np.zeros((N, 96), dtype=np.float32)
-    ec_self96 = np.zeros((N, 96), dtype=np.float32)
-    f_now = np.zeros((N, 96, 4, 36), dtype=np.float32)
-    f_prev = np.zeros((N, 96, 4, 36), dtype=np.float32)
+    hc96 = np.zeros((N, G), dtype=np.float32)
+    cc96 = np.zeros((N, G), dtype=np.float32)
+    ec_self96 = np.zeros((N, G), dtype=np.float32)
+    f_now = np.zeros((N, G, 4, 36), dtype=np.float32)
+    f_prev = np.zeros((N, G, 4, 36), dtype=np.float32)
     start_s = [0.0] * N
     log_name = [""] * N
     is_orig = [False] * N
@@ -859,7 +1045,8 @@ def get_or_build_kin_cache(
 
     log(f"[{split}] kinematic features done in {time.time() - t0:.1f}s -> {cfile}")
     np.savez(cfile, hc96=hc96, cc96=cc96, lk_traj96=cc96, ec_self96=ec_self96, f_now=f_now, f_prev=f_prev)
-    mfile.write_text(json.dumps({"start_s": start_s, "log_name": log_name, "is_orig": is_orig}))
+    mfile.write_text(json.dumps({"start_s": start_s, "log_name": log_name, "is_orig": is_orig,
+                                 "variant_layout": layout.meta()}))
     return {
         "hc96": hc96.astype(np.float64),
         "cc96": cc96.astype(np.float64),
@@ -887,7 +1074,8 @@ def select_epdms_trajectories(
     w_safe: float = 2.0,
     w_cc: float = 1.0,
 ) -> Dict[str, np.ndarray]:
-    """Select final trajectories over the 96-candidate pool using our Stage-1/Stage-2 EPDMS blend."""
+    """Select final trajectories over the 16 x nv candidate pool using our Stage-1/Stage-2 EPDMS blend (weights
+    layout-free; identity columns always allowed, variants when valid; ties identity-first, select2.tie_order)."""
     _ensure_navsim22()
     from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_comfort_metrics import (
         acceleration_threshold,
@@ -901,14 +1089,16 @@ def select_epdms_trajectories(
         dtype=np.float64,
     )
     toks, _, lat96, v2_final, _, _, logit96, valid96 = load_pool_arrays(pool_dir)
+    layout = layout_of_pool(pool_dir)
+    tie = S2.tie_order(layout)
     N = len(toks)
     ar = np.arange(N)
     tok2idx = {t: i for i, t in enumerate(toks)}
-    vtype = np.arange(96) % 6
+    vtype = layout.vtype(16)
     ok_all = valid96 if not valid96[:, 1:].any() else (valid96 | (vtype[None, :] == 0))
 
     prob96 = 1.0 / (1.0 + np.exp(-logit96))
-    v2f96 = np.repeat(v2_final, 6, axis=1)
+    v2f96 = np.repeat(v2_final, layout.nv, axis=1)
     eps = 1e-6
     nc_c, dac_c, ep_c, ttc_c, _ = [prob96[..., i] for i in range(5)]
 
@@ -972,7 +1162,7 @@ def select_epdms_trajectories(
         add_term = 5.0 * ep_c[i] + 5.0 * ttc_c[i] + 2.0 * hc_k[i] + w_cc * cc_k[i] + 2.0 * ec_row
         s2_score = w_safe * (np.log(nc_c[i] + eps) + np.log(dac_c[i] + eps)) + np.log(add_term + eps)
         s_row = (1.0 - beta) * v2f96[i] + beta * s2_score
-        sel_idx[i] = pick_1row(s_row, ok_all[i])
+        sel_idx[i] = pick_1row(s_row, ok_all[i], tie)
 
     chosen = lat96[ar, sel_idx]
     return {toks[i]: chosen[i] for i in range(N)}
@@ -984,16 +1174,19 @@ def select_pdms_trajectories(
     pdms_set: str = "all",
     pdms_lat_mode: str = "on",
 ) -> Dict[str, np.ndarray]:
-    """Select final trajectories over the 96-candidate pool using the official PDMS formula without imitation:
+    """Select final trajectories over the 16 x nv candidate pool using the official PDMS formula without imitation:
     PDMS(p) = NC * DAC * (5 * EP + 5 * TTC + 2 * C) / 12  (select2.select96_pdms when beta=1.0, or w='plugin' when beta<1.0).
+    pdms_set: a variant-set name, resolved through the pool's layout.sets.
     """
     toks, cand96, lat96, v2_final, v2_im, _, logit96, valid96 = load_pool_arrays(pool_dir)
-    types = S2.VARIANT_SETS[pdms_set]
+    layout = layout_of_pool(pool_dir)
+    types = S2.set_types(pdms_set, layout=layout)
     if pdms_beta == 1.0:
-        sel_idx = S2.select96_pdms(logit96, valid96, types=types)
+        sel_idx = S2.select96_pdms(logit96, valid96, types=types, layout=layout)
     else:
-        sel_idx = S2.select96(v2_final, v2_im, logit96, valid96, beta=pdms_beta, types=types, w="plugin")
-    chosen, _ = S2.final_traj(cand96, lat96, sel_idx, pdms_lat_mode)
+        sel_idx = S2.select96(v2_final, v2_im, logit96, valid96, beta=pdms_beta, types=types, w="plugin",
+                              layout=layout)
+    chosen, _ = S2.final_traj(cand96, lat96, sel_idx, pdms_lat_mode, layout=layout)
     return {toks[i]: chosen[i] for i in range(len(toks))}
 
 
@@ -1519,7 +1712,15 @@ def stage_eval(
 ) -> Path:
     pool_dir = resolve_pool_dir(run_dir, out_dir, tag, split)
     if not ((pool_dir / "tokens.json").is_file() and (pool_dir / "lat_traj.npy").is_file()):
-        raise SystemExit(f"[{split}] 96-candidate pool missing in {pool_dir}: run --stage dump first")
+        raise SystemExit(f"[{split}] candidate pool missing in {pool_dir}: run --stage dump first")
+    layout = layout_of_pool(pool_dir)
+    own = own_hydra_cfg(run_dir)
+    if own is not None:
+        expect_layout(f"[{split}] pool {pool_dir} vs the training config {own}", layout, layout_of_hydra(own))
+    else:
+        rec = recorded_layout(run_dir)          # no own config: the arm of launch/settings.json, when recorded
+        if rec is not None:
+            expect_layout(f"[{split}] pool {pool_dir} vs the VARIANTS arm of {run_dir}/launch/settings.json", layout, rec)
     kin_dir = resolve_kin_dir(run_dir, out_dir, tag, split)
     res_dir = out_dir / "results"
     res_dir.mkdir(parents=True, exist_ok=True)
@@ -1549,6 +1750,7 @@ def stage_eval(
             },
             "created": kst(),
             **res_pdms,
+            "variant_layout": layout.meta(),
         }
         pdms_path.write_text(json.dumps(pdms_payload, indent=2))
         log(f"[navtest] saved Official PDMS evaluation results -> {pdms_path}")
@@ -1593,6 +1795,7 @@ def stage_eval(
         "selector": {"beta": beta, "w_safe": w_safe, "w_cc": w_cc},
         "created": kst(),
         **res,
+        "variant_layout": layout.meta(),
     }
     res_path.write_text(json.dumps(payload, indent=2))
     log(f"[{split}] saved EPDMS evaluation results -> {res_path}")
@@ -1608,6 +1811,22 @@ def stage_summary(out_dir: Path, tag: str) -> Path:
         f"- Generated: `{summary['created']}`",
         "",
     ]
+    lays = {}
+    for rp in [res_dir / f"pdms_navtest_{tag}.json"] + [res_dir / f"epdms_{sp}_{tag}.json" for sp in SPLITS]:
+        if not rp.is_file():
+            continue
+        vl = json.loads(rp.read_text()).get("variant_layout")
+        try:
+            lays[rp.name] = S2.layout_from_meta(vl, str(rp))
+        except ValueError as e:
+            raise SystemExit(str(e)) from None
+    if len(set(lays.values())) > 1:
+        raise SystemExit(f"summary {tag}: results of different variant layouts "
+                         f"{ {k: list(v.names) for k, v in lays.items()} }")
+    lay = next(iter(lays.values()), BASE_LAYOUT)
+    summary["variant_layout"] = lay.meta()
+    if not lay.is_base:
+        lines[-1:-1] = [f"- Variant layout: nv {lay.nv} ({', '.join(lay.names)}), pool 16 x {lay.nv} = {lay.g(16)}"]
 
     pdms_rp = res_dir / f"pdms_navtest_{tag}.json"
     if pdms_rp.is_file():
@@ -1692,8 +1911,11 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--w-safe", type=float, default=2.0, help="Risk-averse safety log-weight w_safe for EPDMS (default: 2.0)")
     ap.add_argument("--w-cc", type=float, default=1.0, help="Stage-1 corridor consistency weight w_cc for EPDMS (default: 1.0)")
     ap.add_argument("--pdms-beta", type=float, default=1.0, help="PDMS selector beta (default: 1.0, pure official PDMS without imitation)")
-    ap.add_argument("--pdms-set", default="all", help="PDMS selector variant set (default: all)")
-    ap.add_argument("--pdms-lat-mode", default="on", help="PDMS selector lateral mode (default: on)")
+    ap.add_argument("--pdms-set", default="all", choices=list(S2.SET_NAMES),
+                    help="PDMS selector variant set, resolved by meaning through the pool's variant layout "
+                         "(default: all)")
+    ap.add_argument("--pdms-lat-mode", default="on", choices=list(S2.LAT_MODES),
+                    help="PDMS selector lateral mode (default: on)")
     ap.add_argument("--mc-navtest", default=MC_NAVTEST_DEFAULT, help="NAVSIM v2.2 metric cache path for navtest")
     ap.add_argument("--mc-navtest-v1", default=MC_NAVTEST_V1_DEFAULT, help="NAVSIM v1 metric cache path for navtest PDMS")
     ap.add_argument("--mc-navhard", default=MC_NAVHARD_DEFAULT, help="NAVSIM v2.2 metric cache path for navhard")

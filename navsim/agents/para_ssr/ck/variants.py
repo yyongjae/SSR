@@ -125,6 +125,110 @@ def variant_name(a: float, d: float) -> str:
     return "|".join(parts) if parts else "id"
 
 
+class VariantLayout:
+    """Column layout of a K-parent candidate pool: column c = k * nv + v, v = index into `table` (v = 0 identity).
+
+    Every consumer (warm-up label files, the online pool, recorder / labeler generations, selection, eval dumps) reads
+    nv, the names and the type sets from here instead of the base constants, so a different variant set (ablation arms)
+    only changes the table.  Type sets are defined by meaning on the (a, d) table, which for the base table
+    (SPEEDS, LATS, 'separate') reproduces the historical constants exactly:
+      none = (0,); decel = id + {a < 0, d = 0}; speed = id + {a != 0, d = 0}; lat = id + {d != 0, a = 0};
+      all_noaccel = id + {a <= 0}; all = every type; lat_types = {d != 0} (lateral part, combos included).
+    """
+
+    SET_NAMES = ("none", "decel", "speed", "lat", "all_noaccel", "all")
+
+    def __init__(self, speeds: Sequence[float] = SPEEDS, lats: Sequence[float] = LATS, combine: str = "separate"):
+        self.speeds = tuple(float(a) for a in speeds)
+        self.lats = tuple(float(d) for d in lats)
+        self.combine = str(combine)
+        self.table: Tuple[Tuple[float, float], ...] = tuple(variant_table(self.speeds, self.lats, self.combine))
+        self.names: Tuple[str, ...] = tuple(variant_name(a, d) for a, d in self.table)
+        if len(set(self.names)) != len(self.names):
+            raise ValueError(f"variant names collide ({self.names}): use values distinct at 0.1 precision")
+        self.nv = len(self.table)
+        t = self.table
+        rest = range(1, self.nv)
+        self.sets: Dict[str, Tuple[int, ...]] = {
+            "none": (0,),
+            "decel": (0,) + tuple(v for v in rest if t[v][0] < 0 and t[v][1] == 0),
+            "speed": (0,) + tuple(v for v in rest if t[v][0] != 0 and t[v][1] == 0),
+            "lat": (0,) + tuple(v for v in rest if t[v][1] != 0 and t[v][0] == 0),
+            "all_noaccel": (0,) + tuple(v for v in rest if t[v][0] <= 0),
+            "all": tuple(range(self.nv))}
+        self.lat_types: Tuple[int, ...] = tuple(v for v in rest if t[v][1] != 0)
+
+    @classmethod
+    def from_cfg(cls, vcfg: Optional[Dict] = None) -> "VariantLayout":
+        """From a ck_e2e2.variants-like dict (missing keys = base)."""
+        v = dict(vcfg or {})
+        return cls(v.get("speeds") if v.get("speeds") is not None else SPEEDS,
+                   v.get("lats") if v.get("lats") is not None else LATS, v.get("combine") or "separate")
+
+    @classmethod
+    def from_meta(cls, meta: Optional[Dict]) -> "VariantLayout":
+        """From stored metadata (speeds / lats / combine keys, e.g. a label build.json or an eval dump's layout);
+        None or no keys = base (dumps written before layouts were recorded)."""
+        if not meta or "speeds" not in meta:
+            return cls()
+        return cls(meta["speeds"], meta.get("lats", []), meta.get("combine", "separate"))
+
+    def meta(self) -> Dict:
+        return {"speeds": list(self.speeds), "lats": list(self.lats), "combine": self.combine,
+                "names": list(self.names), "nv": self.nv}
+
+    @property
+    def is_base(self) -> bool:
+        return self.names == BASE_NAMES
+
+    def g(self, k: int = 16) -> int:
+        return k * self.nv
+
+    def vtype(self, k: int = 16) -> np.ndarray:
+        return np.arange(k * self.nv) % self.nv
+
+    def tie_order(self, k: int = 16) -> np.ndarray:
+        """Identity columns first (k ascending), then the variant columns in c order (select2 tie-break)."""
+        g = k * self.nv
+        return np.concatenate([np.arange(0, g, self.nv), np.array([c for c in range(g) if c % self.nv], np.int64)])
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, VariantLayout) and (self.speeds, self.lats, self.combine) == (
+            other.speeds, other.lats, other.combine)
+
+    def __hash__(self) -> int:
+        return hash((self.speeds, self.lats, self.combine))
+
+    def __repr__(self) -> str:
+        return f"VariantLayout(nv={self.nv}, names={self.names})"
+
+
+BASE_LAYOUT = VariantLayout()
+BASE_NAMES = BASE_LAYOUT.names              # ('id', 'a-1.0', 'a-0.5', 'a+0.5', 'l-0.5', 'l+0.5')
+
+# Variant-set ablation arms (experiment.sh VARIANTS=<arm>): speeds [m/s^2], lats [m]; combine 'separate', K = 16.
+# 'base' is the main recipe.  Warm-up label dir of an arm: var_separate_sampler16_accstraight[_<arm>] (base: no suffix).
+VARIANT_ARMS: Dict[str, Dict[str, Tuple[float, ...]]] = {
+    "base": dict(speeds=SPEEDS, lats=LATS),
+    "v8": dict(speeds=(-1.0, -0.5, 0.5, 1.0), lats=(-1.0, -0.5, 0.5, 1.0)),    # 2 per direction, V = 9, 144 cands
+    "v4": dict(speeds=(-0.5, 0.5), lats=(-0.5, 0.5)),                          # 1 per direction, V = 5, 80 cands
+    "spd4": dict(speeds=(-1.0, -0.5, 0.5, 1.0), lats=()),                      # speed only, V = 5
+    "lat4": dict(speeds=(), lats=(-1.0, -0.5, 0.5, 1.0)),                      # lateral only, V = 5
+}
+BASE_VAR_NAME = "var_separate_sampler16_accstraight"
+
+
+def arm_layout(arm: str) -> VariantLayout:
+    if arm not in VARIANT_ARMS:
+        raise ValueError(f"unknown variant arm {arm!r}; one of {sorted(VARIANT_ARMS)}")
+    return VariantLayout(VARIANT_ARMS[arm]["speeds"], VARIANT_ARMS[arm]["lats"], "separate")
+
+
+def arm_var_name(arm: str) -> str:
+    arm_layout(arm)
+    return BASE_VAR_NAME if arm == "base" else f"{BASE_VAR_NAME}_{arm}"
+
+
 def z_speed(a: float) -> np.ndarray:
     """[6] float64 raw longitudinal controls with Q_1..Q_6 = a (= cf_variants.z_speed)."""
     if a < 0:

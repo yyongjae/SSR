@@ -103,6 +103,10 @@ ARMS = {
     "headfree": {"HEADING": "free"}, "bn-frozen": {"BN": "frozen"}, "s1": {"SEED": "1"}, "e20": {"EPOCHS": "20"},
     "g4": {"GPUS": "0,1,2,3"}, "g2": {"GPUS": "4,5"}, "a.1-b": {"TAG": "a.1-b"}, "x": {"EXTRA": "agent.lr=2e-4"},
     "ref-off_bkd-off_x": {"REFINER": "off", "BEV_KD": "off", "EXTRA": "agent.config.plan_anchor=false"},
+    # refiner candidate variant sets (navsim/agents/para_ssr/ck/variants.py VARIANT_ARMS)
+    "var-v8": {"VARIANTS": "v8"}, "var-v4": {"VARIANTS": "v4"}, "var-spd4": {"VARIANTS": "spd4"}, "var-lat4": {"VARIANTS": "lat4"},
+    "rkd-off_bkd-off_var-lat4": {"REFINER_KD": "off", "BEV_KD": "off", "VARIANTS": "lat4"},
+    "r50_mapkd-offref_var-v8_f1_s2": {"BACKBONE": "r50", "MAP_KD": "off_ref", "VARIANTS": "v8", "FRAMES": "3", "SEED": "2"},
     # every part at once, in the fixed order
     "r50_rkd-score_bkd-off_detkd-offref_f4_dist_headfree_z-2_2_bn-frozen_e20_g4_s1_a1_x": {
         "BACKBONE": "r50", "REFINER_KD": "score", "BEV_KD": "off", "DET_KD": "off",
@@ -155,6 +159,7 @@ def test_every_documented_arm_has_its_own_name():
     ({"BEV_KD": "off", "DET_KD": "off"}, {"BEV_KD": "off", "DET_KD": "off_ref"}),
     ({}, {"PILLAR_Z": "-1.0,3.0"}),
     ({"PILLAR_Z": "-2,2"}, {"PILLAR_Z": "-2.0,2"}),
+    ({}, {"VARIANTS": "base"}),
 ])
 def test_one_config_one_name(a, b):
     assert name(**a) == name(**b)
@@ -186,7 +191,8 @@ def test_one_config_one_name(a, b):
     ({"EPOCHS": "5"}, "needs more than 5"), ({"SAVE_EVERY": "7"}, "does not divide"), ({"PILLAR_Z": "3,1"}, "below"),
     ({"PILLAR_Z": "1"}, "a,b"), ({"PILLAR_Z": "a,b"}, "a,b"), ({"REFINER": "maybe"}, "one of"), ({"FRAMES": "1,3"}, "one of"),
     ({"BN": "x"}, "one of"), ({"WANDB": "x"}, "one of"), ({"RUN_ROOT": "rel/path"}, "absolute"), ({"RUN_ROOT": "/a=b"}, "absolute"),
-    ({"NOPE": "1"}, "unknown setting"),
+    ({"NOPE": "1"}, "unknown setting"), ({"VARIANTS": "v8", "REFINER": "off"}, "means nothing"),
+    ({"VARIANTS": "v9"}, "one of base"),
 ])
 def test_refusals(kw, msg):
     with pytest.raises(C.Refused, match=msg):
@@ -216,6 +222,7 @@ def test_extra_refuses_the_locked_keys(line):
     ("agent.config.image_architecture=resnet50.a1_in1k", "BACKBONE"), ("++agent.config.image_size=[770,420]", "BACKBONE"),
     ("++agent.config.vit_lora_rank=8", "BACKBONE"), ("agent.config.frame_indices=[3]", "FRAMES"),
     ("agent.config.ck_e2e2.lat_kd.fixed=0.0", "REFINER_KD"), ("trainer.params.max_epochs=3", "EPOCHS"),
+    ("++agent.config.ck_e2e2.variants.speeds=[-0.5,0.5]", "VARIANTS"), ("agent.config.ck_e2e2.variants.lats=[]", "VARIANTS"),
 ])
 def test_extra_cannot_contradict_the_run_name(line, setting):
     with pytest.raises(C.Refused, match=setting):
@@ -236,7 +243,7 @@ def test_hash_ignores_what_is_not_the_recipe(kw):
 
 
 @pytest.mark.parametrize("kw", [{"SEED": "1"}, {"EPOCHS": "20"}, {"GPUS": "0,1,2,3"}, {"BN": "frozen"}, {"BACKBONE": "r50"},
-                                {"REFINER_KD": "score"}, {"DET_KD": "off_bev"}])
+                                {"REFINER_KD": "score"}, {"DET_KD": "off_bev"}, {"VARIANTS": "v8"}, {"VARIANTS": "lat4"}])
 def test_hash_changes_with_the_recipe(kw):
     assert C.compose(kw).hash6 != C.compose({}).hash6
 
@@ -423,6 +430,11 @@ def test_output_names_of_a_run():
     # the data folders of the warm-up labels stay as they are on disk
     assert k[CK + "warmup.packed"].endswith("/ck/packed/navtrain_train")
     assert k[CK + "warmup.var_dir"].endswith("/ck/ck2/labels/navtrain_train/var_separate_sampler16_accstraight")
+    # a variant arm reads its own label dir, the yaml table otherwise (no variants line at the default)
+    assert not any(x.startswith("variants.") for x in c.set_lines)
+    k = _kv(C.compose({"VARIANTS": "spd4"}))
+    assert k[CK + "warmup.var_dir"].endswith("/ck/ck2/labels/navtrain_train/var_separate_sampler16_accstraight_spd4")
+    assert k[CK + "variants.speeds"] == "[-1.0,-0.5,0.5,1.0]" and k[CK + "variants.lats"] == "[]"
 
 
 def test_launch_environment_of_the_main_recipe():
@@ -471,6 +483,7 @@ def test_reference_diff_passes_on_the_composed_main_recipe():
         assert ok, lines
     assert C.compose({}).default_recipe and not C.compose({"GPUS": "0,1,2,3"}).default_recipe
     assert C.compose({"TAG": "a", "SAVE_EVERY": "5"}).default_recipe and not C.compose({"SEED": "1"}).default_recipe
+    assert C.compose({"VARIANTS": "base"}).default_recipe and not C.compose({"VARIANTS": "v4"}).default_recipe
 
 
 def test_reference_diff_passes_with_other_roots():
@@ -615,7 +628,7 @@ R=$E2E_ROOT/$RUN
 case "$1" in
   start)
     echo "$E2E_ROOT $RUN sha=$SSR_EXPERIMENT_SHA $*" >> "$STUB_LOG"
-    env | grep -E '^(CK_BEV64|SSR_DET_|SSR_MAP_|SSR_GPU_POLICY|CK2_E2E_APPROVED|E2E_NO_LABELER|MAX_EPOCHS)' | sort >> "$STUB_LOG"
+    env | grep -E '^(CK_BEV64|SSR_DET_|SSR_MAP_|SSR_GPU_POLICY|CK2_E2E_APPROVED|E2E_NO_LABELER|MAX_EPOCHS|LABELER_WORKERS)' | sort >> "$STUB_LOG"
     [ -z "${STUB_REFUSE:-}" ] || { echo "stub refuses" >&2; exit 3; }
     shift
     args=(); for a in "$@"; do [ "$a" = --resume ] || args+=("$a"); done
@@ -821,6 +834,18 @@ def test_train_flow_with_a_stub_launcher(tmp_path, stubs):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "start --resume --gpus 7,6,5,4,3,2,1,0" in Path(stubs["STUB_LOG"]).read_text()
     assert list((R / "launch").glob("overrides.*.txt")) and list((R / "launch").glob("settings.*.json"))
+    # LABELER_WORKERS (not a setting): started without it = null recorded, resumed without it (as before); a recorded
+    # value comes back on a resume that does not give its own
+    assert rec["labeler_workers"] is None and "LABELER_WORKERS" not in Path(stubs["STUB_LOG"]).read_text()
+    (R / "launch/settings.json").write_text(json.dumps({**json.loads(old), "labeler_workers": "72"}, indent=1) + "\n")
+    Path(stubs["STUB_LOG"]).unlink()
+    r = sh("resume", *ra, **stubs)
+    assert r.returncode == 0 and "LABELER_WORKERS=72 (recorded" in r.stdout, r.stdout + r.stderr
+    assert "LABELER_WORKERS=72" in Path(stubs["STUB_LOG"]).read_text().splitlines()
+    Path(stubs["STUB_LOG"]).unlink()
+    r = sh("resume", *ra, **stubs, LABELER_WORKERS="24")
+    assert r.returncode == 0 and "(recorded at the start" not in r.stdout, r.stdout + r.stderr
+    assert "LABELER_WORKERS=24" in Path(stubs["STUB_LOG"]).read_text().splitlines()
 
 
 @server_only

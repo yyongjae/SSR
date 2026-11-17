@@ -13,6 +13,7 @@ data on disk.  scripts/experiment.sh is its one caller; the CLI below writes wha
   compose.py reference --overrides F --run-dir R --plan-data P --teacher-cache T --data-root D
                                                     normalise a run's overrides into tools/release/reference/ form
   compose.py settings-args --settings-json F        the KEY=VALUE lines of a run's launch/settings.json
+  compose.py variant-args ARM                       label_variants.py flags of a VARIANTS arm (setup/50_warmup_labels.sh)
   compose.py record --composition J --out F [--asset-profile P --asset-exit N --asset-log L] [--extra-json S]
                                                     write launch/settings.json (settings + commit, host, versions)
   compose.py dirty-record --out-dir D               save the uncommitted diff into the run folder
@@ -20,15 +21,21 @@ data on disk.  scripts/experiment.sh is its one caller; the CLI below writes wha
 
 Run name: only what differs from the defaults, in a fixed order, joined with _, then the hash (main_<hash6> by default):
   [<bb>] [<det>-<map>] [ref-off] [rkd-off|score|lat] [bkd-off] [detkd-off|offbev|offref] [mapkd-off|offbev|offref]
-  [f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
+  [var-<arm>] [f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 A setting implied by another one gets no part: REFINER=off is ref-off only, REFINER_KD=off BEV_KD=off is rkd-off_bkd-off.
+VARIANTS=<arm> (refiner candidate variant set, VARIANT_ARMS of navsim/agents/para_ssr/ck/variants.py, read from its
+source so no torch is imported): set lines variants.speeds / variants.lats and warmup.var_dir of the arm's label dir;
+the default 'base' emits none of them and is left out of the recorded settings, so every earlier record stays as it was.
 hash6 = sha256 over the resolved overrides, minus run-path and wandb lines, with data roots written as placeholders so
 one config has one name on every server, plus the registry pins of the teachers in use.  Never the commit.  A changed
-default changes the overrides, so it changes the hash; launch/settings.json of a run has every setting.
+default changes the overrides, so it changes the hash; launch/settings.json of a run has every setting (VARIANTS only
+off its default).
 """
 from __future__ import annotations
 
 import argparse
+import ast
+import functools
 import hashlib
 import json
 import math
@@ -56,10 +63,74 @@ REFERENCE = REPO / "tools/release/reference/main_overrides.txt"
 ARM_EXTRA = REPO / "tools/ck/e2e2/v2_v15_v7_arm.extra"
 AGENT_YAML = REPO / "navsim/planning/script/config/common/agent/para_ssr_agent.yaml"
 ANCHORS_REL = "resources/planning_vb/trajectory_anchors_256.npy"
+VARIANTS_PY = REPO / "navsim/agents/para_ssr/ck/variants.py"
+_VARIANT_NAMES = ("SPEEDS", "LATS", "BASE_VAR_NAME", "VARIANT_ARMS")
+
+
+def _literal(node: ast.AST, env: Mapping[str, Any]) -> Any:
+    """Value of a module-level constant expression: literals, tuples / lists / dicts, unary -, dict(k=...) and the
+    names assigned before it.  Anything else is refused (the table must stay readable without importing torch)."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return tuple(_literal(e, env) for e in node.elts)
+    if isinstance(node, ast.Dict) and all(k is not None for k in node.keys):
+        return {_literal(k, env): _literal(v, env) for k, v in zip(node.keys, node.values)}
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        v = _literal(node.operand, env)
+        return -v if isinstance(node.op, ast.USub) else +v
+    if isinstance(node, ast.Name) and node.id in env:
+        return env[node.id]
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict" and not node.args
+            and all(k.arg for k in node.keywords)):
+        return {k.arg: _literal(k.value, env) for k in node.keywords}
+    raise ValueError(f"not a constant expression: {ast.dump(node)[:120]}")
+
+
+@functools.lru_cache(maxsize=None)
+def _variants_module() -> Dict[str, Any]:
+    """SPEEDS, LATS, BASE_VAR_NAME, VARIANT_ARMS of navsim/agents/para_ssr/ck/variants.py, from its source."""
+    env: Dict[str, Any] = {}
+    for st in ast.parse(VARIANTS_PY.read_text()).body:
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            name, value = st.targets[0].id, st.value
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+            name, value = st.target.id, st.value
+        else:
+            continue
+        if name in _VARIANT_NAMES:
+            env[name] = _literal(value, env)
+    lack = [k for k in _VARIANT_NAMES if k not in env]
+    if lack:
+        raise RuntimeError(f"{VARIANTS_PY}: no module-level {', '.join(lack)}")
+    return env
+
+
+def variant_arms() -> Dict[str, Dict[str, Tuple[float, ...]]]:
+    """{arm: {speeds, lats}} = variants.VARIANT_ARMS ('base' first: the main recipe)."""
+    arms = _variants_module()["VARIANT_ARMS"]
+    return {a: {"speeds": tuple(float(x) for x in v["speeds"]), "lats": tuple(float(x) for x in v["lats"])}
+            for a, v in arms.items()}
+
+
+def arm_var_name(arm: str) -> str:
+    """Warm-up label dir name of an arm (= variants.arm_var_name)."""
+    if arm not in variant_arms():
+        raise Refused(f"VARIANTS={arm}: one of {' | '.join(variant_arms())}")
+    base = _variants_module()["BASE_VAR_NAME"]
+    return base if arm == VARIANTS_BASE else f"{base}_{arm}"
+
+
+def _float_list(xs: Sequence[float]) -> str:
+    """One spelling per list, also for an empty one: [-1.0,-0.5,0.5] / []."""
+    return "[" + ",".join(repr(float(x)) for x in xs) + "]"
+
+
+VARIANTS_BASE = "base"
 
 # every setting and its default; scripts/experiment.sh has the same block at its top (a test compares them)
 DEFAULTS: Dict[str, str] = {
-    "REFINER": "on", "REFINER_KD": "on", "BEV_KD": "on", "DET_KD": "on", "MAP_KD": "on",
+    "REFINER": "on", "REFINER_KD": "on", "BEV_KD": "on", "DET_KD": "on", "MAP_KD": "on", "VARIANTS": VARIANTS_BASE,
     "BACKBONE": "r34", "DET_TEACHER": "bevfusion", "MAP_TEACHER": "resmap",
     "FRAMES": "2,3", "UNDISTORT": "on", "HEADING": "xy", "PILLAR_Z": "-1,3", "BEV_RANGE": "64", "BN": "moving",
     "SEED": "0", "EPOCHS": "30", "GPUS": "0,1,2,3,4,5,6,7", "SAVE_EVERY": "1",
@@ -70,7 +141,11 @@ CHOICES: Dict[str, Tuple[str, ...]] = {
     "DET_KD": ("on", "off", "off_bev", "off_ref"), "MAP_KD": ("on", "off", "off_bev", "off_ref"),
     "FRAMES": ("2,3", "3", "0,1,2,3"), "UNDISTORT": ("on", "off"), "HEADING": ("xy", "free"),
     "BEV_RANGE": ("64", "32"), "BN": ("moving", "frozen"), "WANDB": ("online", "offline", "disable"), "DRY": ("0", "1"),
+    "VARIANTS": tuple(variant_arms()),
 }
+# settings added after runs were recorded: left out of the canonical settings at their default, so the settings (and
+# launch/settings.json, composition.json) of every configuration that existed before stay byte for byte as they were
+RECORDED_ONLY_OFF_DEFAULT = ("VARIANTS",)
 # settings that describe where or how a run is launched, not what it trains
 NOT_RECIPE = ("GPUS", "SAVE_EVERY", "RUN_ROOT", "TAG", "WANDB", "DRY")
 GPU_COUNTS = (2, 4, 8)
@@ -100,6 +175,7 @@ EXTRA_OWNED = {
     "agent.config.map_pc_range": "PILLAR_Z / BEV_RANGE", "agent.config.bev_h": "BEV_RANGE",
     "agent.config.bev_w": "BEV_RANGE", "agent.config.backbone_bn_mode": "BN", "agent.config.max_epochs": "EPOCHS",
     "trainer.params.max_epochs": "EPOCHS", "trainer.params.devices": "GPUS", "checkpoint.every_n_epochs": "SAVE_EVERY",
+    "agent.config.ck_e2e2.variants": "VARIANTS",
 }
 # overrides that do not enter hash6: run paths, wandb, how often to save, and roots that are lines only on some servers
 HASH_SKIP = ("experiment_name", "output_dir", "agent.config.ck_e2e2.io_dir", "resume_checkpoint",
@@ -254,6 +330,8 @@ def canonicalize(raw: Mapping[str, str], reg: Optional[Mapping[str, Any]] = None
     # refiner / KD: one config, one spelling
     if s["REFINER"] == "off":
         s["REFINER_KD"] = "off"
+        if s["VARIANTS"] != VARIANTS_BASE:
+            raise Refused(f"VARIANTS={s['VARIANTS']} means nothing: the refiner is off (REFINER=off)")
     no_ref, no_bev = s["REFINER_KD"] == "off", s["BEV_KD"] == "off"
     if no_ref and no_bev:
         s["DET_KD"] = s["MAP_KD"] = "off"
@@ -285,7 +363,15 @@ def canonicalize(raw: Mapping[str, str], reg: Optional[Mapping[str, Any]] = None
                       f"at epoch {ONPOLICY_FROM_EPOCH})")
     check_extra(s["EXTRA"])
     s["EXTRA"] = ";".join(extra_lines_of(s["EXTRA"]))
+    for k in RECORDED_ONLY_OFF_DEFAULT:
+        if s[k] == DEFAULTS[k]:
+            del s[k]
     return s
+
+
+def variants_of(s: Mapping[str, str]) -> str:
+    """The VARIANTS arm of canonical (or recorded) settings: absent = base."""
+    return s.get("VARIANTS", VARIANTS_BASE)
 
 
 def teacher_read(s: Mapping[str, str], kd_key: str) -> bool:
@@ -306,7 +392,7 @@ def profile_of(s: Mapping[str, str]) -> str:
 
 def is_default_recipe(s: Mapping[str, str]) -> bool:
     """The main recipe on the reference GPU count: what tools/release/reference/main_overrides.txt describes."""
-    return all(s[k] == v for k, v in DEFAULTS.items() if k not in NOT_RECIPE) and len(s["GPUS"].split(",")) == 8
+    return all(s.get(k, v) == v for k, v in DEFAULTS.items() if k not in NOT_RECIPE) and len(s["GPUS"].split(",")) == 8
 
 
 # ----------------------------------------------------------------------------------------------- the run's lines
@@ -346,6 +432,8 @@ def run_name(s: Mapping[str, str], hash6: str) -> str:
     if s["BEV_KD"] == "off":
         parts.append("bkd-off")
     parts += _teacher_kd_part(s, "DET_KD", "detkd") + _teacher_kd_part(s, "MAP_KD", "mapkd")
+    if variants_of(s) != VARIANTS_BASE:
+        parts.append(f"var-{variants_of(s)}")
     parts += _st_parts(s)
     if s["BN"] != DEFAULTS["BN"]:
         parts.append(f"bn-{s['BN']}")
@@ -378,10 +466,13 @@ def _kd_lists(s: Mapping[str, str]) -> Tuple[List[str], List[str]]:
 def set_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mapping[str, Dict[str, Any]],
               smoke: bool = False) -> List[str]:
     """Lines of the merged set file (ck_e2e2 key=value)."""
-    data = roots["SSR_DATA_ROOT"]
+    data, arm = roots["SSR_DATA_ROOT"], variants_of(s)
     lines = [f"warmup.packed={data}/ck/packed/navtrain_train", f"warmup.raw_labels={data}/ck/labels/navtrain_train/raw256",
-             f"warmup.var_dir={data}/ck/ck2/labels/navtrain_train/var_separate_sampler16_accstraight",
+             f"warmup.var_dir={data}/ck/ck2/labels/navtrain_train/{arm_var_name(arm)}",
              f"seed={s['SEED']}"]
+    if arm != VARIANTS_BASE:         # the arm's table (combine 'separate' as the yaml); base: the yaml's own table
+        v = variant_arms()[arm]
+        lines += [f"variants.speeds={_float_list(v['speeds'])}", f"variants.lats={_float_list(v['lats'])}"]
     if s["REFINER"] == "off":
         return ["enabled=false"] + lines
     if s["REFINER_KD"] == "off":     # tools/ck/e2e2/v2_nokd.set
@@ -769,6 +860,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rf.add_argument("--data-root", required=True)
     a = sub.add_parser("settings-args")
     a.add_argument("--settings-json", required=True)
+    va = sub.add_parser("variant-args", help="label_variants.py flags of a VARIANTS arm: --speeds .. --lats .. --name ..")
+    va.add_argument("arm")
     r = sub.add_parser("record")
     r.add_argument("--composition", required=True)
     r.add_argument("--out", required=True)
@@ -798,8 +891,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(normalize_line(line, roots, args.run_dir))
         elif args.cmd == "settings-args":
             s = json.loads(Path(args.settings_json).read_text())["settings"]
-            for k, val in s.items():
-                print(f"{k}={val}")
+            for k, val in s.items():           # the recorded keys only, as before (a record without a
+                print(f"{k}={val}")             # RECORDED_ONLY_OFF_DEFAULT key: experiment.sh do_resume resets it)
+        elif args.cmd == "variant-args":
+            if args.arm == VARIANTS_BASE:
+                raise Refused("variant-args: the base label dir is built by 50_warmup_labels.sh itself")
+            name = arm_var_name(args.arm)          # Refused for an unknown arm
+            v = variant_arms()[args.arm]
+            print(" ".join(["--speeds", *map(repr, v["speeds"]), "--lats", *map(repr, v["lats"]), "--name", name]))
         elif args.cmd == "record":
             comp = json.loads(Path(args.composition).read_text())
             commit, dirty = git_state()

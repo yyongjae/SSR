@@ -102,22 +102,25 @@ def cfg2(tmp: Path, **over) -> O.CKE2E2Config:
 
 
 def make_gen(io_dir: str, epoch: int, rows, n_rows: int, seed: int = 0, traj96: Optional[np.ndarray] = None,
-             valid96: Optional[np.ndarray] = None):
-    """A small (n_rows) CK2 generation with finite random labels for `rows` (written by write_generation_rows2)."""
+             valid96: Optional[np.ndarray] = None, layout=None):
+    """A small (n_rows) CK2 generation with finite random labels for `rows` (written by write_generation_rows2).
+    layout: variant layout of the generation (ck/variants.VariantLayout or its names; None = base, 96 columns, the
+    same random draws as before); another layout has 16 V columns."""
     from navsim.agents.para_ssr.ck import e2e_data2 as D2
 
     rows = np.asarray(rows, np.int64)
     n = len(rows)
+    g_k = D2.K16 * len(D2.layout_names(layout))
     rng = np.random.default_rng(seed)
-    gen = D2.open_generation2(io_dir, epoch, n_rows=n_rows, mode="w+")
+    gen = D2.open_generation2(io_dir, epoch, n_rows=n_rows, mode="w+", layout=layout)
     if traj96 is None:
         a = np.load(ANCHORS).astype(np.float32)
-        traj96 = np.stack([a[rng.choice(256, 96, replace=False)] for _ in range(n)]) + \
-            0.05 * rng.standard_normal((n, 96, 8, 3)).astype(np.float32)
+        traj96 = np.stack([a[rng.choice(256, g_k, replace=False)] for _ in range(n)]) + \
+            0.05 * rng.standard_normal((n, g_k, 8, 3)).astype(np.float32)
     if valid96 is None:
-        valid96 = np.ones((n, 96), bool)
-    labels = rng.random((n, 96, 9)).astype(np.float32).round(1)
-    cand_ok = np.ones((n, 96), bool)
+        valid96 = np.ones((n, g_k), bool)
+    labels = rng.random((n, g_k, 9)).astype(np.float32).round(1)
+    cand_ok = np.ones((n, g_k), bool)
     D2.write_generation_rows2(gen, rows, traj96.astype(np.float32), labels, cand_ok, valid96)
     return traj96.astype(np.float32), labels, cand_ok
 

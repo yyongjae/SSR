@@ -5,22 +5,26 @@
     /venv/ssr/bin/python tools/ck/e2e2/eval_e2e2.py --run-dir <RUN> --split navtrain_val [--ckpt last] [--limit N] \
     [--gpus 0,1] [--stage extract,dump,label,infer_check,eval,summary | all] [--workers-label 48] \
     [--fix-from <val metrics.json>] [--calib-offset none] [--choose-lat on|any] [--sel-w default|noim|plugin] [--fresh]
+    [--tokens FILE [--tokens-allow-missing]]
 
 Stages (each resumable; --stage all = this order; layout = tools/ck/e2e/eval_e2e.Paths):
   extract      Lightning ckpt 'agent.ck_student.*' -> <RUN>/eval/ck_run/{config.json, ckpt_last.pt} (load_ck format, arm S,
                score_hidden 256, lead_aux 0, e2e2 true, lon head zero) + strict load_ck round trip (eval_e2e.extract_ck).
   dump         agent from <RUN>/train/code/hydra/config.yaml + ckpt (run_aux_evaluation._build_agent, strict; the BEV-KD
-               arm module is rebuilt too), eval forward (CKE2E2.infer: the 96-column pool) on the split's tokens ->
-               eval root <RUN>/eval/root:
-                 packed/<split>/{tokens.parquet, cand96 [N,96,8,3], valid96 [N,96], cand_idx, v2_final, v2_im [N,16],
+               arm module is rebuilt too), eval forward (CKE2E2.infer: the G = 16 x nv column pool, 96 for the base
+               variant set) on the split's tokens -> eval root <RUN>/eval/root:
+                 packed/<split>/{tokens.parquet, cand96 [N,G,8,3], valid96 [N,G], cand_idx, v2_final, v2_im [N,16],
                                  v2_sim [N,16,5], status, gt_traj, sub_traj, ok, ok_rows, meta.json}
-                 infer/<RUN>/<split>/{score_logit [N,96,5], w_lat, e_lat [N,96,6], lat_traj [N,96,8,3], done,
+                 infer/<RUN>/<split>/{score_logit [N,G,5], w_lat, e_lat [N,G,6], lat_traj [N,G,8,3], done,
                                  check_bev.npz, meta.json}
-               asserts cand96[:, ::6] == gather(anchors + offset, topk16(final)) (1e-5), cand_idx == topk and
+               (file names keep '96' for every layout).  The variant layout is the run's training config
+               ck_e2e2.variants (variants.VariantLayout; the dump agent's must be the same), recorded as
+               'variant_layout' in packed / infer meta.json and ck_run/config.json (eval_ck2 reads it from there).
+               asserts cand96[:, ::nv] == gather(anchors + offset, topk16(final)) (1e-5), cand_idx == topk and
                cand96[:, 0] == trajectory (1e-4).  Several GPUs: one child per GPU (whole logs per shard).
-  label        label_cands.run (official score_token, LQR; K = 96 from the file shape) on packed/cand96 -> labels/<split>/
-               pool96_<RUN> and on infer/lat_traj -> lat96_<RUN> (rows = packed ok; workers <= 48).
-  infer_check  the extracted ck_run (load_ck, fp32) on 8 stored BEV grids x 96 columns reproduces score_logit (3e-2) and
+  label        label_cands.run (official score_token, LQR; K = G from the file shape) on packed/cand96 ->
+               labels/<split>/pool96_<RUN> and on infer/lat_traj -> lat96_<RUN> (rows = packed ok; workers <= 48).
+  infer_check  the extracted ck_run (load_ck, fp32) on 8 stored BEV grids x G columns reproduces score_logit (3e-2) and
                lat_traj (2e-3).
   eval         eval_ck2.run_eval: navtrain_val = beta x variant set x lateral-mode grid, choice stored as 'best'
                (beta / variant set; lateral mode fixed 'on' = user decision unless --choose-lat any);
@@ -31,8 +35,12 @@ Stages (each resumable; --stage all = this order; layout = tools/ck/e2e/eval_e2e
                The val result holds ONE frozen eval spec (eval_ck2: choice, sel_w values, calibration offset values +
                source sha, ep_target, ckpt sha16, ...); navtest restores it -- an unset --sel-w / --calib-offset is
                inherited, a given value must equal it, and the navtest dump must be from the same ckpt sha16.
+               --tokens FILE (eval_ck2): restrict this split to a common token list (arms of different variant sets
+               evaluate different token subsets); out dir <split>[...]__tok_<sha8>; a navtest without --fix-from
+               fixes from the val result WITHOUT a token restriction (the run's own navtrain_val choice).
   summary      <RUN>/eval/summary.{json,md} (times in KST) of the (--sel-w, --calib-offset) result dirs; each split's
-               checkpoint comes from its own metrics.json and a val / navtest checkpoint mismatch is refused.
+               checkpoint comes from its own metrics.json and a val / navtest checkpoint or variant-layout mismatch is
+               refused (token-restricted result dirs are not summarized).
 
 Checkpoint pin and cache identity (report 48 F1):
   --ckpt X resolves X ('last' | epoch:<E> | <path>), hashes the FILE and pins it in <RUN>/eval/ckpt.json (written only
@@ -78,24 +86,47 @@ import numpy as np  # noqa: E402
 from tools.ck import ckutil as U  # noqa: E402
 from tools.ck.e2e import eval_e2e as E1  # noqa: E402   (Paths, resolve / pin ckpt, extract_ck, split_table, shards)
 from tools.ck.e2e2 import eval_ck2 as EV  # noqa: E402
+from navsim.agents.para_ssr.ck.variants import BASE_LAYOUT, VariantLayout  # noqa: E402
 
 PY = "/venv/ssr/bin/python"
-K16, G_K = 16, 96
+K16, G_K = 16, 96                    # G_K = the base layout's pool width (16 x 6); a run's width = 16 x layout.nv
 STAGES = ("extract", "dump", "label", "infer_check", "eval", "summary")
 N_CHECK_BEV = 8
 Paths = E1.Paths
-PACKED_SPECS = {          # name -> (per-row shape, dtype, fill)
-    "cand96": ((G_K, 8, 3), np.float32, np.nan), "valid96": ((G_K,), np.bool_, False),
-    "cand_idx": ((K16,), np.int16, -1), "v2_final": ((K16,), np.float32, np.nan),
-    "v2_im": ((K16,), np.float32, np.nan), "v2_sim": ((K16, 5), np.float32, np.nan),
-    "status": ((8,), np.float32, np.nan), "gt_traj": ((8, 3), np.float32, np.nan),
-    "sub_traj": ((8, 3), np.float32, np.nan), "ok": ((), np.bool_, False),
-}
-INFER_SPECS = {
-    "score_logit": ((G_K, 5), np.float32, np.nan), "w_lat": ((G_K, 6), np.float32, np.nan),
-    "e_lat": ((G_K, 6), np.float32, np.nan), "lat_traj": ((G_K, 8, 3), np.float32, np.nan),
-    "done": ((), np.bool_, False),
-}
+BASE_POOL = "c = k*6 + v (v2 top-16 x id, a-1.0, a-0.5, a+0.5, l-0.5, l+0.5)"
+
+
+def packed_specs(g: int = G_K) -> Dict[str, Tuple]:
+    """name -> (per-row shape, dtype, fill) of packed/<split> for a g-column pool."""
+    return {
+        "cand96": ((g, 8, 3), np.float32, np.nan), "valid96": ((g,), np.bool_, False),
+        "cand_idx": ((K16,), np.int16, -1), "v2_final": ((K16,), np.float32, np.nan),
+        "v2_im": ((K16,), np.float32, np.nan), "v2_sim": ((K16, 5), np.float32, np.nan),
+        "status": ((8,), np.float32, np.nan), "gt_traj": ((8, 3), np.float32, np.nan),
+        "sub_traj": ((8, 3), np.float32, np.nan), "ok": ((), np.bool_, False),
+    }
+
+
+def infer_specs(g: int = G_K) -> Dict[str, Tuple]:
+    """infer/<run>/<split> specs ('6' of w_lat / e_lat = the 6 free lateral controls N_FREE, not the variant count)."""
+    return {
+        "score_logit": ((g, 5), np.float32, np.nan), "w_lat": ((g, 6), np.float32, np.nan),
+        "e_lat": ((g, 6), np.float32, np.nan), "lat_traj": ((g, 8, 3), np.float32, np.nan),
+        "done": ((), np.bool_, False),
+    }
+
+
+PACKED_SPECS = packed_specs(G_K)     # base layout
+INFER_SPECS = infer_specs(G_K)
+
+
+def pool_text(layout: VariantLayout) -> str:
+    """the 'layout' / 'pool' text of meta.json / config.json (base: the historical string)."""
+    if layout.is_base:
+        return BASE_POOL
+    return f"c = k*{layout.nv} + v (v2 top-16 x {', '.join(layout.names)})"
+
+
 PRED_TO_PACKED = {"ck2_cand96": "cand96", "ck2_valid96": "valid96", "ck2_cand_idx": "cand_idx",
                   "ck2_v2_final": "v2_final", "ck2_v2_im": "v2_im", "ck2_v2_sim": "v2_sim"}
 PRED_TO_INFER = {"ck2_score_logit": "score_logit", "ck2_w_lat": "w_lat", "ck2_e_lat": "e_lat",
@@ -246,10 +277,16 @@ def hydra_ck2_cfg(P: Paths) -> Dict[str, Any]:
     return OmegaConf.to_container(ck, resolve=False) if ck is not None else {}
 
 
+def run_layout(P: Paths) -> VariantLayout:
+    """the variant layout of the run: its training config's ck_e2e2.variants (no config / key = base)."""
+    return EV.layout_of_cfg((hydra_ck2_cfg(P) or {}).get("variants"))
+
+
 def extract_ck2(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, Any]) -> Dict:
     """eval_e2e.extract_ck (agent.ck_student.* -> load_ck run, strict round trip) + CK2 fields in config.json; the lon
     head of the extracted student must be all zero (z_lon = 0)."""
     from navsim.agents.para_ssr.ck.model import load_ck
+    layout = EV.layout_of_cfg((ck_cfg or {}).get("variants"))
     if not ck_cfg or not str(ck_cfg.get("enabled", "")).lower() in ("true", "1"):
         log(f"warning: training config has no enabled ck_e2e2 ({ck_cfg and ck_cfg.get('enabled')})")
     cfg = E1.extract_ck(ckpt, out_dir, run_name, {"seed": int((ck_cfg or {}).get("seed", 0) or 0)})
@@ -259,7 +296,7 @@ def extract_ck2(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, Any]
     if lon_max != 0.0:
         raise SystemExit(f"extracted student lon head max |w| {lon_max} != 0 (not a CK2 e2e checkpoint)")
     cfg.update(e2e2=True, ck_e2e2=ck_cfg, lon_head="removed (last layer zero, frozen; decode z_lon = 0)",
-               k=G_K, pool="c = k*6 + v (v2 top-16 x id, a-1.0, a-0.5, a+0.5, l-0.5, l+0.5)")
+               k=layout.g(K16), pool=pool_text(layout), variant_layout=layout.meta())
     cfg.pop("ck_e2e", None)
     U.write_json(out_dir / "config.json", cfg)
     load_ck(out_dir, "last", "cpu")          # config.json still loads
@@ -268,13 +305,21 @@ def extract_ck2(ckpt: Path, out_dir: Path, run_name: str, ck_cfg: Dict[str, Any]
 
 # ----------------------------------------------------------------------------------------------- writer
 class EvalRootWriter2(E1.EvalRootWriter):
-    """eval_e2e.EvalRootWriter with the 96-column specs."""
+    """eval_e2e.EvalRootWriter with the 16 x nv column specs of the run's variant layout (layout None = run_layout(P),
+    the training config's ck_e2e2.variants; base = 96 columns)."""
 
-    def __init__(self, P: Paths, tdf, ck_run: Optional[Path] = None):
+    def __init__(self, P: Paths, tdf, ck_run: Optional[Path] = None, layout: Optional[VariantLayout] = None):
         import pandas as pd
         self.P = P
+        self.layout = run_layout(P) if layout is None else layout
+        self.g = self.layout.g(K16)
         n = len(tdf)
         self.n = n
+        for d in (P.packed, P.infer):            # a split dumped with another variant set (recorded layout) is refused
+            old = (U.read_json(d / "meta.json") or {}) if (d / "meta.json").is_file() else {}
+            if "variant_layout" in old and EV.S2.layout_from_meta(old["variant_layout"], str(d)) != self.layout:
+                raise SystemExit(f"{d}: dumped with the variant layout {old['variant_layout'].get('names')}, the run's "
+                                 f"is {list(self.layout.names)}; use --fresh")
         P.packed.mkdir(parents=True, exist_ok=True)
         P.infer.mkdir(parents=True, exist_ok=True)
         tdf = tdf[["token", "log", "city"]].reset_index(drop=True).copy()
@@ -290,15 +335,23 @@ class EvalRootWriter2(E1.EvalRootWriter):
                     tmp = d / f".tokens.tmp{os.getpid()}.parquet"
                     tdf.to_parquet(tmp, index=False)
                     os.replace(tmp, tp)
-            self.A = {k: U.open_memmap(P.packed / f"{k}.npy", (n,) + s, d, fill=f) for k, (s, d, f) in
-                      PACKED_SPECS.items()}
-            self.I = {k: U.open_memmap(P.infer / f"{k}.npy", (n,) + s, d, fill=f) for k, (s, d, f) in
-                      INFER_SPECS.items()}
+            try:
+                self.A = {k: U.open_memmap(P.packed / f"{k}.npy", (n,) + s, d, fill=f) for k, (s, d, f) in
+                          packed_specs(self.g).items()}
+                self.I = {k: U.open_memmap(P.infer / f"{k}.npy", (n,) + s, d, fill=f) for k, (s, d, f) in
+                          infer_specs(self.g).items()}
+            except ValueError as e:
+                raise SystemExit(f"{e} (the run's variant layout {list(self.layout.names)} needs {self.g} pool "
+                                 f"columns; an eval root of another variant set / dump format: use --fresh)") from None
         self.ck_run = ck_run
 
     def write(self, rows, pred, status, gt, traj):
         rows = np.asarray(rows, np.int64)
         B = len(rows)
+        for k in ("ck2_cand96", "ck2_valid96", "ck2_score_logit", "ck2_lat_traj"):
+            if np.shape(pred[k])[1] != self.g:
+                raise SystemExit(f"dump: {k} {tuple(np.shape(pred[k]))} has {np.shape(pred[k])[1]} pool columns, the "
+                                 f"run's variant layout {list(self.layout.names)} needs {self.g}")
         ok = np.isfinite(pred["ck2_cand96"]).reshape(B, -1).all(1)
         ok &= np.isfinite(pred["ck2_score_logit"]).reshape(B, -1).all(1)
         ok &= np.isfinite(pred["ck2_lat_traj"]).reshape(B, -1).all(1)
@@ -316,31 +369,36 @@ class EvalRootWriter2(E1.EvalRootWriter):
     def finalize_meta(self, extra: Dict[str, Any]) -> None:
         self.flush()
         ok = np.asarray(self.A["ok"], bool)
+        vl = self.layout.meta()
         U.write_json(self.P.packed / "meta.json", dict(
-            split=self.P.split, n=self.n, k=G_K, n_ok=int(ok.sum()), source="eval_e2e2 in-process dump (CKE2E2.infer)",
-            layout="c = k*6 + v (v2 top-16 x id, a-1.0, a-0.5, a+0.5, l-0.5, l+0.5)", created=EV.kst(), **extra))
+            split=self.P.split, n=self.n, k=self.g, n_ok=int(ok.sum()),
+            source="eval_e2e2 in-process dump (CKE2E2.infer)",
+            layout=pool_text(self.layout), created=EV.kst(), **extra, variant_layout=vl))
         np.save(self.P.packed / "ok_rows.npy", np.flatnonzero(ok).astype(np.int64))
         meta = U.read_json(self.P.infer / "meta.json", {}) or {}
-        meta.update(run=str(self.ck_run or ""), which="last", arm="S", split=self.P.split, n=self.n, k=G_K, slope=0.0,
-                    source="eval_e2e2 in-process (CKE2E2.infer, fp32, z_lon = 0)", **extra)
+        meta.update(run=str(self.ck_run or ""), which="last", arm="S", split=self.P.split, n=self.n, k=self.g,
+                    slope=0.0,
+                    source="eval_e2e2 in-process (CKE2E2.infer, fp32, z_lon = 0)", **extra, variant_layout=vl)
         U.write_json(self.P.infer / "meta.json", meta)
 
 
 # ----------------------------------------------------------------------------------------------- dump
-def check_pool(pr: Dict[str, Any], anchors=None) -> float:
-    """cand96[:, ::6] == gather(anchors + offset, topk16(final)), cand_idx == topk, cand96[:, 0] == trajectory."""
+def check_pool(pr: Dict[str, Any], anchors=None, *, layout: VariantLayout = BASE_LAYOUT) -> float:
+    """cand96[:, ::nv] == gather(anchors + offset, topk16(final)), cand_idx == topk, cand96[:, 0] == trajectory."""
     import torch
     final = pr["plan_final_rewards"].float()
     top = final.topk(K16, dim=-1).indices
     if anchors is None and "trajectory_anchors" in pr:
         anchors = pr["trajectory_anchors"]
     cand = pr["ck2_cand96"].float()
+    EV.S2.check_cols("check_pool: ck2_cand96", cand.shape[1], layout)
+    nv = layout.nv
     if anchors is not None:
         anchors = anchors.float().to(final.device)
         ref = (anchors.reshape(1, -1, 8, 3) + pr["trajectory_offset"].float()).gather(
             1, top[:, :, None, None].expand(-1, -1, 8, 3))
-        e = float((ref - cand[:, ::6]).abs().max())
-        assert e < 1e-5, f"ck2_cand96[:, ::6] != gather(anchors + offset, topk) ({e})"
+        e = float((ref - cand[:, ::nv]).abs().max())
+        assert e < 1e-5, f"ck2_cand96[:, ::{nv}] != gather(anchors + offset, topk) ({e})"
     assert torch.equal(pr["ck2_cand_idx"].long(), top), "ck2_cand_idx != topk(plan_final_rewards)"
     err1 = float((cand[:, 0] - pr["trajectory"].float()).abs().max())
     assert err1 < 1e-4, f"pool column 0 != submitted trajectory ({err1})"
@@ -378,6 +436,10 @@ def run_dump_shard(P: Paths, ckpt: Path, tdf, shard: int, nshard: int, batch_siz
     agent = RAE._build_agent(P.hydra_cfg, ckpt, dev, aux_protocol=False)   # planning only (64 m grid allowed)
     if getattr(agent, "_ck_e2e2", None) is None:
         raise SystemExit("agent has no CK2 module: training config without ck_e2e2.enabled")
+    lay_agent = EV.layout_of_cfg(agent._ck_e2e2.cfg.variants)
+    if lay_agent != W.layout:
+        raise SystemExit(f"dump agent variant layout {list(lay_agent.names)} != the run config's "
+                         f"{list(W.layout.names)} ({P.hydra_cfg})")
     sp = CM.split(P.split)
     todo_toks = [str(t) for t in tdf.token.to_numpy()[pos]]
     sf = instantiate(OmegaConf.load(CM.resolve_path(sp["scene_filter"])))
@@ -408,7 +470,7 @@ def run_dump_shard(P: Paths, ckpt: Path, tdf, shard: int, nshard: int, batch_siz
             if "ck2_cand96" not in pr:       # infer_outputs off in the stored config: call the hook directly
                 pr = dict(pr)
                 pr.update(agent._ck_e2e2.infer(agent.ck_student, fg, pr))
-        max_top1 = max(max_top1, check_pool(pr, anchors))
+        max_top1 = max(max_top1, check_pool(pr, anchors, layout=W.layout))
         rows = np.array([row_of[t] for t in btok], np.int64)
         npd = {k: pr[k].detach().float().cpu().numpy() if pr[k].is_floating_point() else pr[k].cpu().numpy()
                for k in list(PRED_TO_PACKED) + list(PRED_TO_INFER)}
@@ -567,7 +629,8 @@ def stage_eval(P: Paths, a) -> Path:
     fix = a.fix_from
     sel_w = getattr(a, "sel_w", None) or None
     cal = getattr(a, "calib_offset", "") or ""
-    if P.split == "navtest" and not fix:
+    toks = getattr(a, "tokens", "") or None
+    if P.split == "navtest" and not fix:       # the run's own val choice (never a token-restricted val result)
         cand = P.root / "eval" / P.name / EV.out_name("navtrain_val", sel_w or EV.DEFAULT_SEL_W, EV.read_offset(cal)) / \
             "metrics.json"
         if not cand.is_file():
@@ -575,7 +638,8 @@ def stage_eval(P: Paths, a) -> Path:
                              f"only); run the navtrain_val eval first (looked for {cand})")
         fix = str(cand)
     res = EV.run_eval(P.root, P.name, P.split, None, fix, a.bootstrap, cal or None,
-                      choose_lat=getattr(a, "choose_lat", "on"), sel_w=sel_w)
+                      choose_lat=getattr(a, "choose_lat", "on"), sel_w=sel_w, tokens=toks,
+                      tokens_allow_missing=bool(getattr(a, "tokens_allow_missing", False)))
     return Path(res["out_dir"]) / "metrics.json"
 
 
@@ -586,12 +650,14 @@ def _pct(x) -> str:
 def stage_summary(run_dir: Path, sel_w=None, offset=None) -> Dict:
     """summary of the out_name(split, sel_w, offset) result dirs (default: 'plugin' weights = official PDMS without
     imitation, no calibration).  Each split's checkpoint is taken from its own metrics.json ('model'); val and navtest of
-    different checkpoints are refused (SystemExit: a stale navtest result after a new val, or the reverse)."""
+    different checkpoints or variant layouts are refused (SystemExit: a stale navtest result after a new val, or the
+    reverse).  n_eval / n_total and the variant layout of every split are reported."""
     name = Path(run_dir).name
     ev = Path(run_dir) / "eval"
     out: Dict[str, Any] = {"run": name, "created": EV.kst(), "ckpt_pin": U.read_json(ev / "ckpt.json"), "splits": {},
                            "sel_w": EV.S2.sel_w_name(sel_w or EV.DEFAULT_SEL_W), "calib_offset_values": offset}
     ck_by: Dict[str, Any] = {}
+    lay_by: Dict[str, VariantLayout] = {}
     for split in ("navtrain_val", "navtest"):
         mp = ev / "root" / "eval" / name / EV.out_name(split, sel_w or EV.DEFAULT_SEL_W, offset) / "metrics.json"
         if not mp.is_file():
@@ -601,13 +667,23 @@ def stage_summary(run_dir: Path, sel_w=None, offset=None) -> Dict:
         keep = {"v2", "v2_lat", "oracle16", "oracle96", "oracle96_lat", "pdms", m.get("representative"),
                 "sel b=1 set=all lat=on"}
         rows = {r["key"]: r for r in m["rows"] if r["key"] in keep}
+        try:
+            lay_by[split] = EV.S2.layout_from_meta(m.get("variant_layout"), str(mp))
+        except ValueError as e:
+            raise SystemExit(str(e)) from None
         out["splits"][split] = {"n_eval": m["n_eval"], "n_total": m["n_total"], "n_logs": m["n_logs"],
                                 "choice": m.get("best") or m.get("fixed_from_val"),
                                 "representative": m.get("representative"), "rows": rows,
                                 "infer_check": U.read_json(ev / "root/infer" / name / split / "infer_check.json"),
                                 "model": ck_by[split],
-                                "eval_spec_sha16": (m.get("eval_spec") or {}).get("spec_sha16")}
+                                "eval_spec_sha16": (m.get("eval_spec") or {}).get("spec_sha16"),
+                                "variant_layout": lay_by[split].meta()}
     out["ckpt_by_split"] = ck_by
+    if len(set(lay_by.values())) > 1:
+        raise SystemExit(f"summary: navtrain_val / navtest were evaluated on different variant layouts "
+                         f"({ {k: list(v.names) for k, v in lay_by.items()} }); rerun the stale split (--fresh)")
+    lay = next(iter(lay_by.values()), BASE_LAYOUT)
+    out["variant_layout"] = lay.meta()
     if len(ck_by) == 2:
         a_, b_ = ck_by["navtrain_val"], ck_by["navtest"]
         if a_.get("ckpt_sha16") != b_.get("ckpt_sha16"):
@@ -623,6 +699,9 @@ def stage_summary(run_dir: Path, sel_w=None, offset=None) -> Dict:
          f"{(out.get('ckpt') or {}).get('ckpt_sha16')}, 두 split 같음 확인). 선택 가중치 {out['sel_w']}, 보정 offset "
          f"{out['calib_offset_values'] or 'OFF'}. 공식 채점(score_token, "
          "LQR) [실측]. β·변형 집합·측방 모드는 navtrain_val에서만 골랐다. ★ = 대표 행. oracle·β=1 행은 서술용. 단위 0-100.", ""]
+    if not lay.is_base:
+        L += [f"변형 배치(variant layout): nv {lay.nv}, {', '.join(lay.names)} (pool {lay.g(K16)}열, c = k*{lay.nv} + v). "
+              f"oracle96 / oracle96_lat 행 = 이 pool 전체의 oracle.", ""]
     for split, sp in out["splits"].items():
         L += [f"## {split}", "", f"토큰 {sp['n_eval']} / {sp['n_total']}, log {sp['n_logs']}. 선택: {sp['choice']}", "",
               "| 행 | PDMS | ΔPDMS vs v2 [95% CI] | NC | DAC | EP | TTC | C | 앞차 감속 NC/TTC 실패 (n) | 바뀐 비율 | 측방 적용 |",
@@ -676,6 +755,12 @@ def get_parser():
                     help="selection weight set: plugin (0, 1, 1, 1, official PDMS without imitation, default) | "
                          "default (= SEL_W) | noim; unset: 'plugin' on navtrain_val, inherited from the frozen val spec "
                          "on navtest")
+    ap.add_argument("--tokens", default="",
+                    help="eval stage: restrict this split to the tokens of FILE (eval_ck2 --tokens; out dir "
+                         "<split>[...]__tok_<sha8>), e.g. the tokens every variant arm evaluates")
+    ap.add_argument("--tokens-allow-missing", action="store_true",
+                    help="with --tokens: evaluate the evaluable subset instead of refusing listed tokens that are not "
+                         "evaluable in this run")
     ap.add_argument("--fresh", action="store_true")
     ap.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--nshard", type=int, default=1, help=argparse.SUPPRESS)

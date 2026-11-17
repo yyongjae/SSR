@@ -58,6 +58,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `BEV_KD` | on off | on | `bkd-off` | BEV KD v15 (student BEV로 가는 KD). |
 | `DET_KD` | on off off_bev off_ref | on | `detkd-off` `detkd-offbev` `detkd-offref` | DET teacher에서 오는 KD. `off`는 두 경로 모두, `off_bev`는 BEV KD만, `off_ref`는 refiner KD만 끕니다. |
 | `MAP_KD` | on off off_bev off_ref | on | `mapkd-off` `mapkd-offbev` `mapkd-offref` | MAP teacher에서 오는 KD. 값의 뜻은 같습니다. |
+| `VARIANTS` | base v8 v4 spd4 lat4 | base | `var-<arm>` (`var-v8` 등) | refiner 후보의 운동학 변형 집합. v2 top-16 parent마다 V개(identity 포함)라 후보는 16 × V개입니다. 값과 warm-up label 폴더는 5절 아래 "변형 집합 ablation". `REFINER=off`와 함께 쓰면 거부합니다. |
 | `BACKBONE` | r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 | r34 | 이름 그대로 (`r50`), 맨 앞 | timm 이름과 필요한 플래그는 registry에 있습니다. swin, vit는 코드가 더 필요해서 거부합니다. |
 | `DET_TEACHER` | registry 이름 | bevfusion | `<det>-<map>` | DET teacher. `bevformer`는 등록만 되어 있고 없어서, 무엇이 부족한지 출력하고 거부합니다. |
 | `MAP_TEACHER` | registry 이름 | resmap | `<det>-<map>` | MAP teacher. `mask2map`도 같습니다. |
@@ -83,7 +84,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 
 - 고정된 값: `infer_select`, `submit_selection`, `kd_calib`, `teacher_`, `warmup.`, `distill_lambda_`, `distill_tau_`, `plan_anchor_file`, `dataloader.params.batch_size`, `io_dir`, `output_dir`, `seed`.
 - e2e 구조: `use_task_interaction`, `use_det_motion_head`, `use_map_head`, `map_head_type`, `bev_seg_weight`. task interaction, det head, seg map head는 항상 켜져 있고 실험에서 바꾸지 않습니다.
-- 위 표의 키가 정하는 값 (`use_distill`, `ck_e2e2.enabled`, `image_architecture` 등). 이름과 실제가 달라지기 때문입니다. 해당 키를 쓰라고 안내합니다.
+- 위 표의 키가 정하는 값 (`use_distill`, `ck_e2e2.enabled`, `ck_e2e2.variants.*`, `image_architecture` 등). 이름과 실제가 달라지기 때문입니다. 해당 키를 쓰라고 안내합니다.
 
 ## 4. 폴더 이름
 
@@ -91,7 +92,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 
 ```
 [backbone] [<det>-<map>] [ref-off] [rkd-off|rkd-score|rkd-lat] [bkd-off] [detkd-off|detkd-offbev|detkd-offref]
-[mapkd-off|mapkd-offbev|mapkd-offref] [f1|f4 dist headfree z<a>_<b> r32]
+[mapkd-off|mapkd-offbev|mapkd-offref] [var-<arm>] [f1|f4 dist headfree z<a>_<b> r32]
 [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 ```
 
@@ -102,6 +103,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `BACKBONE=r50` | `r50_<hash6>` |
 | `REFINER_KD=off BEV_KD=off` | `rkd-off_bkd-off_<hash6>` |
 | `REFINER=off BEV_KD=off` | `ref-off_bkd-off_<hash6>` |
+| `VARIANTS=v8` | `var-v8_<hash6>` |
 | `BACKBONE=r50 REFINER_KD=score MAP_KD=off_ref SEED=1 TAG=try1` | `r50_rkd-score_mapkd-offref_s1_try1_<hash6>` |
 
 - 기본값은 이름에 쓰지 않습니다. 기본값이 코드에서 바뀌면 override가 바뀌므로 hash가 바뀌어 다른 이름이 됩니다.
@@ -131,6 +133,8 @@ run 폴더 안의 이름:
 | `DET_KD=off MAP_KD=off` (KD가 하나라도 켜짐) | 거부합니다. `REFINER_KD=off BEV_KD=off`를 쓰세요. |
 | 양쪽 BEV bank 또는 양쪽 refiner source를 모두 끔 | 거부합니다. 각각 `BEV_KD=off`, `REFINER_KD=off`를 쓰세요. |
 | 아무도 읽지 않는 teacher | 기본 teacher로 돌아가 이름에 나오지 않습니다. |
+| `VARIANTS=<arm> REFINER=off` | 거부합니다. refiner가 없으면 변형 후보를 읽는 곳이 없습니다. |
+| `VARIANTS=base` | 기본값이라 설정 기록(`settings.json`, `composition.json`)에 쓰지 않습니다. 이 키가 생기기 전의 기록과 바이트가 같고, 기록에 없으면 base입니다. |
 
 기본 레시피의 override는 `tools/release/reference/main_overrides.txt`(참조 run의 override, 경로만 자리표시자로 바꿈)와 다음 줄만 다를 수 있습니다. `check`가 이를 확인하고 PASS/FAIL을 출력합니다.
 
@@ -181,12 +185,33 @@ run 폴더 안의 이름:
 | BN 고정 | `BN=frozen` | full | 20 h |
 | seed 반복 | `SEED=1` | full | 20 h |
 | v1 planner | `REFINER=off BEV_KD=off EXTRA='agent.config.plan_anchor=false'` | base | ≤ 20 h |
+| 변형 8종 (속도 ±0.5 ±1.0, 횡 ±0.5 ±1.0) | `VARIANTS=v8` | full | 측정 안 됨. 후보 144개: labeler 채점 약 1.5배, 메모리 smoke 먼저 |
+| 변형 4종 (속도 ±0.5, 횡 ±0.5) | `VARIANTS=v4` | full | 측정 안 됨. 후보 80개 |
+| 속도 변형만 4종 (±0.5 ±1.0) | `VARIANTS=spd4` | full | 측정 안 됨. 후보 80개 |
+| 횡 변형만 4종 (±0.5 ±1.0) | `VARIANTS=lat4` | full | 측정 안 됨. 후보 80개 |
 
 | Profile | 무엇 | 디스크 |
 |---|---|---|
 | base | 데이터셋, 지도, anchor, `pdm_score_256`, `pdm_score_256_officialEP`, 환경 | 약 693 GiB |
 | refiner_noteacher | base + navtrain metric cache, GT 저장소, packed, warm-up label | 약 743 GiB |
 | full | refiner_noteacher + BEV teacher 캐시 2개, refiner teacher run 2개 | 약 1.93 TiB |
+
+### 변형 집합 ablation (`VARIANTS`)
+
+refiner 후보는 v2 head의 top-16 parent와 그 운동학 변형입니다. 열 순서는 `c = k × V + v` (k = parent, v = 0이 identity)이고, 변형 표는 `navsim/agents/para_ssr/ck/variants.py`의 `VARIANT_ARMS` 하나에서 옵니다 (combine `separate`, K = 16, 속도는 같은 경로 위의 가속도 m/s², 횡은 m).
+
+- `base` (기본): 속도 -1.0 -0.5 +0.5, 횡 ±0.5. V = 6, 후보 96개. 지금까지의 모든 run.
+- `v8`: 속도 -1.0 -0.5 +0.5 +1.0, 횡 -1.0 -0.5 +0.5 +1.0. V = 9, 후보 144개.
+- `v4`: 속도 -0.5 +0.5, 횡 -0.5 +0.5. V = 5, 후보 80개.
+- `spd4`: 속도 -1.0 -0.5 +0.5 +1.0, 횡 없음. V = 5, 후보 80개.
+- `lat4`: 속도 없음, 횡 -1.0 -0.5 +0.5 +1.0. V = 5, 후보 80개.
+
+arm이 바꾸는 것은 `ck_e2e2.variants.speeds`, `ck_e2e2.variants.lats`(빈 목록은 `[]`로 씀) 두 줄과 `ck_e2e2.warmup.var_dir` 하나뿐입니다. 새 config 키는 없고, `base`는 이 줄들을 하나도 내지 않아 override와 이름(`main_<hash6>`)이 그대로입니다. arm은 기본 레시피가 아니므로 `check`의 기준 run 비교를 하지 않습니다.
+
+- warm-up label: `$SSR_DATA_ROOT/ck/ck2/labels/navtrain_train/var_separate_sampler16_accstraight_<arm>` (base는 `_<arm>` 없음). 만들기: `ARMS="v8 v4 spd4 lat4" bash tools/release/setup/50_warmup_labels.sh`. base 출력이 이미 있는 split은 그대로 두고 arm 폴더만 만듭니다. 다 만든 arm 폴더는 거부하고, 만드는 중인 폴더는 `RESUME=1`이 있어야 이어갑니다. 학생은 navtrain_train만 읽습니다 (`SPLITS=navtrain_train`).
+- 확인: `train`과 `assets`는 `verify_assets --variants <arm>`으로 그 폴더도 봅니다. arm에는 sha 고정값이 없어서 구조를 봅니다: `build.json`의 이름, V, 속도, 횡, `separate`, ext straight, sampler16, anchor와 token sha; `check.json`의 `n_ok == n_expected`, identity와 invalid 비교; 16 × V 모양. `QUICK=0`이면 배열 sha16을 출력하고, `traj.npy`가 `build.json`의 sha와 같은지, anchor_idx가 base 고정값과 같은지, base와 겹치는 변형 열(traj, valid)이 base와 비트 단위로 같은지도 봅니다.
+- refiner teacher: arm마다 다시 학습하지 않고 base teacher를 그대로 씁니다 (registry 고정값도 같음). 나중에 arm label로 다시 학습하려면 `VAR_NAME=var_separate_sampler16_accstraight_<arm> N_VAR=<16 × (V − 1): v8 128, 나머지 64>`를 `teachers`에 환경 변수로 주고, 그 teacher에 새 registry 항목(`DET_TEACHER=`, `MAP_TEACHER=`)을 쓰세요.
+- labeler: 기본은 `min(16 × GPU 수, 48)`개 worker이고 base는 그대로 48입니다. v8은 token당 채점할 궤적이 1.5배라 `LABELER_WORKERS=72 bash scripts/experiment.sh train VARIANTS=v8`처럼 환경 변수로 늘릴 수 있습니다 (최대 96). 값은 `settings.json`의 `labeler_workers`에 남고, `resume RUN=...`은 `LABELER_WORKERS`를 주지 않으면 이 값을 다시 씁니다 (주면 그 값; 시작할 때 주지 않은 run은 기본 규칙 그대로).
 
 거부되는 실험:
 
@@ -227,4 +252,5 @@ run 폴더 안의 이름:
 - 실제 `smoke`와 `train` (DDP 포함). 온라인 calibration을 켠 학습은 이 서버에서 GPU로 돈 적이 없습니다.
 - ResNet34 외 backbone의 GPU 메모리. r50 이상은 `smoke`로 `MEM_LIMIT_GB` 확인이 먼저입니다.
 - DET 또는 MAP을 끈 arm의 DDP와 resume.
+- `VARIANTS`의 arm (v8, v4, spd4, lat4): smoke와 학습, v8의 GPU 메모리와 labeler 처리량. `lat4`는 on-policy에서 짧은 parent의 횡 변형이 무효라 KD 후보 칸이 비면 smoke의 `kd_ok_frac ≥ 0.999` 확인이 base보다 낮게 나올 수 있습니다.
 - 다른 서버에서의 전체 실행.

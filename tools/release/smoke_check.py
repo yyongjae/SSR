@@ -8,6 +8,9 @@ covers refiner off, refiner KD off or partial, BEV KD off, and one teacher off.
 Writes <run>/launch/smoke_check.json, prints each check, exit 1 when one fails.  Peak memory: torch's peak per GPU from
 steps_rank0.jsonl when the refiner writes one; with the refiner off, the peak of nvidia-smi's memory.used sampled by
 scripts/experiment.sh into launch/gpu_mem.csv, which counts reserved memory too, so it reads higher.
+A VARIANTS arm other than base (settings VARIANTS) adds variants_as_set: launch/refiner_effective.json has the arm's
+speeds / lats (combine separate) and its warm-up label dir; info records the arm's V and candidate count.  No other check
+depends on the variant set (the record / label path of the smoke is checked by labeler_generation_0_done).
 """
 from __future__ import annotations
 
@@ -130,6 +133,22 @@ def _refiner_checks(run: Path, s: Dict[str, str], checks: Dict[str, bool], info:
     return st
 
 
+def _variants_checks(run: Path, arm: str, checks: Dict[str, bool], info: Dict[str, Any]) -> None:
+    """The run used the arm's variant table and label dir (launch/refiner_effective.json, written by the launcher)."""
+    from navsim.agents.para_ssr.ck import variants as VV
+    lay = VV.arm_layout(arm)
+    p = run / "launch/refiner_effective.json"
+    eff = json.loads(p.read_text()) if p.is_file() else {}
+    v, wu = eff.get("variants") or {}, eff.get("warmup") or {}
+    try:
+        got = VV.VariantLayout(v["speeds"], v.get("lats") or [], v.get("combine") or "separate") if "speeds" in v else None
+    except ValueError:          # a table the variants module refuses is not the arm's
+        got = None
+    checks["variants_as_set"] = (got == lay and Path(str(wu.get("var_dir", ""))).name == VV.arm_var_name(arm))
+    info["variants"] = {"arm": arm, "nv": lay.nv, "n_cand": 16 * lay.nv, "names": list(lay.names),
+                        "var_dir": wu.get("var_dir")}
+
+
 def check_run(run_dir: str, mem_limit_gb: float = 22.5) -> Dict[str, Any]:
     run = Path(run_dir)
     settings = json.loads((run / "launch/settings.json").read_text())
@@ -150,6 +169,8 @@ def check_run(run_dir: str, mem_limit_gb: float = 22.5) -> Dict[str, Any]:
     steps: List[Dict[str, Any]] = []
     if s["REFINER"] == "on":
         steps = _refiner_checks(run, s, checks, info)
+        if s.get("VARIANTS", "base") != "base":
+            _variants_checks(run, s["VARIANTS"], checks, info)
     else:
         checks["no_refiner_files"] = not (run / "refiner/steps_rank0.jsonl").exists()
 

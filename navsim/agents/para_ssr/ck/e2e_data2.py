@@ -3,6 +3,14 @@
 Contents
   constants                     K16 = 16 (v2 top-k), NV = 6 (variants per parent, VNAMES order), G_K = 96 (= K16 * NV,
                                 column c = k * 6 + v, k-major), streams, G_src codes, default paths
+  variant layout (ablation arms) NV / G_K / VNAMES / N_TYPES are the BASE layout (ck_e2e2.variants defaults).  Another
+                                table (ck_e2e2.variants.speeds / lats, combine 'separate'; ck/variants.VariantLayout)
+                                has V = 1 + len(speeds) + len(lats) variants per parent, 16 * V columns c = k * V + v;
+                                every class / draw below takes it explicitly (layout= a VariantLayout or its names,
+                                nv= for the column draws; None = base, which is bit for bit the code before layouts).
+                                layout_of(cfg) derives it from a config (lazy ck/variants import: main process only).
+                                Non-base layouts are recorded (rec2 chunk key 'vnames', generation meta vnames /
+                                format 'ck2_16x<V>') and checked by every reader; base files are unchanged.
   type_balanced_cols / uniform_cols / draw_cols / sample_cols
                                 per-token choice of n of the 80 non-identity variant columns (NU10; deterministic in
                                 (valid, n, rng state); sample_cols keys the rng by (token, epoch, seed, stream))
@@ -92,6 +100,38 @@ def _np(x) -> np.ndarray:
     return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
 
 
+def layout_names(layout=None) -> Tuple[str, ...]:
+    """Variant names (V order, index 0 'id') of a layout: None -> VNAMES (base); a VariantLayout (anything with .names)
+    or a sequence of names (e.g. a generation meta's vnames).  ValueError on an empty / non-unique table or one whose
+    first variant is not the identity."""
+    if layout is None:
+        return VNAMES
+    names = getattr(layout, "names", layout)
+    if isinstance(names, str):
+        raise ValueError(f"variant layout: a sequence of names expected, got {names!r}")
+    names = tuple(str(s) for s in np.asarray(names).reshape(-1).tolist()) if isinstance(names, np.ndarray) else \
+        tuple(str(s) for s in names)
+    if not names or names[0] != "id" or len(set(names)) != len(names):
+        raise ValueError(f"variant layout names {list(names)}: must start with 'id' and be unique")
+    return names
+
+
+def layout_of(x=None):
+    """ck/variants.VariantLayout of ck_e2e2.variants (validated by cands2.layout_cfg).  x = a VariantLayout (returned
+    as is), anything cfg2_dict takes (its 'variants'; missing = base), or a variants dict itself (speeds / lats /
+    combine keys).  Imports ck/variants (decoder) lazily: main process only (the objects of this module keep plain
+    names, so the dataloader workers and the labeler never import it)."""
+    from .cands2 import layout_cfg
+    from .variants import VariantLayout
+    if isinstance(x, VariantLayout):
+        return x
+    if isinstance(x, dict) and ({"speeds", "lats", "combine"} & set(x)) and "variants" not in x:
+        v = x
+    else:
+        v = cfg2_dict(x).get("variants") or {}
+    return layout_cfg(cfg2_dict(v) if not isinstance(v, dict) else dict(v))
+
+
 def cfg2_dict(x) -> Dict[str, Any]:
     """ck_e2e2 as a plain dict from ParaSSRConfig (attribute ck_e2e2) / CKE2E2Config (to_dict) / DictConfig / dict /
     None ({} = defaults)."""
@@ -137,29 +177,53 @@ def warmup_cfg(x=None) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------------------------------- variant column draw
-def _type_pools(valid: np.ndarray) -> List[np.ndarray]:
-    v = np.asarray(valid, bool).reshape(-1, NV)
-    return [np.flatnonzero(v[:, t]) * NV + t for t in range(1, NV)]          # ascending c per type 1..5
+def _valid2d(valid, nv: Optional[int] = None) -> np.ndarray:
+    """valid -> bool [P, nv] (parent-major).  nv None: the v2_final rule reshape(-1, NV) for every base input (96
+    elements in any shape, or a last axis of NV), else the last axis of a [16, V] valid; any other valid needs nv (a
+    flat width cannot be told apart: v4 / spd4 / lat4 are all 80 wide)."""
+    v = np.asarray(valid, bool)
+    if nv is None:
+        if v.size == G_K or (v.ndim >= 2 and v.shape[-1] == NV):
+            return v.reshape(-1, NV)                  # base: exactly the old reshape(-1, 6)
+        if v.ndim == 2 and v.shape[0] == K16:
+            nv = v.shape[-1]
+        else:
+            raise ValueError(f"variant valid {v.shape}: pass nv (variants per parent)")
+    nv = int(nv)
+    if nv < 1 or v.size % nv or (v.ndim >= 2 and v.shape[-1] != nv):
+        raise ValueError(f"variant valid {v.shape} is not [P, nv = {nv}]")
+    return v.reshape(-1, nv)
 
 
-def type_balanced_cols(valid: np.ndarray, n: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
+def _type_pools(valid: np.ndarray, nv: Optional[int] = None) -> List[np.ndarray]:
+    v = _valid2d(valid, nv)
+    nv = v.shape[1]
+    return [np.flatnonzero(v[:, t]) * nv + t for t in range(1, nv)]          # ascending c per type 1..nv-1
+
+
+def type_balanced_cols(valid: np.ndarray, n: int, rng: np.random.Generator, nv: Optional[int] = None
+                       ) -> Tuple[np.ndarray, np.ndarray]:
     """valid bool [16, 6] (or [96]; identity column ignored) -> (cols int64 [n] in 0..95, ok bool [n]).
+    Another layout: valid [16, V] (or flat with nv = V) -> cols in 0..16 V - 1, the V - 1 types below instead of 5.
 
     Quota n // 5 per type 1..5, the remaining n % 5 quotas +1 on the types rng.permutation(5)[:n % 5]; inside a type
     without replacement (rng.permutation); a type short of its quota -> the shortfall is filled uniformly without
     replacement from the remaining valid columns of all types; fewer than n valid columns in total -> padding by
     repetition (np.resize) with ok False; no valid column -> cols 0 (identity of rank 0), ok False.  Final order =
-    rng.permutation(n).  Deterministic in (valid, n, rng state)."""
+    rng.permutation(n).  Deterministic in (valid, n, rng state); nv = 6 makes exactly the rng calls of the base code."""
     n = int(n)
     if n < 0:
         raise ValueError(f"n {n} < 0")
     if n == 0:
         return np.zeros(0, np.int64), np.zeros(0, bool)
-    pools = _type_pools(valid)
-    quota = np.full(N_TYPES, n // N_TYPES, np.int64)
-    extra = n % N_TYPES
+    pools = _type_pools(valid, nv)
+    n_types = len(pools)                                                       # nv - 1 (N_TYPES = 5 for base)
+    if n_types == 0:
+        return np.zeros(n, np.int64), np.zeros(n, bool)
+    quota = np.full(n_types, n // n_types, np.int64)
+    extra = n % n_types
     if extra:
-        quota[rng.permutation(N_TYPES)[:extra]] += 1
+        quota[rng.permutation(n_types)[:extra]] += 1
     taken, rest = [], []
     for t, pool in enumerate(pools):
         p = pool[rng.permutation(len(pool))]
@@ -170,50 +234,54 @@ def type_balanced_cols(valid: np.ndarray, n: int, rng: np.random.Generator) -> T
     rest_all = np.concatenate(rest).astype(np.int64)
     if short > 0 and len(rest_all):
         cols = np.concatenate([cols, rest_all[rng.permutation(len(rest_all))[:short]]])
-    nv = len(cols)
-    if nv == 0:
+    n_got = len(cols)
+    if n_got == 0:
         return np.zeros(n, np.int64), np.zeros(n, bool)
     ok = np.ones(n, bool)
-    if nv < n:
+    if n_got < n:
         cols = np.resize(cols, n)
-        ok = np.arange(n) < nv
+        ok = np.arange(n) < n_got
     perm = rng.permutation(n)
     return cols[perm].astype(np.int64), ok[perm]
 
 
-def uniform_cols(valid: np.ndarray, n: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
+def uniform_cols(valid: np.ndarray, n: int, rng: np.random.Generator, nv: Optional[int] = None
+                 ) -> Tuple[np.ndarray, np.ndarray]:
     """var_sampling 'uniform' = the CK2Dataset.variant_cols rule (ck2_dataset.py:190-204): valid non-identity columns
-    in a random order, first n; fewer -> padding by repetition with ok False; none -> zeros, ok False."""
+    in a random order, first n; fewer -> padding by repetition with ok False; none -> zeros, ok False.  nv: as
+    type_balanced_cols."""
     n = int(n)
-    v = np.asarray(valid, bool).reshape(-1, NV).copy()
+    v = _valid2d(valid, nv).copy()
     v[:, 0] = False
     cols = np.flatnonzero(v.reshape(-1))
     cols = cols[rng.permutation(len(cols))]
-    nv = len(cols)
-    if nv >= n:
+    n_got = len(cols)
+    if n_got >= n:
         return cols[:n].astype(np.int64), np.ones(n, bool)
-    if nv == 0:
+    if n_got == 0:
         return np.zeros(n, np.int64), np.zeros(n, bool)
-    return np.resize(cols, n).astype(np.int64), np.arange(n) < nv
+    return np.resize(cols, n).astype(np.int64), np.arange(n) < n_got
 
 
-def draw_cols(valid: np.ndarray, n: int, rng: np.random.Generator, mode: str = "type_balanced"):
+def draw_cols(valid: np.ndarray, n: int, rng: np.random.Generator, mode: str = "type_balanced",
+              nv: Optional[int] = None):
     if mode == "type_balanced":
-        return type_balanced_cols(valid, n, rng)
+        return type_balanced_cols(valid, n, rng, nv)
     if mode == "uniform":
-        return uniform_cols(valid, n, rng)
+        return uniform_cols(valid, n, rng, nv)
     raise ValueError(f"var_sampling must be one of {VAR_SAMPLING}, got {mode!r}")
 
 
 def sample_cols(valid96, tokens: Sequence[str], epoch: int, seed: int, stream: str, n: int,
-                mode: str = "type_balanced") -> Tuple[np.ndarray, np.ndarray]:
+                mode: str = "type_balanced", nv: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
     """valid96 bool [B, 96] (numpy or tensor), tokens [B] -> cols int64 [B, n], ok bool [B, n]; per token
-    rng = token_rng(token, epoch, seed, stream) (independent of rank, worker and call order)."""
+    rng = token_rng(token, epoch, seed, stream) (independent of rank, worker and call order).  Another layout:
+    valid [B, 16 V] with nv = V (required: the flat width alone is ambiguous)."""
     v = _np(valid96).astype(bool).reshape(len(tokens), -1)
     cols = np.zeros((len(tokens), int(n)), np.int64)
     ok = np.zeros((len(tokens), int(n)), bool)
     for b, tok in enumerate(tokens):
-        cols[b], ok[b] = draw_cols(v[b], n, token_rng(str(tok), int(epoch), int(seed), stream), mode)
+        cols[b], ok[b] = draw_cols(v[b], n, token_rng(str(tok), int(epoch), int(seed), stream), mode, nv)
     return cols, ok
 
 
@@ -222,14 +290,27 @@ class WUSourceError(ValueError):
     """A warm-up source file has the wrong structure (shape / row count): a configuration error, always raised."""
 
 
+def _wu_shapes(nv: int) -> Dict[str, Tuple[int, ...]]:
+    """per-row shapes of the warm-up sources for nv variants per parent (NV: the base files)."""
+    g_k = K16 * int(nv)
+    return {"p_ok": (), "gt": (8, 3), "raw_y": (256, N_LAB), "raw_ok": (256,), "v_traj": (g_k, 8, 3),
+            "v_y": (g_k, N_LAB), "v_ok": (g_k,), "valid": (K16, int(nv)), "anchor_idx": (K16,), "built": ()}
+
+
 class _WUArrays:
     """Lazy per-process memmaps of the warm-up sources (packed ok / gt, raw256 labels / ok, variant traj / labels /
     ok) + the index.npz members (valid, anchor_idx, built; npz members are loaded, ~11 MB).  ep_target: the EP of the
-    CK targets wu_row derives from the 9 label columns (EP_TARGET_DEFAULT when not given)."""
+    CK targets wu_row derives from the 9 label columns (EP_TARGET_DEFAULT when not given).  layout: the variant layout
+    the files must have (None = base: [N, 96, ...], valid [N, 16, 6]; else [N, 16 V, ...], valid [N, 16, V] and
+    build.json names == the layout's names, n_variants == V)."""
 
-    def __init__(self, wcfg: Dict[str, Any], ep_target: str = EP_TARGET_DEFAULT):
+    def __init__(self, wcfg: Dict[str, Any], ep_target: str = EP_TARGET_DEFAULT, layout=None):
         self.cfg = dict(wcfg)
         self.ep_target = check_ep_target(ep_target)
+        self.vnames = layout_names(layout)
+        self.nv, self.g_k = len(self.vnames), K16 * len(self.vnames)
+        if self.vnames != VNAMES:                     # base instances keep the class attribute (= the old SHAPES)
+            self.SHAPES = _wu_shapes(self.nv)
         pk, rl, vd = Path(wcfg["packed"]), Path(wcfg["raw_labels"]), Path(wcfg["var_dir"])
         self.paths = {"p_ok": pk / "ok.npy", "gt": pk / "gt_traj.npy", "raw_y": rl / "labels.npy",
                       "raw_ok": rl / "ok.npy", "v_traj": vd / "traj.npy", "v_y": vd / "labels.npy",
@@ -241,8 +322,7 @@ class _WUArrays:
         d["_pid"], d["_mm"] = None, {}
         return d
 
-    SHAPES = {"p_ok": (), "gt": (8, 3), "raw_y": (256, N_LAB), "raw_ok": (256,), "v_traj": (G_K, 8, 3),
-              "v_y": (G_K, N_LAB), "v_ok": (G_K,), "valid": (K16, NV), "anchor_idx": (K16,), "built": ()}
+    SHAPES = _wu_shapes(NV)
 
     def arr(self, name: str) -> np.ndarray:
         if self._pid != os.getpid():
@@ -273,9 +353,12 @@ class _WUArrays:
             if self.arr(k).shape[0] != n:
                 raise WUSourceError(f"warm-up source {k}: {self.arr(k).shape[0]} rows != {n}")
         b = json.loads((Path(self.cfg["var_dir"]) / "build.json").read_text())
-        if list(b.get("names", [])) != list(VNAMES) or int(b.get("n_anchors", -1)) != K16:
+        if list(b.get("names", [])) != list(self.vnames) or int(b.get("n_anchors", -1)) != K16:
             raise WUSourceError(f"{self.cfg['var_dir']}/build.json: names {b.get('names')} / n_anchors "
-                             f"{b.get('n_anchors')} != {list(VNAMES)} / {K16}")
+                             f"{b.get('n_anchors')} != {list(self.vnames)} / {K16}")
+        if b.get("n_variants") is not None and int(b["n_variants"]) != self.nv:
+            raise WUSourceError(f"{self.cfg['var_dir']}/build.json: n_variants {b['n_variants']} != {self.nv} "
+                                f"({list(self.vnames)})")
         return {"n_rows": n, "var_build": {k: b.get(k) for k in ("speeds", "lats", "combine", "s_on_frac", "names",
                                                                    "cfg_sha16", "traj_sha16", "merged")},
                 "provenance": self.provenance(b)}
@@ -345,11 +428,13 @@ class _WUArrays:
         return k
 
 
-def empty_wu_row() -> Dict[str, np.ndarray]:
+def empty_wu_row(g_k: int = G_K) -> Dict[str, np.ndarray]:
+    """zeros / ok False of one row; g_k = 16 V columns of the variant layout (G_K: base)."""
+    g_k = int(g_k)
     return {"ck2_wu_ok": np.bool_(False), "ck2_gt": np.zeros((8, 3), np.float32),
             "ck2_raw_y": np.zeros((256, 5), np.float32), "ck2_raw_ok": np.zeros(256, bool),
-            "ck2_var_traj": np.zeros((G_K, 8, 3), np.float32), "ck2_var_y": np.zeros((G_K, 5), np.float32),
-            "ck2_var_ok": np.zeros(G_K, bool), "ck2_var_valid": np.zeros(G_K, bool),
+            "ck2_var_traj": np.zeros((g_k, 8, 3), np.float32), "ck2_var_y": np.zeros((g_k, 5), np.float32),
+            "ck2_var_ok": np.zeros(g_k, bool), "ck2_var_valid": np.zeros(g_k, bool),
             "ck2_var_anchor": np.zeros(K16, np.int64)}
 
 
@@ -369,19 +454,25 @@ def _targets_wu(lab9: np.ndarray, ep_target: str) -> Tuple[np.ndarray, np.ndarra
 def wu_row(src: _WUArrays, r: int) -> Dict[str, np.ndarray]:
     """Warm-up arrays of one packed row (numpy); r < 0 or an unreadable row -> empty_wu_row() (wu_ok False).
     Non-finite values are zeroed; their ok flags are False.  ck2_raw_y / ck2_var_y = ck_targets(labels, src.ep_target)
-    (_targets_wu)."""
+    (_targets_wu).  The variant arrays have src.g_k = 16 V columns (src's layout; the file shapes are checked against
+    it at first open): a layout mismatch is a WUSourceError, never an empty row."""
+    g_k = int(getattr(src, "g_k", G_K))
     if r < 0:
-        return empty_wu_row()
+        return empty_wu_row(g_k)
     A = src.arr
     try:
         if r >= src.n_rows():
-            return empty_wu_row()
+            return empty_wu_row(g_k)
         gt = np.array(A("gt")[r], np.float32)
         ep = getattr(src, "ep_target", EP_TARGET_DEFAULT)
         raw, raw_fin = _targets_wu(np.array(A("raw_y")[r], np.float32), ep)
         vt = np.array(A("v_traj")[r], np.float32)
         vy, vy_fin = _targets_wu(np.array(A("v_y")[r], np.float32), ep)
         v_fin = vy_fin & np.isfinite(vt).all((-1, -2))
+        vv = np.asarray(A("valid")[r], bool)
+        if vt.shape[0] != g_k or vv.size != g_k:        # (arr() checks the shapes; an inconsistent src is structural)
+            raise WUSourceError(f"warm-up variant row {r}: traj {vt.shape} / valid {vv.shape} != the layout's "
+                                f"{g_k} columns")
         out = {"ck2_wu_ok": np.bool_(src.keep(r)),
                "ck2_gt": np.nan_to_num(gt, nan=0.0, posinf=0.0, neginf=0.0),
                "ck2_raw_y": raw,
@@ -389,15 +480,15 @@ def wu_row(src: _WUArrays, r: int) -> Dict[str, np.ndarray]:
                "ck2_var_traj": np.where(np.isfinite(vt), vt, 0.0).astype(np.float32),
                "ck2_var_y": np.where(v_fin[:, None], vy, 0.0).astype(np.float32),
                "ck2_var_ok": np.asarray(A("v_ok")[r], bool) & v_fin,
-               "ck2_var_valid": np.asarray(A("valid")[r], bool).reshape(G_K),
+               "ck2_var_valid": vv.reshape(g_k),
                "ck2_var_anchor": np.asarray(A("anchor_idx")[r], np.int64)}
         if out["ck2_wu_ok"] and not np.isfinite(gt).all():          # pragma: no cover (keep() checks it)
             out["ck2_wu_ok"] = np.bool_(False)
         return out
     except WUSourceError:
-        raise                                       # structural (shape) error: configuration, not a row problem
+        raise                                       # structural (shape / layout) error: configuration, not a row
     except Exception:
-        return empty_wu_row()
+        return empty_wu_row(g_k)
 
 
 # ----------------------------------------------------------------------------------------------- target builder
@@ -419,6 +510,8 @@ class CK2E2ETargetBuilder(_ATB):
         labels as CK targets, CK_KEYS, EP per ck_e2e2.ep_target), ck2_raw_ok bool [256], ck2_var_traj f32 [96,8,3],
         ck2_var_y f32 [96,5] (same rule), ck2_var_ok bool [96],
         ck2_var_valid bool [96] (index.npz valid, k-major), ck2_var_anchor int64 [16]
+      (another variant layout, ck_e2e2.variants: 16 V instead of 96 columns; the warm-up var_dir must be that
+      layout's label files, checked against the layout at first open)
     Emitted for every token in every epoch (the workers do not know the epoch, NU09).
     """
 
@@ -445,7 +538,8 @@ class CK2E2ETargetBuilder(_ATB):
         self.ref_data_root = str(root)
         self.wcfg = warmup_cfg(c)
         self.ep_target = ep_target_of(c)
-        self.src = _WUArrays(self.wcfg, self.ep_target)
+        self.vnames = layout_names(layout_of(c))           # plain names: the pickled builder imports no decoder
+        self.src = _WUArrays(self.wcfg, self.ep_target, layout=self.vnames)
         self.rows = ED.RowMap(self.wcfg["packed"])
         self._gtl = None
         self._pid = None
@@ -494,13 +588,16 @@ class WarmupSampler:
       anchors   AnchorSampler(seed=sampler_seed).sample(token, ck2_gt, ck2_raw_y.T, epoch, shuffle=True) -> 32 ids
                 (8 near + 8 mid + 16 strat, random slot order) = CK2Dataset.sample_anchors
       variants  draw_cols(ck2_var_valid [16, 6], n_var, token_rng(token, epoch, seed, stream), var_sampling)
+                (layout: [16, V] of that variant layout; ck2_var_valid must be 16 V wide, else ValueError)
     Rows with ck2_wu_ok False (or a sampler error) -> ok False, anc_idx 0, group = the canonical pattern
     [0] * 8 + [1] * 8 + [2] * 16 (so 'exactly 16 near+mid per token' always holds), var_cols 0, var_pad_ok False."""
 
     def __init__(self, anchors: Optional[np.ndarray] = None, sampler_seed: int = 0, seed: int = 0, n_var: int = 32,
-                 var_sampling: str = "type_balanced"):
+                 var_sampling: str = "type_balanced", layout=None):
         if var_sampling not in VAR_SAMPLING:
             raise ValueError(f"var_sampling must be one of {VAR_SAMPLING}, got {var_sampling!r}")
+        self.vnames = layout_names(layout)
+        self.nv, self.g_k = len(self.vnames), K16 * len(self.vnames)
         self.sampler = AnchorSampler(anchors=load_anchors() if anchors is None else anchors, seed=int(sampler_seed))
         if self.sampler.K != N_WU_ANCHORS or self.sampler.n_near + self.sampler.n_mid != N_NEAR_MID:
             raise ValueError(f"AnchorSampler K {self.sampler.K} / near+mid {self.sampler.n_near + self.sampler.n_mid}"
@@ -516,7 +613,7 @@ class WarmupSampler:
         c = cfg2_dict(cfg)
         w = warmup_cfg(c)
         return cls(anchors, w["sampler_seed"], int(c.get("seed", 0)), w["n_var"],
-                   str(c.get("var_sampling", "type_balanced")))
+                   str(c.get("var_sampling", "type_balanced")), layout=layout_names(layout_of(c)))
 
     def __getstate__(self):
         d = self.__dict__.copy()
@@ -532,14 +629,18 @@ class WarmupSampler:
     def sample(self, tokens: Sequence[str], arrays: Dict[str, Any], epoch: int, stream: str = STREAM_WU,
                n_var: Optional[int] = None) -> Dict[str, np.ndarray]:
         """tokens [B]; arrays: ck2_wu_ok [B], ck2_gt [B,8,3], ck2_raw_y [B,256,5], ck2_var_valid [B,96] (numpy or
-        tensors) -> anc_idx int64 [B,32], group int8 [B,32], var_cols int64 [B,n], var_pad_ok bool [B,n], ok bool [B],
-        n_valid int64 [B] (valid non-identity variant columns)."""
+        tensors; [B, 16 V] for another layout) -> anc_idx int64 [B,32], group int8 [B,32], var_cols int64 [B,n],
+        var_pad_ok bool [B,n], ok bool [B], n_valid int64 [B] (valid non-identity variant columns)."""
         n = self.n_var if n_var is None else int(n_var)
         B = len(tokens)
         wu = _np(arrays["ck2_wu_ok"]).astype(bool).reshape(B)
         gt = _np(arrays["ck2_gt"]).astype(np.float32).reshape(B, 8, 3)
         ry = _np(arrays["ck2_raw_y"]).astype(np.float32).reshape(B, 256, 5)
-        vv = _np(arrays["ck2_var_valid"]).astype(bool).reshape(B, G_K)
+        vv = _np(arrays["ck2_var_valid"]).astype(bool)
+        if vv.size != B * self.g_k:
+            raise ValueError(f"WarmupSampler: ck2_var_valid {vv.shape} is not [{B}, {self.g_k}] = 16 x {self.nv} "
+                             f"variants {list(self.vnames)} (warm-up label files of another variant layout?)")
+        vv = vv.reshape(B, self.g_k)
         out = {"anc_idx": np.zeros((B, N_WU_ANCHORS), np.int64),
                "group": np.tile(self._canon_group, (B, 1)),
                "var_cols": np.zeros((B, n), np.int64), "var_pad_ok": np.zeros((B, n), bool),
@@ -552,23 +653,41 @@ class WarmupSampler:
             except (ValueError, AssertionError, KeyError):
                 continue
             out["anc_idx"][b], out["group"][b] = s["idx"], s["group"]
-            v = vv[b].reshape(K16, NV)
+            v = vv[b].reshape(K16, self.nv)
             out["n_valid"][b] = int(v[:, 1:].sum())
             out["var_cols"][b], out["var_pad_ok"][b] = draw_cols(v, n, token_rng(str(tok), int(epoch), self.seed,
-                                                                                  stream), self.var_sampling)
+                                                                                  stream), self.var_sampling, self.nv)
             out["ok"][b] = True
         return out
 
 
 # ----------------------------------------------------------------------------------------------- rec2 chunks
 REC2_KEYS = ("row", "traj", "valid", "cand_idx", "v2_final", "v0", "gstep")
+REC2_VNAMES = "vnames"            # optional chunk key: the variant names of a NON-base layout (absent = base, VNAMES)
 
 
-def _check_rec2(a: Dict[str, np.ndarray]) -> None:
+def rec2_vnames(a: Dict[str, Any]) -> Tuple[str, ...]:
+    """variant layout (names) of a rec2 chunk's arrays: key 'vnames' (str [V], written only for a non-base layout)
+    or VNAMES (base chunks never carry the key: byte-identical to the chunks before layouts)."""
+    if REC2_VNAMES not in a:
+        return VNAMES
+    x = np.asarray(a[REC2_VNAMES])
+    if x.ndim != 1 or x.dtype.kind != "U":
+        raise ValueError(f"rec2 chunk: vnames {x.shape} {x.dtype} is not a str [V] array")
+    return layout_names(tuple(x.tolist()))
+
+
+def _check_rec2(a: Dict[str, np.ndarray], layout=None) -> None:
+    """schema of a rec2 chunk (fmt 2; traj / valid 16 V wide for the chunk's own layout, rec2_vnames); layout given:
+    the chunk's layout must be that one (ValueError)."""
     if "fmt" not in a or int(a["fmt"]) != REC2_FMT:
         raise ValueError(f"rec2 chunk: fmt {a.get('fmt')!r} != {REC2_FMT} (a CK1 chunk in a CK2 io_dir?)")
+    vn = rec2_vnames(a)
+    if layout is not None and vn != layout_names(layout):
+        raise ValueError(f"rec2 chunk: variant layout {list(vn)} != the expected {list(layout_names(layout))}")
+    g_k = K16 * len(vn)
     n = a["row"].shape[0] if "row" in a else -1
-    want = {"row": ((n,), np.int64), "traj": ((n, G_K, 8, 3), np.float32), "valid": ((n, G_K), np.bool_),
+    want = {"row": ((n,), np.int64), "traj": ((n, g_k, 8, 3), np.float32), "valid": ((n, g_k), np.bool_),
             "cand_idx": ((n, K16), np.int16), "v2_final": ((n, K16), np.float32), "v0": ((n,), np.float32),
             "gstep": ((n,), np.int64), "epoch": ((), np.int32), "rank": ((), np.int32), "fmt": ((), np.int32)}
     for name, (shape, dt) in want.items():
@@ -579,7 +698,7 @@ def _check_rec2(a: Dict[str, np.ndarray]) -> None:
             raise ValueError(f"rec2 chunk {name}: {x.shape} {x.dtype} != {shape} {np.dtype(dt)}")
 
 
-def _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank) -> Dict[str, np.ndarray]:
+def _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank, layout=None) -> Dict[str, np.ndarray]:
     row = _np(row).astype(np.int64).reshape(-1)
     n = len(row)
     a = {"row": row, "traj": _np(traj).astype(np.float32), "valid": _np(valid).astype(bool),
@@ -588,16 +707,21 @@ def _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank) -
          "gstep": np.broadcast_to(_np(gstep).astype(np.int64).reshape(-1), (n,)).copy(),
          "epoch": np.asarray(int(epoch), np.int32), "rank": np.asarray(int(rank), np.int32),
          "fmt": np.asarray(REC2_FMT, np.int32)}
+    vn = layout_names(layout)
+    if vn != VNAMES:                                  # non-base layout only: base chunks keep the old key set
+        a[REC2_VNAMES] = np.asarray(vn, dtype=str)
     _check_rec2(a)
     return a
 
 
-def write_rec2_chunk(path: PathLike, row, traj, valid, cand_idx, v2_final, v0, gstep, epoch: int, rank: int) -> Path:
+def write_rec2_chunk(path: PathLike, row, traj, valid, cand_idx, v2_final, v0, gstep, epoch: int, rank: int,
+                     layout=None) -> Path:
     """Atomic (np.savez to '.{name}.tmp{pid}' in the same dir, then os.replace).  row int64 [n], traj f32 [n,96,8,3],
     valid bool [n,96], cand_idx int16 [n,16], v2_final f32 [n,16], v0 f32 [n], gstep int64 [n] (scalar broadcast),
-    epoch / rank int32 [], fmt int32 [] = 2."""
+    epoch / rank int32 [], fmt int32 [] = 2.  layout (None = base): another variant layout writes traj [n, 16 V, 8, 3]
+    / valid [n, 16 V] and the extra key 'vnames' (str [V])."""
     path = Path(path)
-    a = _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank)
+    a = _rec2_arrays(row, traj, valid, cand_idx, v2_final, v0, gstep, epoch, rank, layout)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".{path.name}.tmp{os.getpid()}"
     with open(tmp, "wb") as f:
@@ -606,11 +730,12 @@ def write_rec2_chunk(path: PathLike, row, traj, valid, cand_idx, v2_final, v0, g
     return path
 
 
-def read_rec2_chunk(path: PathLike) -> Dict[str, Any]:
-    """-> dict of the arrays (schema checked; fmt must be 2) + 'epoch_i' / 'rank_i' python ints."""
+def read_rec2_chunk(path: PathLike, layout=None) -> Dict[str, Any]:
+    """-> dict of the arrays (schema checked; fmt must be 2) + 'epoch_i' / 'rank_i' python ints.  The chunk's own
+    layout is rec2_vnames(result); layout given: it must be that one (ValueError)."""
     with np.load(path, allow_pickle=False) as z:
         a = {k: z[k] for k in z.files}
-    _check_rec2(a)
+    _check_rec2(a, layout)
     a["epoch_i"], a["rank_i"] = int(a["epoch"]), int(a["rank"])
     return a
 
@@ -619,10 +744,13 @@ class CandRecorder2:
     """Per-rank, per-epoch writer of the recorded 96 trajectories per token (CandRecorder logic, online.py:424-492):
     chunks of chunk_tokens tokens -> write_rec2_chunk at e2e_data.rec_chunk_path(io_dir, epoch, rank, attempt, seq);
     close_epoch() flushes the rest and writes DONE_<attempt>.json (normal epoch end only).  attempt = 8 hex chars, new
-    for every recorder (process x epoch start)."""
+    for every recorder (process x epoch start).  layout (None = base): the variant layout of the recorded 16 V
+    trajectories per token (add() refuses another width; a non-base layout is written into every chunk)."""
 
     def __init__(self, io_dir: PathLike, rank: int, world_size: int, epoch: int, chunk_tokens: int = 64,
-                 attempt: Optional[str] = None):
+                 attempt: Optional[str] = None, layout=None):
+        self.vnames = layout_names(layout)
+        self.g_k = K16 * len(self.vnames)
         self.io_dir, self.rank, self.world_size, self.epoch = str(io_dir), int(rank), int(world_size), int(epoch)
         self.chunk_tokens = int(chunk_tokens)
         if self.chunk_tokens < 1:
@@ -644,8 +772,8 @@ class CandRecorder2:
         if n == 0:
             return 0
         t = _np(traj96)
-        if t.shape[1:] != (G_K, 8, 3):
-            raise ValueError(f"CandRecorder2: traj96 {t.shape} != [n, {G_K}, 8, 3]")
+        if t.shape[1:] != (self.g_k, 8, 3):
+            raise ValueError(f"CandRecorder2: traj96 {t.shape} != [n, {self.g_k}, 8, 3]")
         self._buf["row"].append(r[keep])
         self._buf["traj"].append(t[keep].astype(np.float32))
         self._buf["valid"].append(_np(valid96)[keep].astype(bool))
@@ -664,7 +792,7 @@ class CandRecorder2:
         rest = {k: v[n:] for k, v in cat.items()}
         path = Path(ED.rec_chunk_path(self.io_dir, self.epoch, self.rank, self.attempt, self.seq))
         write_rec2_chunk(path, take["row"], take["traj"], take["valid"], take["cand_idx"], take["v2_final"],
-                         take["v0"], take["gstep"], self.epoch, self.rank)
+                         take["v0"], take["gstep"], self.epoch, self.rank, layout=self.vnames)
         self.chunks.append(path.name)
         self.seq += 1
         self.n_tokens += n
@@ -686,53 +814,101 @@ class CandRecorder2:
 
 
 # ----------------------------------------------------------------------------------------------- generations (96)
-GEN2_FILES = {"traj": ((G_K, 8, 3), np.float32, np.nan), "labels": ((G_K, N_LAB), np.float32, np.nan),
-              "cand_ok": ((G_K,), np.bool_, False), "valid": ((G_K,), np.bool_, False),
-              "row_state": ((), np.uint8, 0)}
+def _gen2_files(g_k: int) -> Dict[str, Tuple[Tuple[int, ...], Any, Any]]:
+    """per-row shape / dtype / fill of the generation files for g_k = 16 V columns (G_K: base)."""
+    g_k = int(g_k)
+    return {"traj": ((g_k, 8, 3), np.float32, np.nan), "labels": ((g_k, N_LAB), np.float32, np.nan),
+            "cand_ok": ((g_k,), np.bool_, False), "valid": ((g_k,), np.bool_, False),
+            "row_state": ((), np.uint8, 0)}
+
+
+GEN2_FILES = _gen2_files(G_K)
 GEN2_KEYS = tuple(GEN2_FILES)
 
 
-def _gen2_meta_ok(meta: Dict[str, Any], d: Path) -> None:
-    if meta.get("format") != GEN2_FORMAT or int(meta.get("k", -1)) != G_K:
+class GenLayoutError(ValueError):
+    """A generation's variant layout (meta vnames) is not the configured one (another ablation arm's io_dir)."""
+
+
+def gen2_format(layout=None) -> str:
+    """generation meta 'format': 'ck2_96' for the base layout (unchanged), 'ck2_16x<V>' for any other (never equal to
+    the base string, even for another 6-variant table; the names in meta vnames tell layouts of equal V apart)."""
+    vn = layout_names(layout)
+    return GEN2_FORMAT if vn == VNAMES else f"ck2_{K16}x{len(vn)}"
+
+
+def gen2_order(layout=None) -> str:
+    vn = layout_names(layout)
+    if vn == VNAMES:
+        return GEN2_ORDER
+    return f"c = k*{len(vn)} + v; k = v2 top-16 rank (plan_final_rewards desc); v = " + ", ".join(vn)
+
+
+def _gen2_meta_ok(meta: Dict[str, Any], d: Path, layout=None) -> Tuple[str, ...]:
+    """-> the generation's variant names.  The meta must be a self-consistent CK2 generation (format == gen2_format
+    (vnames), k == 16 V; a meta without vnames only as the base 'ck2_96' / 96); layout given: its names must be the
+    meta's (GenLayoutError)."""
+    fmt, mv = meta.get("format"), meta.get("vnames")
+    try:
+        vn = VNAMES if mv is None and fmt == GEN2_FORMAT else layout_names(mv)
+    except ValueError:
+        vn = None
+    if vn is None or fmt != gen2_format(vn) or int(meta.get("k", -1)) != K16 * len(vn):
         raise ValueError(f"generation {d}: format {meta.get('format')!r} / k {meta.get('k')} is not "
-                         f"{GEN2_FORMAT!r} / {G_K} (a CK1 generation in a CK2 io_dir?)")
+                         f"{GEN2_FORMAT!r} / {G_K} (a CK1 generation in a CK2 io_dir?)"
+                         + ("" if vn is None or vn == VNAMES else f" (vnames {list(vn)})"))
+    if layout is not None:
+        want = layout_names(layout)
+        if vn != want:
+            raise GenLayoutError(f"generation {d}: variant layout {list(vn)} ({fmt}) != the configured {list(want)} "
+                                 f"({gen2_format(want)}): an io_dir of another variant arm?")
+    return vn
 
 
-def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: str = "r") -> Dict[str, Any]:
+def open_generation2(io_dir: PathLike, epoch: int, n_rows: int = N_ROWS, mode: str = "r", layout=None
+                     ) -> Dict[str, Any]:
     """Generation memmaps {traj f32 [N,96,8,3], labels f32 [N,96,9] (LABEL_COLS), cand_ok bool [N,96], valid bool
     [N,96], row_state uint8 [N], meta, dir} (as e2e_data.open_generation):
       'w+' labeler: creates the files under a FileLock (NaN / False / 0 filled, flushed; meta.json written LAST =
            ready marker, format 'ck2_96'); an existing generation is reopened 'r+' (idempotent restart).
       'r+' labeler restart (must exist).   'r' reader (must exist).
-    A generation whose meta lacks format == 'ck2_96' is refused (ValueError)."""
+    A generation whose meta lacks format == 'ck2_96' is refused (ValueError).
+    layout (variant layout; names or a VariantLayout): 'w+' creates 16 V columns with meta k = 16 V, format
+    gen2_format(layout), vnames (None = base: exactly the files / meta above); an existing generation must have that
+    layout (GenLayoutError), also for 'r' / 'r+' when given.  'r' / 'r+' with layout None accept the meta's own
+    (self-consistent) layout: meta['vnames'] says which."""
     if mode not in ("w+", "r+", "r"):
         raise ValueError(f"open_generation2 mode {mode!r}")
     d = ED.gen_dir(io_dir, epoch)
     meta_p = d / "meta.json"
+    want = layout
     if mode == "w+":
+        vn = layout_names(layout)
+        want = vn
+        files = _gen2_files(K16 * len(vn))
         with ED._FileLock(d / ".lock"):
             if not meta_p.is_file():
                 d.mkdir(parents=True, exist_ok=True)
-                for name, (shape, dt, fill) in GEN2_FILES.items():
+                for name, (shape, dt, fill) in files.items():
                     mm = np.lib.format.open_memmap(d / f"{name}.npy", mode="w+", dtype=dt, shape=(int(n_rows),) + shape)
                     mm[...] = fill
                     mm.flush()
                     del mm
                 ED._atomic_write_json(meta_p, {
-                    "epoch": int(epoch), "n_rows": int(n_rows), "k": G_K, "format": GEN2_FORMAT, "order": GEN2_ORDER,
-                    "vnames": list(VNAMES), "label_cols": list(LABEL_COLS),
-                    "files": {n: [list(s), np.dtype(t).name] for n, (s, t, _) in GEN2_FILES.items()},
+                    "epoch": int(epoch), "n_rows": int(n_rows), "k": K16 * len(vn), "format": gen2_format(vn),
+                    "order": gen2_order(vn), "vnames": list(vn), "label_cols": list(LABEL_COLS),
+                    "files": {n: [list(s), np.dtype(t).name] for n, (s, t, _) in files.items()},
                     "row_state": "0 none, 1 done (written after traj/labels/cand_ok/valid)",
                     "created": time.time(), "utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())})
         mode = "r+"
     if not meta_p.is_file():
         raise FileNotFoundError(f"generation {d} not ready (no meta.json)")
     meta = json.loads(meta_p.read_text())
-    _gen2_meta_ok(meta, d)
+    vn = _gen2_meta_ok(meta, d, want)
     if int(meta["n_rows"]) != int(n_rows):
         raise ValueError(f"{d}: n_rows {meta['n_rows']} != {n_rows}")
     out: Dict[str, Any] = {"meta": meta, "dir": d}
-    for name, (shape, dt, _) in GEN2_FILES.items():
+    for name, (shape, dt, _) in _gen2_files(K16 * len(vn)).items():
         a = np.load(d / f"{name}.npy", mmap_mode=mode)
         if a.shape != (int(n_rows),) + shape or a.dtype != dt:
             raise ValueError(f"{d}/{name}.npy: {a.shape} {a.dtype}")
@@ -744,13 +920,15 @@ def write_generation_rows2(gen: Dict[str, Any], rows, traj, labels, cand_ok, val
                            ) -> np.ndarray:
     """Single-writer helper for the labeler: for rows not yet done (row_state != 1, unless overwrite) write traj
     [n,96,8,3], labels [n,96,9], cand_ok [n,96], valid [n,96]; flush; then row_state = 1; flush.  Duplicate rows in one
-    call: the first occurrence wins.  -> bool [n] mask of the entries actually written."""
+    call: the first occurrence wins.  -> bool [n] mask of the entries actually written.  (96 = the generation's k:
+    16 V columns of its variant layout.)"""
     rows = np.asarray(rows, np.int64).reshape(-1)
     traj, labels = np.asarray(traj, np.float32), np.asarray(labels, np.float32)
     cand_ok, valid = np.asarray(cand_ok, bool), np.asarray(valid, bool)
     n = len(rows)
-    assert traj.shape == (n, G_K, 8, 3) and labels.shape == (n, G_K, N_LAB) and cand_ok.shape == (n, G_K) \
-        and valid.shape == (n, G_K), (traj.shape, labels.shape, cand_ok.shape, valid.shape)
+    g_k = int(gen["traj"].shape[1])
+    assert traj.shape == (n, g_k, 8, 3) and labels.shape == (n, g_k, N_LAB) and cand_ok.shape == (n, g_k) \
+        and valid.shape == (n, g_k), (traj.shape, labels.shape, cand_ok.shape, valid.shape)
     st = gen["row_state"]
     _, first = np.unique(rows, return_index=True)
     w = np.zeros(n, bool)
@@ -790,13 +968,17 @@ class LabelStore2:
       token_rng(token, epoch, seed, 'ck2e2e.lab')) (NU11).  Rows without a generation (or row < 0, or out of range):
       has False, zeros, ok False -> the caller fills them (cands2.fill_fallback, NU12).  Non-finite values are zeroed
       (ok False).  tokens None -> taken from the packed RowMap.
+    layout (None = base): the run's variant layout; every generation must have it (meta vnames, GenLayoutError at
+      refresh / open), identities are then the columns k * V and G_vtype = c % V (1..V-1).
     Lazy per-process memmaps; pickling drops them and the src index (re-read on first use after a pid change).
     """
 
     def __init__(self, io_dir: PathLike, n_rows: int = N_ROWS, packed: PathLike = WARMUP_DEFAULT["packed"],
-                 var_sampling: str = "type_balanced", ep_target: str = EP_TARGET_DEFAULT):
+                 var_sampling: str = "type_balanced", ep_target: str = EP_TARGET_DEFAULT, layout=None):
         if var_sampling not in VAR_SAMPLING:
             raise ValueError(f"var_sampling must be one of {VAR_SAMPLING}")
+        self.vnames = layout_names(layout)
+        self.nv = len(self.vnames)
         self.ep_target = check_ep_target(ep_target)
         self.io_dir = Path(io_dir)
         self.n_rows = int(n_rows)
@@ -828,7 +1010,7 @@ class LabelStore2:
     def _gen(self, epoch: int) -> Dict[str, Any]:
         g = self._gens.get(epoch)
         if g is None:
-            g = self._gens[epoch] = open_generation2(self.io_dir, epoch, self.n_rows, "r")
+            g = self._gens[epoch] = open_generation2(self.io_dir, epoch, self.n_rows, "r", layout=self.vnames)
         return g
 
     def refresh(self, max_epoch: int) -> Dict[str, Any]:
@@ -845,7 +1027,7 @@ class LabelStore2:
                 meta = json.loads((gd / "meta.json").read_text())
             except (OSError, ValueError):
                 continue
-            _gen2_meta_ok(meta, gd)
+            _gen2_meta_ok(meta, gd, self.vnames)
             try:
                 st = np.array(np.load(gd / "row_state.npy", mmap_mode="r"))
             except (OSError, ValueError):
@@ -894,7 +1076,8 @@ class LabelStore2:
         gep = np.full(B, -1, np.int16)
         has = np.zeros(B, bool)
         se = self.src_epoch
-        ident = np.arange(K16, dtype=np.int64) * NV
+        nv = self.nv
+        ident = np.arange(K16, dtype=np.int64) * nv
         for b, rr in enumerate(r):
             self.cum["lookup_rows"] += 1
             if rr < 0 or rr >= self.n_rows:
@@ -906,12 +1089,12 @@ class LabelStore2:
                 self.cum["src_fallback"] += 1
                 continue
             g = self._gen(e)
-            t = np.asarray(g["traj"][rr], np.float32)                       # [96, 8, 3]
+            t = np.asarray(g["traj"][rr], np.float32)                       # [96, 8, 3] (16 V)
             lab = ck_targets(np.asarray(g["labels"][rr], np.float32), self.ep_target)     # [96, 5]
             cok = np.asarray(g["cand_ok"][rr], bool)
             val = np.asarray(g["valid"][rr], bool)
-            cols, pad = draw_cols((val & cok).reshape(K16, NV), int(n_var),
-                                  token_rng(str(tokens[b]), int(epoch), int(seed), STREAM_LAB), self.var_sampling)
+            cols, pad = draw_cols((val & cok).reshape(K16, nv), int(n_var),
+                                  token_rng(str(tokens[b]), int(epoch), int(seed), STREAM_LAB), self.var_sampling, nv)
             c = np.concatenate([ident, cols])
             o = np.concatenate([cok[ident], cok[cols] & val[cols] & pad])
             tt, yy = t[c], lab[c]
@@ -920,7 +1103,7 @@ class LabelStore2:
             traj[b] = np.where(fin_t[:, None, None], tt, 0.0)
             y[b] = np.where(fin_y[:, None], yy, 0.0)
             ok[b] = o & fin_t & fin_y
-            vt[b] = (c % NV).astype(np.int8)
+            vt[b] = (c % nv).astype(np.int8)
             col[b] = c.astype(np.int16)
             src[b] = SRC_PREV if e == self.max_epoch else SRC_OLDER
             gep[b] = e
@@ -957,7 +1140,7 @@ def ck2_warmup_prior(cfg=None, n_max: int = 4000, n_var: Optional[int] = None,
     w = warmup_cfg(cfg)
     ep = check_ep_target(ep_target) if ep_target is not None else ep_target_of(cfg)
     nv_draw = int(w["n_var"] if n_var is None else n_var)
-    src = _WUArrays(w)
+    src = _WUArrays(w, layout=layout_names(layout_of(cfg)))       # cfg's ck_e2e2.variants (base when absent)
     A = src.arr
     try:
         rows = np.flatnonzero(src.keep_all())

@@ -67,6 +67,12 @@ Non-finite: a non-finite L_CK2 is replaced by 0 * sum(student params) (counted);
 Inference (eval, infer_outputs): ck2_* outputs over the 96-candidate pool (v2 top-16 x 6 variants, c = k * 6 + v):
   CK2 logits, the learned lateral control / offsets and every column's laterally corrected trajectory; the selection
   (ck/select2.py: old ck_final blended with v2 by beta, lateral applied after selection) happens in the evaluation.
+Variant layout (ablation arms): 6 / 96 / 80 / types 1..5 above are the base table of ck_e2e2.variants.  Any 'separate'
+  table there (speeds / lats; ck/variants.VARIANT_ARMS) gives V = 1 + len(speeds) + len(lats) variants per parent:
+  the recorded / labelled / inferred pool is 16 V columns c = k * V + v (CKE2E2.layout = cands2.layout_cfg), the
+  n_var bounds are 16 (V - 1), and warmup.var_dir must hold that table's label files (validate, the data side).  The
+  per-step candidate counts (64 warm-up, 48 + 48 on-policy) do not depend on V.  No config key besides variants and
+  warmup.var_dir is involved; the base table runs the code paths of before bit for bit.
 """
 from __future__ import annotations
 
@@ -392,13 +398,14 @@ class CKE2E2Config:
             raise ValueError(f"ck_e2e2.topk must be {K16} (96-column generation layout), got {self.topk}")
         v = self.variants
         try:
-            C2.variants_cfg(v)        # 6-column 'separate' table in VNAMES order, ext const_curv | straight, dtype
+            lay = C2.layout_cfg(v)    # 'separate' table (V = 1 + speeds + lats), ext const_curv | straight, dtype
         except ValueError as e:
             raise ValueError(f"ck_e2e2.variants: {e}") from None
+        n_max = K16 * (lay.nv - 1)    # non-identity variant columns of the 16 x V pool (base 80)
         for key, n in (("n_var_step", self.n_var_step), ("warmup.n_var", self.warmup["n_var"]),
                        ("onpolicy_label.n_var", self.onpolicy_label["n_var"])):
-            if not 0 <= n <= K16 * (NV - 1):
-                raise ValueError(f"ck_e2e2.{key} must be in [0, {K16 * (NV - 1)}], got {n}")
+            if not 0 <= n <= n_max:
+                raise ValueError(f"ck_e2e2.{key} must be in [0, {n_max}], got {n}")
         if self.onpolicy_label["n_orig"] != K16:
             raise ValueError(f"ck_e2e2.onpolicy_label.n_orig must be {K16} (all identities of the generation)")
         if self.onpolicy_label["fallback"] not in ("warmup", "none"):
@@ -832,6 +839,8 @@ class CKE2E2:
 
         self.cfg = CKE2E2Config.from_any(cfg)
         self.max_epochs = int(max_epochs)
+        # variant layout of cfg.variants (16 x V pool): sampler, label store, recorder, telemetry and selection
+        self.layout = C2.layout_cfg(self.cfg.variants)
         e = self.cfg.lat_kd
         self.ema = EmaBalancer(ratio=e["ratio"], m=e["m"], floor=e["floor"], cap=e["cap"], start_step=e["start_mb"])
         self.bev_ctrl = None                 # bev_kd_arm.TeacherRatioControllers (one RatioController per teacher)
@@ -991,7 +1000,8 @@ class CKE2E2:
         if self._labels is None:
             from .e2e_data2 import LabelStore2
             self._labels = LabelStore2(self.cfg.io_dir, n_rows=N_ROWS, packed=self.cfg.warmup["packed"],
-                                       var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target)
+                                       var_sampling=self.cfg.var_sampling, ep_target=self.cfg.ep_target,
+                                       layout=self.layout)
         return self._labels
 
     def sampler(self):
@@ -1000,7 +1010,7 @@ class CKE2E2:
             from .e2e_data2 import WarmupSampler
             w = self.cfg.warmup
             self._sampler = WarmupSampler(load_anchors(), sampler_seed=w["sampler_seed"], seed=self.cfg.seed,
-                                          n_var=w["n_var"], var_sampling=self.cfg.var_sampling)
+                                          n_var=w["n_var"], var_sampling=self.cfg.var_sampling, layout=self.layout)
         return self._sampler
 
     def rowmap(self):
@@ -1041,10 +1051,12 @@ class CKE2E2:
                 raise RuntimeError(f"ck_e2e2: only {frac:.4f} of the first {self.cum['tokens']} training tokens have "
                                    f"a packed row (< strict_rows {self.cfg.strict_rows})")
 
-    def _check_inputs(self, ref_gt_ok: torch.Tensor, kd_ok: Optional[torch.Tensor]) -> None:
+    def _check_inputs(self, ref_gt_ok: torch.Tensor, kd_ok: Optional[torch.Tensor], n_pad: int = 0) -> None:
         """Partly copied caches only show up per token (GTLoader: ref_gt_ok False, teachers: kd_ok False): abort once
         the first TOKENS_CHECK tokens are in when too few of them have the surrogate GT or (teachers on) a KD target.
-        Counted and checked on rank 0 only (a missing file hits every rank alike)."""
+        Counted and checked on rank 0 only (a missing file hits every rank alike).  n_pad: padded variant slots of the
+        step (fewer valid variants than n_var; never a KD candidate, so not counted; the loss passes 0 for the base
+        table, whose counts stay the v2_final ones)."""
         if self.cfg.strict_rows <= 0 or self._inputs_checked or self.rank != 0:
             return
         c = self._inputs
@@ -1052,7 +1064,7 @@ class CKE2E2:
         c["ref_ok"] += int(ref_gt_ok.sum())
         if kd_ok is not None:
             c["kd_ok"] += int(kd_ok.sum())
-            c["kd_all"] += int(kd_ok.numel())
+            c["kd_all"] += int(kd_ok.numel()) - int(n_pad)
         if c["tokens"] < TOKENS_CHECK:
             return
         self._inputs_checked = True
@@ -1118,12 +1130,15 @@ class CKE2E2:
         lat_mask = (grp <= SUR_GROUP_MAX[c.warmup["lat_kd_groups"]]) | (grp == GROUP_VAR)
         wu = W["wu_ok"].bool()
         B = cand.shape[0]
-        vv = targets["ck2_var_valid"].reshape(B, K16, NV)
+        vv = targets["ck2_var_valid"].reshape(B, K16, self.layout.nv)
+        # padded variant slots of tokens with warm-up data (fewer valid variants than n_var: never for the base table)
+        pad_slot = torch.cat([torch.zeros_like(W["anc_idx"], dtype=torch.bool),
+                              ~W["var_pad_ok"].bool() & wu[:, None]], 1)
         return {"cand": cand, "cand_ok": W["teacher_ok"] & fin, "extra": None, "y": W["y"],
                 "ok_lab": W["ok"] & fin, "vtype_lab": W["vtype"], "grp": grp, "sur_pos": sur_pos,
                 "sur_tok_ok": wu, "lat_mask": lat_mask, "kd_tok_ok": wu, "wu_ok": wu,
                 "var_valid_frac": float(vv[:, :, 1:].float().mean()),
-                "src": torch.full((B,), SRC_FALLBACK, dtype=torch.long)}
+                "src": torch.full((B,), SRC_FALLBACK, dtype=torch.long), "pad_slot": pad_slot}
 
     def label_set(self, rows: torch.Tensor, toks: Sequence[str], targets, device) -> Dict[str, torch.Tensor]:
         """The on-policy BCE set G: LabelStore2.lookup (newest generation <= e - label_lag; 16 identities +
@@ -1163,7 +1178,8 @@ class CKE2E2:
                 "sur_tok_ok": torch.ones(B, dtype=torch.bool, device=dev),
                 "lat_mask": torch.ones(B, Kc, dtype=torch.bool, device=dev),
                 "kd_tok_ok": torch.ones(B, dtype=torch.bool, device=dev), "src": G["G_src"].long(),
-                "var_valid_frac": float(V["valid96"].reshape(B, K16, NV)[:, :, 1:].float().mean()),
+                "var_valid_frac": float(V["valid96"].reshape(B, K16, self.layout.nv)[:, :, 1:].float().mean()),
+                "pad_slot": torch.cat([torch.zeros((B, K16), dtype=torch.bool, device=dev), ~P["pad_ok"].bool()], 1),
                 "top": top, "V": V}
 
     # -------------------------------------------------------------------------------------- inference
@@ -1171,7 +1187,8 @@ class CKE2E2:
     def infer(self, student, features, predictions) -> Dict[str, torch.Tensor]:
         """eval-mode outputs over the 96-candidate pool (SPEC s5-1): fp32, decode slope 0, z_lon = 0.  Columns
         c = k * 6 + v (k = v2 top-16 rank, v = VNAMES); ck2_cand96[:, ::6] = top-16, [:, 0] = v2's trajectory.
-        predictions['trajectory'] is untouched (v2's, NU30)."""
+        predictions['trajectory'] is untouched (v2's, NU30).  Another variant layout (self.layout): 16 V columns,
+        c = k * V + v (keys unchanged); infer_select resolves its set / lateral types through that layout."""
         from ..refiner.e2e import ego_inputs
 
         bev = predictions["bev_embed"]
@@ -1192,15 +1209,18 @@ class CKE2E2:
         if sel is not None:
             from . import select2 as S2
             rule = sel.get("rule", "pdms" if sel["beta"] == 1.0 else "wote")
+            lay = self.layout
+            types = sel["set"]                         # set name: select2 resolves it through lay.sets (base: ==
+            #                                            select2.VARIANT_SETS[set], i.e. the old type ids)
             if rule == "pdms":     # plain expected PDMS of the critic (beta / v2 score / im unused)
-                idx = S2.select96_pdms(res["ck2_score_logit"], res["ck2_valid96"], types=S2.VARIANT_SETS[sel["set"]])
+                idx = S2.select96_pdms(res["ck2_score_logit"], res["ck2_valid96"], types=types, layout=lay)
             else:
                 w_sel = "default" if sel.get("rule") == "wote" else "plugin"
                 idx = S2.select96(res["ck2_v2_final"], res["ck2_v2_im"], torch.sigmoid(res["ck2_score_logit"]),
-                                  res["ck2_valid96"], sel["beta"], types=S2.VARIANT_SETS[sel["set"]], w=w_sel)
+                                  res["ck2_valid96"], sel["beta"], types=types, w=w_sel, layout=lay)
             idx_t = torch.as_tensor(np.asarray(idx.cpu() if torch.is_tensor(idx) else idx), dtype=torch.long,
                                     device=dev)
-            traj, _src = S2.final_traj(res["ck2_cand96"], res["ck2_lat_traj"], idx_t, sel["lat_mode"])
+            traj, _src = S2.final_traj(res["ck2_cand96"], res["ck2_lat_traj"], idx_t, sel["lat_mode"], layout=lay)
             res["ck2_sel_idx"] = idx_t
             res["ck2_traj"] = torch.as_tensor(np.asarray(traj.cpu() if torch.is_tensor(traj) else traj),
                                               dtype=torch.float32, device=dev)
@@ -1309,7 +1329,11 @@ class CKE2E2:
             l_ks = bev.new_zeros((), dtype=torch.float32)
             m_lat = S["cand_ok"].bool().to(dev) & S["kd_tok_ok"][:, None] & S["lat_mask"]
             l_lat = bev.new_zeros((), dtype=torch.float32)
-        self._check_inputs(ref_gt_ok, kd_ok if T is not None else None)
+        # padded variant slots (fewer valid variants than n_var) leave the KD counts only for a non-base layout: the base
+        # table keeps the v2_final counts bitwise (kd_ok_frac = kd_ok.mean(), kd_all += numel), also for the tokens whose
+        # non-finite parents leave fewer than n_var valid columns (the broken tokens strict_rows is there to catch)
+        n_pad = int(S["pad_slot"].sum()) if ("pad_slot" in S and not self.layout.is_base) else 0
+        self._check_inputs(ref_gt_ok, kd_ok if T is not None else None, n_pad)
         l_lat_val = _f(l_lat)
         if T is None:
             w = 0.0
@@ -1379,7 +1403,10 @@ class CKE2E2:
                 logs[f"ck2/bce_{name}"] = float(lb)
             logs["ck2/n_var_ok"] = float((okl & (vt > 0)).sum())
             logs["ck2/G_ok_frac"] = float(okl.float().mean()) if okl.numel() else 0.0
-            logs["ck2/kd_ok_frac"] = float(kd_ok.float().mean())
+            # a non-base layout: over the step's real KD candidates (padded variant slots, fewer valid variants than
+            # n_var, e.g. lat4 with many short parents, are not candidates); the base table: always the old expression
+            logs["ck2/kd_ok_frac"] = (float(kd_ok.float().mean()) if n_pad == 0
+                                      else float(kd_ok.sum()) / max(int(kd_ok.numel()) - n_pad, 1))
             logs["ck2/var_valid_frac"] = float(S["var_valid_frac"])
             srcn = S["src"].reshape(-1).cpu()
             if phase == "onpolicy":
@@ -1518,7 +1545,8 @@ def make_ck2_callback(agent):
             phase = ck.phase(ck.epoch)
             rec = None
             if ck.recording(ck.epoch) and phase != "warmup":
-                ck.recorder = CandRecorder2(ck.cfg.io_dir, ck.rank, ck.world_size, ck.epoch, ck.cfg.rec_chunk_tokens)
+                ck.recorder = CandRecorder2(ck.cfg.io_dir, ck.rank, ck.world_size, ck.epoch, ck.cfg.rec_chunk_tokens,
+                                            layout=ck.layout)
                 rec = ck.recorder.attempt
             stats = ck.refresh_labels() if phase == "onpolicy" else None
             ck.label_source_epoch_start()

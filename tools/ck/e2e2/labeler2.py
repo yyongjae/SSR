@@ -15,6 +15,11 @@ Input   rec/ep{E}/r{R}/c_<attempt>_<seq>.npz written by e2e_data2.CandRecorder2 
 Output  lab/ep{E}/{traj, labels, cand_ok, valid, row_state}.npy + meta.json (format 'ck2_96') via
         e2e_data2.open_generation2 / write_generation_rows2: traj = the recorded trajectories (bitwise), valid = the
         recorded validity, labels / cand_ok from score_one (ok = SCORE_COLS finite), row_state 1 written last.
+Variant layout (ablation arms, ck_e2e2.variants): taken from the chunks themselves -- a chunk of a non-base layout
+        carries 'vnames' (e2e_data2.rec2_vnames; base chunks do not) and holds 16 V trajectories per token, which are
+        ALL scored (V = 9: 144 per token, V = 5: 80); the generation of an epoch is created with the layout of its
+        first chunk (meta k = 16 V, vnames, format e2e_data2.gen2_format) and a chunk of another layout for that
+        generation is a BAD chunk (errors.jsonl).  No option needed: base runs are unchanged.
 Defaults --workers 32 (user), --world-size 2 (2-GPU run), --max-epoch 28.  CPU only, OMP_NUM_THREADS=1, os.nice(5).
 """
 from __future__ import annotations
@@ -46,24 +51,36 @@ _t = L1._t
 
 
 class Labeler2(L1.Labeler):
-    """Labeler for 96-column records / generations (see the module docstring)."""
+    """Labeler for 96-column (16 V) records / generations (see the module docstring)."""
 
     def __init__(self, io_dir, world_size: int = DEFAULT_WORLD, workers: int = DEFAULT_WORKERS,
                  skip_invalid: bool = False, **kw):
         kw.setdefault("max_epoch", DEFAULT_MAX_EPOCH)
         super().__init__(io_dir, world_size, workers, **kw)
         self.skip_invalid = bool(skip_invalid)
-        self.valid: Dict[tuple, np.ndarray] = {}         # key -> [96] bool, alongside self.traj
+        self.valid: Dict[tuple, np.ndarray] = {}         # key -> [96] (16 V) bool, alongside self.traj
 
     # ------------------------------------------------------------------- files
-    def gen(self, epoch: int) -> dict:
+    def gen(self, epoch: int, layout=None) -> dict:
+        """generation of epoch: opened once ('r+' when ready, else created 'w+' with layout; None = base when
+        creating, the meta's own layout when reopening).  layout given: it must be the generation's
+        (e2e_data2.GenLayoutError otherwise)."""
         if epoch not in self.gens:
             mode = "r+" if L1.generation_ready(self.io, epoch) else "w+"
-            g = D2.open_generation2(self.io, epoch, self.n_rows, mode)
+            g = D2.open_generation2(self.io, epoch, self.n_rows, mode, layout=layout)
             self.gens[epoch] = g
-            self.log(f"[{_t()}] generation ep{epoch:03d} opened ({mode}, {D2.GEN2_FORMAT}) rows done "
+            self.log(f"[{_t()}] generation ep{epoch:03d} opened ({mode}, {g['meta']['format']}) rows done "
                      f"{int(np.count_nonzero(np.asarray(g['row_state']) == 1))}")
+        elif layout is not None:
+            have, want = self.gen_layout(epoch), D2.layout_names(layout)
+            if have != want:
+                raise D2.GenLayoutError(f"generation ep{epoch:03d}: variant layout {list(have)} != the chunk's "
+                                        f"{list(want)}")
         return self.gens[epoch]
+
+    def gen_layout(self, epoch: int) -> tuple:
+        """variant names of an opened generation (meta vnames)."""
+        return D2.layout_names(self.gens[epoch]["meta"].get("vnames") or D2.VNAMES)
 
     # ------------------------------------------------------------------- task flow
     def _queue(self, ep: int, ckey: str, i: int, r: int, trajs: np.ndarray, valid: Optional[np.ndarray] = None):
@@ -83,8 +100,15 @@ class Labeler2(L1.Labeler):
     def _read(path):
         d = D2.read_rec2_chunk(path)
         trajs = np.asarray(d["traj"], np.float32)
-        assert trajs.ndim == 4 and trajs.shape[1:] == (G_K, 8, 3), f"{trajs.shape}: not [n, {G_K}, 8, 3]"
+        g_k = D2.K16 * len(D2.rec2_vnames(d))                       # G_K for a base chunk
+        assert trajs.ndim == 4 and trajs.shape[1:] == (g_k, 8, 3), f"{trajs.shape}: not [n, {g_k}, 8, 3]"
         return d, trajs, np.asarray(d["valid"], bool)
+
+    def _bad_chunk(self, st: dict, ep: int, path: str, e: Exception):
+        self.log(f"[{_t()}] BAD chunk {path}: {e!r}")
+        self._error(ep, dict(chunk=path, rank=st["rank"], i=-1, row=-1, token="", error=f"bad chunk: {e!r}"))
+        st["bad"] = True
+        self._finish_chunk(st)
 
     def take_chunk(self, c: dict):
         ep, path = int(c["epoch"]), str(c["path"])
@@ -93,12 +117,13 @@ class Labeler2(L1.Labeler):
         try:
             d, trajs, valid = self._read(path)
         except Exception as e:
-            self.log(f"[{_t()}] BAD chunk {path}: {e!r}")
-            self._error(ep, dict(chunk=path, rank=st["rank"], i=-1, row=-1, token="", error=f"bad chunk: {e!r}"))
-            st["bad"] = True
-            self._finish_chunk(st)
+            self._bad_chunk(st, ep, path, e)
             return
-        g = self.gen(ep)
+        try:                                  # the generation has the chunk's variant layout (created with it)
+            g = self.gen(ep, D2.rec2_vnames(d))
+        except D2.GenLayoutError as e:        # a chunk of another arm in this io_dir: BAD, never mixed in
+            self._bad_chunk(st, ep, path, e)
+            return
         rows = np.asarray(d["row"], np.int64)
         st["n"], st["kd_ok"] = len(rows), int(valid.sum())          # marker 'kd_ok' = number of valid columns here
         for i, r in enumerate(rows.tolist()):
@@ -168,6 +193,10 @@ class Labeler2(L1.Labeler):
                     self.log(f"[{_t()}] retry: chunk {path} gone")
                     continue
                 d, trajs, valid = self._read(path)
+                if D2.rec2_vnames(d) != self.gen_layout(ep):
+                    self.log(f"[{_t()}] retry: chunk {path} has variant layout {list(D2.rec2_vnames(d))}, "
+                             f"generation ep{ep:03d} {list(self.gen_layout(ep))}: skipped")
+                    continue
                 ckey = L1.RETRY + path
                 st = self._new_state(ep, sorted(items)[0][2], Path(path).name, ckey, time.time(), retry=True)
                 for i, r, _ in sorted(items):
@@ -216,7 +245,7 @@ def main(argv=None) -> int:
     ap.add_argument("--split", default=L1.SPLIT, help="metric-cache split (common.mc_path)")
     ap.add_argument("--scorer", default="official", choices=("official", "fake"), help="'fake' = tests only")
     ap.add_argument("--skip-invalid", action="store_true",
-                    help="leave valid == False (lateral duplicate) columns unscored (default: label all 96)")
+                    help="leave valid == False (lateral duplicate) columns unscored (default: label all 96 / 16 V)")
     ap.add_argument("--pid-file", default="")
     ap.add_argument("--exit-file", default="")
     a = ap.parse_args(argv)

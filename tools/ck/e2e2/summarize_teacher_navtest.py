@@ -35,6 +35,9 @@ Score quality (train_ck2.key_metrics: fail AUC per key nc / dac / ttc / comfort,
   sign(dp) == sign(dy) on pairs with |dy| > 1e-6; PDMS uses the CK-only score); within-token Spearman of the CK-only
   score vs label PDMS.
 Outputs <D> = CK_DATA/ck2/eval/navtest: metrics.json, table.md, per_token.parquet.
+Variant layout: BASE only (variants.BASE_LAYOUT, the refiner teachers' training table; NV = 6 / NVAR = 5 shapes):
+  require_base refuses producer outputs (r34_variants/meta.json names, <t>/gtfree/meta.json variants.names) of
+  another variant set.
 """
 from __future__ import annotations
 
@@ -59,7 +62,7 @@ import pandas as pd  # noqa: E402
 from navsim.agents.para_ssr.ck import constants as Cn  # noqa: E402
 from navsim.agents.para_ssr.ck.ep_target import EP_KEY_IDX, ck_targets, run_ep_target  # noqa: E402
 from navsim.agents.para_ssr.ck.select import ck_final  # noqa: E402
-from navsim.agents.para_ssr.ck.select2 import VNAMES  # noqa: E402
+from navsim.agents.para_ssr.ck.select2 import BASE_LAYOUT, VNAMES  # noqa: E402
 from tools.ck import ckutil as U  # noqa: E402
 from tools.ck.eval_ck import csv_check, lead_flags, log_bootstrap, row_metrics  # noqa: E402
 from tools.ck.train_ck2 import key_metrics  # noqa: E402
@@ -79,6 +82,16 @@ GTFREE_LABEL = {"P256": "P256 (256 anchor argmax)", "P256_lat": "P256 + lateral"
                 "P96_lat_skiplatvar": "P96 + lateral, l± 변형이면 생략 (P96_onexl)",
                 "oracle_top16": "oracle own top-16", "oracle96": "oracle 96 pool", "oracle256": "oracle 256 anchors"}
 R34_MODES = ("r34_ck_noim", "r34_old_b1", "r34_old_b0.5", "pool96_ck_noim", "pool96_old_b1")
+LAT_TYPES = tuple(BASE_LAYOUT.lat_types)                 # (4, 5) = l-0.5 / l+0.5
+
+
+def require_base(names=None, what: str = "") -> None:
+    """teacher-only summary of the BASE variant layout (SystemExit for inputs written with other variant names)."""
+    if (NV, NVAR, tuple(VNAMES)) != (BASE_LAYOUT.nv, BASE_LAYOUT.nv - 1, BASE_LAYOUT.names):
+        raise SystemExit(f"summarize_teacher_navtest: constants do not match the base variant layout {BASE_LAYOUT!r}")
+    if names is not None and tuple(names) != BASE_LAYOUT.names:
+        raise SystemExit(f"{what}: written with the variant names {list(names)}; the teacher navtest summary supports "
+                         f"only the base layout {list(BASE_LAYOUT.names)}")
 
 
 def kst(t: Optional[float] = None) -> str:
@@ -275,6 +288,10 @@ def main(argv=None) -> int:
         raise SystemExit(f"--out must be under {D}")
     t0 = time.time()
     print(f"[{kst()}] summary start", flush=True)
+    require_base((U.read_json(D / "r34_variants" / "meta.json") or {}).get("names"), str(D / "r34_variants/meta.json"))
+    for t in TEACHERS:
+        gm = D / t / "gtfree" / "meta.json"
+        require_base(((U.read_json(gm) or {}).get("variants") or {}).get("names"), str(gm))
 
     pdir = CK_DATA / "packed" / SPLIT
     tdf = pd.read_parquet(pdir / "tokens.parquet")
@@ -370,7 +387,7 @@ def main(argv=None) -> int:
         LF = L[t]["final5"][0][r]
         LP96 = to_pool(L256[ar[:, None], top16], LV)
         allowed96 = valid96 | (np.arange(K16 * NV) % NV == 0)[None]
-        is_latvar = np.isin(col % NV, (4, 5))
+        is_latvar = np.isin(col % NV, LAT_TYPES)
         chk["P256_final5_eq_raw256_pick"] = int((LF[:, 0] == L256[ar, p256]).all(1).sum())
         chk["P96off_final5_eq_pool_pick"] = int((LF[:, 2] == LP96[ar, col]).all(1).sum())
         chk["P96onexl_eq_rule"] = int((LF[:, 4] == np.where(is_latvar[:, None], LF[:, 2], LF[:, 3])).all(1).sum())

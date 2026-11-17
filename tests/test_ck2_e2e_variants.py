@@ -81,7 +81,7 @@ def test_online_variants_nonfinite_parent_and_config():
     other = (torch.arange(96) % 6) != 3
     assert torch.equal(Vc["traj96"][:, other], ref["traj96"][:, other])
     with pytest.raises(ValueError):
-        C2.variants_cfg({"combine": "cross"})                     # 12 columns != generation layout
+        C2.variants_cfg({"combine": "cross"})                     # 'separate' tables only (layout c = k * V + v)
     with pytest.raises(ValueError):
         C2.variants_cfg({"ext": "centerline_gt"})
     with pytest.raises(ValueError):

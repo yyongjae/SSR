@@ -5,6 +5,7 @@ micro-batches per phase, with the real background-labeler round trip and a resum
 
   cd /workspace/yongjae/SSR-ck2 && nice -n 10 env PYTHONPATH=$PWD OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
     CUDA_VISIBLE_DEVICES= /venv/ssr/bin/python tools/ck/e2e2/cpu_dryrun.py [--arm main|bevkd] [--tag T] [--eval]
+        [--variants base|v8|v4|spd4|lat4]
 
 Steps (output D/ck2/e2e_smoke_cpu/dryrun_<tag>_<arm>/):
   A  Trainer.fit epochs 0-1: epoch 0 'warmup' (64 official-label candidates / token, online teacher KD), epoch 1
@@ -23,6 +24,9 @@ Schedule overrides (dry run only): record_from 1, onpolicy_from 2, record_until 
   grad_share_every 1, lat_kd.start_mb 2, score_prior_rows 200, teacher = CK2 smoke teachers (smoke_ck2{T,M}_ddp2),
   teacher_amp off (CPU); bevkd arm: bev_kd.teachers [det, map], bev_kd.start_mb 2; v2 grad_norm_log_interval 1
   (BEV-KD measurement every mb).
+--variants <arm> (ck/variants.VARIANT_ARMS; default base = the run above unchanged): ck_e2e2.variants.speeds / lats of
+  the arm and warmup.var_dir = <navtrain_train label root>/<variants.arm_var_name(arm)>; output dir
+  dryrun_<tag>_<arm>_<variants>; the generation check expects e2e_data2.gen2_format(arm) (16 x V columns).
 """
 from __future__ import annotations
 
@@ -62,7 +66,7 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%F %T', time.gmtime(time.time() + 9 * 3600))} KST] [cpu_dryrun] {msg}", flush=True)
 
 
-def ck2_dict(io_dir: Path, arm: str) -> dict:
+def ck2_dict(io_dir: Path, arm: str, variants: str = "base") -> dict:
     d = {"enabled": True, "io_dir": str(io_dir), "teacher_det_run": str(SMOKE_T), "teacher_map_run": str(SMOKE_M),
          "teacher_amp": False, "score_prior_rows": 200, "record_from_epoch": 1, "onpolicy_from_epoch": 2,
          "record_until_epoch": 2, "label_refresh_every_mb": 2, "grad_share_every": 1, "lat_kd": {"start_mb": 2},
@@ -71,6 +75,11 @@ def ck2_dict(io_dir: Path, arm: str) -> dict:
          "kd_calib": {"enabled": False}}  # no KD calibration files for the smoke teachers
     if arm == "bevkd":
         d["bev_kd"] = {"enabled": True, "teachers": ["det", "map"], "start_mb": 2}
+    if variants != "base":               # ablation arm: its variant table + its warm-up label files (base: no key)
+        from navsim.agents.para_ssr.ck import e2e_data2 as D2
+        from navsim.agents.para_ssr.ck.variants import VARIANT_ARMS, arm_var_name
+        d["variants"] = {"speeds": list(VARIANT_ARMS[variants]["speeds"]), "lats": list(VARIANT_ARMS[variants]["lats"])}
+        d["warmup"] = {"var_dir": str(Path(D2.WARMUP_DEFAULT["var_dir"]).parent / arm_var_name(variants))}
     return d
 
 
@@ -211,6 +220,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tag", default=time.strftime("%m%d_%H%M", time.gmtime(time.time() + 9 * 3600)))
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--eval-only", default="", help="existing dry-run root: run only the --eval part on it")
+    ap.add_argument("--variants", default="base", choices=["base", "v8", "v4", "spd4", "lat4"],
+                    help="variant-set ablation arm (ck/variants.VARIANT_ARMS)")
     a = ap.parse_args(argv)
     assert os.environ.get("CUDA_VISIBLE_DEVICES", "x") == "", "CPU only: run with CUDA_VISIBLE_DEVICES="
     if a.eval_only:
@@ -226,13 +237,15 @@ def main(argv=None) -> int:
         rp.write_text(json.dumps(res, indent=1, default=str))
         log(f"eval-only checks {json.dumps(chk)} -> pass={res['pass']}")
         return 0 if res["pass"] else 4
-    root = D / "ck2/e2e_smoke_cpu" / f"dryrun_{a.tag}_{a.arm}"
+    root = D / "ck2/e2e_smoke_cpu" / (f"dryrun_{a.tag}_{a.arm}" + ("" if a.variants == "base" else f"_{a.variants}"))
     assert not root.exists(), f"{root} exists (new --tag)"
     io = root / "refiner"
     root.mkdir(parents=True)
-    ck2 = ck2_dict(io, a.arm)
+    ck2 = ck2_dict(io, a.arm, a.variants)
     res = {"root": str(root), "arm": a.arm, "started": time.strftime("%F %T KST", time.gmtime(time.time() + 9 * 3600)),
            "ck_e2e2": ck2}
+    if a.variants != "base":
+        res["variants"] = a.variants
     # ---- A: epochs 0 (warmup) + 1 (warmup_record)
     agent = build_agent(ck2)
     adapter0 = None if getattr(agent, "ck_bev_kd", None) is None else \
@@ -262,6 +275,10 @@ def main(argv=None) -> int:
     nonfin = [(r["mb"], k) for r in recs for k, v in r.items() if k.startswith(("ck2/", "bevkd/", "gnorm/"))
               and isinstance(v, float) and not math.isfinite(v) and not k.endswith("ratio_now")]
     onp = by_phase.get(2, [])
+    from navsim.agents.para_ssr.ck import e2e_data2 as D2
+    from navsim.agents.para_ssr.ck.variants import arm_layout
+    gen_fmt = D2.gen2_format(arm_layout(a.variants))                  # 'ck2_96' for base
+    gen_fmt_key = f"gen_format_{gen_fmt}"
     chk = {
         "phases_0_1_2": sorted(by_phase) == [0, 1, 2] and all(len(v) == 2 for v in by_phase.values()),
         "nonfinite_logs_0": not nonfin,
@@ -269,7 +286,7 @@ def main(argv=None) -> int:
         "record_ep1_ep2": all((io / f"rec/ep{e:03d}").is_dir() for e in (1, 2)),
         "gen1_bitexact": res["gen1"]["rows_labelled"] == 2 and res["gen1"]["mismatch"] == 0,
         "gen2_bitexact": res["gen2"]["rows_labelled"] == 2 and res["gen2"]["mismatch"] == 0,
-        "gen_format_ck2_96": res["gen1"]["format"] == "ck2_96",
+        gen_fmt_key: res["gen1"]["format"] == gen_fmt,
         "onpolicy_G_from_gen1": bool(onp) and all(float(r.get("ck2/G_src_prev", 0)) == 1.0 for r in onp),
         "onpolicy_96_cands": bool(onp) and all(float(r.get("ck2/n_cand", 0)) == 96.0 for r in onp),
         "resume_mb_continuous": st_a.get("mb") == 4 and st_b.get("mb") == 6,

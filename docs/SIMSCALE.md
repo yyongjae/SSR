@@ -40,7 +40,7 @@ bash $S/00_dirs_and_env.sh
 CONDA=/path/to/conda bash $S/install_env.sh
 ```
 
-`paths.env`에서 채울 것은 다음과 같습니다. 뜻은 `paths.env.example`에 있습니다.
+`paths.env`에서 채울 것은 다음과 같습니다. 뜻은 `paths.env.example`에 있습니다. 폴더는 미리 없어도 됩니다. 저장 위치와 `SSR_PLAN_DATA`는 `00_dirs_and_env.sh`가, `SSR_PY`의 env는 `install_env.sh`가, SimScale·test 링크 폴더는 2절 명령이 만듭니다. 적지 않은 변수는 기준 서버의 경로로 채워지므로 아래 것은 모두 적습니다.
 
 - 저장 위치: `SSR_DATA_ROOT`, `SSR_TEACHER_CACHE`, `SSR_RUN_ROOT`
 - 데이터: `OPENSCENE_DATA_ROOT`, `NUPLAN_MAPS_ROOT`, `SSR_TEST_DATA_ROOT`, `SSR_SIMSCALE_ROOT`

@@ -643,6 +643,8 @@ def check_arm_labels(c: Ctx, split: str, soft: bool = False) -> None:
         if r.get("n_ok") != r.get("n_expected"):
             bad.append(f"check.json n_ok {r.get('n_ok')} != n_expected {r.get('n_expected')}")
         for k in ("identity_vs_raw256", "invalid_vs_parent"):
+            if k == "invalid_vs_parent" and (r.get(k) or {}).get("n_invalid") == 0 and (r.get(k) or {}).get("n_compared") == 0:
+                continue             # no invalid variant (no lateral type: spd4, none): nothing to compare
             if (r.get(k) or {}).get("all_equal") is not True:
                 bad.append(f"check.json {k}.all_equal {(r.get(k) or {}).get('all_equal')!r}")
         with np.load(files["index.npz"], allow_pickle=False) as z:

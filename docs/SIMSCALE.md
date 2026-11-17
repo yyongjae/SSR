@@ -26,7 +26,7 @@
 
 - **받을 것**
   - 이 저장소의 브랜치 `v2_final_simscale`
-  - HF `yyongjae/ssr-cam-teachers` (비공개라 접근 권한이 필요합니다): teacher 가중치, config, 캐시 manifest, refiner teacher 2개
+  - HF `yyongjae/ssr-cam-teachers` (비공개라 접근 권한이 필요합니다): teacher 가중치, config, 캐시 manifest, refiner teacher 2개. 폴더를 파일로 받아도 됩니다(3절).
   - `pdm_score_256.npy`, `pdm_score_256.tokens.json` (0.3 GiB, 비공개 가공본): 따로 전달받아 `$SSR_PLAN_DATA`에 둡니다.
   - SimScale은 공개라 토큰이 필요 없습니다. 다운로드는 dataset revision `06a4fc88`(2026-01-25)로 고정되어 있습니다.
 
@@ -59,9 +59,29 @@ SSR_SIMSCALE_ROOT=<D>/simscale
 SSR_TEST_DATA_ROOT=<D>/navsim_test
 # 평가 코드는 test/test 구조를 읽습니다
 mkdir -p <D>/navsim_test/navsim_logs/test <D>/navsim_test/sensor_blobs/test
-ln -s <D>/navsim/navsim_logs/test <D>/navsim_test/navsim_logs/test/test
-ln -s <D>/navsim/sensor_blobs/test <D>/navsim_test/sensor_blobs/test/test
+ln -sfn <D>/navsim/navsim_logs/test <D>/navsim_test/navsim_logs/test/test
+ln -sfn <D>/navsim/sensor_blobs/test <D>/navsim_test/sensor_blobs/test/test
 ```
+
+**SimScale까지 NAVSIM 배치(`navsim_logs/<split>`, `sensor_blobs/<split>`)로 받아 두었다면** (DrivoR, TOAD 방식) 복사하지 않고 링크만 만듭니다. 우리 코드는 라운드마다 `meta_datas`와 `sensor_blobs_hist`가 한 폴더에 있어야 읽습니다.
+
+```bash
+B=/abs/benchmark      # navsim_logs, sensor_blobs, maps가 있는 폴더
+S=/abs/simscale       # 새로 만들 링크 폴더
+T=/abs/navsim_test    # 새로 만들 링크 폴더
+for r in 0 1 2 3 4; do
+  d=$S/synthetic_reaction_pdm_v1.0-$r; mkdir -p $d
+  ln -sfn "$(readlink -f $B/navsim_logs/synthetic_reaction_pdm_v1.0-$r)"  $d/meta_datas
+  ln -sfn "$(readlink -f $B/sensor_blobs/synthetic_reaction_pdm_v1.0-$r)" $d/sensor_blobs_hist
+done
+mkdir -p $T/navsim_logs/test $T/sensor_blobs/test
+ln -sfn $B/navsim_logs/test  $T/navsim_logs/test/test
+ln -sfn $B/sensor_blobs/test $T/sensor_blobs/test/test
+```
+
+- `paths.env`에는 `OPENSCENE_DATA_ROOT=$B`, `NUPLAN_MAPS_ROOT=$B/maps`, `SSR_SIMSCALE_ROOT=$S`, `SSR_TEST_DATA_ROOT=$T`를 절대경로로 씁니다.
+- 라운드 폴더 안에 장면 pkl과 장면 폴더가 바로 있어야 합니다. 링크가 틀렸거나 덜 받은 라운드가 있으면 4절의 첫 단계(토큰 표)가 장면 수를 공개값과 비교해서 멈춥니다.
+- 4절 명령에 `DOWNLOAD=1`을 붙이지 않습니다.
 
 **아직 받지 않았다면** NAVSIM은 `bash $S/10_download_dataset.sh`로 받습니다. SimScale은 4절의 명령에 `DOWNLOAD=1`을 붙이면 받습니다(2.23 TB, 100 MB/s에서 약 6시간).
 
@@ -83,6 +103,8 @@ HF_TOKEN=<본인 토큰> hf download yyongjae/ssr-cam-teachers --local-dir $SSR_
 mkdir -p $SSR_TEACHER_CACHE/refiner
 cp -r $SSR_TEACHER_CACHE/cam_teachers/refiner/{det_bevformer,map_mask2map} $SSR_TEACHER_CACHE/refiner/
 ```
+
+- `cam_teachers` 폴더(1.3 GB)를 파일로 받았다면 `hf download` 대신 그 폴더를 `$SSR_TEACHER_CACHE/cam_teachers`에 둡니다. `sha256sum -c`부터는 같습니다.
 
 ## 4. 학습 자산 (명령 하나)
 

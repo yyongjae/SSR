@@ -26,9 +26,8 @@
 
 - **받을 것**
   - 이 저장소의 브랜치 `v2_final_simscale`
-  - HF `yyongjae/ssr-cam-teachers` (비공개라 접근 권한이 필요합니다): teacher 가중치, config, 캐시 manifest, refiner teacher 2개. 폴더를 파일로 받아도 됩니다(3절).
-  - `pdm_score_256.npy`, `pdm_score_256.tokens.json` (0.3 GiB, 비공개 가공본): 따로 전달받아 `$SSR_PLAN_DATA`에 둡니다.
-  - SimScale은 공개라 토큰이 필요 없습니다. 다운로드는 dataset revision `06a4fc88`(2026-01-25)로 고정되어 있습니다.
+  - HF `yyongjae/ssr-cam-teachers`: teacher 가중치, config, 캐시 manifest, refiner teacher 2개
+  - SimScale과 teacher repo 모두 공개라 HF 토큰이 필요 없습니다. SimScale 다운로드는 dataset revision `06a4fc88`(2026-01-25)로 고정되어 있습니다.
 
 ## 1. 코드, 경로, 환경
 
@@ -43,7 +42,8 @@ CONDA=/path/to/conda bash $S/install_env.sh
 `paths.env`에서 채울 것은 다음과 같습니다. 뜻은 `paths.env.example`에 있습니다.
 
 - 저장 위치: `SSR_DATA_ROOT`, `SSR_TEACHER_CACHE`, `SSR_RUN_ROOT`
-- 데이터: `OPENSCENE_DATA_ROOT`, `NUPLAN_MAPS_ROOT`, `SSR_TEST_DATA_ROOT`, `SSR_SIMSCALE_ROOT`, `SSR_PLAN_DATA`
+- 데이터: `OPENSCENE_DATA_ROOT`, `NUPLAN_MAPS_ROOT`, `SSR_TEST_DATA_ROOT`, `SSR_SIMSCALE_ROOT`
+- `SSR_PLAN_DATA`: 빈 폴더면 됩니다. WoTE의 `pdm_score_256`을 두면 real 행 점수를 그것과 대조하는 데만 씁니다.
 - 실행 파일: `SSR_PY`, `SSR_TORCHRUN`
 - 평가에 쓰는 것: `NAVSIM_V11*`, `NAVSIM_V22*`
 
@@ -85,11 +85,10 @@ ln -sfn $B/sensor_blobs/test $T/sensor_blobs/test/test
 
 **아직 받지 않았다면** NAVSIM은 `bash $S/10_download_dataset.sh`로 받습니다. SimScale은 4절의 명령에 `DOWNLOAD=1`을 붙이면 받습니다(2.23 TB, 100 MB/s에서 약 6시간).
 
-그다음 다음 두 가지를 합니다.
+그다음 navtrain_train / navtrain_val 토큰 표를 만듭니다.
 
 ```bash
-bash $S/15_token_lists.sh                                        # navtrain_train / navtrain_val 토큰 표
-cp pdm_score_256.npy pdm_score_256.tokens.json $SSR_PLAN_DATA/
+bash $S/15_token_lists.sh
 ```
 
 ## 3. 카메라 teacher (GPU 노드에서 한 번)
@@ -98,13 +97,11 @@ cp pdm_score_256.npy pdm_score_256.tokens.json $SSR_PLAN_DATA/
 bash tools/release/teachers/get_teachers.sh $SSR_TEACHER_CACHE/_src          # BEVFormer, Mask2Map 코드 (pin + patch)
 CONDA=$(command -v conda) TEACHER_SRC=$SSR_TEACHER_CACHE/_src \
   bash tools/release/teachers/setup_teacher_env.sh $SSR_TEACHER_CACHE/_env all   # mmcv 빌드, GPU arch 자동(H100 9.0)
-HF_TOKEN=<본인 토큰> hf download yyongjae/ssr-cam-teachers --local-dir $SSR_TEACHER_CACHE/cam_teachers
+hf download yyongjae/ssr-cam-teachers --local-dir $SSR_TEACHER_CACHE/cam_teachers
 (cd $SSR_TEACHER_CACHE/cam_teachers && sha256sum -c SHA256SUMS)
 mkdir -p $SSR_TEACHER_CACHE/refiner
 cp -r $SSR_TEACHER_CACHE/cam_teachers/refiner/{det_bevformer,map_mask2map} $SSR_TEACHER_CACHE/refiner/
 ```
-
-- `cam_teachers` 폴더(1.3 GB)를 파일로 받았다면 `hf download` 대신 그 폴더를 `$SSR_TEACHER_CACHE/cam_teachers`에 둡니다. `sha256sum -c`부터는 같습니다.
 
 ## 4. 학습 자산 (명령 하나)
 

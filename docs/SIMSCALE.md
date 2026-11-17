@@ -32,8 +32,9 @@
 ## 1. 코드, 경로, 환경
 
 ```bash
-git clone <repo> SSR && cd SSR && git checkout v2_final_simscale
+git clone https://github.com/yyongjae/SSR.git SSR && cd SSR && git checkout v2_final_simscale
 cp tools/release/paths.env.example tools/release/paths.env   # 아래 경로를 채웁니다 (git에 올라가지 않습니다)
+set -a; . tools/release/paths.env; set +a                    # 채운 뒤에: 아래 명령들이 $SSR_TEACHER_CACHE 등을 씁니다
 S=tools/release/setup
 bash $S/00_dirs_and_env.sh
 CONDA=/path/to/conda bash $S/install_env.sh
@@ -67,10 +68,10 @@ ln -sfn <D>/navsim/sensor_blobs/test <D>/navsim_test/sensor_blobs/test/test
 
 ```bash
 B=/abs/benchmark      # navsim_logs, sensor_blobs, maps가 있는 폴더
-S=/abs/simscale       # 새로 만들 링크 폴더
+SIM=/abs/simscale     # 새로 만들 링크 폴더
 T=/abs/navsim_test    # 새로 만들 링크 폴더
 for r in 0 1 2 3 4; do
-  d=$S/synthetic_reaction_pdm_v1.0-$r; mkdir -p $d
+  d=$SIM/synthetic_reaction_pdm_v1.0-$r; mkdir -p $d
   ln -sfn "$(readlink -f $B/navsim_logs/synthetic_reaction_pdm_v1.0-$r)"  $d/meta_datas
   ln -sfn "$(readlink -f $B/sensor_blobs/synthetic_reaction_pdm_v1.0-$r)" $d/sensor_blobs_hist
 done
@@ -79,7 +80,7 @@ ln -sfn $B/navsim_logs/test  $T/navsim_logs/test/test
 ln -sfn $B/sensor_blobs/test $T/sensor_blobs/test/test
 ```
 
-- `paths.env`에는 `OPENSCENE_DATA_ROOT=$B`, `NUPLAN_MAPS_ROOT=$B/maps`, `SSR_SIMSCALE_ROOT=$S`, `SSR_TEST_DATA_ROOT=$T`를 절대경로로 씁니다.
+- `paths.env`에는 `OPENSCENE_DATA_ROOT=$B`, `NUPLAN_MAPS_ROOT=$B/maps`, `SSR_SIMSCALE_ROOT=$SIM`, `SSR_TEST_DATA_ROOT=$T`를 절대경로로 씁니다. 바꾼 뒤 1절의 `set -a; . tools/release/paths.env; set +a`를 다시 실행합니다.
 - 라운드 폴더 안에 장면 pkl과 장면 폴더가 바로 있어야 합니다. 링크가 틀렸거나 덜 받은 라운드가 있으면 4절의 첫 단계(토큰 표)가 장면 수를 공개값과 비교해서 멈춥니다.
 - 4절 명령에 `DOWNLOAD=1`을 붙이지 않습니다.
 
@@ -116,7 +117,7 @@ K=16 LABEL_WORKERS=48 SIDE_WORKERS=24 SIM_WORKERS=16 TEACHER_GPUS=0,1,2,3,4,5,6,
   3. GT (`30_*`)
   4. packed (`40_*`)
   5. warm-up 라벨과 점수 파일 (`50_*`)
-  6. teacher 캐시 (`65_cam_teacher_bev.sh`)
+  6. teacher 캐시 (`65_cam_teacher_bev.sh`): BEVFormer(det)와 Mask2Map(map)이 표의 모든 토큰(real 103,288 + SimScale)의 BEV를 `TEACHER_GPUS`로 캐시합니다(3.6 TB). 3절의 코드, 환경, 가중치를 씁니다.
   7. 전체 검사 (`verify_assets.py --data trainval_simscale`)
 - 끊기면 같은 명령을 다시 실행합니다. 끝난 것은 건너뜁니다.
 - 마지막 검사에 FAIL이 없어야 합니다. FAIL 줄마다 고칠 명령이 나옵니다.

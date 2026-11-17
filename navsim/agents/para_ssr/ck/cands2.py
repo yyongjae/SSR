@@ -52,7 +52,7 @@ def _floats(v) -> list:
 
 def variants_cfg(vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """VARIANTS_DEFAULT merged with vcfg; validated: a 'separate' table (c = k * V + v, the generation / label-file
-    layout; V = 1 + len(speeds) + len(lats) >= 2, names unique: ck/variants.VariantLayout), ext const_curv | straight,
+    layout; V = 1 + len(speeds) + len(lats) >= 1 (V = 1: identities only, VARIANTS=none), names unique: ck/variants.VariantLayout), ext const_curv | straight,
     compute dtype.  The default is the base 6-column table in VNAMES order.  Keys returned: those of VARIANTS_DEFAULT."""
     from .variants import EXT_MODES, VariantLayout
 
@@ -74,8 +74,6 @@ def variants_cfg(vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         raise ValueError(f"variants.combine must be 'separate' (generation / label-file layout c = k * V + v), got "
                          f"{c['combine']!r}")
     lay = VariantLayout(c["speeds"], c["lats"], c["combine"])          # value / name checks (variants._check)
-    if lay.nv < 2:
-        raise ValueError("variants: the table has no variant (speeds and lats both empty)")
     return c
 
 

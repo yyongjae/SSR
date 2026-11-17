@@ -214,6 +214,7 @@ VARIANT_ARMS: Dict[str, Dict[str, Tuple[float, ...]]] = {
     "v4": dict(speeds=(-0.5, 0.5), lats=(-0.5, 0.5)),                          # 1 per direction, V = 5, 80 cands
     "spd4": dict(speeds=(-1.0, -0.5, 0.5, 1.0), lats=()),                      # speed only, V = 5
     "lat4": dict(speeds=(), lats=(-1.0, -0.5, 0.5, 1.0)),                      # lateral only, V = 5
+    "none": dict(speeds=(), lats=()),                                          # no variants, V = 1, 16 cands
 }
 BASE_VAR_NAME = "var_separate_sampler16_accstraight"
 

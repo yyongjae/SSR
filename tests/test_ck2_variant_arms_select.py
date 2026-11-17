@@ -186,7 +186,8 @@ EXPECT_SETS = {
     "lat4": {"none": (0,), "decel": (0,), "speed": (0,), "lat": (0, 1, 2, 3, 4), "all_noaccel": (0, 1, 2, 3, 4),
              "all": tuple(range(5))},
 }
-EXPECT_LAT = {"v8": (5, 6, 7, 8), "v4": (3, 4), "spd4": (), "lat4": (1, 2, 3, 4)}
+EXPECT_SETS["none"] = {s: (0,) for s in ("none", "decel", "speed", "lat", "all_noaccel", "all")}
+EXPECT_LAT = {"v8": (5, 6, 7, 8), "v4": (3, 4), "spd4": (), "lat4": (1, 2, 3, 4), "none": ()}
 
 
 def _meaning_ok(layout: VariantLayout, name: str, t: int) -> bool:

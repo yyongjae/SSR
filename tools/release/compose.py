@@ -473,6 +473,8 @@ def set_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mapping[
     if arm != VARIANTS_BASE:         # the arm's table (combine 'separate' as the yaml); base: the yaml's own table
         v = variant_arms()[arm]
         lines += [f"variants.speeds={_float_list(v['speeds'])}", f"variants.lats={_float_list(v['lats'])}"]
+        if not v["speeds"] and not v["lats"]:   # V = 1: no variant columns to draw (16 x (V - 1) = 0)
+            lines += ["n_var_step=0", "warmup.n_var=0", "onpolicy_label.n_var=0"]
     if s["REFINER"] == "off":
         return ["enabled=false"] + lines
     if s["REFINER_KD"] == "off":     # tools/ck/e2e2/v2_nokd.set

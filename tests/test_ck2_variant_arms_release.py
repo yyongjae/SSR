@@ -32,7 +32,7 @@ from tools.release import compose as C  # noqa: E402
 from tools.release import smoke_check as SC  # noqa: E402
 from tools.release import verify_assets as VA  # noqa: E402
 
-ARMS = ("v8", "v4", "spd4", "lat4")
+ARMS = ("v8", "v4", "spd4", "lat4", "none")
 CK = "agent.config.ck_e2e2."
 SH = REPO / "scripts/experiment.sh"
 LOCAL_REGISTRY = Path("/workspace/data/registry.local.yaml")
@@ -43,7 +43,8 @@ OLD_LATS_LINE = "++agent.config.ck_e2e2.variants.lats=[-0.5,0.5]"
 WANT = {"v8": dict(nv=9, speeds=[-1.0, -0.5, 0.5, 1.0], lats=[-1.0, -0.5, 0.5, 1.0]),
         "v4": dict(nv=5, speeds=[-0.5, 0.5], lats=[-0.5, 0.5]),
         "spd4": dict(nv=5, speeds=[-1.0, -0.5, 0.5, 1.0], lats=[]),
-        "lat4": dict(nv=5, speeds=[], lats=[-1.0, -0.5, 0.5, 1.0])}
+        "lat4": dict(nv=5, speeds=[], lats=[-1.0, -0.5, 0.5, 1.0]),
+        "none": dict(nv=1, speeds=[], lats=[])}
 
 
 def _kv(c):
@@ -150,7 +151,11 @@ def test_arm_lines_name_and_layout(arm):
     assert k[CK + "variants.combine"] == "separate"
     # only the three variant lines (and the run-name lines) differ from base
     hb, hc = set(C.hash_lines(base.overrides, base.roots)), set(C.hash_lines(c.overrides, c.roots))
-    assert {C.LU._okey(x) for x in hc ^ hb} <= {CK + "variants.speeds", CK + "variants.lats", CK + "warmup.var_dir"}
+    allowed = {CK + "variants.speeds", CK + "variants.lats", CK + "warmup.var_dir"}
+    if w["nv"] == 1:                 # V = 1: no variant columns, so the three variant draw counts are 0
+        allowed |= {CK + "n_var_step", CK + "warmup.n_var", CK + "onpolicy_label.n_var"}
+        assert all(k[CK + x] == "0" for x in ("n_var_step", "warmup.n_var", "onpolicy_label.n_var"))
+    assert {C.LU._okey(x) for x in hc ^ hb} <= allowed
     ck = L2.effective_ck(c.run_dir, 8, c.set_lines, c.extra_lines)
     assert V.VariantLayout.from_cfg(ck["variants"]) == V.arm_layout(arm) and ck["warmup"]["var_dir"].endswith(V.arm_var_name(arm))
     assert L2.arm_of(ck) == "main"

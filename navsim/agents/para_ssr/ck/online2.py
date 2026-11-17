@@ -1407,7 +1407,8 @@ class CKE2E2:
             # n_var, e.g. lat4 with many short parents, are not candidates); the base table: always the old expression
             logs["ck2/kd_ok_frac"] = (float(kd_ok.float().mean()) if n_pad == 0
                                       else float(kd_ok.sum()) / max(int(kd_ok.numel()) - n_pad, 1))
-            logs["ck2/var_valid_frac"] = float(S["var_valid_frac"])
+            if self.layout.nv > 1:     # V = 1 (VARIANTS=none): no variant column, the fraction is undefined (not logged)
+                logs["ck2/var_valid_frac"] = float(S["var_valid_frac"])
             srcn = S["src"].reshape(-1).cpu()
             if phase == "onpolicy":
                 for code, name in enumerate(SRC_NAMES):

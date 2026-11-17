@@ -139,7 +139,8 @@ def test_layout_cfg_per_arm():
     assert D2.layout_of(SimpleNamespace(ck_e2e2={"variants": vcfg("v8")})) == lay("v8")
     assert D2.layout_of(O.CKE2E2Config.from_any({"variants": vcfg("lat4")})) == lay("lat4")
     assert D2.layout_of(None) == D2.layout_of({}) == D2.layout_of({"warmup": {}}) == BASE_LAYOUT
-    for bad in ({"combine": "cross"}, {"speeds": [], "lats": []}, {"speeds": [0.0]}, {"lats": [9.0]},
+    assert C2.layout_cfg({"speeds": [], "lats": []}) == lay("none") and lay("none").nv == 1   # VARIANTS=none
+    for bad in ({"combine": "cross"}, {"speeds": [0.0]}, {"lats": [9.0]},
                 {"speeds": [-0.5, -0.5]}, {"bogus": 1}, {"ext": "centerline_gt"}):
         with pytest.raises(ValueError):
             C2.variants_cfg(bad)

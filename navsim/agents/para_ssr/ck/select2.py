@@ -261,7 +261,8 @@ def layout_from_cfg(vcfg) -> VariantLayout:
     v = dict(vcfg or {})
     try:
         return VariantLayout.from_cfg({"speeds": _float_list(v.get("speeds")), "lats": _float_list(v.get("lats")),
-                                       "combine": v.get("combine")})
+                                       "combine": v.get("combine"), "cross_speeds": _float_list(v.get("cross_speeds")),
+                                       "cross_lats": _float_list(v.get("cross_lats"))})
     except (TypeError, ValueError) as e:
         raise ValueError(f"ck_e2e2.variants {v}: not a variant table ({e})") from None
 

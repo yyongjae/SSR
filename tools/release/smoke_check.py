@@ -9,7 +9,7 @@ Writes <run>/launch/smoke_check.json, prints each check, exit 1 when one fails. 
 steps_rank0.jsonl when the refiner writes one; with the refiner off, the peak of nvidia-smi's memory.used sampled by
 scripts/experiment.sh into launch/gpu_mem.csv, which counts reserved memory too, so it reads higher.
 A VARIANTS arm other than base (settings VARIANTS) adds variants_as_set: launch/refiner_effective.json has the arm's
-speeds / lats / combine and its warm-up label dir; info records the arm's V and candidate count.  No other check
+speeds / lats / combine (/ cross_speeds / cross_lats) and its warm-up label dir; info records the arm's V and candidate count.  No other check
 depends on the variant set (the record / label path of the smoke is checked by labeler_generation_0_done).
 """
 from __future__ import annotations
@@ -141,7 +141,8 @@ def _variants_checks(run: Path, arm: str, checks: Dict[str, bool], info: Dict[st
     eff = json.loads(p.read_text()) if p.is_file() else {}
     v, wu = eff.get("variants") or {}, eff.get("warmup") or {}
     try:
-        got = VV.VariantLayout(v["speeds"], v.get("lats") or [], v.get("combine") or "separate") if "speeds" in v else None
+        got = (VV.VariantLayout(v["speeds"], v.get("lats") or [], v.get("combine") or "separate", v.get("cross_speeds"),
+                                v.get("cross_lats")) if "speeds" in v else None)
     except ValueError:          # a table the variants module refuses is not the arm's
         got = None
     checks["variants_as_set"] = (got == lay and Path(str(wu.get("var_dir", ""))).name == VV.arm_var_name(arm))

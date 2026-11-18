@@ -399,12 +399,26 @@ def extra_ck_sets(extra: Sequence[str]) -> List[str]:
             if not o.startswith("~") and "=" in o and LU._okey(o).startswith(CK_OVERRIDE)]
 
 
+# optional ck_e2e2.variants keys (not in ck_e2e2.yaml, so the yaml's leaves and every run's overrides stay as they
+# were): settable by a set line, present in the effective dict only when set (= ck/cands2.VARIANTS_OPT, a test checks)
+CK_VARIANTS_OPT = ("cross_speeds", "cross_lats")
+
+
 def effective_ck(run_dir: str, ngpu: int, ck_sets: Sequence[str] = (), extra: Sequence[str] = (),
                  ck_yaml=CK2_YAML) -> Dict[str, Any]:
-    """The ck_e2e2 dict of a run: yaml, counters for ngpu, then set lines, then the extra's ck_e2e2 lines.  No check."""
+    """The ck_e2e2 dict of a run: yaml, counters for ngpu, then set lines, then the extra's ck_e2e2 lines.  No check
+    (CK_VARIANTS_OPT keys only when a line sets them)."""
     ck = scale_mb_counters(load_ck2_yaml(ck_yaml), ngpu)
     ck["io_dir"] = f"{run_dir}/{IO_SUB}"
-    return LU.apply_sets(ck, list(ck_sets) + extra_ck_sets(extra))
+    v = ck.get("variants")
+    opt = [k for k in CK_VARIANTS_OPT if isinstance(v, dict) and k not in v]
+    for k in opt:
+        v[k] = None
+    ck = LU.apply_sets(ck, list(ck_sets) + extra_ck_sets(extra))
+    for k in opt:
+        if ck["variants"].get(k) is None:
+            ck["variants"].pop(k, None)
+    return ck
 
 
 def merge_overrides(run_dir: str, ngpu: int, ck: Dict[str, Any], workers: int = 6, max_epochs: int = 30,

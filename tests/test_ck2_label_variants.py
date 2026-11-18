@@ -65,6 +65,39 @@ def test_config_validation(fake_root):
     assert a["n_variants"] == 6 and c["n_variants"] == 12 and c["names"][:6] == a["names"]
 
 
+def test_cross_subsets_config_and_build(fake_root, tmp_path):
+    """--cross-speeds / --cross-lats (VARIANTS=x13): build.json records the subsets, the table / traj use them; a subset
+    equal to the full list is the plain 'cross' config (same cfg_sha16, no extra keys)."""
+    from navsim.agents.para_ssr.ck import variants as VV
+    sp, la = [-1.0, -0.5, 0.5, 1.0], [-1.0, -0.5, 0.5, 1.0]
+    x = LV.make_config(SPLIT, root=fake_root, combine="cross", speeds=sp, lats=la, cross_speeds=[-0.5, 0.5],
+                       cross_lats=[-0.5, 0.5], ext="straight", limit=2)
+    c = LV.make_config(SPLIT, root=fake_root, combine="cross", speeds=sp, lats=la, ext="straight")
+    f = LV.make_config(SPLIT, root=fake_root, combine="cross", speeds=sp, lats=la, cross_speeds=sp, ext="straight")
+    assert x["n_variants"] == 13 and x["names"] == list(VV.arm_layout("x13").names)
+    assert x["cross_speeds"] == x["cross_lats"] == [-0.5, 0.5] and x["cfg_sha16"] != c["cfg_sha16"]
+    assert "cross_speeds" not in c and f == c
+    with pytest.raises(ValueError):
+        LV.make_config(SPLIT, root=fake_root, cross_lats=[-0.5])          # 'separate' takes no subset
+    out = LV.out_dir(SPLIT, "x13", tmp_path)
+    info = LV.ensure_built(x, out, fake_root, 1, False)
+    assert info["cross_lats"] == [-0.5, 0.5] and info["n_built"] == 2
+    traj = np.load(out / "traj.npy")
+    assert traj.shape[1] == 16 * 13
+    with np.load(out / "index.npz") as z:
+        assert z["names"].tolist() == x["names"] and z["valid"].shape[2] == 13
+        assert z["speed"][9:].tolist() == [-0.5, -0.5, 0.5, 0.5] and z["lat"][9:].tolist() == [-0.5, 0.5, -0.5, 0.5]
+    # the 13 columns are the same decode as the full 'cross' table's matching columns
+    lay_c = VV.arm_layout("cross")
+    full = LV.make_config(SPLIT, root=fake_root, combine="cross", speeds=sp, lats=la, ext="straight", limit=2)
+    outc = LV.out_dir(SPLIT, "cross", tmp_path)
+    LV.ensure_built(full, outc, fake_root, 1, False)
+    tc = np.load(outc / "traj.npy")
+    cols = [lay_c.names.index(n) for n in x["names"]]
+    for k in range(16):
+        assert np.array_equal(traj[:2, k * 13:(k + 1) * 13], tc[:2, [k * 25 + v for v in cols]])
+
+
 def test_build_sampler_cross_layout(fake_root, tmp_path):
     cfg = LV.make_config(SPLIT, combine="cross", subset="sampler", n_anchors=16, root=fake_root, limit=3)
     out = LV.out_dir(SPLIT, "t", tmp_path)

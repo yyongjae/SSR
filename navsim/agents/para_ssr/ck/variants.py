@@ -21,7 +21,9 @@ Variant definitions (refiner/decoder.py decode, no learned parameters)
 
 Variant order (V axis); 'separate' is a prefix of 'cross':
   separate: [id] + [(a, 0) for a in speeds] + [(0, D) for D in lats]                       1 + 3 + 2 = 6
-  cross   : separate + [(a, D) for a in speeds for D in lats]                              6 + 6 = 12
+  cross   : separate + [(a, D) for a in cross_speeds for D in cross_lats]                  6 + 6 = 12
+            (cross_speeds / cross_lats: optional non-empty subsets of speeds / lats, in their own order; None = all,
+            the full product.  VARIANTS=x13: 1 + 4 + 4 + (-0.5, +0.5) x (-0.5, +0.5) = 13)
   names: 'id', 'a-1.0', 'a+0.5', 'l-0.5', 'a-1.0|l+0.5', ...
 
 valid [T,K,V] (decision)
@@ -94,9 +96,20 @@ PRED_MAP_CENTERLINE = 2                                    # MAP_CLASS_NAMES = (
 
 
 # ----------------------------------------------------------------------------------------------- table / controls
-def _check(speeds: Sequence[float], lats: Sequence[float], combine: str, s_on_frac: float):
+def _check(speeds: Sequence[float], lats: Sequence[float], combine: str, s_on_frac: float,
+           cross_speeds: Optional[Sequence[float]] = None, cross_lats: Optional[Sequence[float]] = None):
     if combine not in COMBINES:
         raise ValueError(f"combine must be one of {COMBINES}, got {combine!r}")
+    for nm, sub, full in (("cross_speeds", cross_speeds, speeds), ("cross_lats", cross_lats, lats)):
+        if sub is None:
+            continue
+        if combine != "cross":
+            raise ValueError(f"{nm} needs combine 'cross', got {combine!r}")
+        sub, full = tuple(float(x) for x in sub), tuple(float(x) for x in full)
+        if not sub:
+            raise ValueError(f"{nm} is empty (no combo: use combine 'separate')")
+        if len(set(sub)) != len(sub) or any(x not in full for x in sub):
+            raise ValueError(f"{nm} {list(sub)} must be a duplicate-free subset of {list(full)}")
     for a in speeds:
         if not (np.isfinite(a) and a != 0.0 and -A_DEC < a < A_UP):
             raise ValueError(f"speed offset {a} must be finite, != 0 and in (-{A_DEC}, {A_UP})")
@@ -110,14 +123,25 @@ def _check(speeds: Sequence[float], lats: Sequence[float], combine: str, s_on_fr
 
 
 def variant_table(speeds: Sequence[float] = SPEEDS, lats: Sequence[float] = LATS,
-                  combine: str = "separate") -> List[Tuple[float, float]]:
+                  combine: str = "separate", cross_speeds: Optional[Sequence[float]] = None,
+                  cross_lats: Optional[Sequence[float]] = None) -> List[Tuple[float, float]]:
     """[(a, D_p)] in V order (index 0 = identity (0, 0)); see the module docstring."""
     speeds, lats = tuple(float(a) for a in speeds), tuple(float(d) for d in lats)
-    _check(speeds, lats, combine, S_ON_FRAC)
+    _check(speeds, lats, combine, S_ON_FRAC, cross_speeds, cross_lats)
     tab = [(0.0, 0.0)] + [(a, 0.0) for a in speeds] + [(0.0, d) for d in lats]
     if combine == "cross":
-        tab += [(a, d) for a in speeds for d in lats]
+        cs = speeds if cross_speeds is None else tuple(float(a) for a in cross_speeds)
+        cl = lats if cross_lats is None else tuple(float(d) for d in cross_lats)
+        tab += [(a, d) for a in cs for d in cl]
     return tab
+
+
+def _cross_norm(sub: Optional[Sequence[float]], full: Tuple[float, ...]) -> Optional[Tuple[float, ...]]:
+    """canonical cross subset: None for 'all of full' (also when given as full itself, same order)."""
+    if sub is None:
+        return None
+    sub = tuple(float(x) for x in sub)
+    return None if sub == full else sub
 
 
 def variant_name(a: float, d: float) -> str:
@@ -138,11 +162,16 @@ class VariantLayout:
 
     SET_NAMES = ("none", "decel", "speed", "lat", "all_noaccel", "all")
 
-    def __init__(self, speeds: Sequence[float] = SPEEDS, lats: Sequence[float] = LATS, combine: str = "separate"):
+    def __init__(self, speeds: Sequence[float] = SPEEDS, lats: Sequence[float] = LATS, combine: str = "separate",
+                 cross_speeds: Optional[Sequence[float]] = None, cross_lats: Optional[Sequence[float]] = None):
         self.speeds = tuple(float(a) for a in speeds)
         self.lats = tuple(float(d) for d in lats)
         self.combine = str(combine)
-        self.table: Tuple[Tuple[float, float], ...] = tuple(variant_table(self.speeds, self.lats, self.combine))
+        self.table: Tuple[Tuple[float, float], ...] = tuple(variant_table(self.speeds, self.lats, self.combine,
+                                                                          cross_speeds, cross_lats))
+        # combo subsets of 'cross' (None = every speed / lateral value: the full product, as before)
+        self.cross_speeds = _cross_norm(cross_speeds, self.speeds)
+        self.cross_lats = _cross_norm(cross_lats, self.lats)
         self.names: Tuple[str, ...] = tuple(variant_name(a, d) for a, d in self.table)
         if len(set(self.names)) != len(self.names):
             raise ValueError(f"variant names collide ({self.names}): use values distinct at 0.1 precision")
@@ -160,10 +189,11 @@ class VariantLayout:
 
     @classmethod
     def from_cfg(cls, vcfg: Optional[Dict] = None) -> "VariantLayout":
-        """From a ck_e2e2.variants-like dict (missing keys = base)."""
+        """From a ck_e2e2.variants-like dict (missing keys = base; cross_speeds / cross_lats optional)."""
         v = dict(vcfg or {})
         return cls(v.get("speeds") if v.get("speeds") is not None else SPEEDS,
-                   v.get("lats") if v.get("lats") is not None else LATS, v.get("combine") or "separate")
+                   v.get("lats") if v.get("lats") is not None else LATS, v.get("combine") or "separate",
+                   v.get("cross_speeds"), v.get("cross_lats"))
 
     @classmethod
     def from_meta(cls, meta: Optional[Dict]) -> "VariantLayout":
@@ -171,10 +201,17 @@ class VariantLayout:
         None or no keys = base (dumps written before layouts were recorded)."""
         if not meta or "speeds" not in meta:
             return cls()
-        return cls(meta["speeds"], meta.get("lats", []), meta.get("combine", "separate"))
+        return cls(meta["speeds"], meta.get("lats", []), meta.get("combine", "separate"), meta.get("cross_speeds"),
+                   meta.get("cross_lats"))
+
+    def cross_kw(self) -> Dict:
+        """the optional table keys (cross_speeds / cross_lats) that are set: {} for every full-product / separate
+        layout, so its meta / configs / label builds keep the keys of before."""
+        return {k: list(v) for k, v in (("cross_speeds", self.cross_speeds), ("cross_lats", self.cross_lats))
+                if v is not None}
 
     def meta(self) -> Dict:
-        return {"speeds": list(self.speeds), "lats": list(self.lats), "combine": self.combine,
+        return {"speeds": list(self.speeds), "lats": list(self.lats), "combine": self.combine, **self.cross_kw(),
                 "names": list(self.names), "nv": self.nv}
 
     @property
@@ -192,12 +229,14 @@ class VariantLayout:
         g = k * self.nv
         return np.concatenate([np.arange(0, g, self.nv), np.array([c for c in range(g) if c % self.nv], np.int64)])
 
+    def _key(self):
+        return (self.speeds, self.lats, self.combine, self.cross_speeds, self.cross_lats)
+
     def __eq__(self, other) -> bool:
-        return isinstance(other, VariantLayout) and (self.speeds, self.lats, self.combine) == (
-            other.speeds, other.lats, other.combine)
+        return isinstance(other, VariantLayout) and self._key() == other._key()
 
     def __hash__(self) -> int:
-        return hash((self.speeds, self.lats, self.combine))
+        return hash(self._key())
 
     def __repr__(self) -> str:
         return f"VariantLayout(nv={self.nv}, names={self.names})"
@@ -207,7 +246,8 @@ BASE_LAYOUT = VariantLayout()
 BASE_NAMES = BASE_LAYOUT.names              # ('id', 'a-1.0', 'a-0.5', 'a+0.5', 'l-0.5', 'l+0.5')
 
 # Variant-set ablation arms (experiment.sh VARIANTS=<arm>): speeds [m/s^2], lats [m]; combine 'separate' unless the
-# entry has combine='cross' (adds every (a, D_p) combo after the separate prefix, variant_table), K = 16.
+# entry has combine='cross' (adds the (a, D_p) combos after the separate prefix, variant_table; optional
+# cross_speeds / cross_lats restrict them to a subset, default every value), K = 16.
 # 'base' is the main recipe.  Warm-up label dir of an arm: var_separate_sampler16_accstraight[_<arm>] (base: no suffix;
 # the 'separate' in that name is the historical prefix, also for the cross arm).
 VARIANT_ARMS: Dict[str, Dict[str, object]] = {
@@ -219,6 +259,8 @@ VARIANT_ARMS: Dict[str, Dict[str, object]] = {
     "none": dict(speeds=(), lats=()),                                          # no variants, V = 1, 16 cands
     "cross": dict(speeds=(-1.0, -0.5, 0.5, 1.0), lats=(-1.0, -0.5, 0.5, 1.0),  # v8 + the 16 speed x lateral combos,
                   combine="cross"),                                            # V = 25, 400 cands
+    "x13": dict(speeds=(-1.0, -0.5, 0.5, 1.0), lats=(-1.0, -0.5, 0.5, 1.0),    # v8 + 4 combos (+-0.5 x +-0.5),
+                combine="cross", cross_speeds=(-0.5, 0.5), cross_lats=(-0.5, 0.5)),   # V = 13, 208 cands
 }
 BASE_VAR_NAME = "var_separate_sampler16_accstraight"
 
@@ -227,7 +269,8 @@ def arm_layout(arm: str) -> VariantLayout:
     if arm not in VARIANT_ARMS:
         raise ValueError(f"unknown variant arm {arm!r}; one of {sorted(VARIANT_ARMS)}")
     v = VARIANT_ARMS[arm]
-    return VariantLayout(v["speeds"], v["lats"], v.get("combine", "separate"))
+    return VariantLayout(v["speeds"], v["lats"], v.get("combine", "separate"), v.get("cross_speeds"),
+                         v.get("cross_lats"))
 
 
 def arm_combine(arm: str) -> str:
@@ -594,7 +637,8 @@ def _ext_path(rows: torch.Tensor, ext: str, cfg: Dict, curves: Optional[Dict] = 
 def make_variants(tau: torch.Tensor, v0, speeds: Sequence[float] = SPEEDS, lats: Sequence[float] = LATS,
                   combine: str = "separate", s_on_frac: float = S_ON_FRAC, *,
                   compute_dtype: torch.dtype = torch.float64, max_rows: int = MAX_ROWS, ext: str = "const_curv",
-                  ext_lines=None, ext_cfg: Optional[Dict] = None) -> Dict:
+                  ext_lines=None, ext_cfg: Optional[Dict] = None, cross_speeds: Optional[Sequence[float]] = None,
+                  cross_lats: Optional[Sequence[float]] = None) -> Dict:
     """Speed / lateral variants of every candidate.
 
     Args:
@@ -609,6 +653,7 @@ def make_variants(tau: torch.Tensor, v0, speeds: Sequence[float] = SPEEDS, lats:
       ext_lines: 'centerline_*' only: list of T entries, each a list of [P, 2] N-frame polylines (or None)
              (route_centerline_local / pred_centerlines_local).
       ext_cfg: overrides of EXT_CFG (offset, blend, du, length, fallback, min_s_end, per-mode gates).
+      cross_speeds, cross_lats: 'cross' only, the combo subsets (None = all; variant_table).
     Returns dict:
       traj  f32 [T, K, V, 8, 3]   (traj[:, :, 0] == tau.float() bitwise)
       speed f32 [V], lat f32 [V]  (a [m/s^2], D_p [m]; 0 = none)
@@ -626,10 +671,10 @@ def make_variants(tau: torch.Tensor, v0, speeds: Sequence[float] = SPEEDS, lats:
     if not tau.is_floating_point() or tau.dim() != 4 or tuple(tau.shape[2:]) != (8, 3):
         raise ValueError(f"tau must be a floating [T, K, 8, 3] tensor, got {tuple(tau.shape)} {tau.dtype}")
     speeds, lats = tuple(float(a) for a in speeds), tuple(float(d) for d in lats)
-    _check(speeds, lats, combine, s_on_frac)
+    _check(speeds, lats, combine, s_on_frac, cross_speeds, cross_lats)
     if ext not in EXT_MODES:
         raise ValueError(f"ext must be one of {EXT_MODES}, got {ext!r}")
-    tab = variant_table(speeds, lats, combine)
+    tab = variant_table(speeds, lats, combine, cross_speeds, cross_lats)
     T, K = tau.shape[:2]
     V, N = len(tab), T * K
     dev = tau.device
@@ -694,6 +739,7 @@ def make_variants(tau: torch.Tensor, v0, speeds: Sequence[float] = SPEEDS, lats:
                 lats=lats, s_on_frac=float(s_on_frac), mode=modes, z=zt, w=wt, compute_dtype=str(cd),
                 S8=S8.reshape(T, K).to(torch.float32), lat_on=lat_on.reshape(T, K),
                 dev_xy=dev_xy.reshape(T, K, V), **{k: x.reshape(T, K, V) for k, x in fl.items()})
+    meta.update(VariantLayout(speeds, lats, combine, cross_speeds, cross_lats).cross_kw())   # set subsets only
     meta["ext"] = ext
     meta["ext_on"] = torch.zeros((T, K), dtype=torch.bool, device=dev)
     if ext.startswith("centerline"):

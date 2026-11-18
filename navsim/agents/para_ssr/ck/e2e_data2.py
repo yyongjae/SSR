@@ -360,8 +360,9 @@ class _WUArrays:
         if b.get("n_variants") is not None and int(b["n_variants"]) != self.nv:
             raise WUSourceError(f"{self.cfg['var_dir']}/build.json: n_variants {b['n_variants']} != {self.nv} "
                                 f"({list(self.vnames)})")
-        return {"n_rows": n, "var_build": {k: b.get(k) for k in ("speeds", "lats", "combine", "s_on_frac", "names",
-                                                                   "cfg_sha16", "traj_sha16", "merged")},
+        return {"n_rows": n, "var_build": {**{k: b.get(k) for k in ("speeds", "lats", "combine", "s_on_frac", "names",
+                                                                      "cfg_sha16", "traj_sha16", "merged")},
+                                           **{k: b[k] for k in ("cross_speeds", "cross_lats") if k in b}},
                 "provenance": self.provenance(b)}
 
     def provenance(self, b: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -39,6 +39,7 @@ from .e2e_data2 import (G_K, GROUP_VAR, K16, N_NEAR_MID, N_WU_ANCHORS, NV, SRC_F
 
 VARIANTS_DEFAULT: Dict[str, Any] = {"speeds": [-1.0, -0.5, 0.5], "lats": [-0.5, 0.5], "combine": "separate",
                                     "s_on_frac": 0.2, "ext": "straight", "compute_dtype": "float64"}
+VARIANTS_OPT = ("cross_speeds", "cross_lats")     # optional ('cross' combo subsets, VARIANTS=x13): absent = all
 _DTYPES = {"float64": torch.float64, "float32": torch.float32, "torch.float64": torch.float64,
            "torch.float32": torch.float32}
 
@@ -53,14 +54,15 @@ def _floats(v) -> list:
 def variants_cfg(vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """VARIANTS_DEFAULT merged with vcfg; validated: a 'separate' or 'cross' table (c = k * V + v, the generation /
     label-file layout; 'separate' V = 1 + len(speeds) + len(lats) >= 1 (V = 1: identities only, VARIANTS=none), 'cross'
-    adds the len(speeds) * len(lats) combos after that prefix (variants.variant_table), names unique:
-    ck/variants.VariantLayout), ext const_curv | straight,
-    compute dtype.  The default is the base 6-column table in VNAMES order.  Keys returned: those of VARIANTS_DEFAULT."""
+    adds the combos after that prefix (all len(speeds) * len(lats), or the cross_speeds x cross_lats subsets;
+    variants.variant_table), names unique: ck/variants.VariantLayout), ext const_curv | straight,
+    compute dtype.  The default is the base 6-column table in VNAMES order.  Keys returned: those of VARIANTS_DEFAULT,
+    plus cross_speeds / cross_lats only when they restrict the product (canonical: VariantLayout.cross_kw)."""
     from .variants import EXT_MODES, VariantLayout
 
     c = dict(VARIANTS_DEFAULT)
     if vcfg:
-        bad = sorted(set(vcfg) - set(VARIANTS_DEFAULT))
+        bad = sorted(set(vcfg) - set(VARIANTS_DEFAULT) - set(VARIANTS_OPT))
         if bad:
             raise ValueError(f"variants: unknown key(s) {bad}")
         c.update({k: v for k, v in dict(vcfg).items() if v is not None})
@@ -72,7 +74,13 @@ def variants_cfg(vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         raise ValueError(f"variants.ext must be const_curv | straight (centerline needs per-token lines), got {c['ext']!r}")
     if c["compute_dtype"] not in _DTYPES:
         raise ValueError(f"variants.compute_dtype must be float64 | float32, got {c['compute_dtype']!r}")
-    VariantLayout(c["speeds"], c["lats"], c["combine"])          # combine / value / name checks (variants._check)
+    for k in VARIANTS_OPT:
+        if k in c:
+            c[k] = _floats(c[k])
+    lay = VariantLayout.from_cfg(c)          # combine / value / subset / name checks (variants._check)
+    for k in VARIANTS_OPT:
+        c.pop(k, None)
+    c.update(lay.cross_kw())
     return c
 
 
@@ -81,7 +89,7 @@ def layout_cfg(vcfg: Optional[Dict[str, Any]] = None):
     from .variants import VariantLayout
 
     c = variants_cfg(vcfg)
-    return VariantLayout(c["speeds"], c["lats"], c["combine"])
+    return VariantLayout.from_cfg(c)
 
 
 def check_variant_files(var_dir, vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -101,6 +109,10 @@ def check_variant_files(var_dir, vcfg: Optional[Dict[str, Any]] = None) -> Dict[
            "names": list(b.get("names", [])), "n_variants": int(b.get("n_variants", len(b.get("names", []))))}
     want = {"speeds": c["speeds"], "lats": c["lats"], "combine": c["combine"], "s_on_frac": c["s_on_frac"],
             "ext": c["ext"], "names": list(lay.names), "n_variants": lay.nv}
+    for k in VARIANTS_OPT:                  # combo subsets: compared when either side has them (absent = all)
+        if k in c or k in b:
+            got[k] = None if b.get(k) is None else [float(x) for x in b[k]]
+            want[k] = c.get(k)
     idx = Path(var_dir) / "index.npz"
     if idx.is_file():
         with np.load(idx, allow_pickle=False) as z:
@@ -140,7 +152,8 @@ def online_variants(cand16: torch.Tensor, v0, vcfg: Optional[Dict[str, Any]] = N
     xin = torch.where(fin[..., None, None], x, torch.zeros_like(x))
     v = torch.as_tensor(v0, device=x.device).detach().reshape(B)
     out = make_variants(xin, v, c["speeds"], c["lats"], c["combine"], c["s_on_frac"],
-                        compute_dtype=_DTYPES[c["compute_dtype"]], ext=c["ext"])
+                        compute_dtype=_DTYPES[c["compute_dtype"]], ext=c["ext"], cross_speeds=c.get("cross_speeds"),
+                        cross_lats=c.get("cross_lats"))
     V = out["traj"].shape[2]
     traj = out["traj"].reshape(B, K * V, 8, 3)
     valid = out["valid"].reshape(B, K * V).clone()

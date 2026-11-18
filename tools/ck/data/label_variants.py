@@ -3,6 +3,7 @@
 
   label_variants.py --split S [--combine separate|cross] [--subset sampler|nearest|file] [--n-anchors 16]
                     [--epoch 0] [--seed 0] [--idx-file NPY] [--speeds -1 -0.5 0.5] [--lats -0.5 0.5] [--s-on-frac 0.2]
+                    [--cross-speeds A ..] [--cross-lats D ..]   ('cross' only: combo subsets, default every value)
                     [--name NAME] [--out-root DIR] [--root R] [--limit N] [--workers 48] [--chunk 64]
                     [--build-workers 8] [--build-only | --assemble-only | --check-only] [--retry-errors] [--fresh]
 
@@ -89,11 +90,12 @@ def default_name(combine: str, subset: str, n_anchors: int) -> str:
 
 def make_config(split: str, combine: str = "separate", subset: str = "sampler", n_anchors: int = 16, epoch: int = 0,
                 seed: int = 0, idx_file: str = "", speeds=VV.SPEEDS, lats=VV.LATS, s_on_frac: float = VV.S_ON_FRAC,
-                limit: int = 0, root=None, ext: str = "const_curv") -> Dict:
+                limit: int = 0, root=None, ext: str = "const_curv", cross_speeds=None, cross_lats=None) -> Dict:
     if subset not in SUBSETS:
         raise ValueError(f"subset must be one of {SUBSETS}")
-    tab = VV.variant_table(speeds, lats, combine)          # validates speeds / lats / combine
-    VV._check(tuple(float(a) for a in speeds), tuple(float(d) for d in lats), combine, s_on_frac)
+    lay = VV.VariantLayout(speeds, lats, combine, cross_speeds, cross_lats)   # validates speeds / lats / combine / subsets
+    tab = list(lay.table)
+    VV._check(tuple(float(a) for a in speeds), tuple(float(d) for d in lats), combine, s_on_frac, cross_speeds, cross_lats)
     smp = AS.AnchorSampler(anchors=AS.load_anchors(), seed=seed)
     if subset == "sampler" and n_anchors not in (smp.n_near, smp.n_near + smp.n_mid, smp.K):
         raise ValueError(f"subset 'sampler' takes n_anchors in {(smp.n_near, smp.n_near + smp.n_mid, smp.K)}")
@@ -108,7 +110,8 @@ def make_config(split: str, combine: str = "separate", subset: str = "sampler", 
                n_anchors=int(n_anchors), epoch=int(epoch) if subset == "sampler" else None, seed=int(seed),
                idx_file=idx_file if subset == "file" else "",
                idx_file_sha16=CM.sha256_file(idx_file)[:16] if subset == "file" else "",
-               speeds=[float(a) for a in speeds], lats=[float(d) for d in lats], s_on_frac=float(s_on_frac),
+               speeds=[float(a) for a in speeds], lats=[float(d) for d in lats], **lay.cross_kw(),
+               s_on_frac=float(s_on_frac),
                n_variants=len(tab), names=[VV.variant_name(a, d) for a, d in tab], compute_dtype="torch.float64",
                anchors_file=str(AS.ANCHORS_FILE), anchors_sha16=AS.ANCHORS_SHA16, sampler=smp.config(),
                packed=str(CM.packed_dir(split, root)), n_tokens=len(toks),
@@ -120,6 +123,11 @@ def make_config(split: str, combine: str = "separate", subset: str = "sampler", 
     cfg["cfg_sha16"] = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:16]
     cfg["limit"] = int(limit)                                # not part of cfg_sha16 (but pinned by label_cands)
     return cfg
+
+
+def _table(cfg: Dict):
+    """variant table of a build config (cross_speeds / cross_lats: present only for a combo subset)."""
+    return VV.variant_table(cfg["speeds"], cfg["lats"], cfg["combine"], cfg.get("cross_speeds"), cfg.get("cross_lats"))
 
 
 # ----------------------------------------------------------------------------------------------- build (workers)
@@ -173,7 +181,8 @@ def build_chunk(rows) -> Dict:
     st = np.asarray(_B["status"][rows], np.float64)
     v0 = np.nan_to_num(np.hypot(st[:, 4], st[:, 5]), nan=0.0)                           # [T] (= cf_variants)
     out = VV.make_variants(torch.from_numpy(tau), torch.from_numpy(v0), cfg["speeds"], cfg["lats"], cfg["combine"],
-                           cfg["s_on_frac"], compute_dtype=torch.float64, ext=cfg.get("ext", "const_curv"))
+                           cfg["s_on_frac"], compute_dtype=torch.float64, ext=cfg.get("ext", "const_curv"),
+                           cross_speeds=cfg.get("cross_speeds"), cross_lats=cfg.get("cross_lats"))
     T, K = tau.shape[:2]
     V = out["traj"].shape[2]
     assert np.array_equal(out["traj"][:, :, 0].numpy(), tau), "identity variant must be the anchor bytes"
@@ -216,7 +225,7 @@ def build(cfg: Dict, out: Path, root=None, build_workers: int = 8, rows_per_task
             if (j + 1) % 50 == 0 or j + 1 == len(tasks):
                 print(f"[{time.strftime('%T')}] build {j + 1}/{len(tasks)} tasks, {time.time() - t0:.0f}s", flush=True)
     w.finalize()
-    tab = VV.variant_table(cfg["speeds"], cfg["lats"], cfg["combine"])
+    tab = _table(cfg)
     col = np.arange(K * V)
     CM.atomic_savez(out / "index.npz", **{("pass" if k == "passed" else k): v for k, v in ix.items()},
                     col_k=(col // V).astype(np.int16), col_v=(col % V).astype(np.int16),
@@ -298,7 +307,7 @@ def check(out: Path, root=None) -> Dict:
         res["identity_vs_wote_pdm_score_256"] = dict(n_compared=int(m.sum()), n_equal=per,
                                                      all_equal=all(v == int(m.sum()) for v in per.values()))
     # lateral-disabled duplicates (valid = False) vs their speed-only parent
-    tab = VV.variant_table(cfg["speeds"], cfg["lats"], cfg["combine"])
+    tab = _table(cfg)
     parent = np.array([tab.index((a, 0.0)) for a, _ in tab])
     Lp = L[:, :, parent]
     mi = ~valid & O & O[:, :, parent]
@@ -337,13 +346,14 @@ def run(split: str, combine: str = "separate", subset: str = "sampler", n_anchor
         seed: int = 0, idx_file: str = "", speeds=VV.SPEEDS, lats=VV.LATS, s_on_frac: float = VV.S_ON_FRAC,
         name: str = "", out_root=OUT_ROOT, root=None, limit: int = 0, workers: int = 48, chunk: int = 64,
         build_workers: int = 8, build_only: bool = False, assemble_only: bool = False, check_only: bool = False,
-        retry_errors: bool = False, fresh: bool = False, ext: str = "const_curv") -> Optional[Dict]:
+        retry_errors: bool = False, fresh: bool = False, ext: str = "const_curv", cross_speeds=None,
+        cross_lats=None) -> Optional[Dict]:
     name = name or default_name(combine, subset, n_anchors)
     out = out_dir(split, name, out_root)
     if check_only:
         return check(out, root)
     cfg = make_config(split, combine, subset, n_anchors, epoch, seed, idx_file, speeds, lats, s_on_frac, limit, root,
-                      ext=ext)
+                      ext=ext, cross_speeds=cross_speeds, cross_lats=cross_lats)
     print(f"[{time.strftime('%F %T')}] {split}/{name}: subset {subset} K {n_anchors} x V {cfg['n_variants']} "
           f"({combine}) = {n_anchors * cfg['n_variants']} trajectories / token, limit {limit or 'all'} -> {out}",
           flush=True)
@@ -376,6 +386,10 @@ def main(argv=None):
     ap.add_argument("--idx-file", default="")
     ap.add_argument("--speeds", type=float, nargs="*", default=list(VV.SPEEDS))
     ap.add_argument("--lats", type=float, nargs="*", default=list(VV.LATS))
+    ap.add_argument("--cross-speeds", type=float, nargs="+", default=None,
+                    help="--combine cross only: speed values of the combos (subset of --speeds; default all)")
+    ap.add_argument("--cross-lats", type=float, nargs="+", default=None,
+                    help="--combine cross only: lateral values of the combos (subset of --lats; default all)")
     ap.add_argument("--ext", default="const_curv", choices=list(VV.EXT_MODES),
                     help="accel path extension beyond S_8 (variants.make_variants ext); 'straight' for CK2 (user 10-08)")
     ap.add_argument("--s-on-frac", type=float, default=VV.S_ON_FRAC)
@@ -397,7 +411,8 @@ def main(argv=None):
     print("navsim", LC.navsim.__file__, "| score_trajectories", LC.ST.__file__, flush=True)
     run(a.split, a.combine, a.subset, a.n_anchors, a.epoch, a.seed, a.idx_file, a.speeds, a.lats, a.s_on_frac,
         a.name, a.out_root, a.root or None, a.limit, a.workers, a.chunk, a.build_workers, a.build_only,
-        a.assemble_only, a.check_only, a.retry_errors, a.fresh, ext=a.ext)
+        a.assemble_only, a.check_only, a.retry_errors, a.fresh, ext=a.ext, cross_speeds=a.cross_speeds,
+        cross_lats=a.cross_lats)
 
 
 if __name__ == "__main__":

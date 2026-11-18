@@ -9,7 +9,8 @@
 #   ARMS            default empty.  "v8 v4 spd4 lat4" (any of scripts/experiment.sh VARIANTS except base) also builds those
 #                   arms' variant label dirs, ck2/labels/<split>/var_separate_sampler16_accstraight_<arm>, with the same
 #                   label_variants call and the arm's --speeds / --lats (navsim/agents/para_ssr/ck/variants.py VARIANT_ARMS,
-#                   through tools/release/compose.py variant-args; --combine cross for the cross arm, else separate).
+#                   through tools/release/compose.py variant-args; --combine cross for cross / x13, else separate;
+#                   x13 also --cross-speeds / --cross-lats).
 #                   A split whose base outputs are complete keeps them (no rebuild, no refusal); a finished arm dir
 #                   is refused, a partial one needs RESUME=1 (never --fresh: a build may be running on it).
 #                   Each arm then goes through verify_assets --variants <arm>.

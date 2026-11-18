@@ -32,8 +32,8 @@ from navsim.agents.para_ssr.ck.variants import (BASE_LAYOUT, BASE_VAR_NAME, VARI
                                                 arm_layout, arm_var_name)
 
 torch.set_num_threads(2)
-ARMS = ("base", "v8", "v4", "spd4", "lat4", "cross")
-NV_OF = {"base": 6, "v8": 9, "v4": 5, "spd4": 5, "lat4": 5, "cross": 25}
+ARMS = ("base", "v8", "v4", "spd4", "lat4", "cross", "x13")
+NV_OF = {"base": 6, "v8": 9, "v4": 5, "spd4": 5, "lat4": 5, "cross": 25, "x13": 13}
 
 
 def vcfg(arm):
@@ -41,6 +41,9 @@ def vcfg(arm):
     d = {"speeds": list(a["speeds"]), "lats": list(a["lats"])}
     if a.get("combine", "separate") != "separate":                      # cross: as tools/release/compose.py writes it
         d["combine"] = a["combine"]
+    for k in ("cross_speeds", "cross_lats"):                            # x13: the combo subsets
+        if a.get(k) is not None:
+            d[k] = list(a[k])
     return d
 
 
@@ -129,7 +132,7 @@ def test_layout_cfg_per_arm():
         assert L == lay(arm) and L.nv == NV_OF[arm] and L.g() == 16 * NV_OF[arm]
         assert L.is_base == (arm == "base")
         c = C2.variants_cfg(vcfg(arm))
-        assert sorted(c) == sorted(C2.VARIANTS_DEFAULT)                    # no new key (C1)
+        assert sorted(c) == sorted(list(C2.VARIANTS_DEFAULT) + list(L.cross_kw()))   # no new key (C1) but x13's subsets
         assert D2.layout_of({"variants": vcfg(arm)}) == L == D2.layout_of(vcfg(arm))
         assert D2.layout_names(L) == L.names
     assert lay("v8").names == ("id", "a-1.0", "a-0.5", "a+0.5", "a+1.0", "l-1.0", "l-0.5", "l+0.5", "l+1.0")
@@ -149,6 +152,26 @@ def test_layout_cfg_per_arm():
                                            for d in (-1.0, -0.5, 0.5, 1.0))
     assert C2.layout_cfg({"speeds": "[-1.0,-0.5,0.5,1.0]", "lats": "[-1.0,-0.5,0.5,1.0]", "combine": "cross"}) == lay("cross")
     assert C2.layout_cfg(vcfg("v8")) != lay("cross")                    # combine is part of the layout
+    # VARIANTS=x13: v8's 9 + the 4 combos (-0.5, +0.5) x (-0.5, +0.5) in (a, d) order, V = 13, 208 columns
+    x = lay("x13")
+    assert x.names == lay("v8").names + ("a-0.5|l-0.5", "a-0.5|l+0.5", "a+0.5|l-0.5", "a+0.5|l+0.5") and x.nv == 13
+    assert x.table[9:] == ((-0.5, -0.5), (-0.5, 0.5), (0.5, -0.5), (0.5, 0.5)) and x != lay("cross")
+    assert x.meta()["cross_speeds"] == [-0.5, 0.5] and "cross_speeds" not in lay("cross").meta()
+    assert C2.variants_cfg(vcfg("x13"))["cross_lats"] == [-0.5, 0.5] and "cross_speeds" not in C2.variants_cfg(vcfg("cross"))
+    assert C2.layout_cfg(dict(vcfg("x13"), cross_speeds="[-0.5, 0.5]", cross_lats="[-0.5,0.5]")) == x   # CLI strings
+    # a subset equal to the full list (same order) is the full product: the 'cross' layout, canonical keys
+    full = dict(vcfg("cross"), cross_speeds=[-1.0, -0.5, 0.5, 1.0])
+    assert C2.layout_cfg(full) == lay("cross") and C2.variants_cfg(full) == C2.variants_cfg(vcfg("cross"))
+    assert C2.layout_cfg(dict(vcfg("x13"), cross_speeds=[0.5, -0.5])).table[9:11] == ((0.5, -0.5), (0.5, 0.5))
+    from navsim.agents.para_ssr.ck.variants import make_variants
+    tau = torch.from_numpy(AS.load_anchors()[:16].reshape(1, 16, 8, 3).copy())
+    mv = make_variants(tau, torch.tensor([4.0], dtype=torch.float64), *(list(x.speeds), list(x.lats), "cross"),
+                       cross_speeds=x.cross_speeds, cross_lats=x.cross_lats, ext="straight")
+    assert mv["meta"]["names"] == list(x.names) and mv["traj"].shape[2] == 13 and mv["meta"]["cross_lats"] == [-0.5, 0.5]
+    for bad in ({"cross_speeds": [-0.5]}, dict(vcfg("x13"), cross_speeds=[0.7]), dict(vcfg("x13"), cross_lats=[]),
+                dict(vcfg("x13"), cross_lats=[0.5, 0.5]), dict(vcfg("v8"), cross_speeds=[-0.5])):
+        with pytest.raises(ValueError):                                 # separate / not a subset / empty / duplicate
+            C2.variants_cfg(bad)
     for bad in ({"combine": "grid"}, {"speeds": [0.0]}, {"lats": [9.0]},
                 {"speeds": [-0.5, -0.5]}, {"bogus": 1}, {"ext": "centerline_gt"}):
         with pytest.raises(ValueError):
@@ -321,7 +344,7 @@ def _wu_dirs(root: Path, arm: str, n: int = 6, seed: int = 0, short_rows=(1,)):
              built=np.ones(n, bool), names=np.array(L.names))
     smp = AS.AnchorSampler(seed=0).config()
     build = {"names": list(L.names), "n_variants": nv, "n_anchors": 16, "speeds": list(L.speeds),
-             "lats": list(L.lats), "combine": L.combine, "s_on_frac": 0.2, "ext": "straight", "seed": 0,
+             "lats": list(L.lats), "combine": L.combine, **L.cross_kw(), "s_on_frac": 0.2, "ext": "straight", "seed": 0,
              "sampler": smp, "anchors_sha16": AS.ANCHORS_SHA16, "n_tokens": n, "token_sha16": sha}
     (vd / "build.json").write_text(json.dumps(build))
     w = D2.warmup_cfg({"packed": str(pk), "raw_labels": str(rl), "var_dir": str(vd)})

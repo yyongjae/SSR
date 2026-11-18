@@ -32,7 +32,7 @@ from tools.release import compose as C  # noqa: E402
 from tools.release import smoke_check as SC  # noqa: E402
 from tools.release import verify_assets as VA  # noqa: E402
 
-ARMS = ("v8", "v4", "spd4", "lat4", "none", "cross")
+ARMS = ("v8", "v4", "spd4", "lat4", "none", "cross", "x13")
 CK = "agent.config.ck_e2e2."
 SH = REPO / "scripts/experiment.sh"
 LOCAL_REGISTRY = Path("/workspace/data/registry.local.yaml")
@@ -45,9 +45,14 @@ WANT = {"v8": dict(nv=9, speeds=[-1.0, -0.5, 0.5, 1.0], lats=[-1.0, -0.5, 0.5, 1
         "spd4": dict(nv=5, speeds=[-1.0, -0.5, 0.5, 1.0], lats=[]),
         "lat4": dict(nv=5, speeds=[], lats=[-1.0, -0.5, 0.5, 1.0]),
         "none": dict(nv=1, speeds=[], lats=[]),
-        "cross": dict(nv=25, speeds=[-1.0, -0.5, 0.5, 1.0], lats=[-1.0, -0.5, 0.5, 1.0], combine="cross")}
+        "cross": dict(nv=25, speeds=[-1.0, -0.5, 0.5, 1.0], lats=[-1.0, -0.5, 0.5, 1.0], combine="cross"),
+        "x13": dict(nv=13, speeds=[-1.0, -0.5, 0.5, 1.0], lats=[-1.0, -0.5, 0.5, 1.0], combine="cross",
+                    cross_speeds=[-0.5, 0.5], cross_lats=[-0.5, 0.5])}
+CROSS_KEYS = ("cross_speeds", "cross_lats")
 for _w in WANT.values():
     _w.setdefault("combine", "separate")
+    for _k in CROSS_KEYS:
+        _w.setdefault(_k, None)
 
 
 def _kv(c):
@@ -69,7 +74,9 @@ def sh(*args, **extra):
 # ----------------------------------------------------------------------------------------------- the arm table
 def test_compose_reads_the_arm_table_of_the_variants_module_without_torch():
     want = {a: {"speeds": tuple(map(float, v["speeds"])), "lats": tuple(map(float, v["lats"])),
-                "combine": v.get("combine", "separate")} for a, v in V.VARIANT_ARMS.items()}
+                "combine": v.get("combine", "separate"),
+                **{k: None if v.get(k) is None else tuple(map(float, v[k])) for k in CROSS_KEYS}}
+            for a, v in V.VARIANT_ARMS.items()}
     assert C.variant_arms() == want and list(C.variant_arms())[0] == "base"
     assert C.CHOICES["VARIANTS"] == tuple(V.VARIANT_ARMS) == ("base",) + ARMS
     for a in V.VARIANT_ARMS:
@@ -79,6 +86,7 @@ def test_compose_reads_the_arm_table_of_the_variants_module_without_torch():
         assert (lay.nv, list(lay.speeds), list(lay.lats), lay.combine) == (WANT[a]["nv"], WANT[a]["speeds"],
                                                                           WANT[a]["lats"], WANT[a]["combine"])
         assert C.variant_arms()[a]["combine"] == lay.combine
+        assert {k: lay.cross_kw().get(k) for k in CROSS_KEYS} == {k: WANT[a][k] for k in CROSS_KEYS}
     code = "import sys; from tools.release import compose as C; C.compose({'VARIANTS': 'v8'}); print('torch' in sys.modules)"
     r = subprocess.run([sys.executable, "-c", code], env=_env(), capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and r.stdout.strip() == "False", r.stderr
@@ -162,6 +170,12 @@ def test_arm_lines_name_and_layout(arm):
         assert f"variants.combine={w['combine']}" in c.set_lines
     else:
         assert not any(x.startswith("variants.combine") for x in c.set_lines)
+    for key in CROSS_KEYS:           # x13 only: the combo subsets (absent from every other arm's overrides)
+        if w[key] is None:
+            assert CK + "variants." + key not in k
+        else:
+            allowed.add(CK + "variants." + key)
+            assert k[CK + "variants." + key] == C._float_list(w[key])
     if w["nv"] > 1:                  # the draw counts stay the yaml's (32 <= 16 x (V - 1)), also for 400 columns
         assert not ({CK + "n_var_step", CK + "warmup.n_var", CK + "onpolicy_label.n_var"} & {C.LU._okey(x) for x in hc ^ hb})
     if w["nv"] == 1:                 # V = 1: no variant columns, so the three variant draw counts are 0
@@ -214,7 +228,7 @@ def test_empty_variant_lists_survive_hydra():
     GlobalHydra.instance().clear()
     got = {}
     with initialize_config_dir(config_dir=str(REPO / "navsim/planning/script/config/training"), version_base="1.2"):
-        for arm in ("spd4", "lat4", "v8", "cross"):
+        for arm in ("spd4", "lat4", "v8", "cross", "x13"):
             cfg = compose(config_name="default_training", overrides=C.compose({"VARIANTS": arm}).overrides)
             got[arm] = OmegaConf.to_container(cfg.agent.config.ck_e2e2, resolve=False)
     GlobalHydra.instance().clear()
@@ -248,7 +262,8 @@ def test_records_resume_and_variant_args(tmp_path, capsys):
         out = capsys.readouterr().out.split()
         w = WANT[arm]
         comb = [] if w["combine"] == "separate" else ["--combine", w["combine"]]
-        assert out == [*comb, "--speeds", *map(repr, w["speeds"]), "--lats", *map(repr, w["lats"]), "--name",
+        sub = [x for k in CROSS_KEYS if w[k] is not None for x in ("--" + k.replace("_", "-"), *map(repr, w[k]))]
+        assert out == [*comb, "--speeds", *map(repr, w["speeds"]), "--lats", *map(repr, w["lats"]), *sub, "--name",
                        V.arm_var_name(arm)]
     assert C.main(["variant-args", "base"]) == 3 and C.main(["variant-args", "v9"]) == 3
 
@@ -256,14 +271,15 @@ def test_records_resume_and_variant_args(tmp_path, capsys):
 def test_variant_args_parse_into_the_arm_table(monkeypatch, capsys):
     from tools.ck.data import label_variants as LV
     got = {}
-    monkeypatch.setattr(LV, "run", lambda *a, **k: got.update(speeds=a[7], lats=a[8], name=a[10], combine=a[1], ext=k["ext"]))
+    monkeypatch.setattr(LV, "run", lambda *a, **k: got.update(speeds=a[7], lats=a[8], name=a[10], combine=a[1], ext=k["ext"],
+                                                               cs=k["cross_speeds"], cl=k["cross_lats"]))
     flags = {}
     for arm in ARMS:
         C.main(["variant-args", arm])
         flags[arm] = capsys.readouterr().out.split()
     for arm in ARMS:
         LV.main(["--split", "navtrain_train", "--ext", "straight", *flags[arm], "--workers", "48"])   # combine: default
-        assert V.VariantLayout(got["speeds"], got["lats"], got["combine"]) == V.arm_layout(arm), arm
+        assert V.VariantLayout(got["speeds"], got["lats"], got["combine"], got["cs"], got["cl"]) == V.arm_layout(arm), arm
         assert got["name"] == V.arm_var_name(arm) and got["ext"] == "straight"
 
 
@@ -348,7 +364,7 @@ def _label_dir(d: Path, lay, rng, base=None, split="navtrain_train"):
              col_v=(cols % lay.nv).astype(np.int16))
     name = d.name
     (d / "build.json").write_text(json.dumps(dict(
-        names=list(lay.names), n_variants=lay.nv, speeds=list(lay.speeds), lats=list(lay.lats), combine=lay.combine,
+        names=list(lay.names), n_variants=lay.nv, speeds=list(lay.speeds), lats=list(lay.lats), combine=lay.combine, **lay.cross_kw(),
         ext="straight", subset="sampler", n_anchors=16, epoch=0, seed=0, limit=0, s_on_frac=V.S_ON_FRAC,
         token_sha16="t" * 16, anchors_sha16=VA.ANCHORS_SHA16, n_built=N, traj_sha16=_sha(arr["traj"]))))
     (d / "check.json").write_text(json.dumps(dict(
@@ -428,6 +444,29 @@ def test_verify_cross_needs_a_cross_build(labels_tree):
     _edit_json(d / "build.json", combine="separate")
     r = _check(labels_tree, "cross", True)["labels.var-cross.navtrain_train"]
     assert r["status"] == "FAIL" and "build.json combine 'separate' != 'cross'" in r["detail"], r
+
+
+def test_verify_x13_needs_its_combo_subsets(labels_tree):
+    """x13 = cross with cross_speeds / cross_lats: a build without them (or other ones) is refused."""
+    d = labels_tree.root / "navtrain_train" / V.arm_var_name("x13")
+    assert _check(labels_tree, "x13", True)["labels.var-x13.navtrain_train"]["status"] == "PASS"
+    j = json.loads((d / "build.json").read_text())
+    j.pop("cross_lats")
+    (d / "build.json").write_text(json.dumps(j))
+    r = _check(labels_tree, "x13", True)["labels.var-x13.navtrain_train"]
+    assert r["status"] == "FAIL" and "build.json cross_lats None != [-0.5, 0.5]" in r["detail"], r
+    _edit_json(labels_tree.root / "navtrain_train" / V.arm_var_name("cross") / "build.json", cross_speeds=[-0.5, 0.5])
+    r = _check(labels_tree, "cross", True)["labels.var-cross.navtrain_train"]
+    assert r["status"] == "FAIL" and "build.json cross_speeds" in r["detail"], r
+
+
+def test_variant_opt_keys_match_and_stay_off_the_base_dict():
+    from navsim.agents.para_ssr.ck import cands2 as C2
+    assert L2.CK_VARIANTS_OPT == C2.VARIANTS_OPT == CROSS_KEYS == C.CROSS_KEYS
+    for arm in ("base", "v8", "cross"):
+        c = C.compose({"VARIANTS": arm})
+        ck = L2.effective_ck(c.run_dir, 8, c.set_lines, c.extra_lines)
+        assert not set(CROSS_KEYS) & set(ck["variants"]) and not any("variants.cross_" in o for o in c.overrides)
 
 
 def test_verify_another_80_column_arm_in_the_dir_fails(labels_tree):
@@ -649,8 +688,9 @@ def test_warmup_script_builds_the_arms(setup_tree):
     assert len(v) == 1 + len(ARMS)
     for arm, line in zip(ARMS, v[1:]):
         w = WANT[arm]
+        sub = [x for k in CROSS_KEYS if w[k] is not None for x in ("--" + k.replace("_", "-"), *map(repr, w[k]))]
         want = " ".join([f"--split navtrain_train --combine {w['combine']} --ext straight --speeds", *map(repr, w["speeds"]), "--lats",
-                         *map(repr, w["lats"]), "--name", V.arm_var_name(arm), "--workers 48"])
+                         *map(repr, w["lats"]), *sub, "--name", V.arm_var_name(arm), "--workers 48"])
         assert line == want, (line, want)
     va = [x for x in g if "verify_assets.py" in x]
     assert [x.rsplit(" ", 1)[1] for x in va[1:]] == list(ARMS) and all("--only labels --variants" in x for x in va[1:])

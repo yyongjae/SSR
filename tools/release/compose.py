@@ -24,7 +24,8 @@ Run name: only what differs from the defaults, in a fixed order, joined with _, 
   [var-<arm>] [f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 A setting implied by another one gets no part: REFINER=off is ref-off only, REFINER_KD=off BEV_KD=off is rkd-off_bkd-off.
 VARIANTS=<arm> (refiner candidate variant set, VARIANT_ARMS of navsim/agents/para_ssr/ck/variants.py, read from its
-source so no torch is imported): set lines variants.speeds / variants.lats (+ variants.combine=cross for the cross arm;
+source so no torch is imported): set lines variants.speeds / variants.lats (+ variants.combine=cross for cross / x13,
+variants.cross_speeds / cross_lats for x13;
 V = 1: the three variant draw counts 0) and warmup.var_dir of the arm's label dir; the default 'base' emits none of
 them and is left out of the recorded settings, so every earlier record stays as it was.
 hash6 = sha256 over the resolved overrides, minus run-path and wandb lines, with data roots written as placeholders so
@@ -66,6 +67,7 @@ AGENT_YAML = REPO / "navsim/planning/script/config/common/agent/para_ssr_agent.y
 ANCHORS_REL = "resources/planning_vb/trajectory_anchors_256.npy"
 VARIANTS_PY = REPO / "navsim/agents/para_ssr/ck/variants.py"
 _VARIANT_NAMES = ("SPEEDS", "LATS", "BASE_VAR_NAME", "VARIANT_ARMS")
+CROSS_KEYS = ("cross_speeds", "cross_lats")   # optional VARIANT_ARMS keys ('cross' combo subsets, VARIANTS=x13)
 
 
 def _literal(node: ast.AST, env: Mapping[str, Any]) -> Any:
@@ -112,7 +114,8 @@ def variant_arms() -> Dict[str, Dict[str, Any]]:
     entry without the key, 'cross' for VARIANTS=cross)."""
     arms = _variants_module()["VARIANT_ARMS"]
     return {a: {"speeds": tuple(float(x) for x in v["speeds"]), "lats": tuple(float(x) for x in v["lats"]),
-                "combine": str(v.get("combine", "separate"))}
+                "combine": str(v.get("combine", "separate")),
+                **{k: (None if v.get(k) is None else tuple(float(x) for x in v[k])) for k in CROSS_KEYS}}
             for a, v in arms.items()}
 
 
@@ -478,6 +481,7 @@ def set_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mapping[
         lines += [f"variants.speeds={_float_list(v['speeds'])}", f"variants.lats={_float_list(v['lats'])}"]
         if v["combine"] != "separate":   # the yaml's combine is 'separate': only another one is written (cross)
             lines.append(f"variants.combine={v['combine']}")
+        lines += [f"variants.{k}={_float_list(v[k])}" for k in CROSS_KEYS if v[k] is not None]   # x13 only
         if not v["speeds"] and not v["lats"]:   # V = 1: no variant columns to draw (16 x (V - 1) = 0)
             lines += ["n_var_step=0", "warmup.n_var=0", "onpolicy_label.n_var=0"]
     if s["REFINER"] == "off":
@@ -867,7 +871,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rf.add_argument("--data-root", required=True)
     a = sub.add_parser("settings-args")
     a.add_argument("--settings-json", required=True)
-    va = sub.add_parser("variant-args", help="label_variants.py flags of a VARIANTS arm: [--combine cross] --speeds .. --lats .. --name ..")
+    va = sub.add_parser("variant-args", help="label_variants.py flags of a VARIANTS arm: [--combine cross] --speeds .. --lats .. "
+                        "[--cross-speeds .. --cross-lats ..] --name ..")
     va.add_argument("arm")
     r = sub.add_parser("record")
     r.add_argument("--composition", required=True)
@@ -906,7 +911,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             name = arm_var_name(args.arm)          # Refused for an unknown arm
             v = variant_arms()[args.arm]
             comb = [] if v["combine"] == "separate" else ["--combine", v["combine"]]   # 50_warmup_labels.sh: first
-            print(" ".join([*comb, "--speeds", *map(repr, v["speeds"]), "--lats", *map(repr, v["lats"]), "--name", name]))
+            sub = [x for k in CROSS_KEYS if v[k] is not None for x in ("--" + k.replace("_", "-"), *map(repr, v[k]))]
+            print(" ".join([*comb, "--speeds", *map(repr, v["speeds"]), "--lats", *map(repr, v["lats"]), *sub,
+                            "--name", name]))
         elif args.cmd == "record":
             comp = json.loads(Path(args.composition).read_text())
             commit, dirty = git_state()

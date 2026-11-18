@@ -270,7 +270,7 @@ class CKE2E2Config:
                     v = {}
                 if not isinstance(v, dict):
                     raise ValueError(f"ck_e2e2.{k} must be a mapping, got {v!r}")
-                bad = sorted(set(v) - set(base))
+                bad = sorted(set(v) - set(base) - (set(C2.VARIANTS_OPT) if k == "variants" else set()))
                 if bad:
                     raise ValueError(f"ck_e2e2.{k}: unknown key(s) {bad}")
                 if k == "kd_calib" and "mode" not in v and any(_opt_str(v.get(t)) is not None
@@ -323,6 +323,10 @@ class CKE2E2Config:
                          else [float(a) for a in v["lats"]],
                          "combine": str(v["combine"]), "s_on_frac": float(v["s_on_frac"]), "ext": str(v["ext"]),
                          "compute_dtype": str(v["compute_dtype"]).replace("torch.", "")}
+        for k in C2.VARIANTS_OPT:       # optional 'cross' combo subsets (VARIANTS=x13): kept only when set
+            if v.get(k) is not None:
+                self.variants[k] = ([float(a) for a in _str_list(v[k])] if isinstance(v[k], str)
+                                    else [float(a) for a in v[k]])
         e = dict(self.lat_kd)
         self.lat_kd = {"balance": str(e["balance"]), "ratio": float(e["ratio"]), "m": float(e["m"]),
                        "floor": float(e["floor"]), "cap": _opt_float(e["cap"]), "start_mb": int(e["start_mb"]),

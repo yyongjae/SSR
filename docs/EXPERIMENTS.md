@@ -58,7 +58,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `BEV_KD` | on off | on | `bkd-off` | BEV KD v15 (student BEV로 가는 KD). |
 | `DET_KD` | on off off_bev off_ref | on | `detkd-off` `detkd-offbev` `detkd-offref` | DET teacher에서 오는 KD. `off`는 두 경로 모두, `off_bev`는 BEV KD만, `off_ref`는 refiner KD만 끕니다. |
 | `MAP_KD` | on off off_bev off_ref | on | `mapkd-off` `mapkd-offbev` `mapkd-offref` | MAP teacher에서 오는 KD. 값의 뜻은 같습니다. |
-| `VARIANTS` | base v8 v4 spd4 lat4 none cross | base | `var-<arm>` (`var-v8` 등) | refiner 후보의 운동학 변형 집합. v2 top-16 parent마다 V개(identity 포함)라 후보는 16 × V개입니다. 값과 warm-up label 폴더는 5절 아래 "변형 집합 ablation". `REFINER=off`와 함께 쓰면 거부합니다. |
+| `VARIANTS` | base v8 v4 spd4 lat4 none cross x13 | base | `var-<arm>` (`var-v8` 등) | refiner 후보의 운동학 변형 집합. v2 top-16 parent마다 V개(identity 포함)라 후보는 16 × V개입니다. 값과 warm-up label 폴더는 5절 아래 "변형 집합 ablation". `REFINER=off`와 함께 쓰면 거부합니다. |
 | `BACKBONE` | r18 r34 r50 r101 r152 r50d convnext_tiny regnety_032 efficientnet_b0 | r34 | 이름 그대로 (`r50`), 맨 앞 | timm 이름과 필요한 플래그는 registry에 있습니다. swin, vit는 코드가 더 필요해서 거부합니다. |
 | `DET_TEACHER` | registry 이름 | bevfusion | `<det>-<map>` | DET teacher. `bevformer`는 등록만 되어 있고 없어서, 무엇이 부족한지 출력하고 거부합니다. |
 | `MAP_TEACHER` | registry 이름 | resmap | `<det>-<map>` | MAP teacher. `mask2map`도 같습니다. |
@@ -190,6 +190,7 @@ run 폴더 안의 이름:
 | 속도 변형만 4종 (±0.5 ±1.0) | `VARIANTS=spd4` | full | 측정 안 됨. 후보 80개 |
 | 횡 변형만 4종 (±0.5 ±1.0) | `VARIANTS=lat4` | full | 측정 안 됨. 후보 80개 |
 | 변형 없음 (identity만) | `VARIANTS=none` | full | 측정 안 됨. 후보 16개 |
+| v8 + 조합 4종 (±0.5 × ±0.5) | `VARIANTS=x13` | full | 측정 안 됨. 후보 208개: labeler 채점 약 2.2배 |
 | v8 + 속도 × 횡 조합 16종 | `VARIANTS=cross` | full | 측정 안 됨. 후보 400개: labeler 채점 약 4.2배 (`LABELER_WORKERS=192`), 메모리 smoke 먼저 |
 
 | Profile | 무엇 | 디스크 |
@@ -209,6 +210,7 @@ refiner 후보는 v2 head의 top-16 parent와 그 운동학 변형입니다. 열
 - `lat4`: 속도 없음, 횡 -1.0 -0.5 +0.5 +1.0. V = 5, 후보 80개.
 - `none`: 변형 없음 (identity만). V = 1, 후보 16개. 변형 뽑기 수(`n_var_step`, `warmup.n_var`, `onpolicy_label.n_var`)는 0.
 - `cross`: v8의 9개 (identity, 속도 4, 횡 4) 뒤에 속도 × 횡 조합 16개 (`a-1.0|l-1.0` ... `a+1.0|l+1.0`, 속도 순서 우선). V = 25, 후보 400개. 조합은 횡 변형으로 셉니다 (짧은 parent에서 무효, `lat_kd`/`on_except_latvar`의 횡 변형). 변형 집합 `lat`은 순수 횡 4개만, `all_noaccel`은 a ≤ 0인 조합도 포함. `variants.combine=cross` 한 줄이 더 나갑니다. label 폴더 이름은 규칙대로 `var_separate_sampler16_accstraight_cross`이고 `label_variants.py --combine cross`로 만듭니다.
+- `x13`: v8의 9개 뒤에 조합 4개만 (`a-0.5|l-0.5`, `a-0.5|l+0.5`, `a+0.5|l-0.5`, `a+0.5|l+0.5`). V = 13, 후보 208개. `VARIANT_ARMS`의 `cross_speeds` / `cross_lats` (조합에 쓸 속도 / 횡 값, speeds / lats의 부분집합, 없으면 전부)로 정하고, set 줄 `variants.cross_speeds`, `variants.cross_lats`가 더 나갑니다 (이 키는 ck_e2e2.yaml에 없어서 다른 arm의 override는 그대로). label: `label_variants.py --combine cross ... --cross-speeds -0.5 0.5 --cross-lats -0.5 0.5 --name var_separate_sampler16_accstraight_x13` (build.json에 cross_speeds / cross_lats 기록).
 
 arm이 바꾸는 것은 `ck_e2e2.variants.speeds`, `ck_e2e2.variants.lats`(빈 목록은 `[]`로 씀) 두 줄과 `ck_e2e2.warmup.var_dir` 하나뿐입니다 (`cross`는 `variants.combine`, `none`은 변형 뽑기 수 0 줄이 더 있음). 새 config 키는 없고, `base`는 이 줄들을 하나도 내지 않아 override와 이름(`main_<hash6>`)이 그대로입니다. arm은 기본 레시피가 아니므로 `check`의 기준 run 비교를 하지 않습니다.
 
@@ -256,5 +258,5 @@ arm이 바꾸는 것은 `ck_e2e2.variants.speeds`, `ck_e2e2.variants.lats`(빈 �
 - 실제 `smoke`와 `train` (DDP 포함). 온라인 calibration을 켠 학습은 이 서버에서 GPU로 돈 적이 없습니다.
 - ResNet34 외 backbone의 GPU 메모리. r50 이상은 `smoke`로 `MEM_LIMIT_GB` 확인이 먼저입니다.
 - DET 또는 MAP을 끈 arm의 DDP와 resume.
-- `VARIANTS`의 arm (v8, v4, spd4, lat4, none, cross): smoke와 학습, v8과 cross의 GPU 메모리(추론은 token당 후보 400개)와 labeler 처리량, cross의 generation 디스크 (epoch당 약 4.6 GB, base 약 1.1 GB). `lat4`는 on-policy에서 짧은 parent의 횡 변형이 무효라 KD 후보 칸이 비면 smoke의 `kd_ok_frac ≥ 0.999` 확인이 base보다 낮게 나올 수 있습니다.
+- `VARIANTS`의 arm (v8, v4, spd4, lat4, none, cross, x13): smoke와 학습, v8과 cross의 GPU 메모리(추론은 token당 후보 400개)와 labeler 처리량, cross의 generation 디스크 (epoch당 약 4.6 GB, base 약 1.1 GB). `lat4`는 on-policy에서 짧은 parent의 횡 변형이 무효라 KD 후보 칸이 비면 smoke의 `kd_ok_frac ≥ 0.999` 확인이 base보다 낮게 나올 수 있습니다.
 - 다른 서버에서의 전체 실행.

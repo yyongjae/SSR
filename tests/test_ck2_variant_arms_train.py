@@ -32,13 +32,16 @@ from navsim.agents.para_ssr.ck.variants import (BASE_LAYOUT, BASE_VAR_NAME, VARI
                                                 arm_layout, arm_var_name)
 
 torch.set_num_threads(2)
-ARMS = ("base", "v8", "v4", "spd4", "lat4")
-NV_OF = {"base": 6, "v8": 9, "v4": 5, "spd4": 5, "lat4": 5}
+ARMS = ("base", "v8", "v4", "spd4", "lat4", "cross")
+NV_OF = {"base": 6, "v8": 9, "v4": 5, "spd4": 5, "lat4": 5, "cross": 25}
 
 
 def vcfg(arm):
     a = VARIANT_ARMS[arm]
-    return {"speeds": list(a["speeds"]), "lats": list(a["lats"])}
+    d = {"speeds": list(a["speeds"]), "lats": list(a["lats"])}
+    if a.get("combine", "separate") != "separate":                      # cross: as tools/release/compose.py writes it
+        d["combine"] = a["combine"]
+    return d
 
 
 def lay(arm):
@@ -140,7 +143,13 @@ def test_layout_cfg_per_arm():
     assert D2.layout_of(O.CKE2E2Config.from_any({"variants": vcfg("lat4")})) == lay("lat4")
     assert D2.layout_of(None) == D2.layout_of({}) == D2.layout_of({"warmup": {}}) == BASE_LAYOUT
     assert C2.layout_cfg({"speeds": [], "lats": []}) == lay("none") and lay("none").nv == 1   # VARIANTS=none
-    for bad in ({"combine": "cross"}, {"speeds": [0.0]}, {"lats": [9.0]},
+    # VARIANTS=cross: v8's values + the 16 combos after the separate prefix, V = 25, 400 columns
+    assert lay("cross").names[:9] == lay("v8").names and lay("cross").nv == 25 and lay("cross").combine == "cross"
+    assert lay("cross").names[9:] == tuple(f"a{a:+.1f}|l{d:+.1f}" for a in (-1.0, -0.5, 0.5, 1.0)
+                                           for d in (-1.0, -0.5, 0.5, 1.0))
+    assert C2.layout_cfg({"speeds": "[-1.0,-0.5,0.5,1.0]", "lats": "[-1.0,-0.5,0.5,1.0]", "combine": "cross"}) == lay("cross")
+    assert C2.layout_cfg(vcfg("v8")) != lay("cross")                    # combine is part of the layout
+    for bad in ({"combine": "grid"}, {"speeds": [0.0]}, {"lats": [9.0]},
                 {"speeds": [-0.5, -0.5]}, {"bogus": 1}, {"ext": "centerline_gt"}):
         with pytest.raises(ValueError):
             C2.variants_cfg(bad)
@@ -312,7 +321,7 @@ def _wu_dirs(root: Path, arm: str, n: int = 6, seed: int = 0, short_rows=(1,)):
              built=np.ones(n, bool), names=np.array(L.names))
     smp = AS.AnchorSampler(seed=0).config()
     build = {"names": list(L.names), "n_variants": nv, "n_anchors": 16, "speeds": list(L.speeds),
-             "lats": list(L.lats), "combine": "separate", "s_on_frac": 0.2, "ext": "straight", "seed": 0,
+             "lats": list(L.lats), "combine": L.combine, "s_on_frac": 0.2, "ext": "straight", "seed": 0,
              "sampler": smp, "anchors_sha16": AS.ANCHORS_SHA16, "n_tokens": n, "token_sha16": sha}
     (vd / "build.json").write_text(json.dumps(build))
     w = D2.warmup_cfg({"packed": str(pk), "raw_labels": str(rl), "var_dir": str(vd)})

@@ -29,9 +29,10 @@ from navsim.agents.para_ssr.ck import select2 as S2  # noqa: E402
 from navsim.agents.para_ssr.ck.select import blend, ck_final, select_all  # noqa: E402
 from navsim.agents.para_ssr.ck.variants import BASE_LAYOUT, VariantLayout, arm_layout  # noqa: E402
 
-ARMS = ("v8", "v4", "spd4", "lat4")
+ARMS = ("v8", "v4", "spd4", "lat4", "cross")
 ALL_ARMS = ("base",) + ARMS
-PLANT = {"base": "a+0.5", "v8": "a+1.0", "v4": "a-0.5", "spd4": "a+1.0", "lat4": "l-1.0"}   # a type the arm has
+PLANT = {"base": "a+0.5", "v8": "a+1.0", "v4": "a-0.5", "spd4": "a+1.0", "lat4": "l-1.0",   # a type the arm has
+         "cross": "a-0.5|l+1.0"}
 
 
 # ----------------------------------------------------------------------------------------------- frozen v2_final copy
@@ -187,7 +188,12 @@ EXPECT_SETS = {
              "all": tuple(range(5))},
 }
 EXPECT_SETS["none"] = {s: (0,) for s in ("none", "decel", "speed", "lat", "all_noaccel", "all")}
-EXPECT_LAT = {"v8": (5, 6, 7, 8), "v4": (3, 4), "spd4": (), "lat4": (1, 2, 3, 4), "none": ()}
+# cross: 0 id, 1-4 a-1.0 a-0.5 a+0.5 a+1.0, 5-8 l-1.0 l-0.5 l+0.5 l+1.0, then the combos a-major: 9-12 a-1.0|l*,
+# 13-16 a-0.5|l*, 17-20 a+0.5|l*, 21-24 a+1.0|l* (lat = pure lateral only; every combo is a lateral type)
+EXPECT_SETS["cross"] = {"none": (0,), "decel": (0, 1, 2), "speed": (0, 1, 2, 3, 4), "lat": (0, 5, 6, 7, 8),
+                        "all_noaccel": (0, 1, 2, 5, 6, 7, 8) + tuple(range(9, 17)), "all": tuple(range(25))}
+EXPECT_LAT = {"v8": (5, 6, 7, 8), "v4": (3, 4), "spd4": (), "lat4": (1, 2, 3, 4), "none": (),
+              "cross": tuple(range(5, 25))}
 
 
 def _meaning_ok(layout: VariantLayout, name: str, t: int) -> bool:
@@ -211,7 +217,7 @@ def _rand_arm(layout, n=40, seed=0):
 def test_arm_layout_sets_lat_types_and_tie_order(arm):
     L = arm_layout(arm)
     assert {k: tuple(v) for k, v in L.sets.items()} == EXPECT_SETS[arm] and tuple(L.lat_types) == EXPECT_LAT[arm]
-    assert L.g() == {"v8": 144}.get(arm, 80) and not L.is_base
+    assert L.g() == {"v8": 144, "cross": 400}.get(arm, 80) and not L.is_base
     tie = S2.tie_order(L)
     assert sorted(tie.tolist()) == list(range(L.g())) and tie[:16].tolist() == list(range(0, L.g(), L.nv))
     assert not tie.flags.writeable and S2.tie_order(L) is tie                       # cached per layout
@@ -317,9 +323,9 @@ def test_arm_lateral_rule_final_traj_and_labels(arm):
 def test_layout_from_cfg_and_meta():
     for arm in ALL_ARMS:
         L = arm_layout(arm)
-        assert S2.layout_from_cfg({"speeds": list(L.speeds), "lats": list(L.lats), "combine": "separate"}) == L
-        assert S2.layout_from_cfg({"speeds": "[" + ", ".join(map(str, L.speeds)) + "]",
-                                   "lats": str(list(L.lats))}) == L                  # hydra string form ('[]' too)
+        assert S2.layout_from_cfg({"speeds": list(L.speeds), "lats": list(L.lats), "combine": L.combine}) == L
+        assert S2.layout_from_cfg({"speeds": "[" + ", ".join(map(str, L.speeds)) + "]", "lats": str(list(L.lats)),
+                                   **({} if L.combine == "separate" else {"combine": L.combine})}) == L  # hydra strings
         assert S2.layout_from_meta(L.meta()) == L
     assert S2.layout_from_cfg(None) == S2.layout_from_cfg({}) == BASE_LAYOUT
     assert S2.layout_from_cfg({"s_on_frac": 0.2, "ext": "straight"}) == BASE_LAYOUT
@@ -525,7 +531,7 @@ def _write_hydra(P, layout: VariantLayout, string_form: bool = False, enabled: b
     if string_form:
         sp, la = f"'{sp}'", f"'{la}'"
     P.hydra_cfg.write_text(f"agent:\n  config:\n    ck_e2e2:\n      enabled: {str(enabled).lower()}\n      variants:\n"
-                           f"        speeds: {sp}\n        lats: {la}\n        combine: separate\n")
+                           f"        speeds: {sp}\n        lats: {la}\n        combine: {layout.combine}\n")
 
 
 @pytest.mark.parametrize("arm", ARMS)

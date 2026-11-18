@@ -23,7 +23,7 @@ Stages (each resumable; --stage all = this order; layout = tools/ck/e2e/eval_e2e
                asserts cand96[:, ::nv] == gather(anchors + offset, topk16(final)) (1e-5), cand_idx == topk and
                cand96[:, 0] == trajectory (1e-4).  Several GPUs: one child per GPU (whole logs per shard).
   label        label_cands.run (official score_token, LQR; K = G from the file shape) on packed/cand96 ->
-               labels/<split>/pool96_<RUN> and on infer/lat_traj -> lat96_<RUN> (rows = packed ok; workers <= 48).
+               labels/<split>/pool96_<RUN> and on infer/lat_traj -> lat96_<RUN> (rows = packed ok; workers <= 192).
   infer_check  the extracted ck_run (load_ck, fp32) on 8 stored BEV grids x G columns reproduces score_logit (3e-2) and
                lat_traj (2e-3).
   eval         eval_ck2.run_eval: navtrain_val = beta x variant set x lateral-mode grid, choice stored as 'best'
@@ -546,8 +546,8 @@ def stage_dump(P: Paths, ckpt: Path, a, ckpt_sha16: Optional[str] = None) -> Non
 
 # ----------------------------------------------------------------------------------------------- label
 def stage_label(P: Paths, a) -> None:
-    if not 1 <= a.workers_label <= 48:
-        raise SystemExit("--workers-label must be in [1, 48]")
+    if not 1 <= a.workers_label <= 192:                 # label_cands.MAX_WORKERS (default 48)
+        raise SystemExit("--workers-label must be in [1, 192]")
     rows = P.packed / "ok_rows.npy"
     if not rows.is_file():
         raise SystemExit(f"{rows} missing: run --stage dump first")

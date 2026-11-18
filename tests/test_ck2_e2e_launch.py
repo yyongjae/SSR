@@ -380,8 +380,8 @@ def test_train_e2e2_dry_run(tmp_path):
         assert o in r.stdout.splitlines(), o
     assert _sh(dict(base, CK2_E2E_APPROVED="1"), "start", "--gpus", "0,1,2").returncode == 3
     # labeler workers: default 16 x ngpu capped at 48 (the recipe; 64 made labeler2 die at start on 4 GPUs when the
-    # labeler's MAX_WORKERS was 48); an explicit LABELER_WORKERS is used up to the labeler's MAX_WORKERS = 96 (e.g. the
-    # 144 trajectories per token of the VARIANTS=v8 arm).  The rule is taken from train_e2e2.sh itself.
+    # labeler's MAX_WORKERS was 48); an explicit LABELER_WORKERS is used up to the labeler's MAX_WORKERS = 192 (e.g. the
+    # 144 / 400 trajectories per token of the VARIANTS=v8 / cross arms).  The rule is taken from train_e2e2.sh itself.
     import re
     from tools.ck.e2e import labeler as L1
     m = re.search(r'^  if \[ -n "\$\{LABELER_WORKERS:-\}" \]; then.*?fi$', SH.read_text(), flags=re.M | re.S)
@@ -392,8 +392,8 @@ def test_train_e2e2_dry_run(tmp_path):
     def lw(ng, explicit=None):
         e = dict(env, LABELER_WORKERS=explicit) if explicit else env
         return subprocess.run(["bash", "-c", expr, "_", str(ng)], capture_output=True, text=True, env=e).stdout.strip()
-    assert {ng: lw(ng) for ng in (2, 4, 8)} == {2: "32", 4: "48", 8: "48"} and L1.MAX_WORKERS == 96
-    assert (lw(8, "24"), lw(8, "72"), lw(8, "96"), lw(8, "200")) == ("24", "72", "96", "96")
+    assert {ng: lw(ng) for ng in (2, 4, 8)} == {2: "32", 4: "48", 8: "48"} and L1.MAX_WORKERS == 192
+    assert (lw(8, "24"), lw(8, "72"), lw(8, "96"), lw(8, "192"), lw(8, "200")) == ("24", "72", "96", "192", "192")
 
 
 def test_hydra_compose_full_override_list(tmp_path):

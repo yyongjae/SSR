@@ -80,8 +80,13 @@ def test_online_variants_nonfinite_parent_and_config():
     Vc = C2.online_variants(anc, v0, {"ext": "const_curv"})
     other = (torch.arange(96) % 6) != 3
     assert torch.equal(Vc["traj96"][:, other], ref["traj96"][:, other])
+    # 'cross' (VARIANTS=cross): the separate table is its prefix, the combos follow (c = k * V + v, V = 6 + 3 x 2 = 12)
+    Vx = C2.online_variants(anc, v0, {"combine": "cross"})
+    assert Vx["traj96"].shape == (2, 16 * 12, 8, 3) and torch.equal(Vx["vtype"], torch.arange(16 * 12) % 12)
+    pre = (torch.arange(16 * 12) % 12) < 6
+    assert torch.equal(Vx["traj96"][:, pre], ref["traj96"]) and torch.equal(Vx["valid96"][:, pre], ref["valid96"])
     with pytest.raises(ValueError):
-        C2.variants_cfg({"combine": "cross"})                     # 'separate' tables only (layout c = k * V + v)
+        C2.variants_cfg({"combine": "grid"})                      # 'separate' | 'cross' only
     with pytest.raises(ValueError):
         C2.variants_cfg({"ext": "centerline_gt"})
     with pytest.raises(ValueError):

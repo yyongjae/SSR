@@ -21,7 +21,7 @@ Assembly (when every chunk is done and packed/<split>/tokens.parquet exists):
   The crc of every scored token is checked against the assembly trajectory source (stale-shard guard).
 Output dir: <root>/labels/<split>/<name>/ (default) or --out DIR (used as is; packed inputs still come from <root>).
 Metric caches: core SPLITS[split]['metric_cache']/<log>/unknown/<token>/metric_cache.pkl.
-CPU only; OMP_NUM_THREADS=1; <= 48 worker processes.
+CPU only; OMP_NUM_THREADS=1; <= MAX_WORKERS = 192 worker processes (default 48).
 """
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ import navsim  # noqa: E402
 assert navsim.__file__.startswith(CM.CK), navsim.__file__
 LABEL_COLS = CM.LABEL_COLS
 SCORE_COLS = ("nc", "dac", "ep", "ttc", "comfort", "ddc", "pdms")   # must be finite for ok
+MAX_WORKERS = 192                                                   # run(workers): the reference server has 256 CPUs
 
 _W: Dict[str, object] = {}
 
@@ -218,7 +219,7 @@ def run(split_name: str, name: str, traj: str = "", rows: str = "", root=None, w
         chunk: int = 64, from_dump: bool = False, watch: bool = False, poll: int = 60, assemble_only: bool = False,
         retry_errors: bool = False, fresh: bool = False, k: int = 0, max_wait: int = 4 * 3600,
         out_dir=None) -> Optional[dict]:
-    assert 1 <= workers <= 48, "at most 48 worker processes per agent"
+    assert 1 <= workers <= MAX_WORKERS, f"at most {MAX_WORKERS} worker processes"
     t_start = time.time()
     out = Path(out_dir) if out_dir else CM.labels_dir(split_name, name, root)
     shard_dir = out / "shards"

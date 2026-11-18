@@ -283,7 +283,7 @@ def test_labeler2_defaults_and_args(tmp_path):
     with pytest.raises(AssertionError):
         _lab(tmp_path / "x=y", tok)
     with pytest.raises(AssertionError):
-        _lab(tmp_path / "ok", tok, workers=L2.L1.MAX_WORKERS + 1)     # labeler.MAX_WORKERS (48 -> 96 for v8)
+        _lab(tmp_path / "ok", tok, workers=L2.L1.MAX_WORKERS + 1)     # labeler.MAX_WORKERS (48 -> 96 v8 -> 192 cross)
 
 
 def test_labeler2_cli_exit_file_and_status(tmp_path):

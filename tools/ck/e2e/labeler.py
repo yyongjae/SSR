@@ -28,8 +28,9 @@ Exit    --once: after the current backlog (0).  --limit-chunks N: after N chunks
         Abnormal end (SIGTERM, exception, tasks in flight): the pool workers are SIGKILLed and the process ends with
         os._exit after the final writes -- never Pool.terminate()/join(): a worker that died while holding the pool's
         task-queue lock (e.g. a TERM to the whole process group) makes them deadlock (smoke S4, 2026-10-07).
-CPU only, OMP_NUM_THREADS=1, workers <= 96 (default 24; tools/ck/e2e2/train_e2e2.sh starts min(16 x ngpu, 48) unless
-LABELER_WORKERS asks for more, e.g. for a 144-candidate VARIANTS=v8 run), os.nice(5).
+CPU only, OMP_NUM_THREADS=1, workers <= 192 (default 24; tools/ck/e2e2/train_e2e2.sh starts min(16 x ngpu, 48) unless
+LABELER_WORKERS asks for more, e.g. for a 144-candidate VARIANTS=v8 or a 400-candidate VARIANTS=cross run; the reference
+server has 256 CPUs), os.nice(5).
 """
 from __future__ import annotations
 
@@ -60,7 +61,7 @@ LABEL_COLS = tuple(LCD.LABEL_COLS)
 SCORE_COLS = tuple(LCD.SCORE_COLS)
 PACKED_TOKENS = str(Path(ED.PHASE1_DEFAULT["packed"]) / "tokens.parquet")
 SPLIT = "navtrain_train"
-MAX_WORKERS = 96
+MAX_WORKERS = 192
 G_K = ED.G_K
 GEN_KEYS = ("traj", "labels", "cand_ok", "row_state")
 WRITE_BATCH, WRITE_AGE = 64, 2.0

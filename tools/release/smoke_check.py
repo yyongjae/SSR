@@ -9,7 +9,7 @@ Writes <run>/launch/smoke_check.json, prints each check, exit 1 when one fails. 
 steps_rank0.jsonl when the refiner writes one; with the refiner off, the peak of nvidia-smi's memory.used sampled by
 scripts/experiment.sh into launch/gpu_mem.csv, which counts reserved memory too, so it reads higher.
 A VARIANTS arm other than base (settings VARIANTS) adds variants_as_set: launch/refiner_effective.json has the arm's
-speeds / lats (combine separate) and its warm-up label dir; info records the arm's V and candidate count.  No other check
+speeds / lats / combine and its warm-up label dir; info records the arm's V and candidate count.  No other check
 depends on the variant set (the record / label path of the smoke is checked by labeler_generation_0_done).
 """
 from __future__ import annotations

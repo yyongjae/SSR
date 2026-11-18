@@ -17,7 +17,7 @@ and all 85,109 tokens go through the training GT loader, whose statistics must e
 use it to check their own step.
 --variants ARM (scripts/experiment.sh VARIANTS=<arm>, not base) also checks that arm's warm-up label dir
 (ck2/labels/<split>/<variants.arm_var_name(arm)>; navtrain_train always, navtrain_val when present).  No pins exist for
-an arm: build.json / check.json / index.npz must describe the arm's table (names, V, speeds, lats, 'separate', ext
+an arm: build.json / check.json / index.npz must describe the arm's table (names, V, speeds, lats, combine, ext
 straight, sampler16, the anchors and tokens of the base build), the shapes are 16 x V, and the full check hashes the
 arrays (printed), requires traj.npy == build.json traj_sha16 and the base build's anchor_idx pin, and requires the
 columns of the variant types the arm shares with the base build (traj, valid) to equal the base arrays bitwise (shared
@@ -633,7 +633,7 @@ def check_arm_labels(c: Ctx, split: str, soft: bool = False) -> None:
     else:
         j = json.loads(files["build.json"].read_text())
         want = {"names": list(lay.names), "n_variants": lay.nv, "speeds": list(lay.speeds), "lats": list(lay.lats),
-                "combine": "separate", "ext": "straight", "subset": "sampler", "n_anchors": ARM_K, "epoch": 0, "seed": 0,
+                "combine": lay.combine, "ext": "straight", "subset": "sampler", "n_anchors": ARM_K, "epoch": 0, "seed": 0,
                 "limit": 0, "s_on_frac": VV.S_ON_FRAC, "token_sha16": PINS[f"packed/{split}"]["token_sha16"],
                 "anchors_sha16": ANCHORS_SHA16, "n_built": n}
         bad += [f"build.json {k} {j.get(k)!r} != {v!r}" for k, v in want.items() if j.get(k) != v]

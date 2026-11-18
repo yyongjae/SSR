@@ -24,8 +24,9 @@ Run name: only what differs from the defaults, in a fixed order, joined with _, 
   [var-<arm>] [f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 A setting implied by another one gets no part: REFINER=off is ref-off only, REFINER_KD=off BEV_KD=off is rkd-off_bkd-off.
 VARIANTS=<arm> (refiner candidate variant set, VARIANT_ARMS of navsim/agents/para_ssr/ck/variants.py, read from its
-source so no torch is imported): set lines variants.speeds / variants.lats and warmup.var_dir of the arm's label dir;
-the default 'base' emits none of them and is left out of the recorded settings, so every earlier record stays as it was.
+source so no torch is imported): set lines variants.speeds / variants.lats (+ variants.combine=cross for the cross arm;
+V = 1: the three variant draw counts 0) and warmup.var_dir of the arm's label dir; the default 'base' emits none of
+them and is left out of the recorded settings, so every earlier record stays as it was.
 hash6 = sha256 over the resolved overrides, minus run-path and wandb lines, with data roots written as placeholders so
 one config has one name on every server, plus the registry pins of the teachers in use.  Never the commit.  A changed
 default changes the overrides, so it changes the hash; launch/settings.json of a run has every setting (VARIANTS only
@@ -106,10 +107,12 @@ def _variants_module() -> Dict[str, Any]:
     return env
 
 
-def variant_arms() -> Dict[str, Dict[str, Tuple[float, ...]]]:
-    """{arm: {speeds, lats}} = variants.VARIANT_ARMS ('base' first: the main recipe)."""
+def variant_arms() -> Dict[str, Dict[str, Any]]:
+    """{arm: {speeds, lats, combine}} = variants.VARIANT_ARMS ('base' first: the main recipe; combine 'separate' for an
+    entry without the key, 'cross' for VARIANTS=cross)."""
     arms = _variants_module()["VARIANT_ARMS"]
-    return {a: {"speeds": tuple(float(x) for x in v["speeds"]), "lats": tuple(float(x) for x in v["lats"])}
+    return {a: {"speeds": tuple(float(x) for x in v["speeds"]), "lats": tuple(float(x) for x in v["lats"]),
+                "combine": str(v.get("combine", "separate"))}
             for a, v in arms.items()}
 
 
@@ -470,9 +473,11 @@ def set_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mapping[
     lines = [f"warmup.packed={data}/ck/packed/navtrain_train", f"warmup.raw_labels={data}/ck/labels/navtrain_train/raw256",
              f"warmup.var_dir={data}/ck/ck2/labels/navtrain_train/{arm_var_name(arm)}",
              f"seed={s['SEED']}"]
-    if arm != VARIANTS_BASE:         # the arm's table (combine 'separate' as the yaml); base: the yaml's own table
+    if arm != VARIANTS_BASE:         # the arm's table; base: the yaml's own table
         v = variant_arms()[arm]
         lines += [f"variants.speeds={_float_list(v['speeds'])}", f"variants.lats={_float_list(v['lats'])}"]
+        if v["combine"] != "separate":   # the yaml's combine is 'separate': only another one is written (cross)
+            lines.append(f"variants.combine={v['combine']}")
         if not v["speeds"] and not v["lats"]:   # V = 1: no variant columns to draw (16 x (V - 1) = 0)
             lines += ["n_var_step=0", "warmup.n_var=0", "onpolicy_label.n_var=0"]
     if s["REFINER"] == "off":
@@ -862,7 +867,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rf.add_argument("--data-root", required=True)
     a = sub.add_parser("settings-args")
     a.add_argument("--settings-json", required=True)
-    va = sub.add_parser("variant-args", help="label_variants.py flags of a VARIANTS arm: --speeds .. --lats .. --name ..")
+    va = sub.add_parser("variant-args", help="label_variants.py flags of a VARIANTS arm: [--combine cross] --speeds .. --lats .. --name ..")
     va.add_argument("arm")
     r = sub.add_parser("record")
     r.add_argument("--composition", required=True)
@@ -900,7 +905,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise Refused("variant-args: the base label dir is built by 50_warmup_labels.sh itself")
             name = arm_var_name(args.arm)          # Refused for an unknown arm
             v = variant_arms()[args.arm]
-            print(" ".join(["--speeds", *map(repr, v["speeds"]), "--lats", *map(repr, v["lats"]), "--name", name]))
+            comb = [] if v["combine"] == "separate" else ["--combine", v["combine"]]   # 50_warmup_labels.sh: first
+            print(" ".join([*comb, "--speeds", *map(repr, v["speeds"]), "--lats", *map(repr, v["lats"]), "--name", name]))
         elif args.cmd == "record":
             comp = json.loads(Path(args.composition).read_text())
             commit, dirty = git_state()

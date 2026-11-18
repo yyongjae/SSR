@@ -82,7 +82,7 @@ def test_validate_rules(tmp_path):
            ({"n_var_step": 81}, "n_var_step"), ({"warmup": {"n_var": -1}}, "warmup.n_var"),
            ({"onpolicy_label": {"n_orig": 8}}, "n_orig"), ({"onpolicy_label": {"fallback": "r34"}}, "fallback"),
            ({"var_sampling": "x"}, "var_sampling"), ({"warmup": {"sur_groups": "far"}}, "sur_groups"),
-           ({"variants": {"combine": "cross"}}, "variants"), ({"variants": {"ext": "centerline_gt"}}, "variants"),
+           ({"variants": {"combine": "grid"}}, "variants"), ({"variants": {"ext": "centerline_gt"}}, "variants"),
            # a legal 5-column table since the variant-set arms (ck/variants.VariantLayout): refused only because the
            # default warm-up label files are the base table's (the test needs that var_dir/build.json)
            ({"variants": {"speeds": [-1.0, 0.5]}}, "label files"), ({"variants": {"ext": "const_curv"}}, "label files"),

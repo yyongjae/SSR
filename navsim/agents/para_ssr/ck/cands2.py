@@ -1,8 +1,8 @@
 """CK2 e2e per-step candidate assembly (SPEC ck2e2e §2-1, §2-2, §4-3 fallback).  New file; data side of CKE2E2.
 
 Variant layout: the numbers below are the base table (ck_e2e2.variants defaults: V = 6, 96 = 16 x 6, 80 non-identity
-variants, types 1..5).  Any 'separate' table of ck_e2e2.variants (ablation arms, ck/variants.VARIANT_ARMS) gives
-V = 1 + len(speeds) + len(lats), 16 V columns c = k * V + v and V - 1 types (layout_cfg); every function here takes V
+variants, types 1..5).  Any table of ck_e2e2.variants (ablation arms, ck/variants.VARIANT_ARMS) gives
+V = 1 + len(speeds) + len(lats) ('separate') or that + len(speeds) * len(lats) ('cross', VARIANTS=cross: V = 25), 16 V columns c = k * V + v and V - 1 types (layout_cfg); every function here takes V
 from that configuration / the data and refuses a mismatch between them.
 
   variants_cfg(vcfg) / layout_cfg(vcfg)
@@ -51,8 +51,10 @@ def _floats(v) -> list:
 
 
 def variants_cfg(vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """VARIANTS_DEFAULT merged with vcfg; validated: a 'separate' table (c = k * V + v, the generation / label-file
-    layout; V = 1 + len(speeds) + len(lats) >= 1 (V = 1: identities only, VARIANTS=none), names unique: ck/variants.VariantLayout), ext const_curv | straight,
+    """VARIANTS_DEFAULT merged with vcfg; validated: a 'separate' or 'cross' table (c = k * V + v, the generation /
+    label-file layout; 'separate' V = 1 + len(speeds) + len(lats) >= 1 (V = 1: identities only, VARIANTS=none), 'cross'
+    adds the len(speeds) * len(lats) combos after that prefix (variants.variant_table), names unique:
+    ck/variants.VariantLayout), ext const_curv | straight,
     compute dtype.  The default is the base 6-column table in VNAMES order.  Keys returned: those of VARIANTS_DEFAULT."""
     from .variants import EXT_MODES, VariantLayout
 
@@ -70,10 +72,7 @@ def variants_cfg(vcfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         raise ValueError(f"variants.ext must be const_curv | straight (centerline needs per-token lines), got {c['ext']!r}")
     if c["compute_dtype"] not in _DTYPES:
         raise ValueError(f"variants.compute_dtype must be float64 | float32, got {c['compute_dtype']!r}")
-    if c["combine"] != "separate":
-        raise ValueError(f"variants.combine must be 'separate' (generation / label-file layout c = k * V + v), got "
-                         f"{c['combine']!r}")
-    lay = VariantLayout(c["speeds"], c["lats"], c["combine"])          # value / name checks (variants._check)
+    VariantLayout(c["speeds"], c["lats"], c["combine"])          # combine / value / name checks (variants._check)
     return c
 
 

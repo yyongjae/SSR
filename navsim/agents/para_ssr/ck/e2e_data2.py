@@ -4,8 +4,9 @@ Contents
   constants                     K16 = 16 (v2 top-k), NV = 6 (variants per parent, VNAMES order), G_K = 96 (= K16 * NV,
                                 column c = k * 6 + v, k-major), streams, G_src codes, default paths
   variant layout (ablation arms) NV / G_K / VNAMES / N_TYPES are the BASE layout (ck_e2e2.variants defaults).  Another
-                                table (ck_e2e2.variants.speeds / lats, combine 'separate'; ck/variants.VariantLayout)
-                                has V = 1 + len(speeds) + len(lats) variants per parent, 16 * V columns c = k * V + v;
+                                table (ck_e2e2.variants.speeds / lats / combine; ck/variants.VariantLayout) has
+                                V = 1 + len(speeds) + len(lats) variants per parent ('separate'; 'cross' adds
+                                len(speeds) * len(lats) combos), 16 * V columns c = k * V + v;
                                 every class / draw below takes it explicitly (layout= a VariantLayout or its names,
                                 nv= for the column draws; None = base, which is bit for bit the code before layouts).
                                 layout_of(cfg) derives it from a config (lazy ck/variants import: main process only).

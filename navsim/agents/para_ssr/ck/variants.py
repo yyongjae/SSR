@@ -206,15 +206,19 @@ class VariantLayout:
 BASE_LAYOUT = VariantLayout()
 BASE_NAMES = BASE_LAYOUT.names              # ('id', 'a-1.0', 'a-0.5', 'a+0.5', 'l-0.5', 'l+0.5')
 
-# Variant-set ablation arms (experiment.sh VARIANTS=<arm>): speeds [m/s^2], lats [m]; combine 'separate', K = 16.
-# 'base' is the main recipe.  Warm-up label dir of an arm: var_separate_sampler16_accstraight[_<arm>] (base: no suffix).
-VARIANT_ARMS: Dict[str, Dict[str, Tuple[float, ...]]] = {
+# Variant-set ablation arms (experiment.sh VARIANTS=<arm>): speeds [m/s^2], lats [m]; combine 'separate' unless the
+# entry has combine='cross' (adds every (a, D_p) combo after the separate prefix, variant_table), K = 16.
+# 'base' is the main recipe.  Warm-up label dir of an arm: var_separate_sampler16_accstraight[_<arm>] (base: no suffix;
+# the 'separate' in that name is the historical prefix, also for the cross arm).
+VARIANT_ARMS: Dict[str, Dict[str, object]] = {
     "base": dict(speeds=SPEEDS, lats=LATS),
     "v8": dict(speeds=(-1.0, -0.5, 0.5, 1.0), lats=(-1.0, -0.5, 0.5, 1.0)),    # 2 per direction, V = 9, 144 cands
     "v4": dict(speeds=(-0.5, 0.5), lats=(-0.5, 0.5)),                          # 1 per direction, V = 5, 80 cands
     "spd4": dict(speeds=(-1.0, -0.5, 0.5, 1.0), lats=()),                      # speed only, V = 5
     "lat4": dict(speeds=(), lats=(-1.0, -0.5, 0.5, 1.0)),                      # lateral only, V = 5
     "none": dict(speeds=(), lats=()),                                          # no variants, V = 1, 16 cands
+    "cross": dict(speeds=(-1.0, -0.5, 0.5, 1.0), lats=(-1.0, -0.5, 0.5, 1.0),  # v8 + the 16 speed x lateral combos,
+                  combine="cross"),                                            # V = 25, 400 cands
 }
 BASE_VAR_NAME = "var_separate_sampler16_accstraight"
 
@@ -222,7 +226,13 @@ BASE_VAR_NAME = "var_separate_sampler16_accstraight"
 def arm_layout(arm: str) -> VariantLayout:
     if arm not in VARIANT_ARMS:
         raise ValueError(f"unknown variant arm {arm!r}; one of {sorted(VARIANT_ARMS)}")
-    return VariantLayout(VARIANT_ARMS[arm]["speeds"], VARIANT_ARMS[arm]["lats"], "separate")
+    v = VARIANT_ARMS[arm]
+    return VariantLayout(v["speeds"], v["lats"], v.get("combine", "separate"))
+
+
+def arm_combine(arm: str) -> str:
+    """'separate' | 'cross' of an arm (VARIANT_ARMS entries without a combine key are 'separate')."""
+    return arm_layout(arm).combine
 
 
 def arm_var_name(arm: str) -> str:

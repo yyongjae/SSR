@@ -5,7 +5,7 @@ micro-batches per phase, with the real background-labeler round trip and a resum
 
   cd /workspace/yongjae/SSR-ck2 && nice -n 10 env PYTHONPATH=$PWD OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
     CUDA_VISIBLE_DEVICES= /venv/ssr/bin/python tools/ck/e2e2/cpu_dryrun.py [--arm main|bevkd] [--tag T] [--eval]
-        [--variants base|v8|v4|spd4|lat4|none]
+        [--variants base|v8|v4|spd4|lat4|none|cross]
 
 Steps (output D/ck2/e2e_smoke_cpu/dryrun_<tag>_<arm>/):
   A  Trainer.fit epochs 0-1: epoch 0 'warmup' (64 official-label candidates / token, online teacher KD), epoch 1
@@ -79,6 +79,8 @@ def ck2_dict(io_dir: Path, arm: str, variants: str = "base") -> dict:
         from navsim.agents.para_ssr.ck import e2e_data2 as D2
         from navsim.agents.para_ssr.ck.variants import VARIANT_ARMS, arm_var_name
         d["variants"] = {"speeds": list(VARIANT_ARMS[variants]["speeds"]), "lats": list(VARIANT_ARMS[variants]["lats"])}
+        if VARIANT_ARMS[variants].get("combine", "separate") != "separate":   # cross (as tools/release/compose.py)
+            d["variants"]["combine"] = VARIANT_ARMS[variants]["combine"]
         d["warmup"] = {"var_dir": str(Path(D2.WARMUP_DEFAULT["var_dir"]).parent / arm_var_name(variants))}
         if not d["variants"]["speeds"] and not d["variants"]["lats"]:   # V = 1 (as tools/release/compose.py)
             d["n_var_step"] = 0
@@ -224,7 +226,7 @@ def main(argv=None) -> int:
     ap.add_argument("--tag", default=time.strftime("%m%d_%H%M", time.gmtime(time.time() + 9 * 3600)))
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--eval-only", default="", help="existing dry-run root: run only the --eval part on it")
-    ap.add_argument("--variants", default="base", choices=["base", "v8", "v4", "spd4", "lat4", "none"],
+    ap.add_argument("--variants", default="base", choices=["base", "v8", "v4", "spd4", "lat4", "none", "cross"],
                     help="variant-set ablation arm (ck/variants.VARIANT_ARMS)")
     a = ap.parse_args(argv)
     assert os.environ.get("CUDA_VISIBLE_DEVICES", "x") == "", "CPU only: run with CUDA_VISIBLE_DEVICES="

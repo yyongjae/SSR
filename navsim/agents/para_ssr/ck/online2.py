@@ -67,8 +67,9 @@ Non-finite: a non-finite L_CK2 is replaced by 0 * sum(student params) (counted);
 Inference (eval, infer_outputs): ck2_* outputs over the 96-candidate pool (v2 top-16 x 6 variants, c = k * 6 + v):
   CK2 logits, the learned lateral control / offsets and every column's laterally corrected trajectory; the selection
   (ck/select2.py: old ck_final blended with v2 by beta, lateral applied after selection) happens in the evaluation.
-Variant layout (ablation arms): 6 / 96 / 80 / types 1..5 above are the base table of ck_e2e2.variants.  Any 'separate'
-  table there (speeds / lats; ck/variants.VARIANT_ARMS) gives V = 1 + len(speeds) + len(lats) variants per parent:
+Variant layout (ablation arms): 6 / 96 / 80 / types 1..5 above are the base table of ck_e2e2.variants.  Any table
+  there (speeds / lats / combine; ck/variants.VARIANT_ARMS) gives V = 1 + len(speeds) + len(lats) variants per parent
+  ('separate'; 'cross' adds the len(speeds) x len(lats) combos, VARIANTS=cross V = 25, 400 columns):
   the recorded / labelled / inferred pool is 16 V columns c = k * V + v (CKE2E2.layout = cands2.layout_cfg), the
   n_var bounds are 16 (V - 1), and warmup.var_dir must hold that table's label files (validate, the data side).  The
   per-step candidate counts (64 warm-up, 48 + 48 on-policy) do not depend on V.  No config key besides variants and
@@ -398,7 +399,7 @@ class CKE2E2Config:
             raise ValueError(f"ck_e2e2.topk must be {K16} (96-column generation layout), got {self.topk}")
         v = self.variants
         try:
-            lay = C2.layout_cfg(v)    # 'separate' table (V = 1 + speeds + lats), ext const_curv | straight, dtype
+            lay = C2.layout_cfg(v)    # 'separate' / 'cross' table (variants.variant_table), ext const_curv | straight
         except ValueError as e:
             raise ValueError(f"ck_e2e2.variants: {e}") from None
         n_max = K16 * (lay.nv - 1)    # non-identity variant columns of the 16 x V pool (base 80)

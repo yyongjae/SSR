@@ -8,6 +8,11 @@ covers refiner off, refiner KD off or partial, BEV KD off, and one teacher off.
 Writes <run>/launch/smoke_check.json, prints each check, exit 1 when one fails.  Peak memory: torch's peak per GPU from
 steps_rank0.jsonl when the refiner writes one; with the refiner off, the peak of nvidia-smi's memory.used sampled by
 scripts/experiment.sh into launch/gpu_mem.csv, which counts reserved memory too, so it reads higher.
+REFINER_ARCH=fpd (settings REFINER_ARCH, recorded only off its default ck2): the lateral KD weight must stay 0 (no
+lateral head), the surrogate is not trained (sur_nonfinite may be absent), and arch_as_set (launch/refiner_effective.json
+arch fpd with its fpd dict), fpd_teachers_recorded (teachers.json 'fpd' with both FPD teachers' ckpt sha16, teachers on)
+and ckpt_fpd_student (the student is still agent.ck_student.*, with DiT and scorer tensors and no CKNet trunk) are
+added; info records the arch.  A ck2 run is checked as before.
 """
 from __future__ import annotations
 
@@ -22,6 +27,11 @@ from typing import Any, Dict, List, Optional
 BANKS = {"det": "bevfusion", "map": "resmap"}
 KD_KEYS_OF = {"det": ("nc", "ep", "ttc"), "map": ("dac", "ep")}
 KD_SCORE_KEYS_ALL = ("nc", "dac", "ep", "ttc")     # ck_e2e2.yaml kd_score_keys
+ARCH_DEFAULT = "ck2"                               # settings REFINER_ARCH (tools/release/compose.py): absent = ck2
+
+
+def arch_of(s: Dict[str, str]) -> str:
+    return s.get("REFINER_ARCH", ARCH_DEFAULT)
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -94,7 +104,9 @@ def _refiner_checks(run: Path, s: Dict[str, str], checks: Dict[str, bool], info:
     phases = [e.get("phase") for e in ep if e.get("event") == "epoch_start"]
     checks["two_epochs_warmup_record_onpolicy"] = len(ends) == 2 and phases == ["warmup_record", "onpolicy"]
     cum = ends[-1]["cum"] if ends else {}
-    checks["no_nonfinite_loss"] = bool(ends) and cum.get("nonfinite_loss") == 0 and cum.get("sur_nonfinite") == 0
+    fpd = arch_of(s) == "fpd"
+    sur_bad = cum.get("sur_nonfinite", 0) if fpd else cum.get("sur_nonfinite")     # fpd: no surrogate (lambda_sur 0)
+    checks["no_nonfinite_loss"] = bool(ends) and cum.get("nonfinite_loss") == 0 and sur_bad == 0
     st = read_jsonl(io / "steps_rank0.jsonl")
     bad = sorted({k for r in st for k, v in r.items() if isinstance(v, float) and not math.isfinite(v)})
     checks["no_nonfinite_step_value"] = bool(st) and not bad
@@ -113,16 +125,30 @@ def _refiner_checks(run: Path, s: Dict[str, str], checks: Dict[str, bool], info:
     rkd = s["REFINER_KD"]
     if rkd == "off":
         checks["no_teacher_record"] = teachers.get("mode") == "none" and "det" not in teachers and "map" not in teachers
+        if fpd:
+            checks["no_teacher_record"] = checks["no_teacher_record"] and "fpd" not in teachers
         checks["no_teacher_log"] = not any("ck2/e_abs_T" in r for r in st)
         checks["no_teacher_time"] = bool(teacher_ms) and max(teacher_ms) < 5.0
     else:
         checks["both_teachers_recorded"] = "det" in teachers and "map" in teachers
+        if fpd:                      # the FPD teacher refiners the student distils from (launch_util2.fpd_teacher_check)
+            ft = teachers.get("fpd") or {}
+            checks["fpd_teachers_recorded"] = all((ft.get(t) or {}).get("ckpt_sha16") for t in ("det", "map"))
+            info["fpd_teachers"] = {t: {k: (ft.get(t) or {}).get(k) for k in ("run", "ckpt_sha16")} for t in ("det", "map")}
         ok = [float(r["ck2/kd_ok_frac"]) for r in st if "ck2/kd_ok_frac" in r]
         checks["kd_ok_frac_ge_0.999"] = bool(ok) and sum(ok) / len(ok) >= 0.999
         info["kd_ok_frac_mean"] = sum(ok) / len(ok) if ok else None
-    # each KD term is on exactly when the settings say so
+    # each KD term is on exactly when the settings say so (fpd: no lateral head, no lateral KD whatever REFINER_KD says)
     checks["score_kd_as_set"] = (max(wt_kd, default=0.0) > 0.0) if rkd in ("on", "score") else (max(wt_kd, default=0.0) == 0.0)
-    checks["lateral_kd_as_set"] = (max(wt_lat, default=0.0) > 0.0) if rkd in ("on", "lat") else (max(wt_lat, default=0.0) == 0.0)
+    lat_on = rkd in ("on", "lat") and not fpd
+    checks["lateral_kd_as_set"] = (max(wt_lat, default=0.0) > 0.0) if lat_on else (max(wt_lat, default=0.0) == 0.0)
+    if fpd:
+        eff_p = run / "launch/refiner_effective.json"
+        eff = json.loads(eff_p.read_text()) if eff_p.is_file() else {}
+        fd = eff.get("fpd") if isinstance(eff.get("fpd"), dict) else {}
+        checks["arch_as_set"] = eff.get("arch") == "fpd" and int(fd.get("n_draws") or 0) == 5
+        info["fpd"] = {k: fd.get(k) for k in ("n_draws", "steps", "grid", "lambda_diff", "lambda_traj", "use_gt_target",
+                                              "mt_k", "mt_draws")}
     if rkd in ("on", "score"):
         _calib_checks(run, s, st, teachers, checks, info)
     else:
@@ -136,6 +162,9 @@ def check_run(run_dir: str, mem_limit_gb: float = 22.5) -> Dict[str, Any]:
     s = settings["settings"]
     checks: Dict[str, bool] = {}
     info: Dict[str, Any] = {"run": settings.get("run"), "mem_limit_gb": mem_limit_gb}
+    arch = arch_of(s)
+    if arch != ARCH_DEFAULT:
+        info["arch"] = arch
     ex = run / "launch/train.exit"
     checks["train_exit_0"] = ex.is_file() and ex.read_text().strip() == "0"
     tt = run / "train/train_tokens.json"
@@ -179,6 +208,10 @@ def check_run(run_dir: str, mem_limit_gb: float = 22.5) -> Dict[str, Any]:
         checks["ckpt_refiner_as_set"] = any(k.startswith("agent.ck_student.") for k in keys) == (s["REFINER"] == "on")
         checks["ckpt_bev_kd_as_set"] = any("_distill." in k for k in keys) == (s["BEV_KD"] == "on")
         checks["ckpt_no_teacher_tensor"] = not any(k.startswith("agent.ck_student.") and "teacher" in k for k in keys)
+        if arch == "fpd":            # FPDRefinerNet (tok / dit / scorer) in the CK2 student slot, no CKNet trunk
+            stud = [k for k in keys if k.startswith("agent.ck_student.")]
+            checks["ckpt_fpd_student"] = (any(".dit." in k for k in stud) and any(".scorer." in k for k in stud)
+                                          and not any(k.startswith("agent.ck_student.trunk.") for k in stud))
     return {"pass": all(checks.values()), "checks": checks, "info": info}
 
 

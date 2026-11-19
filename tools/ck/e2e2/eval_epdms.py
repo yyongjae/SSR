@@ -148,8 +148,35 @@ def resolve_ckpt_and_tag(run_dir: Optional[Path], spec: str) -> Tuple[Path, str]
     return ckpt, tag
 
 
+FOREIGN_HYDRA_CFG = Path("/workspace/byounggun/ssr_outputs/final/code/hydra/config.yaml")
+ARCH_DEFAULT = "ck2"
+
+
+def recorded_arch(run_dir: Path, ckpt: Optional[Path] = None) -> Tuple[str, Optional[Path]]:
+    """REFINER_ARCH of the run a checkpoint belongs to, from the launch records of run_dir or of the checkpoint's
+    ancestors (the launcher's launch/refiner_effective.json 'arch', scripts/experiment.sh launch/settings.json
+    'REFINER_ARCH', recorded only off its default): (arch, the record that says so); absent = ('ck2', None), as for every
+    run recorded before the setting."""
+    for d in dict.fromkeys([run_dir, *(list(ckpt.parents)[:6] if ckpt is not None else [])]):
+        for f, field in ((d / "launch/refiner_effective.json", ("arch",)),
+                         (d / "launch/settings.json", ("settings", "REFINER_ARCH"))):
+            if not f.is_file():
+                continue
+            try:
+                v: Any = json.loads(f.read_text())
+                for k in field:
+                    v = v.get(k) if isinstance(v, dict) else None
+            except (OSError, ValueError):
+                continue
+            if v not in (None, "", ARCH_DEFAULT):
+                return str(v), f
+    return ARCH_DEFAULT, None
+
+
 def resolve_hydra_cfg(run_dir: Path, ckpt: Path, explicit_cfg: str = "") -> Path:
-    """Locate hydra/config.yaml from --hydra-cfg, run_dir, or checkpoint ancestors, or synthesize one."""
+    """Locate hydra/config.yaml from --hydra-cfg, run_dir, or checkpoint ancestors, or synthesize one.  The fallbacks
+    (another run's config, a synthesized CK2 recipe) are refused for a run whose records name another refiner
+    structure (REFINER_ARCH, recorded_arch): they would build the CK2 refiner."""
     if explicit_cfg:
         p = Path(explicit_cfg).resolve()
         if not p.is_file():
@@ -162,9 +189,15 @@ def resolve_hydra_cfg(run_dir: Path, ckpt: Path, explicit_cfg: str = "") -> Path
         ckpt.parent.parent / "code/hydra/config.yaml",
         ckpt.parent.parent.parent / "code/hydra/config.yaml",
         ckpt.parent.parent.parent.parent / "code/hydra/config.yaml",
-        Path("/workspace/byounggun/ssr_outputs/final/code/hydra/config.yaml"),
+        FOREIGN_HYDRA_CFG,
     ]
     for c in cands:
+        if c == FOREIGN_HYDRA_CFG:
+            arch, rec = recorded_arch(run_dir, ckpt)
+            if arch != ARCH_DEFAULT:
+                raise SystemExit(f"{run_dir}: no training hydra/config.yaml of its own and the run is REFINER_ARCH={arch} "
+                                 f"({rec}): the fallback configs ({FOREIGN_HYDRA_CFG}, a synthesized CK2 recipe) would "
+                                 f"build the CK2 refiner; pass --hydra-cfg <the run's train/code/hydra/config.yaml>")
         if c.is_file():
             return c.resolve()
 
@@ -314,6 +347,15 @@ class CombinedSceneLoader:
         return self.orig.get_scene_from_token(tok)
 
 
+def set_infer_tokens(agent, btok) -> None:
+    """The batch's scene tokens for a refiner that keys its inference on them (REFINER_ARCH=fpd: the DiT noise of a
+    scene is a function of its token, fpd_net.token_noise): CKE2E2 handlers with needs_tokens get infer_tokens before
+    each forward.  The CK2 refiner has no needs_tokens: nothing is set, the dump is as before."""
+    h = getattr(agent, "_ck_e2e2", None)
+    if getattr(h, "needs_tokens", False):
+        h.infer_tokens = [str(t) for t in btok]
+
+
 def run_dump_shard(
     split: str,
     pool_dir: Path,
@@ -430,10 +472,12 @@ def run_dump_shard(
     for btok, feats, _ in dl:
         fg = {k: v.to(dev, dtype=torch.float32 if v.is_floating_point() else v.dtype) for k, v in feats.items()}
         with torch.inference_mode():
+            set_infer_tokens(agent, btok)
             pr = agent(fg)
             if "ck2_cand96" not in pr:
                 pr = dict(pr)
                 if getattr(agent, "_ck_e2e2", None) is not None and getattr(agent, "ck_student", None) is not None:
+                    set_infer_tokens(agent, btok)
                     pr.update(agent._ck_e2e2.infer(agent.ck_student, fg, pr))
                 elif "plan_final_rewards" in pr:
                     from navsim.agents.para_ssr.ck.online import student_topk
@@ -533,8 +577,13 @@ def merge_pool(split: str, pool_dir: Path) -> None:
 
 
 def try_import_eval_e2e2_dump(run_dir: Path, pool_dir: Path, split: str) -> bool:
-    """If eval_e2e2 already dumped packed/navtest + infer/<run>/navtest, link/copy into pool_dir."""
+    """If eval_e2e2 already dumped packed/navtest + infer/<run>/navtest, link/copy into pool_dir (CK2 runs only: the
+    eval_e2e2 dump does not give a token-keyed refiner its scene tokens, set_infer_tokens)."""
     if split != "navtest":
+        return False
+    arch, _ = recorded_arch(run_dir)
+    if arch != ARCH_DEFAULT:
+        log(f"[navtest] REFINER_ARCH={arch}: an eval_e2e2 dump is not imported (no scene tokens there), dumping anew")
         return False
     pk = run_dir / "eval/root/packed/navtest"
     inf = run_dir / f"eval/root/infer/{run_dir.name}/navtest"

@@ -19,12 +19,18 @@ data on disk.  scripts/experiment.sh is its one caller; the CLI below writes wha
   compose.py resume-check --composition J --settings-json F [--allow-commit-change]
 
 Run name: only what differs from the defaults, in a fixed order, joined with _, then the hash (main_<hash6> by default):
-  [<bb>] [<det>-<map>] [ref-off] [rkd-off|score|lat] [bkd-off] [detkd-off|offbev|offref] [mapkd-off|offbev|offref]
+  [<bb>] [<det>-<map>] [ref-off|fpd] [rkd-off|score|lat] [bkd-off] [detkd-off|offbev|offref] [mapkd-off|offbev|offref]
   [f1|f4 dist headfree z<a>_<b> r32] [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 A setting implied by another one gets no part: REFINER=off is ref-off only, REFINER_KD=off BEV_KD=off is rkd-off_bkd-off.
+REFINER_ARCH=fpd (the refiner structure of FPD-Drive, navsim/agents/para_ssr/ck/fpd_net.py: parent + 5 residual-DiT
+draws per top-16 parent, FPD scorer, no lateral head): set lines arch=fpd, the 80-draw pool counts, lambda_sur 0, lateral
+KD off and the two FPD teacher refiners ${SSR_TEACHER_CACHE}/refiner_fpd/{det,map} (FPD_TEACHER_SUB); REFINER_KD on and
+score are one config (no lateral KD to switch off), lat is refused.  The default ck2 emits none of it and is left out of
+the recorded settings (RECORDED_ONLY_OFF_DEFAULT), so every earlier record stays as it was.
 hash6 = sha256 over the resolved overrides, minus run-path and wandb lines, with data roots written as placeholders so
 one config has one name on every server, plus the registry pins of the teachers in use.  Never the commit.  A changed
-default changes the overrides, so it changes the hash; launch/settings.json of a run has every setting.
+default changes the overrides, so it changes the hash; launch/settings.json of a run has every setting (REFINER_ARCH only
+off its default).
 """
 from __future__ import annotations
 
@@ -56,10 +62,14 @@ REFERENCE = REPO / "tools/release/reference/main_overrides.txt"
 ARM_EXTRA = REPO / "tools/ck/e2e2/v2_v15_v7_arm.extra"
 AGENT_YAML = REPO / "navsim/planning/script/config/common/agent/para_ssr_agent.yaml"
 ANCHORS_REL = "resources/planning_vb/trajectory_anchors_256.npy"
+ARCH_DEFAULT = L2.ARCH_DEFAULT           # REFINER_ARCH: ck2 (the CK2 refiner of every earlier run) | fpd (FPD-Drive)
+# the FPD teacher refiners (tools/release/setup/run_fpd_teachers.sh) under the teacher root, like the CK2 ones
+# (registry refiner_run ${SSR_TEACHER_CACHE}/refiner/{det,map}); trained on the BEV caches of the default teachers
+FPD_TEACHER_SUB = {"det": "refiner_fpd/det", "map": "refiner_fpd/map"}
 
 # every setting and its default; scripts/experiment.sh has the same block at its top (a test compares them)
 DEFAULTS: Dict[str, str] = {
-    "REFINER": "on", "REFINER_KD": "on", "BEV_KD": "on", "DET_KD": "on", "MAP_KD": "on",
+    "REFINER": "on", "REFINER_ARCH": ARCH_DEFAULT, "REFINER_KD": "on", "BEV_KD": "on", "DET_KD": "on", "MAP_KD": "on",
     "BACKBONE": "r34", "DET_TEACHER": "bevfusion", "MAP_TEACHER": "resmap",
     "FRAMES": "2,3", "UNDISTORT": "on", "HEADING": "xy", "PILLAR_Z": "-1,3", "BEV_RANGE": "64", "BN": "moving",
     "SEED": "0", "EPOCHS": "30", "GPUS": "0,1,2,3,4,5,6,7", "SAVE_EVERY": "1",
@@ -70,7 +80,12 @@ CHOICES: Dict[str, Tuple[str, ...]] = {
     "DET_KD": ("on", "off", "off_bev", "off_ref"), "MAP_KD": ("on", "off", "off_bev", "off_ref"),
     "FRAMES": ("2,3", "3", "0,1,2,3"), "UNDISTORT": ("on", "off"), "HEADING": ("xy", "free"),
     "BEV_RANGE": ("64", "32"), "BN": ("moving", "frozen"), "WANDB": ("online", "offline", "disable"), "DRY": ("0", "1"),
+    "REFINER_ARCH": L2.ARCHS,
 }
+# settings added after runs were recorded: left out of the canonical settings at their default, so the settings (and
+# launch/settings.json, composition.json) of every configuration that existed before stay byte for byte as they were;
+# a record without the key was made at the default (experiment.sh do_resume, smoke_check.py, eval read it so)
+RECORDED_ONLY_OFF_DEFAULT = ("REFINER_ARCH",)
 # settings that describe where or how a run is launched, not what it trains
 NOT_RECIPE = ("GPUS", "SAVE_EVERY", "RUN_ROOT", "TAG", "WANDB", "DRY")
 GPU_COUNTS = (2, 4, 8)
@@ -100,6 +115,7 @@ EXTRA_OWNED = {
     "agent.config.map_pc_range": "PILLAR_Z / BEV_RANGE", "agent.config.bev_h": "BEV_RANGE",
     "agent.config.bev_w": "BEV_RANGE", "agent.config.backbone_bn_mode": "BN", "agent.config.max_epochs": "EPOCHS",
     "trainer.params.max_epochs": "EPOCHS", "trainer.params.devices": "GPUS", "checkpoint.every_n_epochs": "SAVE_EVERY",
+    "agent.config.ck_e2e2.arch": "REFINER_ARCH", "agent.config.ck_e2e2.fpd": "REFINER_ARCH",
 }
 # overrides that do not enter hash6: run paths, wandb, how often to save, and roots that are lines only on some servers
 HASH_SKIP = ("experiment_name", "output_dir", "agent.config.ck_e2e2.io_dir", "resume_checkpoint",
@@ -254,6 +270,14 @@ def canonicalize(raw: Mapping[str, str], reg: Optional[Mapping[str, Any]] = None
     # refiner / KD: one config, one spelling
     if s["REFINER"] == "off":
         s["REFINER_KD"] = "off"
+        if s["REFINER_ARCH"] != ARCH_DEFAULT:
+            raise Refused(f"REFINER_ARCH={s['REFINER_ARCH']} means nothing: the refiner is off (REFINER=off)")
+    if s["REFINER_ARCH"] == "fpd":
+        if s["REFINER_KD"] == "lat":
+            raise Refused("REFINER_KD=lat with REFINER_ARCH=fpd: the FPD refiner has no lateral head, lateral KD alone "
+                          "would distil nothing (REFINER_KD=on, score or off)")
+        if s["REFINER_KD"] == "score":
+            s["REFINER_KD"] = "on"          # no lateral KD to switch off: score KD alone is what on already is
     no_ref, no_bev = s["REFINER_KD"] == "off", s["BEV_KD"] == "off"
     if no_ref and no_bev:
         s["DET_KD"] = s["MAP_KD"] = "off"
@@ -276,6 +300,16 @@ def canonicalize(raw: Mapping[str, str], reg: Optional[Mapping[str, Any]] = None
     for role, tk, kd in (("det", "DET_TEACHER", "DET_KD"), ("map", "MAP_TEACHER", "MAP_KD")):
         if not teacher_read(s, kd):
             s[tk] = default_teacher(role)
+    if s["REFINER_ARCH"] == "fpd" and s["REFINER_KD"] != "off":
+        for k in ("DET_KD", "MAP_KD"):
+            if s[k] in ("off", "off_ref"):
+                raise Refused(f"REFINER_ARCH=fpd with {k}={s[k]}: the DiT target bank needs both FPD teachers (DAC "
+                              f"from the map teacher, NC / TTC from the det teacher; a single source would take a key "
+                              f"from an untrained head)")
+        for role, tk in (("det", "DET_TEACHER"), ("map", "MAP_TEACHER")):
+            if s[tk] != default_teacher(role):
+                raise Refused(f"REFINER_ARCH=fpd with {tk}={s[tk]}: the FPD teacher refiners (${{SSR_TEACHER_CACHE}}/"
+                              f"{FPD_TEACHER_SUB[role]}) are trained on the BEV of {tk}={default_teacher(role)}")
 
     # student
     if s["BEV_RANGE"] == "32" and (s["REFINER"] == "on" or s["BEV_KD"] == "on"):
@@ -285,7 +319,15 @@ def canonicalize(raw: Mapping[str, str], reg: Optional[Mapping[str, Any]] = None
                       f"at epoch {ONPOLICY_FROM_EPOCH})")
     check_extra(s["EXTRA"])
     s["EXTRA"] = ";".join(extra_lines_of(s["EXTRA"]))
+    for k in RECORDED_ONLY_OFF_DEFAULT:
+        if s[k] == DEFAULTS[k]:
+            del s[k]
     return s
+
+
+def arch_of(s: Mapping[str, str]) -> str:
+    """The REFINER_ARCH of canonical (or recorded) settings: absent = ck2."""
+    return s.get("REFINER_ARCH", ARCH_DEFAULT)
 
 
 def teacher_read(s: Mapping[str, str], kd_key: str) -> bool:
@@ -306,7 +348,7 @@ def profile_of(s: Mapping[str, str]) -> str:
 
 def is_default_recipe(s: Mapping[str, str]) -> bool:
     """The main recipe on the reference GPU count: what tools/release/reference/main_overrides.txt describes."""
-    return all(s[k] == v for k, v in DEFAULTS.items() if k not in NOT_RECIPE) and len(s["GPUS"].split(",")) == 8
+    return all(s.get(k, v) == v for k, v in DEFAULTS.items() if k not in NOT_RECIPE) and len(s["GPUS"].split(",")) == 8
 
 
 # ----------------------------------------------------------------------------------------------- the run's lines
@@ -341,8 +383,11 @@ def run_name(s: Mapping[str, str], hash6: str) -> str:
         parts.append(f"{s['DET_TEACHER']}-{s['MAP_TEACHER']}")
     if s["REFINER"] == "off":
         parts.append("ref-off")           # the refiner KD goes with it
-    elif s["REFINER_KD"] != "on":
-        parts.append(f"rkd-{s['REFINER_KD']}")
+    else:
+        if arch_of(s) != ARCH_DEFAULT:
+            parts.append(arch_of(s))      # fpd
+        if s["REFINER_KD"] != "on":
+            parts.append(f"rkd-{s['REFINER_KD']}")
     if s["BEV_KD"] == "off":
         parts.append("bkd-off")
     parts += _teacher_kd_part(s, "DET_KD", "detkd") + _teacher_kd_part(s, "MAP_KD", "mapkd")
@@ -375,6 +420,25 @@ def _kd_lists(s: Mapping[str, str]) -> Tuple[List[str], List[str]]:
     return bev_off, src
 
 
+def fpd_teacher_run(roots: Mapping[str, str], role: str) -> str:
+    """The FPD teacher refiner of a role on this server: ${SSR_TEACHER_CACHE}/refiner_fpd/<role> (the same root as
+    the CK2 teacher_det_run / teacher_map_run lines, so normalize_line writes it as a placeholder in the hash)."""
+    return f"{roots['SSR_TEACHER_CACHE'].rstrip('/')}/{FPD_TEACHER_SUB[role]}"
+
+
+def fpd_set_lines(s: Mapping[str, str], roots: Mapping[str, str]) -> List[str]:
+    """Set lines of REFINER_ARCH=fpd (CKE2E2Config arch / fpd of navsim/agents/para_ssr/ck/online2.py): the 96 pool is
+    16 parents + 16 x 5 DiT draws, every draw recorded, labelled and in the step (n_var_step = onpolicy_label.n_var =
+    80), no CK2 kinematic variant from the warm-up labels (warmup.n_var 0), no surrogate (lambda_sur 0), no lateral KD
+    (no lateral head); with the refiner KD on, the two FPD teacher refiners (the CK2 teacher lines stay: the launcher
+    checks them and they still name the teacher BEV caches)."""
+    lines = ["arch=fpd", "n_var_step=80", "warmup.n_var=0", "onpolicy_label.n_var=80", "lambda_sur=0.0"]
+    if s["REFINER_KD"] != "off":     # off: the no-teacher lines above already switch the lateral KD off
+        lines += ["lat_kd.balance=fixed", "lat_kd.fixed=0.0", f"fpd.teacher_det_run={fpd_teacher_run(roots, 'det')}",
+                  f"fpd.teacher_map_run={fpd_teacher_run(roots, 'map')}"]
+    return lines
+
+
 def set_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mapping[str, Dict[str, Any]],
               smoke: bool = False) -> List[str]:
     """Lines of the merged set file (ck_e2e2 key=value)."""
@@ -396,9 +460,12 @@ def set_lines(s: Mapping[str, str], roots: Mapping[str, str], teachers: Mapping[
             lines += ["lat_kd.balance=fixed", "lat_kd.fixed=0.0"]
         if s["REFINER_KD"] == "lat":  # the Platt calibration acts on score KD logits only: nothing would read it
             lines += ["lambda_kd_score=0.0", "kd_calib.enabled=false"]
+    fpd = arch_of(s) == "fpd"
+    if fpd:
+        lines += fpd_set_lines(s, roots)
     if smoke:                        # scripts/training/smoke_v2_final.sh
         lines += ["record_from_epoch=0", "record_until_epoch=0", "onpolicy_from_epoch=1", "label_refresh_every_mb=20"]
-        if s["REFINER_KD"] in ("on", "lat"):
+        if s["REFINER_KD"] in ("on", "lat") and not fpd:     # fpd: no lateral KD to start
             lines.append("lat_kd.start_mb=30")
         if s["REFINER_KD"] in ("on", "score"):
             lines.append("kd_calib.min_n=50")
@@ -738,6 +805,12 @@ def verify(comp: Mapping[str, Any], overrides_path: str, teachers_json: Optional
                       f"{rec[role].get('ckpt_sha16')} != registry {pin['refiner_ckpt_sha16']}")
             else:
                 print(f"[check] {role} refiner teacher ckpt sha16 {pin['refiner_ckpt_sha16']} matches the registry")
+        fpd = rec.get("fpd") or {}                # REFINER_ARCH=fpd (launch_util2.fpd_teacher_check): no registry pin
+        for role in ("det", "map"):
+            if role in fpd:
+                t = fpd[role]
+                print(f"[check] {role} FPD teacher {t.get('run')}: ckpt sha16 {t.get('ckpt_sha16')}, done.json "
+                      f"{'yes' if t.get('done') is not None else 'NO (accepted in smoke mode)'}")
     if comp.get("default_recipe"):
         ok, lines = reference_diff(got, comp["roots"], comp["run_dir"])
         print(f"[check] reference diff ({REFERENCE.relative_to(REPO)}): {'PASS' if ok else 'FAIL'}")
@@ -798,8 +871,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(normalize_line(line, roots, args.run_dir))
         elif args.cmd == "settings-args":
             s = json.loads(Path(args.settings_json).read_text())["settings"]
-            for k, val in s.items():
-                print(f"{k}={val}")
+            for k, val in s.items():           # the recorded keys only, as before (a record without a
+                print(f"{k}={val}")             # RECORDED_ONLY_OFF_DEFAULT key: experiment.sh do_resume resets it)
         elif args.cmd == "record":
             comp = json.loads(Path(args.composition).read_text())
             commit, dirty = git_state()

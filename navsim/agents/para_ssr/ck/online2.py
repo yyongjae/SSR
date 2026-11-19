@@ -150,8 +150,27 @@ def _d_bev_kd() -> Dict[str, Any]:
 BEV_KD_PER_TEACHER = ("ratio_det", "ratio_map", "cap_det", "cap_map")
 
 
+def _d_fpd() -> Dict[str, Any]:
+    # arch 'fpd' only (ck/fpd_e2e.py, FPD-Drive refiner structure): frozen FPD teacher runs (tools/ck/fpd/
+    # train_fpd_teacher.py; '' = not set), DiT draws per parent (96 = 16 x (1 + 5)), DDIM steps, scene-token grid,
+    # DiT loss weights (FPD Eq. 6), GT DiT target on / off, multi-target distillation (FPD Sec. 3.3: <= mt_k targets,
+    # min ADE mt_min_ade m; mt_source 'bank' (default) = the teachers' offline banks <run>/bank/<split> (teacher-DiT
+    # draws of the 16 near + mid anchors, OFFICIAL PDM labels; safety = label NC, DAC >= mt_label_thr), as FPD-Drive's
+    # cached, evaluator-labelled teacher targets; 'online' = mt_draws teacher draws per current parent and teacher,
+    # sampled every step, safety = teacher scorer P(NC), P(DAC) >= mt_thr)
+    return {"teacher_det_run": "", "teacher_map_run": "", "teacher_which": "last", "n_draws": 5, "steps": 8,
+            "grid": 8, "lambda_diff": 1.0, "lambda_traj": 1.0, "use_gt_target": True, "mt_k": 4, "mt_draws": 2,
+            "mt_min_ade": 1.0, "mt_thr": 0.5, "mt_source": "bank", "mt_label_thr": 1.0}
+
+
+ARCHS = ("ck2", "fpd")                # refiner structure: CK2 (CKNet + rule variants) | FPD-Drive (DiT + scorer)
+FPD_N_DRAWS = 5                       # the 96-column base layout: 16 parents x (1 + 5 DiT draws)
+# optional keys outside ck_e2e2.yaml: to_dict() leaves them out at these defaults (every arch 'ck2' record unchanged)
+_OPTIONAL_DEFAULTS = {"arch": lambda: "ck2", "fpd": _d_fpd}
+
+
 _NESTED2 = {"variants": _d_variants, "lat_kd": _d_lat_kd, "warmup": _d_warmup, "onpolicy_label": _d_onpolicy_label,
-            "bev_kd": _d_bev_kd, "kd_calib": _d_kd_calib}
+            "bev_kd": _d_bev_kd, "kd_calib": _d_kd_calib, "fpd": _d_fpd}
 KD_CALIB_TEACHERS = ("det", "map")
 _INFER_SELECT_KEYS = ("beta", "set", "lat_mode")
 _INFER_SELECT_OPT = ("rule",)          # rule: "pdms" (default, select2.select96_pdms) | "wote" (select2.select96)
@@ -233,6 +252,10 @@ class CKE2E2Config:
     submit_selection: bool = False      # True: predictions['trajectory'] = ck2_traj (the infer_select pick)
     strict_rows: float = 0.999
     bev_kd: Dict[str, Any] = field(default_factory=_d_bev_kd)
+    # refiner structure (optional keys, not in ck_e2e2.yaml; to_dict() leaves both out at their defaults): 'ck2' =
+    # CKNet + rule variants (every run so far), 'fpd' = FPD-Drive's residual DiT + scorer (ck/fpd_e2e.py), options fpd
+    arch: str = "ck2"
+    fpd: Dict[str, Any] = field(default_factory=_d_fpd)
 
     # ------------------------------------------------------------------------------------------ parse
     @classmethod
@@ -353,9 +376,25 @@ class CKE2E2Config:
         self.ep_target = str(self.ep_target)
         if self.ep_target not in EP_TARGETS:
             raise ValueError(f"ck_e2e2.ep_target must be one of {EP_TARGETS}, got {self.ep_target!r}")
+        self.arch = str(self.arch).strip()
+        if self.arch not in ARCHS:
+            raise ValueError(f"ck_e2e2.arch must be one of {ARCHS}, got {self.arch!r}")
+        p = dict(self.fpd)
+        self.fpd = {"teacher_det_run": _opt_str(p["teacher_det_run"]) or "",
+                    "teacher_map_run": _opt_str(p["teacher_map_run"]) or "", "teacher_which": str(p["teacher_which"]),
+                    "n_draws": int(p["n_draws"]), "steps": int(p["steps"]), "grid": int(p["grid"]),
+                    "lambda_diff": float(p["lambda_diff"]), "lambda_traj": float(p["lambda_traj"]),
+                    "use_gt_target": _b(p["use_gt_target"]), "mt_k": int(p["mt_k"]), "mt_draws": int(p["mt_draws"]),
+                    "mt_min_ade": float(p["mt_min_ade"]), "mt_thr": float(p["mt_thr"]),
+                    "mt_source": str(p["mt_source"]), "mt_label_thr": float(p["mt_label_thr"])}
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # the optional arch keys are recorded only off their defaults: every arch 'ck2' dict is the one of before
+        if all(d[k] == dflt() for k, dflt in _OPTIONAL_DEFAULTS.items()):
+            for k in _OPTIONAL_DEFAULTS:
+                del d[k]
+        return d
 
     @property
     def compute_dtype(self) -> torch.dtype:
@@ -516,6 +555,77 @@ class CKE2E2Config:
                 C2.check_variant_files(self.warmup["var_dir"], v)
             except ValueError as e:
                 raise ValueError(f"ck_e2e2.variants vs warm-up label files: {e}") from None
+        self._validate_arch()
+
+    def _validate_arch(self) -> None:
+        """arch 'ck2' reads no fpd option (the block must stay at its defaults).  arch 'fpd' (ck/fpd_e2e.py): the
+        CK2 base layout with the 80 rule variants replaced by 16 x 5 DiT draws -- warm-up = the 32 raw anchors
+        (warmup.n_var 0), on-policy KD set = all 96 current candidates (n_var_step 80), label set = all 96 columns of
+        the lagged generation (onpolicy_label.n_var 80); no lateral / longitudinal decoder (lambda_sur 0, lateral KD
+        fixed 0); the frozen FPD teachers (fpd.teacher_*_run, config.json trainer train_fpd_teacher, arm T / M) with
+        use_teachers, none without (the CK2 teacher runs still name the teacher BEV caches)."""
+        f = self.fpd
+        if self.arch != "fpd":
+            if f != _d_fpd():
+                raise ValueError(f"ck_e2e2.fpd is only read with arch 'fpd' (arch {self.arch!r} needs the fpd block "
+                                 f"at its defaults), got {f}")
+            return
+        from .fpd_net import DDIM_T, FPD_TEACHER_ARMS, FPD_TEACHER_TRAINER
+
+        bad = []
+        if self.warmup["n_var"] != 0:
+            bad.append(f"warmup.n_var must be 0 (warm-up = the 32 raw anchors), got {self.warmup['n_var']}")
+        if self.n_var_step != K16 * FPD_N_DRAWS:
+            bad.append(f"n_var_step must be {K16 * FPD_N_DRAWS} (KD set = all 96 current candidates), got "
+                       f"{self.n_var_step}")
+        if self.onpolicy_label["n_var"] != K16 * FPD_N_DRAWS:
+            bad.append(f"onpolicy_label.n_var must be {K16 * FPD_N_DRAWS} (label set = all 96 columns of the "
+                       f"generation), got {self.onpolicy_label['n_var']}")
+        if self.lambda_sur != 0.0:
+            bad.append(f"lambda_sur must be 0 (no lateral / longitudinal decoder), got {self.lambda_sur}")
+        lk = self.lat_kd
+        if lk["balance"] != "fixed" or lk["fixed"] != 0.0:
+            bad.append(f"lat_kd must be balance 'fixed' with fixed 0 (no lateral head), got {lk['balance']!r} / "
+                       f"{lk['fixed']}")
+        if f["n_draws"] != FPD_N_DRAWS:
+            bad.append(f"fpd.n_draws must be {FPD_N_DRAWS} (96 = 16 x (1 + 5)), got {f['n_draws']}")
+        if not 1 <= f["steps"] <= DDIM_T:
+            bad.append(f"fpd.steps must be in [1, {DDIM_T}], got {f['steps']}")
+        if f["grid"] < 1:
+            bad.append(f"fpd.grid must be >= 1, got {f['grid']}")
+        if not (f["lambda_diff"] >= 0.0 and f["lambda_traj"] >= 0.0):
+            bad.append(f"fpd.lambda_diff / lambda_traj must be >= 0, got {f['lambda_diff']} / {f['lambda_traj']}")
+        # mt_min_ade > 0: at 0 fpd_net.select_targets can pick an already selected candidate again (one safe bank
+        # candidate -> mt_k - 1 copies of the same teacher target)
+        if not (f["mt_k"] >= 1 and f["mt_draws"] >= 1 and f["mt_min_ade"] > 0.0 and 0.0 <= f["mt_thr"] <= 1.0):
+            bad.append(f"fpd needs mt_k >= 1, mt_draws >= 1, mt_min_ade > 0, 0 <= mt_thr <= 1, got {f['mt_k']}, "
+                       f"{f['mt_draws']}, {f['mt_min_ade']}, {f['mt_thr']}")
+        if f["mt_source"] not in ("bank", "online") or not 0.0 <= f["mt_label_thr"] <= 1.0:
+            bad.append(f"fpd.mt_source must be 'bank' or 'online' and 0 <= mt_label_thr <= 1, got "
+                       f"{f['mt_source']!r}, {f['mt_label_thr']}")
+        if not f["teacher_which"]:
+            bad.append("fpd.teacher_which must not be empty")
+        if self.use_teachers:
+            for name in ("det", "map"):
+                run = f[f"teacher_{name}_run"]
+                if not run:
+                    bad.append(f"fpd.teacher_{name}_run is required (use_teachers)")
+                    continue
+                cj = Path(run) / "config.json"
+                if cj.is_file():
+                    rc = json.loads(cj.read_text())
+                    if rc.get("trainer") != FPD_TEACHER_TRAINER or rc.get("arm") != FPD_TEACHER_ARMS[name]:
+                        bad.append(f"fpd.teacher_{name}_run {run}: config.json trainer {rc.get('trainer')!r} / arm "
+                                   f"{rc.get('arm')!r}, expected {FPD_TEACHER_TRAINER!r} / "
+                                   f"{FPD_TEACHER_ARMS[name]!r}")
+        else:
+            if f["teacher_det_run"] or f["teacher_map_run"]:
+                bad.append(f"fpd.teacher_det_run / teacher_map_run must be null without teachers (got "
+                           f"{f['teacher_det_run']!r} / {f['teacher_map_run']!r})")
+            if not f["use_gt_target"]:
+                bad.append("fpd.use_gt_target false needs the teachers (the DiT would have no target)")
+        if bad:
+            raise ValueError("ck_e2e2.arch fpd: " + "; ".join(bad))
 
 
 # ----------------------------------------------------------------------------------------------- student
@@ -1466,7 +1576,7 @@ def ck2_parameters(agent) -> List[torch.nn.Parameter]:
     return [p for p in agent.ck_student.parameters() if p.requires_grad]
 
 
-STEP_LOG_PREFIXES = ("ck2/", "bevkd/", "gnorm/", "loss")
+STEP_LOG_PREFIXES = ("ck2/", "bevkd/", "gnorm/", "loss", "fpd/")
 
 
 def make_ck2_callback(agent):

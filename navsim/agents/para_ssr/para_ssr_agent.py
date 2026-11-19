@@ -448,10 +448,18 @@ class ParaSSRAgent(AbstractAgent):
         self._ck_e2e2 = None
         ck2 = self._ck_e2e2_config(config)
         if ck2 is not None and ck2.enabled:
-            from .ck.online2 import CKE2E2, build_student_ck2
+            if ck2.arch == "fpd":
+                # FPD-Drive refiner structure (ck/fpd_e2e.py): FPDRefinerNet student (forked RNG) + FPDE2E helper,
+                # same attribute names (optimiser group, clip, strict load and eval read ck_student / _ck_e2e2)
+                from .ck.fpd_e2e import FPDE2E, build_student_fpd
 
-            self.ck_student = build_student_ck2(ck2, apply_prior=not checkpoint_path)
-            self._ck_e2e2 = CKE2E2(ck2, max_epochs=int(config.max_epochs))
+                self.ck_student = build_student_fpd(ck2, apply_prior=not checkpoint_path)
+                self._ck_e2e2 = FPDE2E(ck2, max_epochs=int(config.max_epochs))
+            else:
+                from .ck.online2 import CKE2E2, build_student_ck2
+
+                self.ck_student = build_student_ck2(ck2, apply_prior=not checkpoint_path)
+                self._ck_e2e2 = CKE2E2(ck2, max_epochs=int(config.max_epochs))
             self.ck_bev_kd = None
             if ck2.bev_kd["enabled"]:
                 from .ck.bev_kd_arm import build_bev_kd_arm

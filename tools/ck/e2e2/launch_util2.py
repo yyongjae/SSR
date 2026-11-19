@@ -8,6 +8,8 @@ helpers, W&B mode); this file adds the CK2 recipe, the ck_e2e2 dict, the teacher
                              [--teacher-check strict|smoke] --out R/launch/overrides.txt
   launch_util2.py teacher-check --det RUN --map RUN [--mode strict|smoke] [--ep-target decoupled|official] [--out F.json]
                                 [--kd-calib-det F.json] [--kd-calib-map F.json]            exit 3 when not usable
+  launch_util2.py fpd-teacher-check --det RUN --map RUN [--which last] [--mode strict|smoke] [--ep-target ...]
+                                [--out F.json]          FPD teacher refiners (REFINER_ARCH=fpd), exit 3 when not usable
   launch_util2.py gpu-check  --gpus 0,1 [--max-used-mib 1024] [--list-only]               2 or 4 GPUs of 0-3
   launch_util2.py labeler-health --run-dir R --state F [--stall-s 1200]                   exit 5 when the labeler hangs
   launch_util2.py status     --run-dir R [--json]
@@ -37,10 +39,20 @@ function-level tests: the 'overrides' command refuses it unless SSR_ALLOW_FILE_C
 Refiner off: '++agent.config.ck_e2e2.enabled=false' in the extra file (or a set line).  Extra lines that set ck_e2e2 keys
 are merged BEFORE the checks, so the teacher and warm-up checks are skipped then, refiner_effective.json says what the
 run really uses, and arm_of gives 'noref'.
+Refiner structure (REFINER_ARCH of scripts/experiment.sh): ck_e2e2.arch 'ck2' (CKNet, every earlier run) | 'fpd'
+(FPD-Drive's residual DiT + scorer, navsim/agents/para_ssr/ck/fpd_net.py) and its dict ck_e2e2.fpd are optional keys,
+not in ck_e2e2.yaml (OPTIONAL_CK): effective_ck has them only when a set line names them (the fpd dict, all of its
+leaves, also whenever arch is fpd), so the dict, overrides and hash of every run without them are what they were.  FPD
+guard (fpd_teacher_check, arch fpd with teachers): both ck_e2e2.fpd teacher runs have config.json trainer
+'train_fpd_teacher' and arm T / M, ep_target == the student's, score_keys covering the KD keys taken from that teacher,
+ckpt_<which>.pt, and in strict mode done.json (smoke mode: a warning); recorded in teachers.json ('fpd').  The CK2
+teacher_check still runs on teacher_det_run / teacher_map_run.  arm_of: 'fpd' / 'fpd_nokd' (W&B tag; never 'noref',
+so the labeler starts).
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -81,6 +93,17 @@ WANDB_GROUP = "refiner"
 EXPERIMENT_PREFIX = "refiner"
 GSHARE_WARN = 0.5
 KST = 9 * 3600
+# refiner structure (ck_e2e2.arch; CKE2E2Config.arch of navsim/agents/para_ssr/ck/online2.py)
+ARCH_DEFAULT = "ck2"
+ARCHS = ("ck2", "fpd")
+# = online2._d_fpd() (CKE2E2Config().fpd; tests/test_fpd_launch.py and build_overrides2 compare them).  A copy because
+# online2 imports torch and this dict is needed where nothing may (tools/release/compose.py predicts the overrides).
+FPD_CK_DEFAULTS: Dict[str, Any] = {
+    "teacher_det_run": "", "teacher_map_run": "", "teacher_which": "last", "n_draws": 5, "steps": 8, "grid": 8,
+    "lambda_diff": 1.0, "lambda_traj": 1.0, "use_gt_target": True, "mt_k": 4, "mt_draws": 2, "mt_min_ade": 1.0,
+    "mt_thr": 0.5, "mt_source": "bank", "mt_label_thr": 1.0}
+# ck_e2e2 keys that are not in ck_e2e2.yaml: placeholders while set lines are applied (effective_ck)
+OPTIONAL_CK: Dict[str, Any] = {"arch": ARCH_DEFAULT, "fpd": FPD_CK_DEFAULTS}
 
 
 def kst(t: Optional[float] = None) -> str:
@@ -113,9 +136,16 @@ def _false(v: Any) -> bool:
     return str(v).strip().lower() in ("false", "0", "no", "off")
 
 
+def arch_of(ck: Dict[str, Any]) -> str:
+    """ck_e2e2.arch of a ck_e2e2 dict (refiner_effective.json too): absent = ck2."""
+    return str(ck.get("arch") or ARCH_DEFAULT)
+
+
 def arm_of(ck: Dict[str, Any]) -> str:
     if _false(ck.get("enabled", True)):
         return "noref"                      # no refiner at all
+    if arch_of(ck) == "fpd":                # FPD-Drive refiner (the labeler labels its 96 like the CK2 pool)
+        return "fpd_nokd" if _false(ck.get("use_teachers", True)) else "fpd"
     if _false(ck.get("use_teachers", True)):
         return "nokd"                       # no refiner teachers, no refiner KD
     return "bevkd" if bool((ck.get("bev_kd") or {}).get("enabled")) else "main"
@@ -204,6 +234,96 @@ def teacher_check(det_run: str, map_run: str, which: str = "last", mode: str = "
     if kd_calib is not None:
         out["kd_calib"] = kd_calib_record(kd_calib, out, det_run, map_run, which, kd_keys)
     return out
+
+
+def _key_list(v: Any) -> List[str]:
+    if isinstance(v, str):
+        return [x.strip() for x in v.strip().strip("[]").split(",") if x.strip()]
+    return [str(x) for x in (v or [])]
+
+
+def fpd_teacher_check(det_run: str, map_run: str, which: str = "last", mode: str = "strict",
+                      ep_target: Optional[str] = None, kd_keys: Optional[Sequence[str]] = None,
+                      kd_sources: Sequence[str] = ("det", "map")) -> Dict[str, Any]:
+    """Refuse an FPD teacher refiner (ck_e2e2.fpd.teacher_det_run / teacher_map_run, REFINER_ARCH=fpd) that the student
+    cannot use (= teacher_check for the CK2 teachers): config.json trainer 'train_fpd_teacher' and arm T / M
+    (fpd_net.FPD_TEACHER_TRAINER / FPD_TEACHER_ARMS), ep_target == the student's ck_e2e2.ep_target (a run without the
+    key = 'official'), score_keys covering the KD keys the student takes from that teacher (kd_calib.fit_keys of its arm
+    over kd_keys, when it is one of kd_sources), ckpt_<which>.pt present, and in mode 'strict' done.json (training
+    finished); mode 'smoke' accepts a teacher still training with a warning.  -> record of both runs (ckpt sha16 = the
+    one fpd_net.load_fpd_teacher reports, done.json, score_keys, steps / grid / seed) and 'warnings'."""
+    import hashlib
+    from navsim.agents.para_ssr.ck.ep_target import check_ep_target, run_ep_target
+    from navsim.agents.para_ssr.ck.fpd_net import FPD_TEACHER_ARMS, FPD_TEACHER_TRAINER
+    from navsim.agents.para_ssr.ck.kd_calib import fit_keys
+    if ep_target is None:
+        from navsim.agents.para_ssr.ck.online2 import CKE2E2Config
+        ep_target = CKE2E2Config().ep_target
+    try:
+        want_ep = check_ep_target(ep_target)
+    except ValueError as e:
+        raise LaunchError(f"student {e}") from None
+    out: Dict[str, Any] = {"mode": mode, "which": which, "checked": kst(), "ep_target": want_ep, "warnings": []}
+    for name, run in (("det", det_run), ("map", map_run)):
+        arm = FPD_TEACHER_ARMS[name]
+        if not run:
+            raise LaunchError(f"FPD teacher {name}: ck_e2e2.fpd.teacher_{name}_run is not set")
+        rd = Path(str(run))
+        LU.no_equals(str(rd), f"FPD teacher {name} run")
+        cj = rd / "config.json"
+        if not cj.is_file():
+            raise LaunchError(f"FPD teacher {name} {rd}: no config.json (train it first: bash scripts/experiment.sh "
+                              f"teachers ARCH=fpd WHICH={name})")
+        cfg = json.loads(cj.read_text())
+        if cfg.get("trainer") != FPD_TEACHER_TRAINER:
+            raise LaunchError(f"FPD teacher {name} {rd}: trainer {cfg.get('trainer')!r} != {FPD_TEACHER_TRAINER!r}")
+        if cfg.get("arm") != arm:
+            raise LaunchError(f"FPD teacher {name} {rd}: arm {cfg.get('arm')!r} != {arm!r}")
+        try:
+            t_ep = run_ep_target(cfg)
+        except ValueError as e:
+            raise LaunchError(f"FPD teacher {name} {rd}: config.json {e}") from None
+        if t_ep != want_ep:
+            raise LaunchError(f"FPD teacher {name} {rd}: ep_target {t_ep!r} (config.json; missing = 'official') != the "
+                              f"student's ck_e2e2.ep_target {want_ep!r} (label BCE and EP KD would disagree)")
+        keys = _key_list(cfg.get("score_keys"))
+        need = fit_keys(arm, list(kd_keys)) if kd_keys is not None and name in kd_sources else []
+        lack = [k for k in need if k not in keys]
+        if lack:
+            raise LaunchError(f"FPD teacher {name} {rd}: score_keys {keys} lack {lack}, KD key(s) the student takes "
+                              f"from this teacher")
+        done = rd / "done.json"
+        if not done.is_file():
+            msg = f"FPD teacher {name} {rd}: no done.json (FPD teacher still training)"
+            if mode == "strict":
+                raise LaunchError(msg + "; the e2e runs start only after both FPD teachers have finished")
+            out["warnings"].append(msg + ": accepted in smoke mode")
+            print(f"[launch_util2] WARNING: {out['warnings'][-1]}", file=sys.stderr)
+        ck = rd / (which if which.endswith(".pt") else f"ckpt_{which}.pt")
+        if not ck.is_file():
+            raise LaunchError(f"FPD teacher {name} {rd}: {ck.name} missing")
+        h = hashlib.sha256()
+        with open(ck, "rb") as f:
+            for blk in iter(lambda: f.read(1 << 24), b""):
+                h.update(blk)
+        out[name] = {"run": str(rd), "arm": arm, "trainer": cfg.get("trainer"), "ckpt": str(ck),
+                     "ckpt_mtime": kst(ck.stat().st_mtime), "ckpt_bytes": ck.stat().st_size,
+                     "ckpt_sha16": h.hexdigest()[:16], "done": json.loads(done.read_text()) if done.is_file() else None,
+                     "ep_target": t_ep, "score_keys": keys,
+                     **{k: cfg.get(k) for k in ("seed", "steps", "grid", "stage", "epochs")}}
+    return out
+
+
+def fpd_defaults_check() -> None:
+    """FPD_CK_DEFAULTS == the fpd defaults of CKE2E2Config (online2): the placeholders effective_ck writes for the
+    leaves no line sets must be the agent's own defaults (LaunchError naming the difference)."""
+    from navsim.agents.para_ssr.ck import online2 as O2
+    ref = O2._d_fpd() if hasattr(O2, "_d_fpd") else getattr(O2.CKE2E2Config(), "fpd", None)
+    if ref != FPD_CK_DEFAULTS:
+        diff = sorted(k for k in set(ref or {}) | set(FPD_CK_DEFAULTS)
+                      if (ref or {}).get(k, "<absent>") != FPD_CK_DEFAULTS.get(k, "<absent>"))
+        raise LaunchError(f"launch_util2.FPD_CK_DEFAULTS differs from the ck_e2e2.fpd defaults of online2 in {diff}: "
+                          f"keep the two equal")
 
 
 def warmup_check(c) -> Dict[str, Any]:
@@ -398,12 +518,37 @@ def extra_ck_sets(extra: Sequence[str]) -> List[str]:
             if not o.startswith("~") and "=" in o and LU._okey(o).startswith(CK_OVERRIDE)]
 
 
+def _set_top_keys(sets: Sequence[str]) -> set:
+    """Top-level ck_e2e2 keys the set lines name ('fpd.n_draws=5' -> 'fpd'; comments and blank lines skipped, as
+    LU.apply_sets does)."""
+    out = set()
+    for s in sets:
+        s = str(s).strip()
+        if s and not s.startswith("#"):
+            out.add(s.split("=", 1)[0].strip().split(".", 1)[0])
+    return out
+
+
 def effective_ck(run_dir: str, ngpu: int, ck_sets: Sequence[str] = (), extra: Sequence[str] = (),
                  ck_yaml=CK2_YAML) -> Dict[str, Any]:
-    """The ck_e2e2 dict of a run: yaml, counters for ngpu, then set lines, then the extra's ck_e2e2 lines.  No check."""
+    """The ck_e2e2 dict of a run: yaml, counters for ngpu, then set lines, then the extra's ck_e2e2 lines.  No check.
+    The optional keys (OPTIONAL_CK: arch, fpd; not in the yaml) are in the dict only when a line names them, the fpd
+    dict (every leaf, FPD_CK_DEFAULTS for the ones no line sets) also whenever arch is fpd; lines naming none of them
+    (every run before REFINER_ARCH) give the yaml's dict alone, as before."""
     ck = scale_mb_counters(load_ck2_yaml(ck_yaml), ngpu)
     ck["io_dir"] = f"{run_dir}/{IO_SUB}"
-    return LU.apply_sets(ck, list(ck_sets) + extra_ck_sets(extra))
+    sets = list(ck_sets) + extra_ck_sets(extra)
+    named = _set_top_keys(sets) & set(OPTIONAL_CK)
+    if not named:
+        return LU.apply_sets(ck, sets)
+    added = [k for k in OPTIONAL_CK if k not in ck]
+    for k in added:                  # placeholders: LU.apply_sets refuses a key the dict does not have
+        ck[k] = copy.deepcopy(OPTIONAL_CK[k])
+    out = LU.apply_sets(ck, sets)
+    for k in added:
+        if k not in named and not (k == "fpd" and arch_of(out) == "fpd"):
+            del out[k]
+    return out
 
 
 def merge_overrides(run_dir: str, ngpu: int, ck: Dict[str, Any], workers: int = 6, max_epochs: int = 30,
@@ -444,12 +589,20 @@ def build_overrides2(run_dir: str, gpus: Sequence[str], workers: int = 6, max_ep
             raise LaunchError("ck_e2e2.teacher_require_done=false is only for smoke runs (E2E_SMOKE=1)")
         if max_epochs <= c.onpolicy_from_epoch and teacher_mode == "strict":
             raise LaunchError(f"max_epochs {max_epochs} <= onpolicy_from_epoch {c.onpolicy_from_epoch}")
+        fpd = str(getattr(c, "arch", arch_of(ck))) == "fpd"
+        if fpd:
+            fpd_defaults_check()
         if c.use_teachers:
             teachers = teacher_check(c.teacher_det_run, c.teacher_map_run, c.teacher_which, teacher_mode, teacher_deep,
                                      ep_target=c.ep_target, kd_calib=c.kd_calib, kd_keys=c.kd_score_keys)
             bk = bevkd_norms(c)
             if bk:
                 teachers["bev_kd"] = bk
+            if fpd:                  # the FPD teacher refiners the student distils from (REFINER_ARCH=fpd)
+                f = c.fpd
+                teachers["fpd"] = fpd_teacher_check(f["teacher_det_run"], f["teacher_map_run"], f["teacher_which"],
+                                                    teacher_mode, ep_target=c.ep_target, kd_keys=c.kd_score_keys,
+                                                    kd_sources=c.kd_sources)
         else:   # CKE2E2Config.validate already refused any teacher / KD setting
             teachers = {"mode": "none", "use_teachers": False, "checked": kst(), "ep_target": c.ep_target,
                         "kd_calib": {"enabled": False}}
@@ -785,6 +938,13 @@ def main(argv=None) -> int:
     t.add_argument("--kd-calib-det", default="", help="KD calibration file of the DET teacher (checked when given)")
     t.add_argument("--kd-calib-map", default="", help="KD calibration file of the MAP teacher (checked when given)")
     t.add_argument("--out", default="")
+    ft = sub.add_parser("fpd-teacher-check", help="the FPD teacher refiners of REFINER_ARCH=fpd (fpd_teacher_check)")
+    ft.add_argument("--det", required=True)
+    ft.add_argument("--map", required=True)
+    ft.add_argument("--which", default="last")
+    ft.add_argument("--mode", default="strict", choices=["strict", "smoke"])
+    ft.add_argument("--ep-target", default=None, choices=["official", "decoupled"])
+    ft.add_argument("--out", default="")
     g = sub.add_parser("gpu-check")
     g.add_argument("--gpus", required=True)
     g.add_argument("--max-used-mib", type=int, default=1024)
@@ -834,6 +994,13 @@ def main(argv=None) -> int:
             kc = ({"enabled": True, "det": a.kd_calib_det or None, "map": a.kd_calib_map or None}
                   if (a.kd_calib_det or a.kd_calib_map) else None)
             rec = teacher_check(a.det, a.map, a.which, a.mode, ep_target=a.ep_target, kd_calib=kc)
+            if a.out:
+                LU._write_json(a.out, rec)
+            print(json.dumps(rec, indent=1, default=str))
+        elif a.cmd == "fpd-teacher-check":
+            from navsim.agents.para_ssr.ck.online2 import CKE2E2Config
+            rec = fpd_teacher_check(a.det, a.map, a.which, a.mode, ep_target=a.ep_target,
+                                    kd_keys=CKE2E2Config().kd_score_keys)
             if a.out:
                 LU._write_json(a.out, rec)
             print(json.dumps(rec, indent=1, default=str))

@@ -35,6 +35,7 @@
 | 8 | `50_warmup_labels.sh` | raw256, 변형 라벨 (`make_raw256_traj.py`), 공식 EP 파일 (`assemble_official_ep.py`) | `refiner_noteacher`, `full` | 3.1 + 2.4 + 0.25 GiB | raw256 2.4시간, 변형 약 50분 (CPU 48 worker) | 아니오 | 4, 5, 7 |
 | 9 | `60_teacher_bev.sh` | ReSMap, BEVFusion cache | `full` | 727 + 508 GiB | ReSMap 약 1시간, BEVFusion 복사 시간 미측정 | 아니오 (재생성은 예) | 없음 |
 | 10 | `run_refiner_teachers.sh` | refiner teacher 2개 | `full` | 1 GiB | 2.77시간 | **4 + 4 GPU** | 6, 7, 8, 9 |
+| 10b | `run_fpd_teachers.sh` (선택) | `REFINER_ARCH=fpd`용 FPD-Drive 구조 teacher refiner 2개 (`${SSR_TEACHER_CACHE}/refiner_fpd/{det,map}`: DiT 학습, bank 샘플 + CPU 공식 라벨, scorer 학습) | `REFINER_ARCH=fpd`만 | 약 5 GiB | 미측정 (단계당 약 2.5시간 추정) | **4 + 4 GPU** | 5, 7, 8, 9 |
 | 11 | `70_pristine_navsim.sh` | 원본 NAVSIM v1.1, v2.2, navtest cache | 평가 | 3 + 3.6 GiB | v1.1 cache 44분 | 아니오 | 2 |
 | 12 | `verify_assets.py --profile <프로필>` | 전체 검사 | 전부 | - | 수 분 | 아니오 | 위 전부 |
 | 13 | `scripts/experiment.sh check`, `smoke` | 조립 확인, 짧은 학습 | 전부 | 2.5 GiB | check 수 초, smoke 7분 | smoke만 **8 GPU** | 12 |
@@ -65,6 +66,7 @@ bash $S/40_packed_from_dataset.sh
 bash $S/50_warmup_labels.sh             # 끝에 공식 EP 파일도 만든다
 BEVFUSION_SRC=host:/path/cache_train_100x100/ bash $S/60_teacher_bev.sh
 bash scripts/experiment.sh teachers     # run_refiner_teachers.sh. GPU 8장, 2.77시간
+bash scripts/experiment.sh teachers ARCH=fpd   # run_fpd_teachers.sh. REFINER_ARCH=fpd를 돌릴 때만
 bash $S/70_pristine_navsim.sh
 
 /venv/.../python tools/release/verify_assets.py --profile full     # 전체 검사. 실패하면 고칠 방법을 줄마다 알려 준다

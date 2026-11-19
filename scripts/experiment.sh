@@ -9,6 +9,7 @@
 #
 # ---------------------------------------------------------------------------------------------------- settings
 REFINER=on                  # on | off: the refiner (critic + lateral correction on the v2 head's candidates)
+REFINER_ARCH=ck2            # ck2 | fpd: refiner structure; fpd = FPD-Drive's residual DiT + scorer, no lateral head (docs/EXPERIMENTS.md)
 REFINER_KD=on               # on | off | score (lateral KD off) | lat (score KD off).  off: no refiner teacher is loaded
 BEV_KD=on                   # on | off: BEV KD v15 from both teachers
 DET_KD=on                   # on | off (both KD paths) | off_bev | off_ref: KD from the DET teacher
@@ -48,15 +49,17 @@ if [ -n "${SSR_RELEASE_TEST_STUBS:-}" ]; then
   E2E_START=$SSR_RELEASE_TEST_STUBS/train_e2e2.sh; VERIFY_ASSETS=$SSR_RELEASE_TEST_STUBS/verify_assets.py
   EVAL_SH=$SSR_RELEASE_TEST_STUBS/eval.sh; SMOKE_CHECK=$SSR_RELEASE_TEST_STUBS/smoke_check.py
 fi
-SETTINGS=(REFINER REFINER_KD BEV_KD DET_KD MAP_KD BACKBONE DET_TEACHER MAP_TEACHER FRAMES
+SETTINGS=(REFINER REFINER_ARCH REFINER_KD BEV_KD DET_KD MAP_KD BACKBONE DET_TEACHER MAP_TEACHER FRAMES
           UNDISTORT HEADING PILLAR_Z BEV_RANGE BN SEED EPOCHS GPUS SAVE_EVERY RUN_ROOT TAG WANDB EXTRA DRY)
-# options of single commands; these may also come from the environment
+# options of single commands; these may also come from the environment (ARCH, of teachers, only from the command line:
+# shells often export ARCH for other tools)
 RUN=""; EPOCH=""; EPDMS=""; CONFIRM=${CONFIRM:-0}; REGISTRY=${REGISTRY:-}; CHECK_ROOT=${CHECK_ROOT:-}
 ALLOW_DIRTY=${ALLOW_DIRTY:-0}; ALLOW_MIXED=${ALLOW_MIXED:-0}; ALLOW_COMMIT_CHANGE=${ALLOW_COMMIT_CHANGE:-0}
 FORCE_CONCURRENT=${FORCE_CONCURRENT:-0}; MIN_FREE_GB=${MIN_FREE_GB:-70}; MEM_LIMIT_GB=${MEM_LIMIT_GB:-22.5}
 SMOKE_KEEP=${SMOKE_KEEP:-1}; QUICK=${QUICK:-0}; BASE=${BASE:-}; GPUS_DET=${GPUS_DET:-}; GPUS_MAP=${GPUS_MAP:-}; WHICH=${WHICH:-}
+ARCH=ck2
 OPTIONS=(RUN EPOCH EPDMS CONFIRM REGISTRY CHECK_ROOT ALLOW_DIRTY ALLOW_MIXED ALLOW_COMMIT_CHANGE FORCE_CONCURRENT MIN_FREE_GB
-         MEM_LIMIT_GB SMOKE_KEEP QUICK BASE GPUS_DET GPUS_MAP WHICH)
+         MEM_LIMIT_GB SMOKE_KEEP QUICK BASE GPUS_DET GPUS_MAP WHICH ARCH)
 
 say() { echo "[experiment] $*"; }
 die() { echo "[experiment] REFUSED: $*" >&2; exit 3; }
@@ -73,6 +76,11 @@ for a in "$@"; do
   printf -v "$k" '%s' "$v"
   GIVEN+=("$k")
 done
+# ARCH picks the teacher refiners 'teachers' trains; a run's refiner structure is the setting REFINER_ARCH (train ARCH=fpd
+# would otherwise launch the ck2 recipe without a word)
+if _in ARCH "${GIVEN[@]:-}" && [ "$CMD" != teachers ]; then
+  die "ARCH is an option of 'teachers' only; the refiner structure of a run is REFINER_ARCH=ck2|fpd"
+fi
 [ -n "$REGISTRY" ] && export SSR_RELEASE_REGISTRY=$REGISTRY
 RUN_ROOT=${RUN_ROOT:-$SSR_RUN_ROOT}
 
@@ -227,6 +235,9 @@ do_resume() {
   _in WANDB "${GIVEN[@]:-}" && given_wandb=$WANDB
   _in SAVE_EVERY "${GIVEN[@]:-}" && given_save=$SAVE_EVERY
   local keep_root=$RUN_ROOT
+  # settings recorded only off their default (compose RECORDED_ONLY_OFF_DEFAULT): a settings.json without the key (ck2,
+  # and every run recorded before it) was made at the default, whatever the block above says
+  REFINER_ARCH=ck2
   while IFS= read -r line; do k=${line%%=*}; printf -v "$k" '%s' "${line#*=}"; done < <(py "$COMPOSE" settings-args --settings-json "$sj")
   RUN_ROOT=$keep_root
   [ -z "$given_gpus" ] || GPUS=$given_gpus
@@ -335,12 +346,30 @@ PY
 }
 
 do_teachers() {
-  only_keys teachers DET_TEACHER MAP_TEACHER GPUS_DET GPUS_MAP WHICH REGISTRY
-  [ -f "$REPO/tools/release/setup/run_refiner_teachers.sh" ] || die "tools/release/setup/run_refiner_teachers.sh is missing"
+  # ARCH=ck2: the CK2 refiner teachers; ARCH=fpd: the FPD teacher refiners of REFINER_ARCH=fpd (same GPUS_DET / GPUS_MAP /
+  # WHICH; on the BEV caches of the same teachers)
+  only_keys teachers DET_TEACHER MAP_TEACHER GPUS_DET GPUS_MAP WHICH REGISTRY ARCH
+  local script
+  case "$ARCH" in
+    ck2) script=tools/release/setup/run_refiner_teachers.sh;;
+    fpd) script=tools/release/setup/run_fpd_teachers.sh;;
+    *) die "ARCH=$ARCH: ck2 | fpd";;
+  esac
+  [ -f "$REPO/$script" ] || die "$script is missing"
+  if [ "$ARCH" = fpd ]; then
+    # one FPD teacher run per role (${SSR_TEACHER_CACHE}/refiner_fpd/{det,map}), read by every REFINER_ARCH=fpd run on
+    # the BEV of the default teachers (compose refuses fpd with another one): trained on that BEV only
+    local dflt; dflt=$(py -c 'from tools.release.compose import DEFAULTS as D; print(D["DET_TEACHER"], D["MAP_TEACHER"])') \
+      || die "cannot read the default teachers of tools/release/compose.py"
+    case "${WHICH:-both}" in both|det) [ "$DET_TEACHER" = "${dflt% *}" ] || die "teachers ARCH=fpd: DET_TEACHER=$DET_TEACHER: \
+the FPD teacher refiners are trained on the BEV of the default teachers only (DET_TEACHER=${dflt% *})";; esac
+    case "${WHICH:-both}" in both|map) [ "$MAP_TEACHER" = "${dflt#* }" ] || die "teachers ARCH=fpd: MAP_TEACHER=$MAP_TEACHER: \
+the FPD teacher refiners are trained on the BEV of the default teachers only (MAP_TEACHER=${dflt#* })";; esac
+  fi
   [ -z "$GPUS_DET" ] || export GPUS_DET
   [ -z "$GPUS_MAP" ] || export GPUS_MAP
   [ -z "$WHICH" ] || export WHICH
-  DET_TEACHER=$DET_TEACHER MAP_TEACHER=$MAP_TEACHER SSR_GPU_POLICY=any exec bash "$REPO/tools/release/setup/run_refiner_teachers.sh"
+  DET_TEACHER=$DET_TEACHER MAP_TEACHER=$MAP_TEACHER SSR_GPU_POLICY=any exec bash "$REPO/$script"
 }
 
 do_purge() {

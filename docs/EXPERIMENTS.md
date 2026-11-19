@@ -36,7 +36,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `eval` | `RUN=<이름> GPUS=... [EPOCH=<n>] [EPDMS=0|1]`. 평가의 유일한 경로입니다. 다른 인자는 받지 않습니다. | GPU, 채점 트리, 캐시 |
 | `table` | `<RUN_ROOT>/*/eval/*/summary.json`을 표로 출력합니다. | 평가 결과 |
 | `assets` | 이 설정에 필요한 파일이 맞게 있는지 확인합니다 (`QUICK=1`은 빠른 확인). | 없음 |
-| `teachers` | refiner teacher 두 개를 학습합니다 (`GPUS_DET=`, `GPUS_MAP=`, `WHICH=both|det|map`). 각 2.8시간, GPU 4장. | BEV 캐시 |
+| `teachers` | refiner teacher 두 개를 학습합니다 (`GPUS_DET=`, `GPUS_MAP=`, `WHICH=both|det|map`). 각 2.8시간, GPU 4장. `ARCH=fpd`는 `REFINER_ARCH=fpd`가 쓰는 FPD teacher 두 개를 학습합니다 (`tools/release/setup/run_fpd_teachers.sh`, 같은 옵션, 기본 teacher `bevfusion`, `resmap`의 BEV로만). 기본은 `ARCH=ck2`. | BEV 캐시 |
 | `purge` | `RUN=<이름> CONFIRM=1`. `TRAIN_DONE`이 있는 run의 `refiner/{lab,rec}`만 지웁니다. 평가에 쓰지 않는 파일입니다. | 없음 |
 
 `train`이 거부하는 경우:
@@ -54,6 +54,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | 키 | 값 | 기본 | 기본값과 다를 때 이름에 들어가는 부분 | 뜻 |
 |---|---|---|---|---|
 | `REFINER` | on off | on | `ref-off` | refiner 전체를 켜고 끕니다. 끄면 labeler도 안 돌고 v2 head 궤적을 제출합니다. |
+| `REFINER_ARCH` | ck2 fpd | ck2 | `fpd` | refiner 구조. `fpd`는 FPD-Drive의 residual DiT + scorer로 바꿉니다 (아래 "refiner 구조"). `REFINER=on`일 때만 됩니다. |
 | `REFINER_KD` | on off score lat | on | `rkd-off` `rkd-score` `rkd-lat` | refiner로 가는 KD. `off`는 teacher를 아예 읽지 않습니다. `score`는 score KD만 남기고 lateral KD를 끕니다. `lat`는 lateral KD만 남기고 score KD를 끕니다. |
 | `BEV_KD` | on off | on | `bkd-off` | BEV KD v15 (student BEV로 가는 KD). |
 | `DET_KD` | on off off_bev off_ref | on | `detkd-off` `detkd-offbev` `detkd-offref` | DET teacher에서 오는 KD. `off`는 두 경로 모두, `off_bev`는 BEV KD만, `off_ref`는 refiner KD만 끕니다. |
@@ -77,20 +78,33 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | `EXTRA` | Hydra 줄, `;`로 구분 | 없음 | `x` | 위 키에 없는 것을 바꿀 때. hash에 들어갑니다. |
 | `DRY` | 0 1 | 0 | 없음 | 1이면 `train`, `smoke`가 시작하지 않고 출력만 합니다. |
 
-명령별 옵션: `RUN`, `EPOCH`, `EPDMS`, `CONFIRM`, `QUICK`, `BASE`(표의 기준 run), `CHECK_ROOT`, `REGISTRY`(registry 파일 경로), `ALLOW_DIRTY`, `ALLOW_MIXED`, `ALLOW_COMMIT_CHANGE`, `FORCE_CONCURRENT`, `MIN_FREE_GB`, `MEM_LIMIT_GB`(기본 22.5), `SMOKE_KEEP`(0이면 통과 후 그 스모크의 ckpt, rec, lab 삭제), `GPUS_DET`, `GPUS_MAP`, `WHICH`. 그 외 키는 거부합니다.
+명령별 옵션: `RUN`, `EPOCH`, `EPDMS`, `CONFIRM`, `QUICK`, `BASE`(표의 기준 run), `CHECK_ROOT`, `REGISTRY`(registry 파일 경로), `ALLOW_DIRTY`, `ALLOW_MIXED`, `ALLOW_COMMIT_CHANGE`, `FORCE_CONCURRENT`, `MIN_FREE_GB`, `MEM_LIMIT_GB`(기본 22.5), `SMOKE_KEEP`(0이면 통과 후 그 스모크의 ckpt, rec, lab 삭제), `GPUS_DET`, `GPUS_MAP`, `WHICH`, `ARCH`(`teachers`만, 명령줄로만 받음. 다른 명령에 주면 거부합니다. run의 refiner 구조는 `REFINER_ARCH`). 그 외 키는 거부합니다.
 
 `EXTRA`에서 거부하는 것:
 
 - 고정된 값: `infer_select`, `submit_selection`, `kd_calib`, `teacher_`, `warmup.`, `distill_lambda_`, `distill_tau_`, `plan_anchor_file`, `dataloader.params.batch_size`, `io_dir`, `output_dir`, `seed`.
 - e2e 구조: `use_task_interaction`, `use_det_motion_head`, `use_map_head`, `map_head_type`, `bev_seg_weight`. task interaction, det head, seg map head는 항상 켜져 있고 실험에서 바꾸지 않습니다.
-- 위 표의 키가 정하는 값 (`use_distill`, `ck_e2e2.enabled`, `image_architecture` 등). 이름과 실제가 달라지기 때문입니다. 해당 키를 쓰라고 안내합니다.
+- 위 표의 키가 정하는 값 (`use_distill`, `ck_e2e2.enabled`, `image_architecture`, `ck_e2e2.arch`, `ck_e2e2.fpd.*` 등). 이름과 실제가 달라지기 때문입니다. 해당 키를 쓰라고 안내합니다.
+
+### refiner 구조 (`REFINER_ARCH`)
+
+`REFINER_ARCH=fpd`는 refiner의 구조만 FPD-Drive(arXiv 2610.13232)의 것으로 바꿉니다 (`navsim/agents/para_ssr/ck/fpd_net.py`). 나머지(v2 head, BEV KD v15, on-policy labeler, 일정, 평가, 선택 규칙)는 그대로입니다.
+
+- 후보: v2 top-16 parent마다 parent 자신 + DiT draw 5개 = 96개. 열 순서는 CK2와 같습니다 (`c = 6k + v`, `v = 0`이 parent). labeler는 지금처럼 기록된 96개를 채점합니다.
+- 학습: FPD scorer가 on-policy label로 배웁니다. score KD는 FPD teacher의 scorer에서, DiT는 GT 궤적 + FPD teacher DiT 샘플(teacher scorer가 고른 것)의 multi-target distillation으로 배웁니다. lateral head가 없으므로 lateral KD는 0이고, surrogate도 쓰지 않습니다.
+- teacher: FPD teacher 두 개(`${SSR_TEACHER_CACHE}/refiner_fpd/det`, `.../map`)를 먼저 학습합니다: `bash scripts/experiment.sh teachers ARCH=fpd`. CK2 teacher(`refiner/{det,map}`)의 줄과 확인도 그대로 남습니다. teacher가 끝나지 않았으면(`done.json` 없음) `check`, `train`이 거부합니다. `smoke`는 launcher가 경고만 남기지만, 학습이 teacher를 읽을 때 거부합니다 (`teacher_require_done`, CK2 teacher와 같음).
+- `REFINER_KD`: `on`과 `score`는 같은 설정이라 `on`으로 정리됩니다 (끌 lateral KD가 없음). `off`는 teacher를 하나도 읽지 않습니다. `lat`는 거부합니다.
+- 기본 teacher(`bevfusion`, `resmap`)에서만 됩니다. FPD teacher가 그 BEV로 학습되기 때문입니다 (refiner KD가 꺼져 있으면 제한 없음).
+- 기록: `settings.json`에는 기본값(`ck2`)이 아닐 때만 `REFINER_ARCH`가 들어갑니다. 그래서 이전 run의 기록, 이름, hash는 그대로이고, 키가 없는 기록은 `ck2`로 읽습니다 (`resume`, `smoke_check.py`, `check_build.py`, 평가).
+- 평가: `tools/ck/e2e2/eval_epdms.py`가 batch의 scene token을 refiner에 넘깁니다 (DiT noise가 token마다 고정). run의 hydra config가 없을 때 쓰는 대체 config(다른 run의 것, CK2 레시피로 만든 것)는 fpd run에서 거부합니다.
+- `assets`(`verify_assets`)는 FPD teacher를 보지 않습니다. 확인은 launcher가 합니다 (`check`).
 
 ## 4. 폴더 이름
 
 기본값과 다른 것만 아래 순서대로 `_`로 잇고, 맨 뒤에 hash를 붙입니다. 다른 것이 없으면 `main_<hash6>`입니다.
 
 ```
-[backbone] [<det>-<map>] [ref-off] [rkd-off|rkd-score|rkd-lat] [bkd-off] [detkd-off|detkd-offbev|detkd-offref]
+[backbone] [<det>-<map>] [ref-off|fpd] [rkd-off|rkd-score|rkd-lat] [bkd-off] [detkd-off|detkd-offbev|detkd-offref]
 [mapkd-off|mapkd-offbev|mapkd-offref] [f1|f4 dist headfree z<a>_<b> r32]
 [bn-frozen] [e<N>] [g<N>] [s<N>] [<TAG>] [x] <hash6>
 ```
@@ -98,6 +112,7 @@ bash scripts/experiment.sh table                            # 모든 run의 결�
 | 인자 | 이름 |
 |---|---|
 | (없음) | `main_<hash6>` |
+| `REFINER_ARCH=fpd` | `fpd_<hash6>` |
 | `DET_KD=off` | `detkd-off_<hash6>` |
 | `BACKBONE=r50` | `r50_<hash6>` |
 | `REFINER_KD=off BEV_KD=off` | `rkd-off_bkd-off_<hash6>` |
@@ -131,6 +146,8 @@ run 폴더 안의 이름:
 | `DET_KD=off MAP_KD=off` (KD가 하나라도 켜짐) | 거부합니다. `REFINER_KD=off BEV_KD=off`를 쓰세요. |
 | 양쪽 BEV bank 또는 양쪽 refiner source를 모두 끔 | 거부합니다. 각각 `BEV_KD=off`, `REFINER_KD=off`를 쓰세요. |
 | 아무도 읽지 않는 teacher | 기본 teacher로 돌아가 이름에 나오지 않습니다. |
+| `REFINER_ARCH=fpd REFINER_KD=score` | `REFINER_KD=on`과 같은 설정입니다 (`fpd_<hash6>`). |
+| `REFINER_ARCH=fpd`와 `REFINER=off`, `REFINER_KD=lat`, 또는 refiner KD가 켜진 채 기본이 아닌 teacher | 거부합니다. |
 
 기본 레시피의 override는 `tools/release/reference/main_overrides.txt`(참조 run의 override, 경로만 자리표시자로 바꿈)와 다음 줄만 다를 수 있습니다. `check`가 이를 확인하고 PASS/FAIL을 출력합니다.
 
@@ -181,12 +198,16 @@ run 폴더 안의 이름:
 | BN 고정 | `BN=frozen` | full | 20 h |
 | seed 반복 | `SEED=1` | full | 20 h |
 | v1 planner | `REFINER=off BEV_KD=off EXTRA='agent.config.plan_anchor=false'` | base | ≤ 20 h |
+| FPD refiner (FPD teacher 필요) | `REFINER_ARCH=fpd` | full | 측정 안 됨. DiT draw 80개 샘플링 추가. 메모리 smoke 필수 |
+| FPD refiner, refiner KD 끔 | `REFINER_ARCH=fpd REFINER_KD=off` | full | 측정 안 됨 |
 
 | Profile | 무엇 | 디스크 |
 |---|---|---|
 | base | 데이터셋, 지도, anchor, `pdm_score_256`, `pdm_score_256_officialEP`, 환경 | 약 693 GiB |
 | refiner_noteacher | base + navtrain metric cache, GT 저장소, packed, warm-up label | 약 743 GiB |
 | full | refiner_noteacher + BEV teacher 캐시 2개, refiner teacher run 2개 | 약 1.93 TiB |
+
+`REFINER_ARCH=fpd`는 KD가 켜져 있으면 FPD teacher run 2개(`teachers ARCH=fpd`)도 필요합니다. `assets`는 이것을 확인하지 않고, `check`(launcher)가 확인합니다.
 
 거부되는 실험:
 

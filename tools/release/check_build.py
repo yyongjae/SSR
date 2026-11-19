@@ -54,6 +54,14 @@ def summarize(agent):
         "lat_kd_fixed": ck.cfg.lat_kd["fixed"], "kd_calib_enabled": ck.cfg.kd_calib["enabled"],
         "kd_calib_mode": ck.cfg.kd_calib["mode"], "infer_select": ck.cfg.infer_select,
         "submit_selection": ck.cfg.submit_selection, "seed": ck.cfg.seed}
+    arch = str(getattr(ck.cfg, "arch", "ck2")) if ck is not None else "ck2"
+    if arch != "ck2":                # REFINER_ARCH=fpd: its structure and student size (the ck2 record stays as it was)
+        rec["refiner"]["arch"] = arch
+        rec["refiner"]["fpd"] = dict(getattr(ck.cfg, "fpd", None) or {})
+        stud = getattr(agent, "ck_student", None)
+        if stud is not None:
+            rec["refiner"]["student_params"] = (stud.param_counts() if hasattr(stud, "param_counts")
+                                                else sum(p.numel() for p in stud.parameters()))
     return rec
 
 
@@ -122,6 +130,8 @@ def main(argv=None) -> int:
           f"undistort {rec['undistort']}, heading from xy {rec['heading_from_xy']}")
     print(f"[check_build] BEV KD {rec['bev_kd']}")
     print(f"[check_build] refiner {rec['refiner']}")
+    if (rec["refiner"] or {}).get("arch"):
+        print(f"[check_build] refiner arch {rec['refiner']['arch']}: student params {rec['refiner'].get('student_params')}")
     if a.reader_tokens:
         print(f"[check_build] teacher readers agree on {a.reader_tokens} tokens, sha16 {rec['reader_sha16']}")
     print("[check_build] refusals: none")
